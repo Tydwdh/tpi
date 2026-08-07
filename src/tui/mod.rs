@@ -35,6 +35,15 @@ use model::{Entry, LineKind, StatusLine, ToolCard, ToolCardState, TranscriptLine
 /// 帧合并间隔（§16.1：100-500 deltas/s 时按 16 ms 合并，而不是 delta 数量等于 draw 次数）。
 pub const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// 活动区高度：约 2/5 屏，随终端行数自适应。
+///
+/// - 下限 12 行（小终端仍可读）；
+/// - 上限为 `rows - 12`（给 plan/footer/input 区域留空间），大终端自动拓展。
+pub fn activity_height(rows: u16) -> u16 {
+    let proportional = (rows * 2) / 5;
+    proportional.clamp(12, rows.saturating_sub(12).max(12))
+}
+
 /// spinner 动画帧（§16.1：动画时钟独立，活动时推进）。
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -68,6 +77,8 @@ pub enum HitTarget {
 /// `draw` 是唯一写 stdout 的路径。帧合并由 [`should_draw`](Self::should_draw) 控制。
 pub struct Renderer {
     terminal: Terminal<CrosstermBackend<BufWriter<Stdout>>>,
+    /// 当前活动区高度（resize 时随终端行数重新计算并重建 viewport）。
+    activity_rows: u16,
     last_draw: Option<Instant>,
     /// 距上次 draw 的合并计数（诊断与测试用）。
     pub coalesced_events: u64,
@@ -111,9 +122,9 @@ impl Renderer {
         );
         let stdout = BufWriter::new(std::io::stdout());
         let backend = CrosstermBackend::new(stdout);
-        // §16.1：活动区高度在启动时按窗口计算一次（约 2/5 屏，夹在 12..=32）。
+        // §16.1：活动区高度随终端大小自适应（约 2/5 屏，resize 时重新计算）。
         let (_, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
-        let height = ((rows * 2) / 5).clamp(12, 32);
+        let height = activity_height(rows);
         let mut terminal = match Terminal::with_options(
             backend,
             ratatui::TerminalOptions {
@@ -133,6 +144,7 @@ impl Renderer {
         // inline TUI 不清除 scrollback 或整个屏幕；首帧只绘制自己的区域。
         Ok(Self {
             terminal,
+            activity_rows: height,
             last_draw: None,
             coalesced_events: 0,
             theme: theme::Theme::omp(),
@@ -234,8 +246,34 @@ impl Renderer {
     }
 
     /// 终端 resize 时重算布局（§16.1：不丢 transcript、不闪白）。
+    /// 终端 resize 时重算布局（§16.1：不丢 transcript、不闪白）。
+    ///
+    /// ratatui 的 `Viewport::Inline(height)` 高度在 resize 时保持不变（只重算原点）；
+    /// 这里在终端行数变化时重新计算活动区高度并重建 viewport，实现随终端自适应。
     pub fn autoresize(&mut self) -> std::io::Result<()> {
-        self.terminal.autoresize()
+        self.terminal.autoresize()?;
+        let (_, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+        let height = activity_height(rows);
+        if height != self.activity_rows {
+            self.rebuild_viewport(height)?;
+        }
+        Ok(())
+    }
+
+    /// 以新高度重建 inline viewport（scrollback 在终端缓冲区中，重建不清屏）。
+    fn rebuild_viewport(&mut self, height: u16) -> std::io::Result<()> {
+        let stdout = BufWriter::new(std::io::stdout());
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(height),
+            },
+        )?;
+        self.terminal = terminal;
+        self.terminal.hide_cursor()?;
+        self.activity_rows = height;
+        Ok(())
     }
 
     /// 恢复终端（异常退出也能恢复，§21 M5 验收）。
@@ -1494,6 +1532,21 @@ mod tests {
         assert_eq!(fmt_tokens(999), "999");
         assert_eq!(fmt_tokens(12_345), "12.3k");
         assert_eq!(fmt_tokens(2_000_000), "2.0M");
+    }
+
+    #[test]
+    fn activity_height_scales_with_terminal_rows() {
+        // 小终端：2/5 屏不足下限 → 12 行。
+        assert_eq!(activity_height(24), 12);
+        // 常规终端：2/5 屏。
+        assert_eq!(activity_height(50), 20);
+        assert_eq!(activity_height(80), 32);
+        // 大终端：不再被 32 上限卡住，自动拓展（上限 rows-12）。
+        assert_eq!(activity_height(100), 40);
+        assert_eq!(activity_height(120), 48);
+        // 极端小终端：保底 12（不 panic）。
+        assert_eq!(activity_height(12), 12);
+        assert_eq!(activity_height(15), 12);
     }
 
     #[test]

@@ -195,13 +195,17 @@ pub async fn run<P: Provider>(
         let _ = ui.send(RuntimeEvent::TurnStarted { turn }).await;
 
         // §15.4：compaction 检查（只在下一次请求前；完整 boundary 之后）。
+        // P0-9：投影用请求级估算（system prompt + 计划快照 + 工具 schema），
+        // 只算 messages 会低估实际请求，导致 compaction 触发过晚。
         if let Some(context_window) = config.model.context_window {
             let usable = crate::context::usable_input(
                 context_window,
                 config.model.max_output_tokens.unwrap_or(0) as u64,
                 config.safety_reserve_tokens,
             );
-            let projected = crate::context::estimate_messages(&messages);
+            let system_prompt = system_prompt_text(config, current_plan.lock().unwrap().as_ref());
+            let projected =
+                crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
             if crate::context::should_compact(projected, usable) && !compaction_failed {
                 match compact_turn(provider, &mut messages, session, config, &cancel).await {
                     Ok(()) => {
@@ -244,7 +248,10 @@ pub async fn run<P: Provider>(
                 config.model.max_output_tokens.unwrap_or(0) as u64,
                 config.safety_reserve_tokens,
             );
-            let projected = crate::context::estimate_messages(&messages);
+            let system_prompt =
+                system_prompt_text(config, current_plan.lock().unwrap().as_ref());
+            let projected =
+                crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
             let _ = ui
                 .send(RuntimeEvent::ContextUsage { projected, usable })
                 .await;
@@ -286,6 +293,8 @@ pub async fn run<P: Provider>(
                             break 'run_loop CompletionReason::Cancelled;
                         }
                         Err(e) => {
+                            // 错误详情记录到日志（§19.2：provider 错误可诊断）。
+                            tracing::error!(%request_id, error = %e, "provider request failed");
                             session
                                 .append_event(&SessionEvent::RunCompleted {
                                     reason: CompletionReason::Error,
@@ -704,8 +713,12 @@ error: invalid_arguments
             session
                 .complete_tool(calls[index].call_id, &outcome)
                 .map_err(|e| RunFailure::Session(e.to_string()))?;
-            // §10.7 第 6 步：ToolCompleted 已持久化，崩溃恢复窗口关闭，删除 backup。
-            if let Some(backup) = backup_cleanup.remove(&index) {
+            // §10.7 第 6 步：ToolCompleted 已持久化，崩溃恢复窗口关闭。
+            // P0-11：只有成功才删除 backup；失败（如 commit_recovery_failed，
+            // 无法证明恢复完成）必须保留恢复现场（§10.7 第 5 条“保留所有文件”）。
+            if backup_cleanup_allowed(outcome.status)
+                && let Some(backup) = backup_cleanup.remove(&index)
+            {
                 let _ = std::fs::remove_file(backup);
             }
             if calls[index].name != "update_plan" {
@@ -823,6 +836,8 @@ async fn compact_turn<P: Provider>(
     let recent = pruned[split..].to_vec();
 
     // 3. 用 compaction 角色（默认 primary，§7.2）生成结构化 summary。
+    // P0-2：stream 与事件消费必须并发——provider 在同一 task 内 `send().await`，
+    // 若先等 stream 返回再收事件，事件数超过 channel 容量时双方互相等待（死锁）。
     let (event_tx, mut event_rx) = mpsc::channel(crate::provider::EVENT_CHANNEL_CAPACITY);
     let request = ModelRequest {
         model: config.model.name.clone(),
@@ -832,12 +847,24 @@ async fn compact_turn<P: Provider>(
         reasoning: config.model.reasoning.clone(),
         context_window: config.model.context_window,
     };
-    provider
-        .stream(request, event_tx, cancel.clone())
-        .await
-        .map_err(|e| RunFailure::Provider(e.to_string()))?;
+    let stream = provider.stream(request, event_tx, cancel.clone());
+    tokio::pin!(stream);
     let mut summary_text = String::new();
-    while let Some(event) = event_rx.recv().await {
+    loop {
+        tokio::select! {
+            Some(event) = event_rx.recv() => {
+                if let ProviderEvent::TextDelta(text) = event {
+                    summary_text.push_str(&text);
+                }
+            }
+            result = &mut stream => {
+                let _response = result.map_err(|e| RunFailure::Provider(e.to_string()))?;
+                break;
+            }
+        }
+    }
+    // stream 返回后 channel 中可能还有已入队的尾部 delta，全部收完。
+    while let Ok(event) = event_rx.try_recv() {
         if let ProviderEvent::TextDelta(text) = event {
             summary_text.push_str(&text);
         }
@@ -862,15 +889,9 @@ async fn compact_turn<P: Provider>(
         ));
     }
     let seq = session.seq();
-    // covered.end 是 **exclusive**（= compaction 时下一条事件的 seq）：
-    // 覆盖 seq 1..=seq-1 的全部事件。恢复端 session_to_messages 用
-    // `index < covered.end - 1` 跳过这些事件，两处 off-by-one 必须同步修改。
     session
         .append_event(&SessionEvent::CompactionCommitted {
-            covered: crate::session::EventRange {
-                start: EventId::from_u128(1),
-                end: EventId::from_u128(seq as u128),
-            },
+            covered: compaction_covered_range(seq),
             summary: crate::session::CompactSummary {
                 text: summary_text.clone(),
             },
@@ -888,16 +909,27 @@ async fn compact_turn<P: Provider>(
     Ok(())
 }
 
-/// 构造上下文 projection（§15.1 顺序：system → 用户目标 → 历史 turns → 当前输入在尾部）。
-///
-/// §13：每次 model request 的 runtime snapshot 都包含规范化计划（compaction 或
-/// 长对话不会让模型只靠记忆遵循 Todo）。
-fn build_context(
-    config: &Config,
-    messages: &[ChatMessage],
-    plan: Option<&crate::tool::plan::Plan>,
-) -> Vec<ChatMessage> {
-    let mut out = Vec::with_capacity(messages.len() + 2);
+/// compaction 覆盖范围（P0-8 修复）：
+/// `covered.end` 是 exclusive，必须等于 compaction 时**下一条**事件的 seq
+/// （= 最后一条事件 seq + 1），覆盖全部压缩前事件。
+/// 此前写 `session.seq()` 少覆盖最后一条，短会话恢复时该 raw 事件会与
+/// summary 重复注入（恢复端 `session_to_messages` 按 `index < end - 1` 跳过）。
+fn compaction_covered_range(session_seq: u64) -> crate::session::EventRange {
+    crate::session::EventRange {
+        start: EventId::from_u128(1),
+        end: EventId::from_u128(session_seq as u128 + 1),
+    }
+}
+
+/// P0-11：backup 清理策略——只有工具成功提交后才允许删除 backup。
+/// 失败（含 commit_recovery_failed：无法证明恢复完成）时 backup 是唯一
+/// 恢复现场，必须保留（§10.7 第 5 条“保留所有文件”）。
+fn backup_cleanup_allowed(status: ToolStatus) -> bool {
+    status == ToolStatus::Succeeded
+}
+
+/// 拼接 system prompt 文本（P0-9 提取：预算估算与请求构造共用同一来源）。
+fn system_prompt_text(config: &Config, plan: Option<&crate::tool::plan::Plan>) -> String {
     let mut system = DEFAULT_SYSTEM_PROMPT.to_string();
     if let Some(extra) = &config.system_prompt_extra {
         system.push_str("\n\n");
@@ -908,7 +940,20 @@ fn build_context(
         system.push_str("\n\n");
         system.push_str(&snapshot);
     }
-    out.push(ChatMessage::System(system));
+    system
+}
+
+/// 构造上下文 projection（§15.1 顺序：system → 用户目标 → 历史 turns → 当前输入在尾部）。
+///
+/// §13：每次 model request 的 runtime snapshot 都包含规范化计划（compaction 或
+/// 长对话不会让模型只靠记忆遵循 Todo）。
+fn build_context(
+    config: &Config,
+    messages: &[ChatMessage],
+    plan: Option<&crate::tool::plan::Plan>,
+) -> Vec<ChatMessage> {
+    let mut out = Vec::with_capacity(messages.len() + 2);
+    out.push(ChatMessage::System(system_prompt_text(config, plan)));
     out.extend_from_slice(messages);
     out
 }
@@ -1073,4 +1118,32 @@ pub fn session_path(
     sessions_root
         .join(session::workspace_id_for(workspace_root.as_std_path()))
         .join(format!("{session_id}.jsonl"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P0-8：covered.end 是 exclusive，必须等于 compaction 时下一条事件的 seq。
+    /// 此前写 `session.seq()`（最后一条事件 seq），短会话恢复时最后一条
+    /// raw 事件与 summary 重复注入。
+    #[test]
+    fn compaction_covered_end_is_next_seq() {
+        let range = compaction_covered_range(3);
+        assert_eq!(range.end, EventId::from_u128(4));
+        assert_eq!(range.start, EventId::from_u128(1));
+        let range = compaction_covered_range(126);
+        assert_eq!(range.end, EventId::from_u128(127));
+    }
+
+    /// P0-11：backup 只允许在工具成功时删除；失败（含 commit_recovery_failed，
+    /// 无法证明恢复完成）必须保留恢复现场。
+    #[test]
+    fn backup_cleanup_policy_keeps_recovery_on_failure() {
+        use crate::tool::outcome::ToolStatus;
+        assert!(backup_cleanup_allowed(ToolStatus::Succeeded));
+        assert!(!backup_cleanup_allowed(ToolStatus::Failed));
+        assert!(!backup_cleanup_allowed(ToolStatus::Rejected));
+        assert!(!backup_cleanup_allowed(ToolStatus::Cancelled));
+    }
 }

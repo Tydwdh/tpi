@@ -22,8 +22,20 @@ use crate::ids::{RunId, SessionId};
 use crate::provider::openai_compat::OpenAiCompatClient;
 use crate::provider::{ChatMessage, Provider};
 use crate::session::{self, SessionEvent, SessionLog};
-use crate::tui::{Renderer, model::ViewModel};
+use crate::tui::{Renderer, model::LineKind, model::ViewModel};
 use ratatui::crossterm::event::Event;
+
+/// P0-4：系统消息 + 立即重绘。
+/// slash 命令输出此前 push 后直接 continue 不 draw，用户看不到任何反馈，
+/// 直到下一次键盘事件触发重绘。
+fn push_system_line(
+    view: &mut ViewModel,
+    renderer: &mut Renderer,
+    text: String,
+) -> Result<(), String> {
+    view.push_line(LineKind::System, text);
+    renderer.draw(view).map_err(|e| e.to_string())
+}
 
 /// 会话定位方式（§18.3）。
 pub enum SessionTarget {
@@ -130,7 +142,9 @@ pub async fn run(
 }
 
 /// 非交互单次 run（输出经 stdout，仅最终答案）。
-async fn run_prompt_once<P: Provider>(
+///
+/// `pub`：`-p` 模式的执行路径，集成测试直接覆盖（P0-1 死锁回归）。
+pub async fn run_prompt_once<P: Provider>(
     provider: &mut P,
     session: &mut SessionLog,
     config: &Config,
@@ -140,7 +154,12 @@ async fn run_prompt_once<P: Provider>(
 ) -> Result<agent::AgentOutcome, String> {
     let cancel = CancellationToken::new();
     *current_cancel.lock().unwrap() = Some(cancel.clone());
-    let (ui_tx, _ui_rx) = mpsc::channel(128);
+    let (ui_tx, mut ui_rx) = mpsc::channel(128);
+    // P0-1：`-p` 模式没有 TUI 消费 UI 事件；直接丢弃 rx 会在 channel 满后
+    // 让 agent 的 `ui.send().await` 永久等待（挂死）。drain task 持续消费。
+    tokio::spawn(async move {
+        while ui_rx.recv().await.is_some() {}
+    });
     let outcome = agent::run(
         provider,
         session,
@@ -201,8 +220,13 @@ async fn interactive_loop<P: Provider>(
     renderer.draw(&view).map_err(|e| e.to_string())?;
 
     // `@` 文件索引：后台扫描一次（跟随 .gitignore，有界 2000），不阻塞启动。
-    let (index_tx, mut index_rx) = mpsc::channel::<Vec<String>>(1);
+    // P0-3：不用一次性 channel + select 分支——sender drop 后 `recv()` 每次
+    // poll 都立即返回 None，空闲时主循环忙转（CPU 空转）。改为共享状态，
+    // 由键盘事件驱动的重绘路径顺带检查（索引到达不需要立即重绘）。
+    let file_index: std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     {
+        let index_slot = file_index.clone();
         let index_root = config.workspace_root.clone();
         tokio::spawn(async move {
             let files = tokio::task::spawn_blocking(move || {
@@ -210,7 +234,7 @@ async fn interactive_loop<P: Provider>(
             })
             .await
             .unwrap_or_default();
-            let _ = index_tx.send(files).await;
+            *index_slot.lock().unwrap() = Some(files);
         });
     }
 
@@ -297,13 +321,12 @@ async fn interactive_loop<P: Provider>(
                     _ => {}
                 }
             }
-            // `@` 文件索引就绪（一次）。
-            files = index_rx.recv() => {
-                if let Some(files) = files {
-                    view.file_index = files;
-                    need_draw = true;
-                }
-            }
+        }
+
+        // `@` 文件索引就绪（P0-3：共享状态顺带检查，不占 select 分支）。
+        if let Some(files) = file_index.lock().unwrap().take() {
+            view.file_index = files;
+            need_draw = true;
         }
 
         // 空闲时不重绘：否则没有任何状态变化也会以 60 FPS 占用终端和 CPU。
@@ -350,8 +373,9 @@ async fn interactive_loop<P: Provider>(
                     } else {
                         "未配置 key"
                     };
-                    view.push_line(
-                        LineKind::System,
+                    push_system_line(
+                        &mut view,
+                        &mut renderer,
                         format!(
                             "配置来源: {}\nworkspace: {}\nsessions: {}\nartifacts: {}\nshell: {shell}\nweb_search: Brave（{brave_key}）\n自动打开浏览器: {}\n保留 token: {}",
                             config.source,
@@ -361,12 +385,13 @@ async fn interactive_loop<P: Provider>(
                             if config.auto_open_browser { "是" } else { "否" },
                             config.safety_reserve_tokens,
                         ),
-                    );
+                    )?;
                     continue;
                 }
                 "/model" => {
-                    view.push_line(
-                        LineKind::System,
+                    push_system_line(
+                        &mut view,
+                        &mut renderer,
                         format!(
                             "primary:\n  名称: {}\n  provider: {}\n  base_url: {}\n  reasoning: {}\n  max_output_tokens: {}\n  context_window: {}\n  api_key_env: {}",
                             config.model.name,
@@ -385,7 +410,7 @@ async fn interactive_loop<P: Provider>(
                                 .unwrap_or_else(|| "未配置".to_string()),
                             config.model.api_key_env,
                         ),
-                    );
+                    )?;
                     continue;
                 }
                 "/help" => {
@@ -399,7 +424,7 @@ async fn interactive_loop<P: Provider>(
                          Ctrl+U 清空 · Ctrl+A/E 行首/行尾 · PgUp/PgDn 翻页 · \
                          滚轮滚动 · 点击工具卡片展开 · Ctrl-C 取消 run",
                     );
-                    view.push_line(LineKind::System, text);
+                    push_system_line(&mut view, &mut renderer, text)?;
                     continue;
                 }
                 "/session" => {
@@ -412,7 +437,7 @@ async fn interactive_loop<P: Provider>(
                         ),
                         None => "尚无 session（第一条消息后创建）".to_string(),
                     };
-                    view.push_line(LineKind::System, info);
+                    push_system_line(&mut view, &mut renderer, info)?;
                     continue;
                 }
                 "/sessions" => {
@@ -420,12 +445,20 @@ async fn interactive_loop<P: Provider>(
                     let sessions = match list_sessions(&config.sessions_root, &config.workspace_root) {
                         Ok(sessions) => sessions,
                         Err(error) => {
-                            view.push_line(LineKind::System, format!("无法列出 session: {error}"));
+                            push_system_line(
+                                &mut view,
+                                &mut renderer,
+                                format!("无法列出 session: {error}"),
+                            )?;
                             continue;
                         }
                     };
                     if sessions.is_empty() {
-                        view.push_line(LineKind::System, "当前 workspace 没有历史 session");
+                        push_system_line(
+                            &mut view,
+                            &mut renderer,
+                            "当前 workspace 没有历史 session".to_string(),
+                        )?;
                         continue;
                     }
                     view.menu = Some(crate::tui::model::MenuView {
@@ -441,24 +474,37 @@ async fn interactive_loop<P: Provider>(
                         selected: 0,
                         kind: crate::tui::model::MenuKind::Session,
                     });
-                    view.push_line(
-                        LineKind::System,
-                        "会话列表：↑/↓ 选择，Enter 恢复（Esc 关闭）",
-                    );
+                    push_system_line(
+                        &mut view,
+                        &mut renderer,
+                        "会话列表：↑/↓ 选择，Enter 恢复（Esc 关闭）".to_string(),
+                    )?;
                     continue;
                 }
                 "/new" => {
                     *session = None;
                     history.clear();
-                    view.push_line(LineKind::System, "已开始新会话");
+                    push_system_line(
+                        &mut view,
+                        &mut renderer,
+                        "已开始新会话".to_string(),
+                    )?;
                     continue;
                 }
                 "/cancel" => {
                     if let Some(cancel) = current_cancel.lock().unwrap().clone() {
                         cancel.cancel();
-                        view.push_line(LineKind::System, "已发送取消（§11.5：保留 session）");
+                        push_system_line(
+                            &mut view,
+                            &mut renderer,
+                            "已发送取消（§11.5：保留 session）".to_string(),
+                        )?;
                     } else {
-                        view.push_line(LineKind::System, "当前没有正在运行的 run");
+                        push_system_line(
+                            &mut view,
+                            &mut renderer,
+                            "当前没有正在运行的 run".to_string(),
+                        )?;
                     }
                     continue;
                 }
@@ -468,12 +514,13 @@ async fn interactive_loop<P: Provider>(
                         .reasoning
                         .clone()
                         .unwrap_or_else(|| "未配置（默认）".to_string());
-                    view.push_line(
-                        LineKind::System,
+                    push_system_line(
+                        &mut view,
+                        &mut renderer,
                         format!(
                             "reasoning: {value}\n说明: 透传给 provider 的推理设置（§18.1 [model.primary] reasoning）；\n未配置时使用 provider 默认。",
                         ),
-                    );
+                    )?;
                     continue;
                 }
                 "/diff" => {
@@ -481,14 +528,15 @@ async fn interactive_loop<P: Provider>(
                         Some(log) => last_edit_diff(log),
                         None => "尚无 session".to_string(),
                     };
-                    view.push_line(LineKind::System, diff);
+                    push_system_line(&mut view, &mut renderer, diff)?;
                     continue;
                 }
                 "/compact" => {
-                    view.push_line(
-                        LineKind::System,
-                        "compaction 会在上下文超过预算时自动在完整边界执行（§15.4）；运行中的自动压缩状态见状态栏。",
-                    );
+                    push_system_line(
+                        &mut view,
+                        &mut renderer,
+                        "compaction 会在上下文超过预算时自动在完整边界执行（§15.4）；运行中的自动压缩状态见状态栏。".to_string(),
+                    )?;
                     continue;
                 }
                 _ => {}
@@ -503,7 +551,7 @@ async fn interactive_loop<P: Provider>(
                 )?);
             }
             let mut session_log = session.take().unwrap();
-            let outcome = run_interactive(
+            let outcome = match run_interactive(
                 provider,
                 &mut session_log,
                 config,
@@ -517,7 +565,23 @@ async fn interactive_loop<P: Provider>(
                 &mut pending_session,
                 current_cancel.clone(),
             )
-            .await?;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // 交互模式：run 失败（provider/工具基础设施）不得杀死整个 TUI。
+                    // 显示实际错误并保留 session，用户可以继续对话。
+                    view.status = crate::tui::model::StatusLine::Idle;
+                    view.turn = 0;
+                    view.push_line(
+                        LineKind::System,
+                        format!("run 失败，session 已保留：{error}"),
+                    );
+                    renderer.draw(&view).map_err(|e| e.to_string())?;
+                    *session = Some(session_log);
+                    continue;
+                }
+            };
             view.add_usage(&outcome.usage);
             history.extend(outcome.messages);
             *session = Some(session_log);
@@ -543,6 +607,12 @@ fn refresh_menus(view: &mut ViewModel) {
 /// 对标成熟 TUI Agent：Alt+Enter 换行、↑/↓ 输入历史（命令菜单打开时改为选择）、
 /// Tab 补全斜杠命令、Esc 关闭菜单、Alt+T 思考折叠、Ctrl+U 清空、Ctrl+A/E 行首/行尾。
 #[allow(clippy::too_many_arguments)]
+/// editor 变更后同步输入投影（P0-5：Editor 是输入事实源，view.input 只是投影）。
+fn sync_input(editor: &crate::tui::editor::Editor, view: &mut ViewModel) {
+    view.input = editor.text().to_string();
+    view.input_cursor = editor.cursor;
+}
+
 fn handle_key(
     key: ratatui::crossterm::event::KeyEvent,
     editor: &mut crate::tui::editor::Editor,
@@ -554,6 +624,7 @@ fn handle_key(
     match key.code {
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
             editor.insert_char('\n');
+            sync_input(editor, view);
         }
         KeyCode::Enter => {
             // 命令菜单打开时先补全为选中命令（Claude Code 式菜单交互）。
@@ -570,7 +641,13 @@ fn handle_key(
                     _ => view.complete_menu_command(),
                 }
             }
-            let text = editor.submit();
+            let text = {
+                // P0-5：菜单补全结果先写回 editor（输入事实源），再提交。
+                // 无菜单时 view.input 与 editor 文本一致，set_text 无副作用。
+                editor.set_text(view.input.clone());
+                sync_input(editor, view);
+                editor.submit()
+            };
             if !text.is_empty() {
                 *pending = Some(text);
             }
@@ -584,6 +661,9 @@ fn handle_key(
                     menu.selected = (menu.selected + 1) % menu.items.len();
                 }
                 view.complete_menu_command();
+                // P0-5：补全结果写回 editor（它是输入事实源）。
+                editor.set_text(view.input.clone());
+                sync_input(editor, view);
             }
         }
         KeyCode::Esc => {
@@ -595,10 +675,12 @@ fn handle_key(
         }
         KeyCode::Backspace => {
             editor.backspace();
+            sync_input(editor, view);
             view.refresh_command_menu();
         }
         KeyCode::Delete => {
             editor.delete();
+            sync_input(editor, view);
             view.refresh_command_menu();
         }
         KeyCode::Left => editor.move_left(),
@@ -621,6 +703,7 @@ fn handle_key(
                 }
             } else {
                 editor.history_up();
+                sync_input(editor, view);
                 view.refresh_command_menu();
             }
         }
@@ -633,6 +716,7 @@ fn handle_key(
                 }
             } else {
                 editor.history_down();
+                sync_input(editor, view);
                 view.refresh_command_menu();
             }
         }
@@ -656,6 +740,7 @@ fn handle_key(
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'u' {
                 editor.clear();
+                sync_input(editor, view);
                 view.refresh_command_menu();
                 return;
             }
@@ -677,6 +762,7 @@ fn handle_key(
                 return;
             }
             editor.insert_char(c);
+            sync_input(editor, view);
             view.refresh_command_menu();
         }
         _ => {}
@@ -1078,5 +1164,58 @@ fn fmt_time(t: std::time::SystemTime) -> String {
         format!("{days}d {hours:02}:{minutes:02}")
     } else {
         format!("{hours:02}:{minutes:02}:{seconds:02}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::editor::Editor;
+    use crate::tui::model::ViewModel;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// P0-5 回归：Tab 补全必须同步到 editor（此前只改 view.input，
+    /// 主循环 `view.input = editor.text()` 会把补全结果覆盖掉，Enter 提交原文）。
+    #[test]
+    fn menu_completion_syncs_editor_text() {
+        let mut editor = Editor::new();
+        let mut view = ViewModel::default();
+        let mut pending: Option<String> = None;
+        let mut pending_session: Option<String> = None;
+        for ch in "/set".chars() {
+            handle_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &mut editor,
+                &mut view,
+                &mut pending,
+                &mut pending_session,
+            );
+        }
+        assert!(view.menu.is_some(), "输入 /set 应弹出命令菜单");
+        handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut editor,
+            &mut view,
+            &mut pending,
+            &mut pending_session,
+        );
+        assert_eq!(
+            editor.text(),
+            "/settings",
+            "Tab 补全必须同步 editor（当前: {}）",
+            editor.text()
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut editor,
+            &mut view,
+            &mut pending,
+            &mut pending_session,
+        );
+        assert_eq!(
+            pending.as_deref(),
+            Some("/settings"),
+            "Enter 提交的必须是补全后的命令"
+        );
     }
 }

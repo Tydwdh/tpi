@@ -9,6 +9,8 @@
 //! tpi --model <name>
 //! tpi --no-session
 //! tpi auth set <provider>     # 把 token 写入 Windows Credential Manager（§18.4）
+//! tpi auth clear <provider>
+//! tpi auth status <provider>
 //! ```
 
 use std::io::Write;
@@ -37,7 +39,9 @@ struct Cli {
     #[arg(long)]
     no_session: bool,
     /// 继续当前 workspace 最近 session
-    #[arg(long)]
+    // P0-6：设计文档/README 写的是 `--continue`；clap 默认按字段名生成
+    // `--continue-session`，显式指定 long 名对齐文档。
+    #[arg(long = "continue")]
     continue_session: bool,
     /// 恢复指定 session
     #[arg(long)]
@@ -53,15 +57,19 @@ struct Cli {
 enum Command {
     /// 凭据管理（§18.4：写入 Windows Credential Manager，配置只保存 label）。
     Auth {
-        /// provider 名（如 brave、opencode-go）。
-        provider: String,
-        /// token 从 stdin 读取（不回显提示由调用方控制）。
-        #[arg(long)]
-        set: bool,
-        /// 清除已保存凭据。
-        #[arg(long)]
-        clear: bool,
+        #[command(subcommand)]
+        command: AuthCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthCommand {
+    /// 保存凭据（token 从 stdin 读取，不回显提示由调用方控制）。
+    Set { provider: String },
+    /// 清除已保存凭据。
+    Clear { provider: String },
+    /// 查询凭据状态。
+    Status { provider: String },
 }
 
 fn main() {
@@ -79,40 +87,37 @@ fn main() {
 
 fn run(cli: Cli) -> Result<(), String> {
     // auth 子命令不需要完整配置/日志。
-    if let Some(Command::Auth {
-        provider,
-        set,
-        clear,
-    }) = &cli.command
-    {
-        if *set {
-            print!("输入 token（粘贴后回车）: ");
-            std::io::stdout().flush().map_err(|e| e.to_string())?;
-            let mut token = String::new();
-            std::io::stdin()
-                .read_line(&mut token)
-                .map_err(|e| format!("读取输入失败: {e}"))?;
-            let token = token.trim();
-            if token.is_empty() {
-                return Err("token 为空".into());
-            }
-            tpi::auth::auth_set(provider, token)?;
-            println!("已保存凭据: {provider}（Windows Credential Manager，§18.4）");
-            return Ok(());
-        }
-        if *clear {
-            tpi::auth::auth_clear(provider)?;
-            println!("已清除凭据: {provider}");
-            return Ok(());
-        }
-        return match tpi::auth::auth_get(provider) {
-            Some(_) => {
-                println!("凭据已配置: {provider}");
+    if let Some(Command::Auth { command }) = &cli.command {
+        return match command {
+            AuthCommand::Set { provider } => {
+                print!("输入 token（粘贴后回车）: ");
+                std::io::stdout().flush().map_err(|e| e.to_string())?;
+                let mut token = String::new();
+                std::io::stdin()
+                    .read_line(&mut token)
+                    .map_err(|e| format!("读取输入失败: {e}"))?;
+                let token = token.trim();
+                if token.is_empty() {
+                    return Err("token 为空".into());
+                }
+                tpi::auth::auth_set(provider, token)?;
+                println!("已保存凭据: {provider}（Windows Credential Manager，§18.4）");
                 Ok(())
             }
-            None => Err(format!(
-                "未配置凭据: {provider}（用 `tpi auth set {provider}` 保存）"
-            )),
+            AuthCommand::Clear { provider } => {
+                tpi::auth::auth_clear(provider)?;
+                println!("已清除凭据: {provider}");
+                Ok(())
+            }
+            AuthCommand::Status { provider } => match tpi::auth::auth_get(provider) {
+                Some(_) => {
+                    println!("凭据已配置: {provider}");
+                    Ok(())
+                }
+                None => Err(format!(
+                    "未配置凭据: {provider}（用 `tpi auth set {provider}` 保存）"
+                )),
+            },
         };
     }
 
@@ -145,6 +150,7 @@ fn run(cli: Cli) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
+    tracing::info!(workspace = %workspace_root, model = %config.model.name, "tpi starting");
     runtime.block_on(app::run(
         config,
         session_target,
@@ -167,10 +173,59 @@ fn init_logging() -> Result<(), String> {
                 .with_target(false),
         )
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            // 默认 INFO：try_from_default_env 在未设置 RUST_LOG 时返回 error 级
+            // 默认过滤器，会把 info/warn 全部吞掉（日志文件永远为空，无法诊断）。
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+                .from_env_lossy(),
         );
     subscriber.init();
     // 保持 non-blocking writer guard 存活（程序生命周期内）。
     Box::leak(Box::new(_guard));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// P0-6 回归：设计文档/README 的 `--continue` 必须可解析。
+    /// （此前 `#[arg(long)] continue_session` 只生成 `--continue-session`。）
+    #[test]
+    fn continue_flag_matches_design_doc() {
+        let cli = Cli::parse_from(["tpi", "--continue"]);
+        assert!(cli.continue_session);
+    }
+
+    /// P0-7 回归：`tpi auth set <provider>` 子命令形态（文档 §18.3/README）。
+    /// （此前是 `tpi auth <provider> --set`。）
+    #[test]
+    fn auth_set_subcommand_matches_design_doc() {
+        let cli = Cli::parse_from(["tpi", "auth", "set", "opencode-go"]);
+        match cli.command.expect("auth subcommand") {
+            Command::Auth {
+                command: AuthCommand::Set { provider },
+            } => assert_eq!(provider, "opencode-go"),
+            other => panic!("expected auth set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_clear_and_status_subcommands() {
+        let cli = Cli::parse_from(["tpi", "auth", "clear", "brave"]);
+        assert!(matches!(
+            cli.command.expect("auth subcommand"),
+            Command::Auth {
+                command: AuthCommand::Clear { provider }
+            } if provider == "brave"
+        ));
+        let cli = Cli::parse_from(["tpi", "auth", "status", "opencode-go"]);
+        assert!(matches!(
+            cli.command.expect("auth subcommand"),
+            Command::Auth {
+                command: AuthCommand::Status { provider }
+            } if provider == "opencode-go"
+        ));
+    }
 }

@@ -453,9 +453,10 @@ impl SessionLog {
             seq: 0,
             pending_sync: false,
         };
-        // 恢复 seq：最后一条完整事件 + 1。
-        let events = read_events(&path)?;
-        log.seq = events.len() as u64 + 1;
+        // 恢复 seq：历史最大 envelope seq + 1（P0-12：不能按 events.len()——
+        // 中间有损坏行时 len 小于 max_seq，续写会导致 seq 重复/倒退）。
+        let (_, max_seq) = read_events_and_max_seq(&path)?;
+        log.seq = max_seq + 1;
         Ok(log)
     }
 
@@ -528,9 +529,17 @@ impl SessionLog {
 
 /// 读取 session 的全部事件（含残行丢弃）。
 pub fn read_events(path: &Path) -> std::io::Result<Vec<SessionEvent>> {
+    Ok(read_events_and_max_seq(path)?.0)
+}
+
+/// 读取全部事件并返回历史最大 envelope seq（P0-12：恢复 seq 必须基于
+/// max_seq 而不是 events.len()——中间存在损坏行时两者不一致，继续 append
+/// 会导致 seq 重复/倒退，破坏 envelope seq 单调性契约）。
+pub fn read_events_and_max_seq(path: &Path) -> std::io::Result<(Vec<SessionEvent>, u64)> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut events = Vec::new();
+    let mut max_seq: u64 = 0;
     let mut lines = reader.lines();
     loop {
         let line = lines.next();
@@ -540,7 +549,10 @@ pub fn read_events(path: &Path) -> std::io::Result<Vec<SessionEvent>> {
                     continue;
                 }
                 match serde_json::from_str::<Envelope>(&line) {
-                    Ok(envelope) => events.push(envelope.to_session_event()),
+                    Ok(envelope) => {
+                        max_seq = max_seq.max(envelope.seq);
+                        events.push(envelope.to_session_event());
+                    }
                     Err(error) => {
                         // 非最后一行损坏：记录并跳过。
                         tracing::warn!(%error, "skipping unparseable session line");
@@ -557,10 +569,70 @@ pub fn read_events(path: &Path) -> std::io::Result<Vec<SessionEvent>> {
             None => break,
         }
     }
-    Ok(events)
+    Ok((events, max_seq))
 }
 
 /// 该工具是否属于需要 write-ahead 的类型（§12.1：Write / WorkspaceUnknown）。
 pub fn requires_write_ahead(tool_name: &str) -> bool {
     matches!(tool_name, "edit" | "write" | "bash")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::RunId;
+    use camino::Utf8PathBuf;
+
+    /// P0-12：session 文件中存在损坏行时，恢复 seq 必须基于历史最大 envelope
+    /// seq（而不是 events.len()），否则继续 append 会 seq 重复，破坏单调性。
+    #[test]
+    fn seq_after_open_is_max_seq_plus_one_even_with_corrupt_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let sessions_root = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let workspace_id = workspace_id_for(workspace.as_std_path());
+        let session_id = SessionId::new_v7();
+        let path = sessions_root
+            .join(&workspace_id)
+            .join(format!("{session_id}.jsonl"));
+
+        // 手工构造：seq 1、seq 2、损坏行、seq 4（3 是垃圾）。
+        let mut log = SessionLog::create_with_id(
+            &sessions_root,
+            workspace.as_std_path(),
+            RunId::new_v7(),
+            session_id,
+        )
+        .unwrap();
+        log.append_event(&SessionEvent::UserSubmitted {
+            content: "one".into(),
+        })
+        .unwrap();
+        log.append_event(&SessionEvent::UserSubmitted {
+            content: "two".into(),
+        })
+        .unwrap();
+        drop(log);
+        std::fs::write(&path, std::fs::read_to_string(&path).unwrap() + "this-is-not-json\n")
+            .unwrap();
+        // 崩溃后恢复：open 既有 session，追加一条（应为 seq 4）。
+        let mut log = SessionLog::open(&sessions_root, workspace.as_std_path(), session_id).unwrap();
+        let seq = log
+            .append_event(&SessionEvent::UserSubmitted {
+                content: "four".into(),
+            })
+            .unwrap();
+        assert_eq!(seq, 4, "损坏行之后的 append 必须是 max_seq+1");
+        drop(log);
+
+        let (events, max_seq) = read_events_and_max_seq(&path).unwrap();
+        assert_eq!(max_seq, 4, "max_seq 必须包含损坏行之后的事件");
+        assert_eq!(events.len(), 3, "损坏行被跳过");
+
+        // 重新 open 后 seq 必须是 max_seq+1，append 的事件 seq 单调且不重复。
+        let reopened = SessionLog::open(&sessions_root, workspace.as_std_path(), session_id)
+            .expect("open session");
+        assert_eq!(reopened.seq(), 5, "恢复 seq 必须基于 max_seq（P0-12）");
+    }
 }

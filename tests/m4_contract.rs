@@ -264,8 +264,11 @@ async fn update_plan_and_compaction_integration() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     // 小 context_window + 小 reserve 强制触发 compaction（§15.4：projected > usable）。
+    // P0-9 后 projected 含 system prompt（≈919 tokens）与工具 schema（≈5482 tokens），
+    // 窗口 4000 会让第一轮就触发且 history 为空无法显著缩小（校验失败）；
+    // 9000 保证首轮不触发、多轮 read 累积后触发且 history 足够大。
     let mut config = test_config(&workspace);
-    config.model.context_window = Some(2000);
+    config.model.context_window = Some(9000);
     config.safety_reserve_tokens = 100;
 
     // 单闭包状态机：工具请求按序推进（update_plan → read×N → 完成）；

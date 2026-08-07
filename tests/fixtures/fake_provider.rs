@@ -15,6 +15,8 @@ use tpi::session::Usage;
 #[derive(Debug, Clone)]
 pub struct FakeResponse {
     pub text: String,
+    /// 非 None 时按条发送多个 TextDelta（P0-2 死锁回归：事件数超过 channel 容量）。
+    pub deltas: Option<Vec<String>>,
     pub tool_calls: Vec<ToolCall>,
     pub finish: FinishReason,
     /// 本次请求返回的 usage（默认 0；usage 累加测试用）。
@@ -25,6 +27,18 @@ impl FakeResponse {
     pub fn text(text: &str) -> Self {
         Self {
             text: text.to_string(),
+            deltas: None,
+            tool_calls: Vec::new(),
+            finish: FinishReason::Stop,
+            usage: Usage::default(),
+        }
+    }
+
+    /// 逐条发送多个文本增量（每块一条 ProviderEvent，可超过 channel 容量）。
+    pub fn text_deltas(deltas: Vec<String>) -> Self {
+        Self {
+            text: String::new(),
+            deltas: Some(deltas),
             tool_calls: Vec::new(),
             finish: FinishReason::Stop,
             usage: Usage::default(),
@@ -34,6 +48,7 @@ impl FakeResponse {
     pub fn with_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
         Self {
             text: String::new(),
+            deltas: None,
             tool_calls,
             finish: FinishReason::ToolCalls,
             usage: Usage::default(),
@@ -144,7 +159,16 @@ impl Provider for FakeProvider {
             );
             owned_script(&request)
         };
-        if !response.text.is_empty() {
+        if let Some(deltas) = &response.deltas {
+            for delta in deltas {
+                self.events_log
+                    .push(ProviderEvent::TextDelta(delta.clone()));
+                events
+                    .send(ProviderEvent::TextDelta(delta.clone()))
+                    .await
+                    .map_err(|_| ProviderError::Protocol("channel closed".into()))?;
+            }
+        } else if !response.text.is_empty() {
             self.events_log
                 .push(ProviderEvent::TextDelta(response.text.clone()));
             let _ = events.send(ProviderEvent::TextDelta(response.text)).await;

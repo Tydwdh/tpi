@@ -21,6 +21,27 @@ pub fn estimate_messages(messages: &[ChatMessage]) -> u64 {
     messages.iter().map(estimate_message).sum()
 }
 
+/// 请求级 token 估算（P0-9：compaction 判断与用量条必须包含 system prompt、
+/// 计划快照和工具 schema，不能只算 messages——否则实际请求超窗口而估算
+/// 不触发，provider 直接报 length error）。
+pub fn estimate_request(
+    system_prompt: &str,
+    messages: &[ChatMessage],
+    tools: &[crate::provider::ToolDef],
+) -> u64 {
+    let mut total = estimate_tokens(system_prompt);
+    total += estimate_messages(messages);
+    for tool in tools {
+        total += estimate_tokens(&tool.name);
+        total += estimate_tokens(&tool.description);
+        total += estimate_tokens(&tool.parameters.to_string());
+    }
+    // 每条消息的 role/tool_call_id/name 等 envelope 开销（§15.4 保守系数）。
+    total += (messages.len() as u64) * 8;
+    total
+}
+
+
 fn estimate_message(message: &ChatMessage) -> u64 {
     match message {
         ChatMessage::System(text) | ChatMessage::User(text) => estimate_tokens(text),
@@ -147,4 +168,40 @@ pub fn parse_summary(text: &str) -> String {
 /// 明显缩小校验（§15.4 第 5 条：只有明显缩小才提交 CompactionCommitted）。
 pub fn is_significant_shrink(original_tokens: u64, summary_tokens: u64) -> bool {
     summary_tokens > 0 && summary_tokens * 4 < original_tokens.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::ToolDef;
+
+    /// P0-9：请求级估算必须包含 system prompt 与工具 schema。
+    /// 此前只估算 messages，实际请求明显超窗口时 compaction 不触发。
+    #[test]
+    fn estimate_request_includes_system_and_tool_schemas() {
+        let system = "s".repeat(3000);
+        let messages = vec![ChatMessage::User("hello".into())];
+        let tool = ToolDef {
+            name: "bash".into(),
+            description: "run a shell command".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}}
+            }),
+        };
+        let estimate = estimate_request(&system, &messages, std::slice::from_ref(&tool));
+        // system prompt（3000 字符 ≈ 1000 token）必须计入。
+        assert!(
+            estimate > estimate_messages(&messages),
+            "system prompt 必须计入: {estimate}"
+        );
+        assert!(estimate >= 1000, "system prompt 估算过低: {estimate}");
+        // 工具 schema 数量影响估算。
+        let many_tools = vec![tool; 20];
+        let with_many = estimate_request(&system, &messages, &many_tools);
+        assert!(
+            with_many > estimate,
+            "tool schema 必须计入: {with_many} vs {estimate}"
+        );
+    }
 }

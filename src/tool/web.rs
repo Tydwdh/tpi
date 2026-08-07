@@ -69,7 +69,17 @@ pub fn set_allow_private_web_targets_for_tests(allow: bool) {
 }
 
 fn web_fetch_client() -> reqwest::Client {
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(5));
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(
+        |attempt| {
+            // P0-10：redirect 逐跳校验（此前 Policy::limited 自动跟随，
+            // 私有/loopback 目标直接可达）。
+            if let Err(error) = redirect_allowed(attempt.url()) {
+                attempt.error(format!("blocked redirect target: {error}"))
+            } else {
+                attempt.follow()
+            }
+        },
+    ));
     if allow_private_web_targets() {
         builder = builder.no_proxy();
     }
@@ -95,7 +105,11 @@ fn is_blocked_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // url crate 的 host_str() 对 IPv6 返回带括号形式（如 "[::1]"、
+    // "[::ffff:7f00:1]"）；必须先去掉括号才能 parse 成 IpAddr——
+    // 否则所有字面 IPv6（含 ::1、mapped-v6）都会绕过检查。
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
         return is_blocked_ip(ip);
     }
     // 字面 IPv6 可能带 []，Url 已解析 host 时不含括号。
@@ -113,6 +127,12 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v4.octets()[0] == 0
         }
         IpAddr::V6(v6) => {
+            // P0-10：IPv4-mapped IPv6（::ffff:a.b.c.d）按映射的 v4 判定——
+            // 此前只查 v6 字面范围，`::ffff:127.0.0.1` / `::ffff:192.168.1.1`
+            // 直接放行（SSRF 绕过）。
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
             if v6.is_loopback() || v6.is_unspecified() {
                 return true;
             }
@@ -128,6 +148,20 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
             false
         }
     }
+}
+
+/// P0-10：redirect 目标逐跳校验（policy 闭包与 web_fetch 共用）。
+/// 校验 scheme 与 host；`allow_private_web_targets()` 开启时放行。
+fn redirect_allowed(url: &Url) -> Result<(), String> {
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("unsupported scheme: {scheme}"));
+    }
+    let host = url.host_str().ok_or_else(|| "missing host".to_string())?;
+    if !allow_private_web_targets() && is_blocked_host(host) {
+        return Err(format!("blocked host: {host}"));
+    }
+    Ok(())
 }
 
 async fn read_bounded_bytes(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
@@ -328,22 +362,58 @@ struct BraveResult {
 
 /// web_fetch（§17：限制 redirect、响应体大小和 timeout；HTML 转换）。
 pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
-    if let Err(error) = validate_fetch_url(&args.url) {
-        return ToolOutcome::failed(
-            "web_fetch",
-            ModelPayload {
-                status: ToolStatus::Failed,
-                program: None,
-                exit_code: None,
-                duration_ms: 0,
-                output: format!("status: failed\ntool: web_fetch\nerror: ssrf_blocked\n\n{error}"),
-                effect: None,
-                artifact: None,
-            },
-        );
-    }
+    let url = match validate_fetch_url(&args.url) {
+        Ok(url) => url,
+        Err(error) => {
+            return ToolOutcome::failed(
+                "web_fetch",
+                ModelPayload {
+                    status: ToolStatus::Failed,
+                    program: None,
+                    exit_code: None,
+                    duration_ms: 0,
+                    output: format!(
+                        "status: failed\ntool: web_fetch\nerror: ssrf_blocked\n\n{error}"
+                    ),
+                    effect: None,
+                    artifact: None,
+                },
+            );
+        }
+    };
 
     let client = web_fetch_client();
+
+    // P0-10：DNS 预解析——域名解析出的任何地址命中私有/loopback 都拒绝。
+    // 字面 IP 已在 validate_fetch_url 校验；这里防“域名解析到私有地址”的
+    // SSRF 绕过（DNS rebinding 需要连接后二次验证，不在本次范围，§17 注释）。
+    if !allow_private_web_targets()
+        && let Some(host) = url.host_str()
+        // 字面 IP（含带括号的 IPv6）已由 validate_fetch_url 校验。
+        && host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_err()
+    {
+        let port = url.port_or_known_default().unwrap_or(80);
+        if let Ok(addresses) = tokio::net::lookup_host((host, port)).await {
+            let blocked = addresses.map(|addr| addr.ip()).find(|ip| is_blocked_ip(*ip));
+            if let Some(ip) = blocked {
+                return ToolOutcome::failed(
+                    "web_fetch",
+                    ModelPayload {
+                        status: ToolStatus::Failed,
+                        program: None,
+                        exit_code: None,
+                        duration_ms: 0,
+                        output: format!(
+                            "status: failed\ntool: web_fetch\nerror: ssrf_blocked\n\n域名 {host} 解析到被拦截地址 {ip}"
+                        ),
+                        effect: None,
+                        artifact: None,
+                    },
+                );
+            }
+        }
+        // 解析失败（NXDOMAIN 等）由请求阶段报错，不在此拦截。
+    }
 
     let response = match client.get(&args.url).timeout(FETCH_TIMEOUT).send().await {
         Ok(response) => response,
@@ -532,12 +602,52 @@ mod tests {
     fn blocks_loopback_urls() {
         assert!(validate_fetch_url("http://127.0.0.1/").is_err());
         assert!(validate_fetch_url("http://localhost/").is_err());
+        // 字面 IPv6 回环（host_str 带括号，此前 parse 失败绕过检查）。
+        assert!(validate_fetch_url("http://[::1]/").is_err());
     }
 
     #[test]
     fn blocks_private_network_urls() {
         assert!(validate_fetch_url("http://192.168.1.1/").is_err());
         assert!(validate_fetch_url("http://10.0.0.5/").is_err());
+    }
+
+    /// P0-10：IPv4-mapped IPv6（`::ffff:a.b.c.d`）必须按映射的 v4 地址判定——
+    /// 此前 v6 分支只查 loopback/unspecified/fe80/fc00，`::ffff:127.0.0.1`
+    /// 与 `::ffff:192.168.1.1` 直接放行（SSRF 绕过）。
+    #[test]
+    fn blocks_ipv4_mapped_ipv6_loopback_and_private() {
+        assert!(
+            validate_fetch_url("http://[::ffff:127.0.0.1]/").is_err(),
+            "::ffff:127.0.0.1 必须拦截"
+        );
+        assert!(
+            validate_fetch_url("http://[::ffff:192.168.1.1]/").is_err(),
+            "::ffff:192.168.1.1 必须拦截"
+        );
+        assert!(
+            validate_fetch_url("http://[::ffff:10.0.0.5]/").is_err(),
+            "::ffff:10.0.0.5 必须拦截"
+        );
+        assert!(
+            validate_fetch_url("http://[::ffff:169.254.169.254]/").is_err(),
+            "::ffff:169.254.169.254（metadata）必须拦截"
+        );
+        // 映射到公共地址的 v6 不受影响。
+        assert!(validate_fetch_url("http://[::ffff:8.8.8.8]/").is_ok());
+    }
+
+    /// P0-10：redirect 目标也必须逐跳通过校验（此前 Policy::limited(5)
+    /// 自动跟随 redirect，私有/loopback 目标直接可达）。
+    #[test]
+    fn redirect_target_is_ssrf_checked() {
+        // 逐跳验证函数：redirect policy 与 web_fetch 共用同一校验。
+        let public: Url = "https://example.com/page".parse().unwrap();
+        assert!(redirect_allowed(&public).is_ok());
+        let private: Url = "http://127.0.0.1:8080/ssrf".parse().unwrap();
+        assert!(redirect_allowed(&private).is_err());
+        let mapped: Url = "http://[::ffff:10.0.0.5]/".parse().unwrap();
+        assert!(redirect_allowed(&mapped).is_err());
     }
 
     #[test]

@@ -119,7 +119,7 @@ pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
     let mut scanned_bytes = 0u64;
     let mut stop_reason = StopReason::Complete;
 
-    'scan: for entry in WalkBuilder::new(&root) {
+    'scan: for entry in WalkBuilder::new(&root, Some(args.depth)) {
         let Ok(entry) = entry else { continue };
         let Ok(meta) = entry.metadata() else { continue };
         if entry.depth() == 0 {
@@ -224,7 +224,7 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
     const MAX_OUTPUT_BYTES: usize = 32 * 1024;
     let mut output_bytes = 0usize;
 
-    'scan: for entry in WalkBuilder::new(&root) {
+    'scan: for entry in WalkBuilder::new(&root, None) {
         let Ok(entry) = entry else { continue };
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
@@ -404,7 +404,9 @@ struct WalkBuilder {
 }
 
 impl WalkBuilder {
-    fn new(root: &Utf8PathBuf) -> Self {
+    /// max_depth：None = 不限（search/index_files）；Some(n) 让 ignore crate
+    /// 在深度 n 处停止（P0-13：list depth=2 不再遍历整棵树）。
+    fn new(root: &Utf8PathBuf, max_depth: Option<usize>) -> Self {
         let mut builder = ignore::WalkBuilder::new(root.as_std_path());
         builder
             .hidden(true)
@@ -414,7 +416,7 @@ impl WalkBuilder {
             .follow_links(false)
             .parents(true)
             .standard_filters(true)
-            .max_depth(None);
+            .max_depth(max_depth);
         Self {
             inner: builder.build(),
         }
@@ -435,7 +437,7 @@ impl Iterator for WalkBuilder {
 pub fn index_files(root: &Utf8PathBuf, limit: usize) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
-    for entry in WalkBuilder::new(root) {
+    for entry in WalkBuilder::new(root, None) {
         let Ok(entry) = entry else { continue };
         let Ok(meta) = entry.metadata() else { continue };
         if entry.depth() == 0 {
@@ -462,6 +464,28 @@ pub fn index_files(root: &Utf8PathBuf, limit: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// 构造最小 ToolContext（list 行为测试用）。
+    fn test_ctx(root: &Utf8PathBuf) -> ToolContext {
+        ToolContext {
+            workspace_root: root.clone(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            artifacts_root: root.join(".artifacts").into(),
+            session_id: "test".into(),
+            call_id: crate::ids::ToolCallId::new_v7(),
+            output_tx: None,
+            scan_snapshots: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            shell_path: None,
+            snapshot_store: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::tool::edit::SnapshotStore::new(16, 4),
+            )),
+            current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            web_brave_key_env: "TPI_BRAVE_API_KEY".into(),
+            interactive: false,
+        }
+    }
+
     #[test]
     fn index_files_lists_relative_paths_dirs_first_and_bounded() {
         let dir = tempfile::tempdir().unwrap();
@@ -478,7 +502,10 @@ mod tests {
         // 目录优先（@ 引用逐级下钻）；路径为相对形式。
         assert!(files.contains(&"src/".to_string()), "{files:?}");
         assert!(files.contains(&"src/main.rs".to_string()), "{files:?}");
-        assert!(!files.contains(&"ignored.txt".to_string()), ".gitignore 生效: {files:?}");
+        assert!(
+            !files.contains(&"ignored.txt".to_string()),
+            ".gitignore 生效: {files:?}"
+        );
 
         // 有界。
         for i in 0..300 {
@@ -487,4 +514,61 @@ mod tests {
         let files = index_files(&root, 50);
         assert_eq!(files.len(), 50, "索引必须受 limit 约束");
     }
+
+    /// P0-13：list 的 max_depth 必须让 ignore 在指定深度停止遍历
+    /// （此前 WalkBuilder 无 max_depth，depth=2 也会扫描整棵树）。
+    #[test]
+    fn walk_builder_respects_max_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+        std::fs::write(root.join("a/b/c/d.txt"), "x").unwrap();
+        std::fs::write(root.join("a/top.txt"), "x").unwrap();
+
+        // max_depth=2：深层条目（depth>2）不会出现在遍历结果里。
+        let depths: Vec<usize> = WalkBuilder::new(&root, Some(2))
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.depth())
+            .collect();
+        assert!(
+            depths.iter().all(|d| *d <= 2),
+            "max_depth 必须限制遍历深度: {depths:?}"
+        );
+
+        // 对比：不限深度时深层条目可达。
+        let depths: Vec<usize> = WalkBuilder::new(&root, None)
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.depth())
+            .collect();
+        assert!(depths.iter().any(|d| *d > 2), "无限制时可达深层: {depths:?}");
+    }
+
+    /// P0-13 行为面：list depth=2 不返回深层路径。
+    #[test]
+    fn list_respects_depth_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+        std::fs::write(root.join("a/b/c/d.txt"), "x").unwrap();
+        std::fs::write(root.join("a/top.txt"), "x").unwrap();
+        let ctx = test_ctx(&root);
+        let outcome = list(
+            ListArgs {
+                path: ".".into(),
+                depth: 2,
+                cursor: None,
+            },
+            &ctx,
+        );
+        let output = outcome.model_payload.output;
+        assert!(
+            output.contains("top.txt"),
+            "depth 2 内文件应列出: {output}"
+        );
+        assert!(
+            !output.contains("d.txt"),
+            "depth 2 之外的路径不得出现: {output}"
+        );
+    }
 }
+
