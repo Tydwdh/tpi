@@ -223,3 +223,32 @@ fn move_by_rows_helpers_agree_with_model() {
         4
     );
 }
+
+#[test]
+fn tool_overlay_does_not_change_transcript_anchor() {
+    // §64：tool overlay 不改变 transcript anchor（§17）。
+    let mut view = ViewModel::default();
+    messages(&mut view, 40);
+    layout(&mut view, 80, 24);
+    view.scroll_up(10);
+    let ScrollMode::Locked(anchor) = view.scroll_mode else {
+        panic!();
+    };
+    view.begin_tool("c1", "bash", Some("cmd".into()), None);
+    view.finish_tool(
+        "c1",
+        "bash",
+        tpi::tool::outcome::ToolStatus::Failed,
+        1,
+        Some(1),
+        "err",
+    );
+    view.open_tool_overlay("c1");
+    assert_eq!(
+        view.scroll_mode,
+        ScrollMode::Locked(anchor),
+        "打开 overlay 不得改变锚点"
+    );
+    view.close_overlay();
+    assert_eq!(view.scroll_mode, ScrollMode::Locked(anchor));
+}

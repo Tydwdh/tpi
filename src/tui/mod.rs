@@ -1200,10 +1200,10 @@ fn draw_footer(
             Style::default().fg(theme.warning),
         ));
     }
-    // 整改 C：scroll lock 期间的新消息提示。
+    // §16：Locked 期间的新内容提示（End 一键返回最新）。
     if view.pending_below > 0 {
         spans.push(Span::styled(
-            format!(" · ↓{} 条新消息 · Ctrl+End 返回最新", view.pending_below),
+            format!(" · ↓{} 条新内容 · End 返回最新", view.pending_below),
             Style::default().fg(theme.warning),
         ));
     }

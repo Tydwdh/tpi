@@ -121,5 +121,5 @@ fn fullscreen_pending_below_hint_renders() {
     view.push_line(LineKind::Assistant, "新输出");
     let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
     let all: String = row_texts(&buf).join("\n");
-    assert!(all.contains("条新消息"), "scroll lock 提示应可见: {all:?}");
+    assert!(all.contains("条新内容"), "scroll lock 提示应可见: {all:?}");
 }
