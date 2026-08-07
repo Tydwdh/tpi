@@ -199,6 +199,34 @@ pub enum MenuKind {
     Session,
 }
 
+/// 流式消息（TUI v2 §7.2：live 区，finalize 前不进 transcript）。
+#[derive(Debug, Clone, Default)]
+pub struct StreamingMessage {
+    pub text: String,
+    /// 文本变化时递增（渲染缓存失效；与 TranscriptLine.version 同义）。
+    pub version: u64,
+    /// 超出单条消息上限（MAX_MESSAGE_CHARS）标记。
+    pub truncated: bool,
+}
+
+/// 正在变化的 turn 状态（TUI v2 §7.2）：与 finalized transcript 分离。
+///
+/// 分离收益（§59）：历史 finalized entry 不会因当前 tool output /
+/// streaming 重排；滚动锚点（EntryId + row）只针对 finalized 内容。
+/// finalize 时机：工具开始（上一段流式文本结束）、工具完成（卡片终态）、
+/// run 结束（剩余内容全部提交）。
+#[derive(Debug, Clone, Default)]
+pub struct LiveTurnState {
+    /// 流式 assistant 消息（未完成；begin_tool 时 finalize）。
+    pub assistant: Option<StreamingMessage>,
+    /// 流式 reasoning 消息（未完成；begin_tool / run 结束时 finalize）。
+    pub reasoning: Option<StreamingMessage>,
+    /// 运行中的工具卡片（按 call_id）。
+    pub tools: HashMap<String, ToolCard>,
+    /// 工具启动顺序（finalize/渲染保持视觉顺序）。
+    pub tool_order: Vec<String>,
+}
+
 /// 只读渲染输入（§16.1：renderer 的唯一输入）。
 #[derive(Debug, Clone)]
 pub struct ViewModel {
@@ -212,6 +240,8 @@ pub struct ViewModel {
     pub workspace: String,
     /// 当前正在运行的 turn 数。
     pub turn: u32,
+    /// 正在变化的 turn（流式文本 + 运行中工具；§7.2 与 transcript 分离）。
+    pub live: LiveTurnState,
     /// 滚动模式（TUI v2 §3）：Follow = 尾部；Locked = 锚定 EntryId + row。
     pub scroll_mode: ScrollMode,
     /// 兼容字段：距转录末尾的逻辑行数（0 = 跟随）。TUI v2 起
@@ -255,6 +285,7 @@ impl Default for ViewModel {
             model_name: "?".into(),
             workspace: String::new(),
             turn: 0,
+            live: LiveTurnState::default(),
             scroll_mode: ScrollMode::Follow,
             transcript_scroll: 0,
             pending_below: 0,
@@ -310,45 +341,89 @@ impl ViewModel {
         self.trim_transcript();
     }
 
-    /// 追加同一条流式消息。provider 的 token chunk 不是视觉行，不能逐 chunk
-    /// 创建 transcript item，否则会把“你好”渲染成多条带前缀的碎片行。
+    /// 追加同一条流式消息（TUI v2 §7.2：写 live 区，finalize 前不进 transcript）。
+    /// provider 的 token chunk 不是视觉行，不能逐 chunk 创建条目，
+    /// 否则会把“你好”渲染成多条带前缀的碎片行。
     pub fn push_stream_delta(&mut self, kind: LineKind, text: &str) {
         let version = self.alloc_version();
-        match self.transcript.last_mut() {
-            Some(Entry::Message { line, .. }) if line.kind == kind => {
-                // P1-9：单条消息有界（超出丢弃中段并标记，防 transcript 膨胀）。
-                if line.text.len() < MAX_MESSAGE_CHARS {
-                    let room = MAX_MESSAGE_CHARS - line.text.len();
-                    if text.len() <= room {
-                        line.text.push_str(text);
-                    } else {
-                        // 截断到 UTF-8 字符边界，避免切出非法字节（§24 统一 helper）。
-                        line.text
-                            .push_str(&text[..crate::tui::text::floor_char_boundary(text, room)]);
-                        line.text.push_str("…[truncated]");
-                    }
-                } else if !line.text.contains("truncated") {
-                    // 已满后仍来内容：标记一次，后续静默丢弃。
-                    line.text.push_str("\n…[truncated]");
-                }
-                line.version = version; // 文本变化 → 渲染缓存失效
-            }
+        let slot = match kind {
+            LineKind::Assistant => &mut self.live.assistant,
+            LineKind::Reasoning => &mut self.live.reasoning,
             _ => {
+                // User/System/Tool 不走流式（防御）。
+                self.push_line(kind, text);
+                return;
+            }
+        };
+        let msg = slot.get_or_insert_with(|| StreamingMessage {
+            text: String::new(),
+            version: 0,
+            truncated: false,
+        });
+        // P1-9：单条消息有界（超出丢弃中段并标记，防膨胀）。
+        if msg.text.len() < MAX_MESSAGE_CHARS {
+            let room = MAX_MESSAGE_CHARS - msg.text.len();
+            if text.len() <= room {
+                msg.text.push_str(text);
+            } else {
+                // 截断到 UTF-8 字符边界，避免切出非法字节（§24 统一 helper）。
+                msg.text
+                    .push_str(&text[..crate::tui::text::floor_char_boundary(text, room)]);
+                msg.text.push_str("…[truncated]");
+                msg.truncated = true;
+            }
+        } else if !msg.text.contains("truncated") {
+            // 已满后仍来内容：标记一次，后续静默丢弃。
+            msg.text.push_str("\n…[truncated]");
+            msg.truncated = true;
+        }
+        msg.version = version; // 文本变化 → 渲染缓存失效
+        // 整改 C + TUI v2 §16：Locked 时流式新内容不移动视口（计数
+        // 语义：新 entry 才计数；流式合并不增加条目，保持视觉连续）。
+    }
+
+    /// 把 live 区的流式消息提交为 transcript 条目（§7.2 finalize）。
+    /// 工具开始（上一段文本结束）与 run 结束时调用。
+    pub fn finalize_streaming(&mut self) {
+        for kind in [LineKind::Reasoning, LineKind::Assistant] {
+            let slot = match kind {
+                LineKind::Reasoning => &mut self.live.reasoning,
+                LineKind::Assistant => &mut self.live.assistant,
+                _ => unreachable!(),
+            };
+            if let Some(msg) = slot.take() {
+                if msg.text.is_empty() {
+                    continue;
+                }
+                let version = self.alloc_version();
                 let id = self.alloc_entry_id();
                 self.transcript.push(Entry::Message {
                     id,
                     line: TranscriptLine {
                         kind,
-                        text: text.to_string(),
+                        text: msg.text,
                         version,
                     },
                 });
                 self.note_new_content();
-                self.trim_transcript();
             }
         }
-        // 整改 C：不再强制拉回底部——用户滚动查看历史时新输出只计数。
-        // Follow 模式保持跟随；Locked 时累计 pending（§16）。
+        self.trim_transcript();
+    }
+
+    /// run 结束：提交全部剩余 live 内容（流式消息 + 未完成工具卡片）。
+    pub fn finalize_live(&mut self) {
+        self.finalize_streaming();
+        // 剩余运行中工具（run 被取消/异常结束时）也提交，保持历史可见。
+        let order = std::mem::take(&mut self.live.tool_order);
+        for call_id in order {
+            if let Some(card) = self.live.tools.remove(&call_id) {
+                let entry_id = self.alloc_entry_id();
+                self.transcript.push(Entry::Tool { id: entry_id, card });
+                self.note_new_content();
+            }
+        }
+        self.trim_transcript();
     }
 
     /// 整改 C + TUI v2 §16：Locked 期间的新条目计数（footer 提示）。
@@ -436,7 +511,8 @@ impl ViewModel {
             .collect()
     }
 
-    /// 工具开始：追加一张运行中的卡片（整改 A2：一个 call 一张卡，原地更新）。
+    /// 工具开始（TUI v2 §7.2：进 live 区；完成时 finalize 进 transcript）。
+    /// 工具开始 = 上一段流式文本结束 → 先 finalize streaming。
     pub fn begin_tool(
         &mut self,
         id: impl Into<String>,
@@ -444,11 +520,12 @@ impl ViewModel {
         target: Option<String>,
         command: Option<String>,
     ) {
-        let entry_id = self.alloc_entry_id();
-        self.transcript.push(Entry::Tool {
-            id: entry_id,
-            card: ToolCard {
-                id: id.into(),
+        self.finalize_streaming();
+        let call_id = id.into();
+        self.live.tools.insert(
+            call_id.clone(),
+            ToolCard {
+                id: call_id.clone(),
                 name: name.into(),
                 target,
                 command,
@@ -458,37 +535,32 @@ impl ViewModel {
                 expanded: false,
                 tail: None,
             },
-        });
-        self.note_new_content();
-        self.trim_transcript();
+        );
+        self.live.tool_order.push(call_id);
     }
 
-    /// 工具执行中的实时输出增量（有界累积；运行中卡片可见）。
+    /// 工具执行中的实时输出增量（有界累积；live 区运行中卡片可见）。
     pub fn append_tool_output(&mut self, id: impl Into<String>, text: impl Into<String>) {
         let id = id.into();
         let text = text.into();
-        if let Some(Entry::Tool { card, .. }) = self
-            .transcript
-            .iter_mut()
-            .rev()
-            .find(|entry| matches!(entry, Entry::Tool { card, .. } if card.id == id))
-        {
-            let current = card.output.get_or_insert_with(String::new);
-            if current.len() + text.len() > MAX_CARD_OUTPUT {
-                card.output_truncated = true;
-                // 丢弃旧内容超出部分（保留尾部：错误相关输出通常在末尾）。
-                // §24：drain 起点必须落在字符边界，否则中文/emoji 输出会 panic。
-                let overflow = current.len() + text.len() - MAX_CARD_OUTPUT;
-                let drop =
-                    crate::tui::text::floor_char_boundary(current, overflow.min(current.len()));
-                current.drain(..drop);
-                // 单块超大时只保留其尾部（起点同样按字符边界对齐）。
-                let remaining = MAX_CARD_OUTPUT.saturating_sub(current.len());
-                let tail = crate::tui::text::suffix_by_bytes_safe(&text, remaining);
-                current.push_str(tail);
-            } else {
-                current.push_str(&text);
-            }
+        let Some(card) = self.live.tools.get_mut(&id) else {
+            // 兜底：live 区找不到（理论不会：ToolStarted 先于增量）。
+            return;
+        };
+        let current = card.output.get_or_insert_with(String::new);
+        if current.len() + text.len() > MAX_CARD_OUTPUT {
+            card.output_truncated = true;
+            // 丢弃旧内容超出部分（保留尾部：错误相关输出通常在末尾）。
+            // §24：drain 起点必须落在字符边界，否则中文/emoji 输出会 panic。
+            let overflow = current.len() + text.len() - MAX_CARD_OUTPUT;
+            let drop = crate::tui::text::floor_char_boundary(current, overflow.min(current.len()));
+            current.drain(..drop);
+            // 单块超大时只保留其尾部（起点同样按字符边界对齐）。
+            let remaining = MAX_CARD_OUTPUT.saturating_sub(current.len());
+            let tail = crate::tui::text::suffix_by_bytes_safe(&text, remaining);
+            current.push_str(tail);
+        } else {
+            current.push_str(&text);
         }
     }
 
@@ -595,7 +667,8 @@ impl ViewModel {
         self.overlay = None;
     }
 
-    /// 工具终态：按 call_id 定位卡片，更新状态与耗时；失败时保留关键 tail（有界）。
+    /// 工具终态（TUI v2 §7.2）：从 live 区移除并 finalize 为 transcript 卡片
+    /// （终态 immutable，历史不再因 live 输出重排）。失败保留关键 tail（有界）。
     pub fn finish_tool(
         &mut self,
         id: impl Into<String>,
@@ -608,7 +681,30 @@ impl ViewModel {
         let id = id.into();
         let name = name.into();
         let tail = tail.into();
-        // 从后往前找（同一 run 内 call_id 唯一；防御性支持乱序完成）。
+        if let Some(mut card) = self.live.tools.remove(&id) {
+            card.name = name;
+            card.state = ToolCardState::Done {
+                status,
+                duration_ms,
+                exit_code,
+            };
+            // 完整输出始终保留（成功也可见，Alt+E/鼠标展开）；失败时折叠态显示 tail。
+            if !tail.is_empty() {
+                card.output = Some(bound_output(&tail));
+                if tail.len() > MAX_CARD_OUTPUT {
+                    card.output_truncated = true;
+                }
+            }
+            if status != ToolStatus::Succeeded && !tail.is_empty() {
+                card.tail = Some(bound_tail(&tail));
+            }
+            let entry_id = self.alloc_entry_id();
+            self.transcript.push(Entry::Tool { id: entry_id, card });
+            self.note_new_content();
+            self.trim_transcript();
+            return;
+        }
+        // 未找到 live 卡：可能在 transcript 中（防御性重复 finish）——更新状态。
         for entry in self.transcript.iter_mut().rev() {
             if let Entry::Tool { card, .. } = entry
                 && card.id == id
@@ -619,7 +715,6 @@ impl ViewModel {
                     duration_ms,
                     exit_code,
                 };
-                // 完整输出始终保留（成功也可见，Alt+E/鼠标展开）；失败时折叠态显示 tail。
                 if !tail.is_empty() {
                     card.output = Some(bound_output(&tail));
                     if tail.len() > MAX_CARD_OUTPUT {
@@ -632,7 +727,7 @@ impl ViewModel {
                 return;
             }
         }
-        // 未找到（理论上不会：ToolStarted 先于 ToolCompleted）——兜底追加终态卡片。
+        // 仍未找到（理论上不会：ToolStarted 先于 ToolCompleted）——兜底追加终态卡片。
         let entry_id = self.alloc_entry_id();
         self.transcript.push(Entry::Tool {
             id: entry_id,
@@ -822,9 +917,18 @@ mod tests {
         let mut view = ViewModel::default();
         view.push_stream_delta(LineKind::Assistant, "你");
         view.push_stream_delta(LineKind::Assistant, "好");
+        assert_eq!(
+            view.transcript.len(),
+            0,
+            "finalize 前不进 transcript（§7.2）"
+        );
+        let msg = view.live.assistant.as_ref().expect("live 区必须有消息");
+        assert_eq!(msg.text, "你好");
+        // finalize 后进入 transcript。
+        view.finalize_streaming();
         assert_eq!(view.transcript.len(), 1);
         let Entry::Message { line, .. } = &view.transcript[0] else {
-            panic!("assistant delta 必须是消息条目");
+            panic!("finalize 后必须是消息条目");
         };
         assert_eq!(line.text, "你好");
     }
@@ -833,15 +937,9 @@ mod tests {
     fn stream_delta_bumps_version_for_render_cache() {
         let mut view = ViewModel::default();
         view.push_stream_delta(LineKind::Assistant, "a");
-        let v1 = match &view.transcript[0] {
-            Entry::Message { line, .. } => line.version,
-            _ => panic!(),
-        };
+        let v1 = view.live.assistant.as_ref().unwrap().version;
         view.push_stream_delta(LineKind::Assistant, "b");
-        let v2 = match &view.transcript[0] {
-            Entry::Message { line, .. } => line.version,
-            _ => panic!(),
-        };
+        let v2 = view.live.assistant.as_ref().unwrap().version;
         assert_ne!(v1, v2);
     }
 
@@ -905,11 +1003,14 @@ mod tests {
             }
         );
         assert!(card.tail.as_deref().unwrap_or("").contains("错误详情"));
-        // 未完成的 call-2 保持 Running。
-        let Entry::Tool { card: card2, .. } = &view.transcript[1] else {
-            panic!("call-2 必须是卡片");
-        };
+        // 未完成的 call-2 仍在 live 区（§7.2），保持 Running。
+        let card2 = view.live.tools.get("call-2").expect("call-2 必须在 live");
         assert_eq!(card2.state, ToolCardState::Running);
+        assert_eq!(
+            view.transcript.len(),
+            1,
+            "只有 call-1 finalize 进 transcript"
+        );
     }
 
     #[test]
@@ -1051,9 +1152,7 @@ mod tests {
         view.begin_tool("c", "bash", None, None);
         let big = "x".repeat(40 * 1024);
         view.append_tool_output("c", &big);
-        let Entry::Tool { card, .. } = &view.transcript[0] else {
-            panic!();
-        };
+        let card = view.live.tools.get("c").expect("live 区必须有卡片");
         assert!(card.output_truncated, "超过预算必须标记截断");
         assert!(card.output.as_ref().unwrap().len() <= MAX_CARD_OUTPUT);
         // 尾部保留（错误相关输出通常在末尾）。
@@ -1114,17 +1213,14 @@ mod p1_message_cap_tests {
         for _ in 0..total_chunks {
             view.push_stream_delta(LineKind::Assistant, &chunk);
         }
-        let entry = view.transcript.last().unwrap();
-        let Entry::Message { line, .. } = entry else {
-            panic!("最后一条应是消息");
-        };
+        let msg = view.live.assistant.as_ref().expect("live 区必须有消息");
         assert!(
-            line.text.len() <= MAX_MESSAGE_CHARS + 32,
+            msg.text.len() <= MAX_MESSAGE_CHARS + 32,
             "消息必须被截断: {} > {}",
-            line.text.len(),
+            msg.text.len(),
             MAX_MESSAGE_CHARS
         );
-        assert!(line.text.contains("truncated"), "截断必须带标记");
+        assert!(msg.text.contains("truncated"), "截断必须带标记");
     }
 
     /// P1-9：reasoning 同样有界。
@@ -1134,11 +1230,8 @@ mod p1_message_cap_tests {
         for _ in 0..(MAX_MESSAGE_CHARS / 1024 + 10) {
             view.push_stream_delta(LineKind::Reasoning, &"r".repeat(1024));
         }
-        let entry = view.transcript.last().unwrap();
-        let Entry::Message { line, .. } = entry else {
-            panic!("最后一条应是消息");
-        };
-        assert!(line.text.len() <= MAX_MESSAGE_CHARS + 32);
+        let msg = view.live.reasoning.as_ref().expect("live 区必须有消息");
+        assert!(msg.text.len() <= MAX_MESSAGE_CHARS + 32);
     }
 }
 

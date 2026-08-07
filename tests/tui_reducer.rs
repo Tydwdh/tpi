@@ -170,10 +170,13 @@ fn agent_events_drive_view_state() {
             text: "增量二".into(),
         }),
     );
-    let Entry::Message { line, .. } = &s.view.transcript[0] else {
-        panic!("assistant 增量必须是消息条目");
-    };
-    assert_eq!(line.text, "增量一增量二", "同一条消息的流式增量必须合并");
+    let msg = s
+        .view
+        .live
+        .assistant
+        .as_ref()
+        .expect("live 区必须有流式消息");
+    assert_eq!(msg.text, "增量一增量二", "同一条消息的流式增量必须合并");
 
     let call_id = tpi::ids::ToolCallId::new_v7();
     reducer::update(

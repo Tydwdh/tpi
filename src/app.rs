@@ -785,6 +785,8 @@ async fn run_interactive<P: Provider>(
     };
     *current_cancel.lock().unwrap() = None;
     ui_state.running = false;
+    // TUI v2 §7.2：run 结束（成功或失败）→ 提交全部剩余 live 内容。
+    ui_state.view.finalize_live();
     let outcome = outcome.map_err(|failure| failure.to_string())?;
     match outcome.reason {
         crate::session::CompletionReason::Error => {

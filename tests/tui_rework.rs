@@ -123,7 +123,7 @@ fn reasoning_flood_collapses_to_one_line() {
     view.push_stream_delta(LineKind::Reasoning, &flood);
     let buffer = draw_to_test_backend(&mut view, 80, 12);
     let text = buffer_text(&buffer);
-    assert!(text.contains("已折叠"), "默认折叠: {text}");
+    assert!(text.contains("思考"), "默认折叠（live 区）: {text}");
     assert!(!text.contains("reasoning"), "正文不进入 transcript: {text}");
     // 折叠态整块 = 1 行（"◇ 思考" 行）。
     let reasoning_rows = buffer

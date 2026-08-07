@@ -374,16 +374,15 @@ fn plan_window(
 ) -> FramePlan {
     let width = width.max(1) as usize;
     // 按 entry 构建逻辑行（entry → wrapped 行 + hits）。
+    // ids/heights 必须以 wrapped_by_entry 为准（含 live 哨兵 group，§7.2）。
     let per_entry = build_transcript_text(view, theme, cache, width);
-    let ids: Vec<EntryId> = view.transcript.iter().map(Entry::id).collect();
-    let mut wrapped_by_entry: Vec<(EntryId, Vec<Line<'static>>, Vec<Option<HitTarget>>)> =
-        Vec::with_capacity(per_entry.len());
-    let mut heights: Vec<usize> = Vec::with_capacity(per_entry.len());
+    let mut wrapped_by_entry: Vec<EntryGroup> = Vec::with_capacity(per_entry.len());
     for (id, logical, hits) in per_entry {
         let (wrapped, wrapped_hits) = wrap_lines_with_hits(logical, hits, width);
-        heights.push(wrapped.len());
         wrapped_by_entry.push((id, wrapped, wrapped_hits));
     }
+    let ids: Vec<EntryId> = wrapped_by_entry.iter().map(|(id, _, _)| *id).collect();
+    let heights: Vec<usize> = wrapped_by_entry.iter().map(|(_, w, _)| w.len()).collect();
     // 写回高度表（滚动跨 entry 定位用；§4）。
     for (id, height) in ids.iter().zip(heights.iter()) {
         view.entry_heights.insert(*id, *height);
@@ -542,18 +541,20 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// 按 entry 分组的渲染结果：(EntryId, 逻辑行, 逐行 hits)。
+/// hits 与 lines 等长，工具卡片的行对应卡片 id（鼠标点击展开）。
+type EntryGroup = (EntryId, Vec<Line<'static>>, Vec<Option<HitTarget>>);
+
 /// 把转录条目渲染为逻辑行（Message 按类型着色/加 rail；Tool 渲染为卡片）。
 ///
-/// 返回按 entry 分组的结果：每项 = (EntryId, 逻辑行, 逐行 hits)。
-/// hits 与 lines 等长，工具卡片的行对应卡片 id（鼠标点击展开）。
+/// 返回按 entry 分组的结果（含 live 哨兵组，§7.2）。
 fn build_transcript_text(
     view: &ViewModel,
     theme: theme::Theme,
     cache: &mut HashMap<u64, Vec<Line<'static>>>,
     width: usize,
-) -> Vec<(EntryId, Vec<Line<'static>>, Vec<Option<HitTarget>>)> {
-    let mut groups: Vec<(EntryId, Vec<Line<'static>>, Vec<Option<HitTarget>>)> =
-        Vec::with_capacity(view.transcript.len());
+) -> Vec<EntryGroup> {
+    let mut groups: Vec<EntryGroup> = Vec::with_capacity(view.transcript.len());
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut hits: Vec<Option<HitTarget>> = Vec::new();
     let push_hit = |lines: &mut Vec<Line<'static>>,
@@ -669,7 +670,87 @@ fn build_transcript_text(
             std::mem::take(&mut hits),
         ));
     }
+    // TUI v2 §7.2：live 区（流式 assistant/reasoning + 运行中工具）作为
+    // 最后一个 group（哨兵 id；Follow 时显示在尾部，Locked 锚定不到它）。
+    build_live_group(view, theme, cache, width, &mut out, &mut hits, &mut groups);
     groups
+}
+
+/// 渲染 live 区（§7.2）：reasoning（折叠策略同历史）→ assistant（Markdown）
+/// → 运行中工具卡片（按启动顺序）。
+fn build_live_group(
+    view: &ViewModel,
+    theme: theme::Theme,
+    cache: &mut HashMap<u64, Vec<Line<'static>>>,
+    width: usize,
+    out: &mut Vec<Line<'static>>,
+    hits: &mut Vec<Option<HitTarget>>,
+    groups: &mut Vec<EntryGroup>,
+) {
+    let live = &view.live;
+    if live.reasoning.is_none() && live.assistant.is_none() && live.tools.is_empty() {
+        return;
+    }
+    out.clear();
+    hits.clear();
+    // 流式 reasoning（折叠策略与历史一致：Alt+T 展开 / 点击打开 Overlay）。
+    if let Some(msg) = &live.reasoning
+        && !msg.text.is_empty()
+    {
+        if view.reasoning_visible {
+            for (i, s) in msg.text.split('\n').enumerate() {
+                let prefix = if i == 0 { "思考 " } else { "    " };
+                out.push(Line::styled(
+                    format!("{prefix}{s}"),
+                    Style::default()
+                        .fg(theme.muted)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+                hits.push(None);
+            }
+        } else {
+            out.push(Line::styled(
+                "◇ 思考 · 流式中…（Alt+T 展开 · 点击查看）",
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+            hits.push(None);
+        }
+    }
+    // 流式 assistant（Markdown，按 version 缓存）。
+    if let Some(msg) = &live.assistant
+        && !msg.text.is_empty()
+    {
+        let rendered = if let Some(lines) = cache.get(&msg.version) {
+            lines.clone()
+        } else {
+            let lines = render_markdown(&msg.text, theme);
+            if cache.len() > 2048 {
+                cache.clear();
+            }
+            cache.insert(msg.version, lines);
+            cache[&msg.version].clone()
+        };
+        out.extend(rendered.iter().cloned());
+        hits.extend(rendered.iter().map(|_| None));
+    }
+    // 运行中工具卡片（按启动顺序）。
+    for call_id in &live.tool_order {
+        if let Some(card) = live.tools.get(call_id) {
+            let card_id = card.id.clone();
+            for line in tool_card_lines(card, view.anim_tick, theme, width) {
+                out.push(line);
+                hits.push(Some(HitTarget::Tool(card_id.clone())));
+            }
+        }
+    }
+    groups.push((
+        // 哨兵 id：Locked 锚定不到 live 区（§16：live 只在 Follow 尾部可见）。
+        EntryId(u64::MAX),
+        std::mem::take(out),
+        std::mem::take(hits),
+    ));
 }
 
 /// 按条目版本缓存 Markdown 渲染（流式增量只重渲染变化条目，§16.1）。
