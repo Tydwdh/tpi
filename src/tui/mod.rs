@@ -17,6 +17,7 @@
 
 pub mod editor;
 pub mod model;
+pub mod text;
 pub mod theme;
 
 use std::collections::HashMap;

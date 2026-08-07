@@ -282,12 +282,9 @@ impl ViewModel {
                     if text.len() <= room {
                         line.text.push_str(text);
                     } else {
-                        // 截断到 UTF-8 字符边界，避免切出非法字节。
-                        let mut end = room;
-                        while !text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        line.text.push_str(&text[..end]);
+                        // 截断到 UTF-8 字符边界，避免切出非法字节（§24 统一 helper）。
+                        line.text
+                            .push_str(&text[..crate::tui::text::floor_char_boundary(text, room)]);
                         line.text.push_str("…[truncated]");
                     }
                 } else if !line.text.contains("truncated") {
@@ -360,13 +357,15 @@ impl ViewModel {
             if current.len() + text.len() > MAX_CARD_OUTPUT {
                 card.output_truncated = true;
                 // 丢弃旧内容超出部分（保留尾部：错误相关输出通常在末尾）。
+                // §24：drain 起点必须落在字符边界，否则中文/emoji 输出会 panic。
                 let overflow = current.len() + text.len() - MAX_CARD_OUTPUT;
-                let drop = overflow.min(current.len());
+                let drop =
+                    crate::tui::text::floor_char_boundary(current, overflow.min(current.len()));
                 current.drain(..drop);
-                // 单块超大时只保留其尾部。
+                // 单块超大时只保留其尾部（起点同样按字符边界对齐）。
                 let remaining = MAX_CARD_OUTPUT.saturating_sub(current.len());
-                let tail_start = text.len().saturating_sub(remaining);
-                current.push_str(&text[tail_start..]);
+                let tail = crate::tui::text::suffix_by_bytes_safe(&text, remaining);
+                current.push_str(tail);
             } else {
                 current.push_str(&text);
             }
@@ -682,12 +681,16 @@ fn bound_tail(tail: &str) -> String {
 }
 
 /// 卡片输出有界化（保留尾部；完整输出仍可通过 read @artifact 读取）。
+/// §24：尾部起点按字符边界对齐，中文/emoji 输出不 panic。
 fn bound_output(output: &str) -> String {
     if output.len() <= MAX_CARD_OUTPUT {
         return output.to_string();
     }
     // “…” 是 3 字节 UTF-8，截断窗口相应减 3，保证总长不超过 MAX_CARD_OUTPUT。
-    format!("…{}", &output[output.len() - (MAX_CARD_OUTPUT - 3)..])
+    format!(
+        "…{}",
+        crate::tui::text::suffix_by_bytes_safe(output, MAX_CARD_OUTPUT - 3)
+    )
 }
 
 #[cfg(test)]
