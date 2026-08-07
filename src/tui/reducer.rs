@@ -75,8 +75,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             }
         }
         KeyCode::Esc => {
+            // §49：Esc 优先级 = overlay > modal > menu > run 取消。
             if state.view.overlay.is_some() {
                 state.view.close_overlay();
+            } else if state.view.modal.is_some() {
+                state.view.close_modal();
             } else if state.view.menu.is_some() {
                 state.view.menu = None;
             } else if state.running {

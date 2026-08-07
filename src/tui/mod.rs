@@ -337,6 +337,15 @@ fn render_frame(
         draw_menu(frame, Rect::new(area.x, y, w, h), view, theme);
     }
 
+    // 操作型 Modal（§42：/help /settings /doctor 等；覆盖显示，Esc 关闭）。
+    if view.modal.is_some() {
+        let w = area.width.min(88).saturating_sub(4).max(40);
+        let h = trans_area.height.min(28).saturating_sub(2).max(10);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = trans_area.y + trans_area.height.saturating_sub(h) / 2;
+        draw_modal(frame, Rect::new(x, y, w, h), view, theme);
+    }
+
     // 详情 Overlay（整改 B：覆盖显示，不重写 scrollback；Esc 关闭）。
     if view.overlay.is_some() {
         let w = area.width.min(88).saturating_sub(4).max(40);
@@ -1244,6 +1253,50 @@ fn input_cursor_cell(input: &str, cursor: usize, width: u16) -> (u16, u16) {
 
 /// 详情 Overlay（整改 B）：带边框对话框，展示 command/output/status；
 /// Esc 关闭、PgUp/PgDn 内部滚动；不修改 scrollback。
+/// 操作型 Modal（§42）：标题 + 正文（内部滚动，Esc 关闭，PgUp/PgDn 翻页）。
+fn draw_modal(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: theme::Theme) {
+    let Some(modal) = &view.modal else {
+        return;
+    };
+    let inner_w = rect.width.saturating_sub(2).max(1) as usize;
+    let inner_h = rect.height.saturating_sub(2).max(1) as usize;
+
+    let mut content: Vec<Line<'static>> = Vec::new();
+    content.push(Line::styled(
+        format!("{}（Esc 关闭 · ↑/↓ 滚动）", modal.title),
+        Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD),
+    ));
+    content.push(Line::default());
+    for line in modal.body.lines() {
+        content.push(Line::styled(
+            line.to_string(),
+            Style::default().fg(theme.text),
+        ));
+    }
+    let wrapped = wrap_lines(content, inner_w);
+    let total = wrapped.len();
+    let scroll = modal.scroll.min(total.saturating_sub(inner_h) as u16);
+    let start = scroll as usize;
+    let window = wrapped[start..start + inner_h.min(total)].to_vec();
+
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    frame.render_widget(
+        ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(theme.info)),
+        rect,
+    );
+    let inner = Rect::new(
+        rect.x + 1,
+        rect.y + 1,
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2),
+    );
+    frame.render_widget(Paragraph::new(window).scroll((0, 0)), inner);
+}
+
 fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: theme::Theme) {
     let Some(overlay) = &view.overlay else {
         return;

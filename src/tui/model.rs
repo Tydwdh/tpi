@@ -86,6 +86,29 @@ pub enum ToolCardState {
     },
 }
 
+/// 操作型 UI Modal（TUI v2 §42/§61）：/help /settings /doctor /session
+/// /sessions /diff 等输出进 Modal，不污染 transcript。
+/// 与 Overlay 的区别：Overlay 是“内容详情”，Modal 是“操作面板”。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModalState {
+    /// 标题（如 `/settings`）。
+    pub title: String,
+    /// 正文（多行）。
+    pub body: String,
+    /// Modal 内滚动偏移（行）。
+    pub scroll: u16,
+}
+
+impl ModalState {
+    pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            scroll: 0,
+        }
+    }
+}
+
 /// 详情 Overlay 状态（整改 B：历史/工具详情不重写 scrollback，覆盖显示）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayState {
@@ -270,6 +293,8 @@ pub struct ViewModel {
     pub file_index: Vec<String>,
     /// 详情 Overlay（None = 关闭；打开时 Esc 关闭、PgUp/PgDn 滚动）。
     pub overlay: Option<OverlayState>,
+    /// 操作型 Modal（None = 关闭；§42：/help /settings /doctor 等不污染 transcript）。
+    pub modal: Option<ModalState>,
     pub next_version: u64,
     pub next_entry_id: u64,
 }
@@ -300,6 +325,7 @@ impl Default for ViewModel {
             context_usage: None,
             file_index: Vec::new(),
             overlay: None,
+            modal: None,
             next_version: 1,
             next_entry_id: 1,
         }
@@ -662,9 +688,19 @@ impl ViewModel {
         self.overlay = Some(OverlayState::for_reasoning(&line.text));
     }
 
+    /// 打开操作型 Modal（§42）。
+    pub fn open_modal(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        self.modal = Some(ModalState::new(title, body));
+    }
+
     /// 关闭 Overlay（Esc）。
     pub fn close_overlay(&mut self) {
         self.overlay = None;
+    }
+
+    /// 关闭 Modal（Esc；优先级低于 Overlay，§49）。
+    pub fn close_modal(&mut self) {
+        self.modal = None;
     }
 
     /// 工具终态（TUI v2 §7.2）：从 live 区移除并 finalize 为 transcript 卡片

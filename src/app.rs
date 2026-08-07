@@ -385,11 +385,17 @@ async fn interactive_loop<P: Provider>(
                     } else {
                         "未配置 key"
                     };
-                    push_system_line(
-                        &mut ui_state.view,
-                        &mut renderer,
+                    ui_state.view.open_modal(
+                        "/settings",
                         format!(
-                            "配置来源: {}\nworkspace: {}\nsessions: {}\nartifacts: {}\nshell: {shell}\nweb_search: Brave（{brave_key}）\n自动打开浏览器: {}\n保留 token: {}",
+                            "配置来源: {}
+workspace: {}
+sessions: {}
+artifacts: {}
+shell: {shell}
+web_search: Brave（{brave_key}）
+自动打开浏览器: {}
+保留 token: {}",
                             config.source,
                             config.workspace_root,
                             config.sessions_root.display(),
@@ -401,15 +407,24 @@ async fn interactive_loop<P: Provider>(
                             },
                             config.safety_reserve_tokens,
                         ),
-                    )?;
+                    );
+                    renderer
+                        .draw(&mut ui_state.view)
+                        .map_err(|e| e.to_string())?;
                     continue;
                 }
                 "/model" => {
-                    push_system_line(
-                        &mut ui_state.view,
-                        &mut renderer,
+                    ui_state.view.open_modal(
+                        "/model",
                         format!(
-                            "primary:\n  名称: {}\n  provider: {}\n  base_url: {}\n  reasoning: {}\n  max_output_tokens: {}\n  context_window: {}\n  api_key_env: {}",
+                            "primary:
+  名称: {}
+  provider: {}
+  base_url: {}
+  reasoning: {}
+  max_output_tokens: {}
+  context_window: {}
+  api_key_env: {}",
                             config.model.name,
                             config.model.provider,
                             config.model.base_url,
@@ -430,34 +445,48 @@ async fn interactive_loop<P: Provider>(
                                 .unwrap_or_else(|| "未配置".to_string()),
                             config.model.api_key_env,
                         ),
-                    )?;
+                    );
+                    renderer
+                        .draw(&mut ui_state.view)
+                        .map_err(|e| e.to_string())?;
                     continue;
                 }
                 "/help" => {
-                    let mut text = String::from("命令：\n");
+                    let mut text = String::from(
+                        "命令：
+",
+                    );
                     for (name, desc) in SLASH_COMMANDS {
-                        text.push_str(&format!("/{name} —— {desc}\n"));
+                        text.push_str(&format!(
+                            "/{name} —— {desc}
+"
+                        ));
                     }
                     text.push_str(
-                        "快捷键：Alt+Enter 换行 · ↑/↓ 输入历史 · Tab 命令补全 · \
-                         @文件 引用补全 · Alt+T 思考折叠 · Alt+E 展开工具输出 · \
-                         Ctrl+U 清空 · Ctrl+A/E 行首/行尾 · PgUp/PgDn 翻页 · \
-                         滚轮滚动 · 点击工具卡片展开 · Ctrl-C 取消 run",
+                        "快捷键：Shift+Enter 换行 · ↑/↓ 多行/历史 · Tab 命令补全 ·                          @文件 引用补全 · Alt+T 思考折叠 · Alt+E 展开工具输出 ·                          Ctrl+F 搜索 · Ctrl+U 清空 · Ctrl+A/E 行首/行尾 ·                          PgUp/PgDn 翻页 · 滚轮滚动 · 点击工具卡片展开 · Ctrl-C 取消 run",
                     );
-                    push_system_line(&mut ui_state.view, &mut renderer, text)?;
+                    ui_state.view.open_modal("/help", text);
+                    renderer
+                        .draw(&mut ui_state.view)
+                        .map_err(|e| e.to_string())?;
                     continue;
                 }
                 "/session" => {
                     let info = match session.as_ref() {
                         Some(log) => format!(
-                            "session: {}\nworkspace: {}\n事件数: {}",
+                            "session: {}
+workspace: {}
+事件数: {}",
                             log.session_id(),
                             log.workspace_id(),
                             log.seq()
                         ),
                         None => "尚无 session（第一条消息后创建）".to_string(),
                     };
-                    push_system_line(&mut ui_state.view, &mut renderer, info)?;
+                    ui_state.view.open_modal("/session", info);
+                    renderer
+                        .draw(&mut ui_state.view)
+                        .map_err(|e| e.to_string())?;
                     continue;
                 }
                 "/sessions" => {
@@ -502,11 +531,12 @@ async fn interactive_loop<P: Provider>(
                         selected: 0,
                         kind: crate::tui::model::MenuKind::Session,
                     });
-                    push_system_line(
-                        &mut ui_state.view,
-                        &mut renderer,
-                        "会话列表：↑/↓ 选择，Enter 恢复（Esc 关闭）".to_string(),
-                    )?;
+                    ui_state
+                        .view
+                        .open_modal("/sessions", "会话列表：↑/↓ 选择，Enter 恢复（Esc 关闭）");
+                    renderer
+                        .draw(&mut ui_state.view)
+                        .map_err(|e| e.to_string())?;
                     continue;
                 }
                 "/new" => {
@@ -542,13 +572,17 @@ async fn interactive_loop<P: Provider>(
                         .reasoning
                         .clone()
                         .unwrap_or_else(|| "未配置（默认）".to_string());
-                    push_system_line(
-                        &mut ui_state.view,
-                        &mut renderer,
+                    ui_state.view.open_modal(
+                        "/thinking",
                         format!(
-                            "reasoning: {value}\n说明: 透传给 provider 的推理设置（§18.1 [model.primary] reasoning）；\n未配置时使用 provider 默认。",
+                            "reasoning: {value}
+说明: 透传给 provider 的推理设置（§18.1 [model.primary] reasoning）；
+未配置时使用 provider 默认。",
                         ),
-                    )?;
+                    );
+                    renderer
+                        .draw(&mut ui_state.view)
+                        .map_err(|e| e.to_string())?;
                     continue;
                 }
                 "/diff" => {

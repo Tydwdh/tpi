@@ -8,7 +8,9 @@
 //! - 历史详情走 Overlay，不重写 scrollback；
 //! - scroll lock 期间新输出不强制拉回底部。
 
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tpi::tool::outcome::ToolStatus;
+use tpi::tui::event::UiEvent;
 use tpi::tui::model::{Entry, LineKind, MAX_CARD_OUTPUT, ToolCard, ToolCardState, ViewModel};
 use tpi::tui::{HitTarget, draw_to_test_backend};
 
@@ -299,4 +301,36 @@ fn hit_targets_distinguish_tool_and_reasoning() {
     assert!(view.overlay.as_ref().unwrap().title.contains("思考"));
     let _ = buffer;
     let _ = HitTarget::Tool("x".into());
+}
+
+/// T7：操作型 UI 进 Modal，不污染 transcript（§42）。
+#[test]
+fn modal_keeps_transcript_clean_and_renders() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::User, "请修复测试");
+    view.push_line(LineKind::Assistant, "好的。");
+    view.open_modal("/settings", "workspace: x\nsessions: y\n保留 token: 8192");
+    assert!(view.modal.is_some());
+    // Modal 打开不产生 transcript 条目。
+    assert_eq!(view.transcript.len(), 2, "Modal 不得污染 transcript");
+    // 渲染：Modal 内容可见（覆盖层）。
+    let buffer = draw_to_test_backend(&mut view, 80, 24);
+    let text: String = buffer
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(text.contains("/settings"), "Modal 标题可见: {text}");
+    assert!(text.contains("workspace: x"), "Modal 正文可见: {text}");
+    // Esc 关闭（reducer 路径）。
+    let mut state = tpi::tui::state::UiState::new(view);
+    let effects = tpi::tui::reducer::update(
+        &mut state,
+        UiEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    );
+    assert!(state.view.modal.is_none(), "Esc 关闭 Modal");
+    assert!(effects.is_empty(), "关 Modal 不产生取消效果");
+    // transcript 仍干净。
+    assert_eq!(state.view.transcript.len(), 2);
 }
