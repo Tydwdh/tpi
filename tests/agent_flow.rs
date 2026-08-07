@@ -177,3 +177,45 @@ async fn usage_accumulates_across_turns() {
     assert_eq!(completed.input_tokens, 180, "session 记录的 usage 必须累加");
     assert_eq!(completed.output_tokens, 30);
 }
+
+/// 上下文用量事件：配置 context_window 时每次请求前发送 ContextUsage（TUI 用量条）。
+#[tokio::test]
+async fn context_usage_event_sent_before_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let mut config = test_config(&workspace);
+    // 窗口足够大，不触发 compaction（只验证 ContextUsage 事件）。
+    config.model.context_window = Some(100_000);
+    let mut provider = FakeProvider::new(vec![FakeResponse::text("done")]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, mut rx) = mpsc::channel(16);
+
+    let _outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        &[],
+        "hi".into(),
+        tx,
+        CancellationToken::new(),
+        true,
+    )
+    .await
+    .expect("run succeeds");
+
+    let mut saw_usage = false;
+    while let Ok(event) = rx.try_recv() {
+        if let agent::RuntimeEvent::ContextUsage { projected, usable } = event {
+            saw_usage = true;
+            // usable = window - output(未配置) - reserve = 100000 - 8192。
+            assert_eq!(usable, 100_000 - 8192);
+            assert!(projected > 0, "投影必须非零");
+        }
+    }
+    assert!(saw_usage, "必须发送 ContextUsage 事件");
+}

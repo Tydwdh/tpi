@@ -52,6 +52,8 @@ pub fn test_tool_context(workspace_root: &Utf8PathBuf) -> tpi::tool::ToolContext
         cancel: tokio_util::sync::CancellationToken::new(),
         artifacts_root: workspace_root.join(".tpi-test-artifacts").into(),
         session_id: "test-session".into(),
+        call_id: tpi::ids::ToolCallId::new_v7(),
+        output_tx: None,
         scan_snapshots: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
             String,
             ScanSnapshot,

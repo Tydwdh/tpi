@@ -30,6 +30,11 @@ pub enum LineKind {
 }
 
 /// 工具卡片（§16.2：单行 `icon name duration status`，运行中动画）。
+///
+/// 输出展示（对照 crush 的可展开工具消息）：
+/// - 运行中：`output` 累积实时增量（有界），渲染为卡片下方尾注；
+/// - 终态：`output` 保存完整输出（成功也保留，不再丢弃），
+///   折叠时显示摘要 + 失败 tail，`expanded` 时显示正文（Alt+E/鼠标切换）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCard {
     /// ToolCallId 的字符串形式。
@@ -38,10 +43,18 @@ pub struct ToolCard {
     /// 可读命令/参数摘要（如 `bash: cargo test`）；None 表示只有工具名。
     pub detail: Option<String>,
     pub state: ToolCardState,
-    /// 失败/超时等终态时携带的关键输出 tail（有界，渲染为红色尾注）。
+    /// 完整输出（有界累积，≤ MAX_CARD_OUTPUT；成功与失败都保留）。
+    pub output: Option<String>,
+    /// 输出被截断（超过 MAX_CARD_OUTPUT 丢弃中段）。
+    pub output_truncated: bool,
+    /// 展开状态（显示完整输出正文；默认折叠）。
+    pub expanded: bool,
+    /// 失败/超时等终态时携带的关键输出 tail（有界，折叠时渲染为红色尾注）。
     pub tail: Option<String>,
 }
 
+/// 卡片输出上限（UI 内存与渲染预算；完整输出仍可通过 read @artifact 读取）。
+pub const MAX_CARD_OUTPUT: usize = 32 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCardState {
     Running,
@@ -71,9 +84,21 @@ pub enum StatusLine {
 /// 斜杠命令补全菜单（输入以 `/` 开头时弹出，§16.2 信息层级之外的小浮层）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuView {
-    /// 与输入前缀匹配的命令（name, 中文说明）。
-    pub items: Vec<(&'static str, &'static str)>,
+    /// 与输入前缀匹配的项（label, 中文说明）。
+    pub items: Vec<(String, String)>,
     pub selected: usize,
+    pub kind: MenuKind,
+}
+
+/// 菜单种类（决定 Enter/Tab 的插入行为）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuKind {
+    /// `/命令` 补全：Enter/Tab 插入 `/name`。
+    SlashCommand,
+    /// `@文件` 引用：Enter 把选中路径替换到光标前的 `@` token。
+    File,
+    /// `/sessions` 会话列表：Enter 恢复选中 session。
+    Session,
 }
 
 /// 只读渲染输入（§16.1：renderer 的唯一输入）。
@@ -100,6 +125,10 @@ pub struct ViewModel {
     pub anim_tick: u64,
     /// 命令补全菜单（None = 关闭）。
     pub menu: Option<MenuView>,
+    /// 上下文占用投影（projected, usable；footer 用量条）。
+    pub context_usage: Option<(u64, u64)>,
+    /// workspace 文件索引（`@` 引用补全用；会话开始时扫描一次，有界）。
+    pub file_index: Vec<String>,
     pub next_version: u64,
 }
 
@@ -120,6 +149,8 @@ impl Default for ViewModel {
             output_tokens: 0,
             anim_tick: 0,
             menu: None,
+            context_usage: None,
+            file_index: Vec::new(),
             next_version: 1,
         }
     }
@@ -182,9 +213,59 @@ impl ViewModel {
             name: name.into(),
             detail,
             state: ToolCardState::Running,
+            output: None,
+            output_truncated: false,
+            expanded: false,
             tail: None,
         }));
         self.trim_transcript();
+    }
+
+    /// 工具执行中的实时输出增量（有界累积；运行中卡片可见）。
+    pub fn append_tool_output(&mut self, id: impl Into<String>, text: impl Into<String>) {
+        let id = id.into();
+        let text = text.into();
+        if let Some(Entry::Tool(card)) = self.transcript.iter_mut().rev().find(|entry| {
+            matches!(entry, Entry::Tool(card) if card.id == id)
+        }) {
+            let current = card.output.get_or_insert_with(String::new);
+            if current.len() + text.len() > MAX_CARD_OUTPUT {
+                card.output_truncated = true;
+                // 丢弃旧内容超出部分（保留尾部：错误相关输出通常在末尾）。
+                let overflow = current.len() + text.len() - MAX_CARD_OUTPUT;
+                let drop = overflow.min(current.len());
+                current.drain(..drop);
+                // 单块超大时只保留其尾部。
+                let remaining = MAX_CARD_OUTPUT.saturating_sub(current.len());
+                let tail_start = text.len().saturating_sub(remaining);
+                current.push_str(&text[tail_start..]);
+            } else {
+                current.push_str(&text);
+            }
+        }
+    }
+
+    /// 切换某张卡片展开/折叠（显示完整输出正文）。
+    pub fn toggle_expand(&mut self, id: impl Into<String>) {
+        let id = id.into();
+        for entry in self.transcript.iter_mut().rev() {
+            if let Entry::Tool(card) = entry
+                && card.id == id
+            {
+                card.expanded = !card.expanded;
+                return;
+            }
+        }
+    }
+
+    /// 切换最后一张卡片展开（Alt+E 键盘兜底）。
+    pub fn toggle_last_tool_expanded(&mut self) {
+        for entry in self.transcript.iter_mut().rev() {
+            if let Entry::Tool(card) = entry {
+                card.expanded = !card.expanded;
+                return;
+            }
+        }
     }
 
     /// 工具终态：按 call_id 定位卡片，更新状态与耗时；失败时保留关键 tail（有界）。
@@ -211,6 +292,13 @@ impl ViewModel {
                     duration_ms,
                     exit_code,
                 };
+                // 完整输出始终保留（成功也可见，Alt+E/鼠标展开）；失败时折叠态显示 tail。
+                if !tail.is_empty() {
+                    card.output = Some(bound_output(&tail));
+                    if tail.len() > MAX_CARD_OUTPUT {
+                        card.output_truncated = true;
+                    }
+                }
                 if status != ToolStatus::Succeeded && !tail.is_empty() {
                     card.tail = Some(bound_tail(&tail));
                 }
@@ -227,6 +315,13 @@ impl ViewModel {
                 duration_ms,
                 exit_code,
             },
+            output: if tail.is_empty() {
+                None
+            } else {
+                Some(bound_output(&tail))
+            },
+            output_truncated: tail.len() > MAX_CARD_OUTPUT,
+            expanded: false,
             tail: if status == ToolStatus::Succeeded {
                 None
             } else {
@@ -266,10 +361,10 @@ impl ViewModel {
         let Some(rest) = self.input.strip_prefix('/') else {
             return;
         };
-        let items: Vec<(&'static str, &'static str)> = crate::tui::SLASH_COMMANDS
+        let items: Vec<(String, String)> = crate::tui::SLASH_COMMANDS
             .iter()
             .filter(|(name, _)| name.starts_with(rest))
-            .copied()
+            .map(|(name, desc)| (name.to_string(), desc.to_string()))
             .collect();
         if items.is_empty() {
             return;
@@ -277,6 +372,40 @@ impl ViewModel {
         self.menu = Some(MenuView {
             selected: selected.min(items.len() - 1),
             items,
+            kind: MenuKind::SlashCommand,
+        });
+    }
+
+    /// 输入中是否存在 `@` 引用 token（refresh_at_menu 的触发条件）。
+    pub fn has_at_token(&self) -> bool {
+        at_token(&self.input).is_some()
+    }
+
+    /// 依据当前输入与文件索引重建 `@` 引用菜单（文件菜单覆盖斜杠菜单）。
+    ///
+    /// 触发条件：输入中最后一个空格分隔的 token 以 `@` 开头（如 `看看 @src/m`）。
+    /// 插入时替换该 token（保留其他输入）。
+    pub fn refresh_at_menu(&mut self) {
+        let selected = self.menu.as_ref().map(|m| m.selected).unwrap_or(0);
+        self.menu = None;
+        let Some((_, token)) = at_token(&self.input) else {
+            return;
+        };
+        let needle = token.strip_prefix('@').unwrap_or("");
+        let items: Vec<(String, String)> = self
+            .file_index
+            .iter()
+            .filter(|path| path.starts_with(needle))
+            .take(20)
+            .map(|path| (path.clone(), String::new()))
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.menu = Some(MenuView {
+            selected: selected.min(items.len() - 1),
+            items,
+            kind: MenuKind::File,
         });
     }
 
@@ -288,10 +417,46 @@ impl ViewModel {
         let Some((name, _)) = menu.items.get(menu.selected) else {
             return;
         };
-        self.input = format!("/{name}");
-        self.input_cursor = self.input.len();
-        self.refresh_command_menu();
+        match menu.kind {
+            MenuKind::SlashCommand => {
+                self.input = format!("/{name}");
+                self.input_cursor = self.input.len();
+                self.refresh_command_menu();
+            }
+            MenuKind::File => {
+                // 替换光标前最后一个 `@` token 为选中路径。
+                let path = name.clone();
+                if let Some((start, _)) = at_token(&self.input) {
+                    self.input.replace_range(start.., &path);
+                    self.input_cursor = self.input.len();
+                }
+                self.menu = None;
+            }
+            MenuKind::Session => {
+                // 会话选择由 app 层处理（需要重建 SessionLog/history），这里只关闭菜单。
+                self.menu = None;
+            }
+        }
     }
+
+    /// 返回选中的菜单项（app 层处理 Session 恢复时用）。
+    pub fn selected_menu_item(&self) -> Option<(String, MenuKind)> {
+        let menu = self.menu.as_ref()?;
+        let (label, _) = menu.items.get(menu.selected)?;
+        Some((label.clone(), menu.kind))
+    }
+}
+
+/// 输入中最后一个空格分隔 token 的 `@` 前缀位置（`(start, prefix)`）。
+fn at_token(input: &str) -> Option<(usize, &str)> {
+    let start = input.rfind([' ', '\n']).map(|i| i + 1).unwrap_or(0);
+    let token = &input[start..];
+    if let Some(at) = token.find('@')
+        && at == 0
+    {
+        return Some((start, token));
+    }
+    None
 }
 
 /// 失败 tail 有界化（§16.2：保留关键 tail，不自动展开几十屏）。
@@ -305,6 +470,14 @@ fn bound_tail(tail: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+/// 卡片输出有界化（保留尾部；完整输出仍可通过 read @artifact 读取）。
+fn bound_output(output: &str) -> String {
+    if output.len() <= MAX_CARD_OUTPUT {
+        return output.to_string();
+    }
+    format!("…{}", &output[output.len() - MAX_CARD_OUTPUT..])
 }
 
 #[cfg(test)]
@@ -480,5 +653,87 @@ mod tests {
     fn reasoning_fold_defaults_visible() {
         let view = ViewModel::default();
         assert!(view.reasoning_visible);
+    }
+
+    #[test]
+    fn finish_tool_keeps_success_output_expandable() {
+        let mut view = ViewModel::default();
+        view.begin_tool("call-1", "bash", None);
+        // 运行中实时输出累积。
+        view.append_tool_output("call-1", "line-1\n");
+        view.append_tool_output("call-1", "line-2\n");
+        view.finish_tool("call-1", "bash", ToolStatus::Succeeded, 42, Some(0), "line-1\nline-2\n");
+        let Entry::Tool(card) = &view.transcript[0] else {
+            panic!();
+        };
+        // 成功也保留完整输出（此前被丢弃）。
+        assert_eq!(card.output.as_deref(), Some("line-1\nline-2\n"));
+        assert_eq!(card.tail, None, "成功卡片折叠态不显示红色 tail");
+        assert!(!card.expanded);
+        // 展开切换。
+        view.toggle_expand("call-1");
+        let Entry::Tool(card) = &view.transcript[0] else {
+            panic!();
+        };
+        assert!(card.expanded);
+        view.toggle_last_tool_expanded();
+        let Entry::Tool(card) = &view.transcript[0] else {
+            panic!();
+        };
+        assert!(!card.expanded, "Alt+E 再次切换回折叠");
+    }
+
+    #[test]
+    fn append_tool_output_is_bounded() {
+        let mut view = ViewModel::default();
+        view.begin_tool("c", "bash", None);
+        let big = "x".repeat(40 * 1024);
+        view.append_tool_output("c", &big);
+        let Entry::Tool(card) = &view.transcript[0] else {
+            panic!();
+        };
+        assert!(card.output_truncated, "超过预算必须标记截断");
+        assert!(card.output.as_ref().unwrap().len() <= MAX_CARD_OUTPUT);
+        // 尾部保留（错误相关输出通常在末尾）。
+        assert!(card.output.as_ref().unwrap().ends_with('x'));
+    }
+
+    #[test]
+    fn at_menu_filters_file_index() {
+        let mut view = ViewModel {
+            file_index: vec![
+                "src/main.rs".into(),
+                "src/lib.rs".into(),
+                "Cargo.toml".into(),
+            ],
+            ..Default::default()
+        };
+        view.input = "看看 @src/".into();
+        assert!(view.has_at_token());
+        view.refresh_at_menu();
+        let menu = view.menu.as_ref().expect("@ 菜单应打开");
+        assert_eq!(menu.kind, crate::tui::model::MenuKind::File);
+        assert_eq!(menu.items.len(), 2, "只显示前缀匹配的文件");
+        // Enter 补全：@token 被替换为选中路径。
+        view.menu.as_mut().unwrap().selected = 0;
+        view.complete_menu_command();
+        assert_eq!(view.input, "看看 src/main.rs");
+        assert_eq!(view.menu, None, "补全后菜单关闭");
+    }
+
+    #[test]
+    fn at_menu_closes_without_match_or_token() {
+        let mut view = ViewModel {
+            file_index: vec!["src/main.rs".into()],
+            ..Default::default()
+        };
+        // 无 @ token：不弹菜单。
+        view.input = "hello".into();
+        view.refresh_at_menu();
+        assert!(view.menu.is_none());
+        // 有 token 但无匹配：关闭。
+        view.input = "@no-such-file".into();
+        view.refresh_at_menu();
+        assert!(view.menu.is_none());
     }
 }

@@ -13,6 +13,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tool::command::RunArgs;
 
+/// 实时输出回调（bash 执行中逐帧转发到 UI；由工具层构造，进程层不感知 UI 细节）。
+pub type StreamSink = dyn Fn(u8, &[u8]) + Sync;
+
 /// process-host 的控制/数据消息。
 const MSG_START: u8 = 0;
 const MSG_OUTPUT: u8 = 1;
@@ -75,6 +78,7 @@ pub struct IsolationError(pub String);
 /// 5. 取消/超时 → TerminateJobObject，host 与整棵进程树一起退出。
 ///
 /// 归组失败时返回 [`IsolationError`]，绝不静默降级为 unmanaged process（§11.5）。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_in_host(
     args: &RunArgs,
     resolved_program: &PathBuf,
@@ -83,6 +87,7 @@ pub async fn run_in_host(
     timeout: std::time::Duration,
     _session_id: &str,
     mut artifact: Option<&mut crate::session::artifact::ArtifactWriter>,
+    stream_sink: Option<&StreamSink>,
 ) -> Result<HostRunOutput, String> {
     // 单二进制 process-host（§11.5）：默认用自身；测试用 TPI_PROCESS_HOST 指向真实 tpi.exe。
     let exe = std::env::var_os("TPI_PROCESS_HOST")
@@ -172,6 +177,10 @@ pub async fn run_in_host(
                     Ok(Some((MSG_OUTPUT, payload))) if payload.len() >= 5 => {
                         let stream = payload[0];
                         let bytes = &payload[1..];
+                        if let Some(sink) = stream_sink {
+                            // 实时转发（bash 执行中 UI 可见增量输出；同步回调不阻塞读循环）。
+                            sink(stream, bytes);
+                        }
                         if let Some(writer) = artifact.as_mut() {
                             let _ = writer.write(
                                 if stream == STREAM_STDOUT {

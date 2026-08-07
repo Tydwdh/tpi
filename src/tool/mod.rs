@@ -181,6 +181,19 @@ pub enum ValidatedArgs {
     WebFetch(web::WebFetchArgs),
 }
 
+/// 工具流式输出事件（bash 实时输出 → UI；tool 层不依赖 agent 层）。
+///
+/// 进程层读帧时同步发送（UnboundedSender 不阻塞执行路径）；
+/// agent 桥接转发为 [`crate::agent::RuntimeEvent::ToolOutputDelta`]。
+#[derive(Debug, Clone)]
+pub struct ToolStreamEvent {
+    /// 工具调用的内部 id（与 ToolStarted 事件一致，UI 按此匹配卡片）。
+    pub call_id: crate::ids::ToolCallId,
+    /// 流标识（STREAM_STDOUT / STREAM_STDERR）。
+    pub stream: u8,
+    pub text: String,
+}
+
 /// 工具执行上下文。
 pub struct ToolContext {
     pub workspace_root: Utf8PathBuf,
@@ -189,6 +202,10 @@ pub struct ToolContext {
     pub artifacts_root: std::path::PathBuf,
     /// 当前 session id（artifact 引用与 cursor 作用域）。
     pub session_id: String,
+    /// 当前工具调用的内部 id（流式输出事件按此匹配 UI 卡片）。
+    pub call_id: crate::ids::ToolCallId,
+    /// 流式输出通道（bash 实时输出；None = 无 UI 订阅）。
+    pub output_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolStreamEvent>>,
     /// list/search 分页 snapshot（session 作用域；cursor 翻页不重新扫描，§8.4）。
     pub scan_snapshots:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, search::ScanSnapshot>>>,

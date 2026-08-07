@@ -197,7 +197,22 @@ async fn interactive_loop<P: Provider>(
     } else {
         Some(initial_prompt.to_string())
     };
+    let mut pending_session: Option<String> = None;
     renderer.draw(&view).map_err(|e| e.to_string())?;
+
+    // `@` 文件索引：后台扫描一次（跟随 .gitignore，有界 2000），不阻塞启动。
+    let (index_tx, mut index_rx) = mpsc::channel::<Vec<String>>(1);
+    {
+        let index_root = config.workspace_root.clone();
+        tokio::spawn(async move {
+            let files = tokio::task::spawn_blocking(move || {
+                crate::tool::search::index_files(&index_root, 2000)
+            })
+            .await
+            .unwrap_or_default();
+            let _ = index_tx.send(files).await;
+        });
+    }
 
     // 键盘线程：整个交互期间由独立线程读取 crossterm 事件（§16.1：模型生成中
     // 也响应输入/翻页/折叠；输入不因生成被阻塞）。
@@ -218,12 +233,41 @@ async fn interactive_loop<P: Provider>(
                 match event {
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                         need_draw = true;
-                        handle_key(key, &mut editor, &mut view, &mut pending_message);
+                        handle_key(
+                            key,
+                            &mut editor,
+                            &mut view,
+                            &mut pending_message,
+                            &mut pending_session,
+                        );
                     }
                     Some(Event::Paste(text)) => {
                         need_draw = true;
                         editor.insert_str(&text);
-                        view.refresh_command_menu();
+                        refresh_menus(&mut view);
+                    }
+                    // 鼠标：滚轮翻页、点击工具卡片展开（空闲态）。
+                    Some(Event::Mouse(mouse)) => {
+                        use ratatui::crossterm::event::MouseEventKind;
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                view.scroll_up(3);
+                                need_draw = true;
+                            }
+                            MouseEventKind::ScrollDown => {
+                                view.scroll_down(3);
+                                need_draw = true;
+                            }
+                            MouseEventKind::Down(_) => {
+                                if let Some(card_id) =
+                                    renderer.hit_tool_card(mouse.column, mouse.row)
+                                {
+                                    view.toggle_expand(card_id);
+                                    need_draw = true;
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     Some(Event::Resize(_, _)) => {
                         renderer.autoresize().map_err(|e| e.to_string())?;
@@ -232,12 +276,41 @@ async fn interactive_loop<P: Provider>(
                     _ => {}
                 }
             }
+            // `@` 文件索引就绪（一次）。
+            files = index_rx.recv() => {
+                if let Some(files) = files {
+                    view.file_index = files;
+                    need_draw = true;
+                }
+            }
         }
 
         // 空闲时不重绘：否则没有任何状态变化也会以 60 FPS 占用终端和 CPU。
         if need_draw {
             view.input = editor.text().to_string();
             view.input_cursor = editor.cursor;
+            renderer.draw(&view).map_err(|e| e.to_string())?;
+        }
+
+        // 会话恢复选择（/sessions 菜单 Enter）。
+        if let Some(session_id) = pending_session.take() {
+            match parse_session_id(&session_id) {
+                Ok(id) => match resume_session(&config.sessions_root, &config.workspace_root, id) {
+                    Ok((new_session, new_history)) => {
+                        *session = new_session;
+                        *history = new_history;
+                        view.push_line(
+                            LineKind::System,
+                            format!("已恢复 session {id}（对话历史已加载）"),
+                        );
+                    }
+                    Err(error) => {
+                        view.push_line(LineKind::System, format!("恢复失败: {error}"));
+                    }
+                },
+                Err(error) => view.push_line(LineKind::System, error),
+            }
+            view.menu = None;
             renderer.draw(&view).map_err(|e| e.to_string())?;
         }
 
@@ -301,8 +374,9 @@ async fn interactive_loop<P: Provider>(
                     }
                     text.push_str(
                         "快捷键：Alt+Enter 换行 · ↑/↓ 输入历史 · Tab 命令补全 · \
-                         Alt+T 思考折叠 · Ctrl+U 清空 · Ctrl+A/E 行首/行尾 · \
-                         PgUp/PgDn 翻页 · Ctrl-C 取消 run",
+                         @文件 引用补全 · Alt+T 思考折叠 · Alt+E 展开工具输出 · \
+                         Ctrl+U 清空 · Ctrl+A/E 行首/行尾 · PgUp/PgDn 翻页 · \
+                         滚轮滚动 · 点击工具卡片展开 · Ctrl-C 取消 run",
                     );
                     view.push_line(LineKind::System, text);
                     continue;
@@ -318,6 +392,38 @@ async fn interactive_loop<P: Provider>(
                         None => "尚无 session（第一条消息后创建）".to_string(),
                     };
                     view.push_line(LineKind::System, info);
+                    continue;
+                }
+                "/sessions" => {
+                    // 会话浏览器：列出当前 workspace 的 session，Enter 恢复。
+                    let sessions = match list_sessions(&config.sessions_root, &config.workspace_root) {
+                        Ok(sessions) => sessions,
+                        Err(error) => {
+                            view.push_line(LineKind::System, format!("无法列出 session: {error}"));
+                            continue;
+                        }
+                    };
+                    if sessions.is_empty() {
+                        view.push_line(LineKind::System, "当前 workspace 没有历史 session");
+                        continue;
+                    }
+                    view.menu = Some(crate::tui::model::MenuView {
+                        items: sessions
+                            .iter()
+                            .map(|(id, modified, count)| {
+                                (
+                                    id.to_string(),
+                                    format!("{} · {} 事件", fmt_time(*modified), count),
+                                )
+                            })
+                            .collect(),
+                        selected: 0,
+                        kind: crate::tui::model::MenuKind::Session,
+                    });
+                    view.push_line(
+                        LineKind::System,
+                        "会话列表：↑/↓ 选择，Enter 恢复（Esc 关闭）",
+                    );
                     continue;
                 }
                 "/new" => {
@@ -387,6 +493,7 @@ async fn interactive_loop<P: Provider>(
                 &mut editor,
                 &mut key_rx,
                 &mut pending_message,
+                &mut pending_session,
                 current_cancel.clone(),
             )
             .await?;
@@ -401,6 +508,15 @@ async fn interactive_loop<P: Provider>(
     Ok(())
 }
 
+/// 输入变化后重建菜单：`@` 文件菜单优先（维护中不触碰），否则斜杠命令菜单。
+fn refresh_menus(view: &mut ViewModel) {
+    if view.has_at_token() {
+        view.refresh_at_menu();
+    } else {
+        view.refresh_command_menu();
+    }
+}
+
 /// 处理单个按键事件（空闲与运行中共用）。
 ///
 /// 对标成熟 TUI Agent：Alt+Enter 换行、↑/↓ 输入历史（命令菜单打开时改为选择）、
@@ -411,6 +527,7 @@ fn handle_key(
     editor: &mut crate::tui::editor::Editor,
     view: &mut ViewModel,
     pending: &mut Option<String>,
+    pending_session: &mut Option<String>,
 ) {
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     match key.code {
@@ -419,14 +536,24 @@ fn handle_key(
         }
         KeyCode::Enter => {
             // 命令菜单打开时先补全为选中命令（Claude Code 式菜单交互）。
-            if view.menu.is_some() {
-                view.complete_menu_command();
+            if view.menu.is_some()
+                && let Some((label, kind)) = view.selected_menu_item()
+            {
+                match kind {
+                    crate::tui::model::MenuKind::Session => {
+                        // 会话恢复由交互循环执行（需要重建 SessionLog/history）。
+                        *pending_session = Some(label);
+                        view.menu = None;
+                        return;
+                    }
+                    _ => view.complete_menu_command(),
+                }
             }
             let text = editor.submit();
             if !text.is_empty() {
                 *pending = Some(text);
             }
-            view.refresh_command_menu();
+            refresh_menus(view);
         }
         KeyCode::Tab => {
             if view.menu.is_some() {
@@ -498,6 +625,11 @@ fn handle_key(
                 view.reasoning_visible = !view.reasoning_visible;
                 return;
             }
+            if key.modifiers.contains(KeyModifiers::ALT) && c == 'e' {
+                // 展开/折叠最后一张工具卡片（鼠标点击的键盘等价）。
+                view.toggle_last_tool_expanded();
+                return;
+            }
             editor.insert_char(c);
             view.refresh_command_menu();
         }
@@ -521,6 +653,7 @@ async fn run_interactive<P: Provider>(
     editor: &mut crate::tui::editor::Editor,
     key_rx: &mut mpsc::Receiver<Event>,
     pending_message: &mut Option<String>,
+    pending_session: &mut Option<String>,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 ) -> Result<agent::AgentOutcome, String> {
     use crate::tui::model::{LineKind, StatusLine};
@@ -568,6 +701,12 @@ async fn run_interactive<P: Provider>(
                     Some(RuntimeEvent::ToolCompleted { call_id, name, status, duration_ms, exit_code, tail }) => {
                         view.finish_tool(call_id.to_string(), name, status, duration_ms, exit_code, tail);
                     }
+                    Some(RuntimeEvent::ToolOutputDelta { call_id, stream: _stream, text }) => {
+                        view.append_tool_output(call_id.to_string(), text);
+                    }
+                    Some(RuntimeEvent::ContextUsage { projected, usable }) => {
+                        view.context_usage = Some((projected, usable));
+                    }
                     Some(RuntimeEvent::TurnStarted { turn }) => {
                         view.turn = turn;
                         view.status = StatusLine::Running {
@@ -599,10 +738,11 @@ async fn run_interactive<P: Provider>(
                             cancel.cancel();
                             view.push_line(LineKind::System, "已发送取消（Esc）；保留 session");
                         } else {
-                            handle_key(key, editor, view, pending_message);
+                            handle_key(key, editor, view, pending_message, pending_session);
                         }
                         view.input = editor.text().to_string();
                         view.input_cursor = editor.cursor;
+                        refresh_menus(view);
                         renderer.draw(view).map_err(|e| e.to_string())?;
                     }
                     Some(Event::Paste(text)) => {
@@ -610,7 +750,30 @@ async fn run_interactive<P: Provider>(
                         view.refresh_command_menu();
                         view.input = editor.text().to_string();
                         view.input_cursor = editor.cursor;
+                        refresh_menus(view);
                         renderer.draw(view).map_err(|e| e.to_string())?;
+                    }
+                    // 鼠标：滚轮翻页；点击工具卡片展开/折叠。
+                    Some(Event::Mouse(mouse)) => {
+                        use ratatui::crossterm::event::MouseEventKind;
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                view.scroll_up(3);
+                                renderer.draw(view).map_err(|e| e.to_string())?;
+                            }
+                            MouseEventKind::ScrollDown => {
+                                view.scroll_down(3);
+                                renderer.draw(view).map_err(|e| e.to_string())?;
+                            }
+                            MouseEventKind::Down(_) => {
+                                if let Some(card_id) = renderer.hit_tool_card(mouse.column, mouse.row)
+                                {
+                                    view.toggle_expand(card_id);
+                                    renderer.draw(view).map_err(|e| e.to_string())?;
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     Some(Event::Resize(_, _)) => {
                         renderer.autoresize().map_err(|e| e.to_string())?;
@@ -794,34 +957,55 @@ fn latest_session_id(
     sessions_root: &std::path::Path,
     workspace_root: &Utf8PathBuf,
 ) -> Result<SessionId, String> {
+    let sessions = list_sessions(sessions_root, workspace_root)?;
+    sessions
+        .first()
+        .map(|(id, _, _)| *id)
+        .ok_or_else(|| "当前 workspace 没有历史 session".into())
+}
+
+/// 列出当前 workspace 的全部 session（按修改时间倒序）：(id, 最后修改, 事件数)。
+fn list_sessions(
+    sessions_root: &std::path::Path,
+    workspace_root: &Utf8PathBuf,
+) -> Result<Vec<(SessionId, std::time::SystemTime, usize)>, String> {
     let workspace_id = session::workspace_id_for(workspace_root.as_std_path());
     let dir = sessions_root.join(&workspace_id);
     if !dir.exists() {
-        return Err("当前 workspace 没有历史 session".into());
+        return Ok(Vec::new());
     }
-    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(&dir)
-        .map_err(|e| e.to_string())?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .map(|e| e == "jsonl")
-                .unwrap_or(false)
-        })
-        .filter_map(|entry| {
-            entry
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .map(|t| (t, entry.path()))
-        })
-        .collect();
-    entries.sort_by_key(|(time, _)| std::cmp::Reverse(*time));
-    let (_, path) = entries.first().ok_or("当前 workspace 没有历史 session")?;
-    let name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("无效 session 文件名")?;
-    parse_session_id(name)
+    let mut entries: Vec<(std::time::SystemTime, SessionId, usize)> = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let Ok(entry) = entry else { continue };
+        if entry.path().extension().map(|e| e == "jsonl").unwrap_or(false)
+            && let Ok(meta) = entry.metadata()
+            && let Ok(modified) = meta.modified()
+            && let Some(name) = entry.path().file_stem().and_then(|s| s.to_str())
+            && let Ok(id) = parse_session_id(name)
+        {
+            let count = crate::session::read_events(&entry.path())
+                .map(|events| events.len())
+                .unwrap_or(0);
+            entries.push((modified, id, count));
+        }
+    }
+    entries.sort_by_key(|(time, _, _)| std::cmp::Reverse(*time));
+    Ok(entries.into_iter().map(|(t, id, n)| (id, t, n)).collect())
+}
+
+/// 会话列表展示用的时间格式（HH:MM:SS 或 MM-DD HH:MM）。
+fn fmt_time(t: std::time::SystemTime) -> String {
+    let Ok(duration) = t.duration_since(std::time::UNIX_EPOCH) else {
+        return "-".into();
+    };
+    let secs = duration.as_secs();
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if days > 0 {
+        format!("{days}d {hours:02}:{minutes:02}")
+    } else {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    }
 }

@@ -45,6 +45,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("model", "查看当前模型"),
     ("help", "显示帮助与快捷键"),
     ("session", "查看会话与成本"),
+    ("sessions", "浏览并恢复历史会话"),
     ("new", "开始新会话"),
     ("cancel", "取消当前 run"),
     ("thinking", "查看推理设置"),
@@ -70,12 +71,22 @@ pub struct Renderer {
     md_cache: HashMap<u64, Vec<Line<'static>>>,
     /// 缓存有效时的终端宽度；宽度变化清空缓存并重置提交位置（§16.1）。
     cache_width: u16,
+    /// 最近一帧的转录区矩形（鼠标 hit-test 用）。
+    last_transcript_rect: Option<Rect>,
+    /// 最近一帧窗口内每行对应的工具卡片 id（鼠标点击展开用）。
+    last_row_hits: Vec<Option<String>>,
+    /// 已提交到 scrollback 的行数（折叠/展开状态变化时 hit 失效，置空）。
+    hits_valid: bool,
 }
 
 /// 一帧的布局结果：待提交到 scrollback 的行与新的提交位置。
 struct FramePlan {
     /// 活动区窗口内容（已按宽度折行的逻辑行，直接渲染）。
     window: Vec<Line<'static>>,
+    /// 窗口内每行对应的工具卡片 id（鼠标点击展开；消息行为 None）。
+    row_hits: Vec<Option<String>>,
+    /// 转录区屏幕矩形（鼠标 hit-test）。
+    transcript_rect: Rect,
     overflow: Vec<Line<'static>>,
     committed_after: usize,
 }
@@ -84,6 +95,11 @@ impl Renderer {
     /// 初始化终端（raw mode + 隐藏光标 + inline viewport + 同步更新支持）。
     pub fn new() -> std::io::Result<Self> {
         ratatui::crossterm::terminal::enable_raw_mode()?;
+        // 鼠标：点击工具卡片展开、滚轮翻页（键盘线程的 event::read 会收到）。
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::EnableMouseCapture
+        );
         let stdout = BufWriter::new(std::io::stdout());
         let backend = CrosstermBackend::new(stdout);
         // §16.1：活动区高度在启动时按窗口计算一次（约 2/5 屏，夹在 12..=32）。
@@ -115,7 +131,23 @@ impl Renderer {
             committed_lines: 0,
             md_cache: HashMap::new(),
             cache_width: 0,
+            last_transcript_rect: None,
+            last_row_hits: Vec::new(),
+            hits_valid: false,
         })
+    }
+
+    /// 鼠标点击 hit-test：命中工具卡片返回其 id（Alt+E 的鼠标等价）。
+    pub fn hit_tool_card(&self, column: u16, row: u16) -> Option<String> {
+        if !self.hits_valid {
+            return None;
+        }
+        let rect = self.last_transcript_rect?;
+        if column < rect.x || row < rect.y || row >= rect.y + rect.height {
+            return None;
+        }
+        let index = (row - rect.y) as usize;
+        self.last_row_hits.get(index).cloned().flatten()
     }
 
     /// 距上次 draw 是否已过帧间隔（§16.1：16 ms 合并）。
@@ -135,8 +167,15 @@ impl Renderer {
         let mut overflow: Vec<Line<'static>> = Vec::new();
         let mut new_committed = committed;
         let scrollback = self.scrollback;
+        let mut plan_out: Option<FramePlan> = None;
         self.terminal.draw(|frame| {
-            let plan = render_frame(
+            let FramePlan {
+                window,
+                row_hits,
+                transcript_rect,
+                overflow: frame_overflow,
+                committed_after,
+            } = render_frame(
                 frame,
                 view,
                 theme,
@@ -145,9 +184,22 @@ impl Renderer {
                 &mut committed,
                 scrollback,
             );
-            overflow = plan.overflow;
-            new_committed = plan.committed_after;
+            overflow = frame_overflow;
+            new_committed = committed_after;
+            plan_out = Some(FramePlan {
+                window,
+                row_hits,
+                transcript_rect,
+                overflow: Vec::new(),
+                committed_after,
+            });
         })?;
+        // 鼠标 hit-test 数据（卡片展开状态变化时由调用方置 invalid）。
+        if let Some(plan) = plan_out {
+            self.last_transcript_rect = Some(plan.transcript_rect);
+            self.last_row_hits = plan.row_hits;
+            self.hits_valid = true;
+        }
         // §16.1：闭合且不再变化的行提交到 scrollback（活动区上方）。
         if scrollback && !overflow.is_empty() {
             let lines = std::mem::take(&mut overflow);
@@ -180,6 +232,10 @@ impl Renderer {
     /// 恢复终端（异常退出也能恢复，§21 M5 验收）。
     pub fn restore(&mut self) -> std::io::Result<()> {
         self.terminal.show_cursor()?;
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::DisableMouseCapture
+        );
         self.terminal.flush()?;
         ratatui::crossterm::terminal::disable_raw_mode()
     }
@@ -190,6 +246,10 @@ impl Drop for Renderer {
         // app 因错误提前返回时仍尽力还原终端。显式 restore 是正常路径；
         // 这里的重复调用安全且避免用户遗留在 raw mode。
         let _ = self.terminal.show_cursor();
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::DisableMouseCapture
+        );
         let _ = self.terminal.flush();
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
     }
@@ -280,6 +340,8 @@ fn render_frame(
     draw_input(frame, input_area, view, theme);
     FramePlan {
         window: Vec::new(),
+        row_hits: plan.row_hits,
+        transcript_rect: trans_area,
         overflow,
         committed_after: *committed,
     }
@@ -298,14 +360,15 @@ fn plan_window(
     reset_committed: bool,
     cache: &mut HashMap<u64, Vec<Line<'static>>>,
 ) -> FramePlan {
-    let logical = build_transcript_text(view, theme, cache);
-    let wrapped = wrap_lines(logical, width as usize);
+    let (logical, hits) = build_transcript_text(view, theme, cache);
+    let (wrapped, wrapped_hits) = wrap_lines_with_hits(logical, hits, width as usize);
     let total = wrapped.len();
     let area_h = area_h as usize;
     let scroll = view.transcript_scroll as usize;
     let window_bottom = total.saturating_sub(scroll);
     let window_start = window_bottom.saturating_sub(area_h);
     let window = wrapped[window_start..window_bottom].to_vec();
+    let row_hits = wrapped_hits[window_start..window_bottom].to_vec();
     let (overflow, committed_after) = if reset_committed {
         (Vec::new(), window_start)
     } else if scroll == 0 && window_start > committed {
@@ -316,9 +379,71 @@ fn plan_window(
     };
     FramePlan {
         window,
+        row_hits,
+        // plan_window 不感知屏幕坐标；transcript_rect 由 render_frame 覆盖。
+        transcript_rect: Rect::default(),
         overflow,
         committed_after,
     }
+}
+
+/// [`wrap_lines`] 的 hit 伴随版本：折行时卡片 id 跟随所属逻辑行。
+fn wrap_lines_with_hits(
+    lines: Vec<Line<'static>>,
+    hits: Vec<Option<String>>,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<Option<String>>) {
+    let width = width.max(1);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut out_hits: Vec<Option<String>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0usize;
+    let mut cur_hit: Option<String> = None;
+    let flush = |out: &mut Vec<Line<'static>>,
+                     out_hits: &mut Vec<Option<String>>,
+                     cur: &mut Vec<Span<'static>>,
+                     cur_w: &mut usize,
+                     cur_hit: &mut Option<String>| {
+        if !cur.is_empty() {
+            out.push(Line::from(std::mem::take(cur)));
+            out_hits.push(cur_hit.clone());
+            *cur_w = 0;
+            *cur_hit = None;
+        }
+    };
+    let mut hit_iter = hits.into_iter();
+    for line in lines {
+        let hit = hit_iter.next().flatten();
+        if line.spans.is_empty() {
+            if !cur.is_empty() {
+                flush(&mut out, &mut out_hits, &mut cur, &mut cur_w, &mut cur_hit);
+            }
+            out.push(Line::default());
+            out_hits.push(hit);
+            continue;
+        }
+        if cur_hit.is_none() {
+            cur_hit = hit.clone();
+        }
+        for span in line.spans {
+            let style = span.style;
+            for ch in span.content.chars() {
+                let w = unicode_width::UnicodeWidthChar::width(ch)
+                    .unwrap_or(0)
+                    .max(1);
+                if cur_w + w > width && !cur.is_empty() {
+                    flush(&mut out, &mut out_hits, &mut cur, &mut cur_w, &mut cur_hit);
+                    cur_hit = hit.clone();
+                }
+                cur.push(Span::styled(ch.to_string(), style));
+                cur_w += w;
+            }
+        }
+        if !cur.is_empty() {
+            flush(&mut out, &mut out_hits, &mut cur, &mut cur_w, &mut cur_hit);
+        }
+    }
+    (out, out_hits)
 }
 
 /// 把逻辑行按 width 折行（替代 ratatui 新版 `Text::wrap`；逐 span 保持样式）。
@@ -362,12 +487,22 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
 }
 
 /// 把转录条目渲染为逻辑行（Message 按类型着色/加 rail；Tool 渲染为卡片）。
+///
+/// 返回 (lines, hits)：hits 与 lines 等长，工具卡片的行对应卡片 id（鼠标点击展开）。
 fn build_transcript_text(
     view: &ViewModel,
     theme: theme::Theme,
     cache: &mut HashMap<u64, Vec<Line<'static>>>,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<Option<String>>) {
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut hits: Vec<Option<String>> = Vec::new();
+    let push_hit = |lines: &mut Vec<Line<'static>>,
+                        hits: &mut Vec<Option<String>>,
+                        line: Line<'static>,
+                        hit: Option<String>| {
+        lines.push(line);
+        hits.push(hit);
+    };
     for entry in &view.transcript {
         match entry {
             Entry::Message(line) => match line.kind {
@@ -387,7 +522,7 @@ fn build_transcript_text(
                             spans.push(Span::raw("    "));
                         }
                         spans.extend(rendered_line.spans.iter().cloned());
-                        out.push(Line::from(spans));
+                        push_hit(&mut out, &mut hits, Line::from(spans), None);
                     }
                 }
                 // §16.2：assistant 无填充卡片，正文为主（Markdown 渲染）。
@@ -400,47 +535,50 @@ fn build_transcript_text(
                     if view.reasoning_visible {
                         for (i, s) in line.text.split('\n').enumerate() {
                             let prefix = if i == 0 { "思考 " } else { "    " };
-                            out.push(Line::styled(
+                            push_hit(&mut out, &mut hits, Line::styled(
                                 format!("{prefix}{s}"),
                                 Style::default()
                                     .fg(theme.muted)
                                     .add_modifier(Modifier::ITALIC),
-                            ));
+                            ), None);
                         }
                     } else {
-                        out.push(Line::styled(
+                        push_hit(&mut out, &mut hits, Line::styled(
                             "思考 · 已折叠（Alt+T 展开）",
                             Style::default()
                                 .fg(theme.muted)
                                 .add_modifier(Modifier::ITALIC),
-                        ));
+                        ), None);
                     }
                 }
                 LineKind::Tool => {
                     for (i, s) in line.text.split('\n').enumerate() {
                         let prefix = if i == 0 { "工具 " } else { "    " };
-                        out.push(Line::styled(
+                        push_hit(&mut out, &mut hits, Line::styled(
                             format!("{prefix}{s}"),
                             Style::default().fg(theme.info),
-                        ));
+                        ), None);
                     }
                 }
                 LineKind::System => {
                     for (i, s) in line.text.split('\n').enumerate() {
                         let prefix = if i == 0 { "系统 " } else { "    " };
-                        out.push(Line::styled(
+                        push_hit(&mut out, &mut hits, Line::styled(
                             format!("{prefix}{s}"),
                             Style::default().fg(theme.warning),
-                        ));
+                        ), None);
                     }
                 }
             },
             Entry::Tool(card) => {
-                out.extend(tool_card_lines(card, view.anim_tick, theme));
+                let card_id = card.id.clone();
+                for line in tool_card_lines(card, view.anim_tick, theme) {
+                    push_hit(&mut out, &mut hits, line, Some(card_id.clone()));
+                }
             }
         }
     }
-    out
+    (out, hits)
 }
 
 /// 按条目版本缓存 Markdown 渲染（流式增量只重渲染变化条目，§16.1）。
@@ -599,7 +737,8 @@ fn flush_line(out: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>) {
 }
 
 /// 工具卡片（§16.2）：`icon name · duration · status`，运行中 spinner 动画；
-/// 命令摘要（detail）缩进一行展示；失败时保留红色关键 tail（不自动展开几十屏）。
+/// 命令摘要（detail）缩进一行展示；实时输出（运行中）/完整输出（展开时）
+/// 作为缩进正文；失败时折叠态保留红色关键 tail。
 fn tool_card_lines(card: &ToolCard, anim_tick: u64, theme: theme::Theme) -> Vec<Line<'static>> {
     let (icon, status_style, status_text) = match &card.state {
         ToolCardState::Running => (
@@ -646,6 +785,11 @@ fn tool_card_lines(card: &ToolCard, anim_tick: u64, theme: theme::Theme) -> Vec<
     if !status_text.is_empty() {
         spans.push(Span::styled(format!(" · {status_text}"), status_style));
     }
+    // 展开/实时输出提示（折叠且有输出时可见）。
+    if card.output.is_some() {
+        let hint = if card.expanded { " [−]" } else { " [+展开]" };
+        spans.push(Span::styled(hint, Style::default().fg(theme.muted)));
+    }
     let mut lines = vec![Line::from(spans)];
     // §16.2：实际命令摘要独立一行，缩进展示（运行中也可见，便于观察正在做什么）。
     if let Some(detail) = &card.detail
@@ -656,7 +800,41 @@ fn tool_card_lines(card: &ToolCard, anim_tick: u64, theme: theme::Theme) -> Vec<
             Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
         ));
     }
-    if let Some(tail) = &card.tail {
+    // 展开时显示完整输出正文（有界），否则失败显示 tail、运行中显示实时尾注。
+    let show_body = if card.expanded {
+        card.output.as_deref()
+    } else if let ToolCardState::Running = card.state {
+        card.output.as_deref() // 运行中的实时输出（折叠态也显示，截断为尾注）
+    } else {
+        None
+    };
+    if let Some(body) = show_body {
+        // 折叠态实时输出只保留最后几行；展开态显示全部（渲染层不再截断）。
+        let body_lines: Vec<&str> = body.split('\n').collect();
+        let shown: Vec<&str> = if card.expanded {
+            body_lines
+        } else {
+            body_lines.iter().rev().take(6).copied().collect::<Vec<_>>()
+        };
+        for s in shown {
+            let prefix = "│ ";
+            let style = if card.expanded {
+                Style::default().fg(theme.text)
+            } else {
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
+            };
+            lines.push(Line::styled(format!("{prefix}{s}"), style));
+        }
+        if card.output_truncated && card.expanded {
+            lines.push(Line::styled(
+                "│ …（输出超预算被截断；完整内容可通过 read @artifact 读取）",
+                Style::default().fg(theme.muted),
+            ));
+        }
+    }
+    if !card.expanded
+        && let Some(tail) = &card.tail
+    {
         for s in tail.split('\n') {
             lines.push(Line::styled(
                 format!("│ {s}"),
@@ -756,6 +934,25 @@ fn draw_footer(
             muted,
         ));
     }
+    // 上下文用量条（§对比：gemini-cli ContextUsageDisplay；projected/usable）。
+    if let Some((projected, usable)) = view.context_usage
+        && usable > 0
+    {
+        let ratio = projected as f64 / usable as f64;
+        let filled = ((ratio * 20.0) as usize).clamp(0, 20);
+        let bar: String = "█".repeat(filled) + &"░".repeat(20 - filled);
+        let style = if ratio >= 0.9 {
+            theme.error
+        } else if ratio >= 0.7 {
+            theme.warning
+        } else {
+            theme.info
+        };
+        spans.push(Span::styled(
+            format!(" · ctx {}% {bar}", (ratio * 100.0) as u64),
+            style,
+        ));
+    }
     if !scrollback {
         spans.push(Span::styled(
             " · 兼容模式（无滚动回退）",
@@ -850,8 +1047,12 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
         } else {
             (" ", Style::default().fg(theme.text))
         };
+        let label = match menu.kind {
+            model::MenuKind::SlashCommand => format!("/{name}"),
+            model::MenuKind::File | model::MenuKind::Session => name.clone(),
+        };
         lines.push(Line::from(vec![
-            Span::styled(format!("{glyph} /{name}"), style),
+            Span::styled(format!("{glyph} {label}"), style),
             Span::styled(format!("  {desc}"), Style::default().fg(theme.muted)),
         ]));
     }
@@ -1084,6 +1285,9 @@ mod tests {
             name: "bash".into(),
             detail: Some("bash: cargo test".into()),
             state: ToolCardState::Running,
+            output: None,
+            output_truncated: false,
+            expanded: false,
             tail: None,
         };
         let lines = tool_card_lines(&card, 0, theme);
@@ -1109,6 +1313,9 @@ mod tests {
                 duration_ms: 1234,
                 exit_code: Some(2),
             },
+            output: None,
+            output_truncated: false,
+            expanded: false,
             tail: Some("exit_code: 1".into()),
         };
         let lines = tool_card_lines(&card, 0, theme);
@@ -1153,6 +1360,9 @@ mod tests {
             name: "bash".into(),
             detail: None,
             state: ToolCardState::Running,
+            output: None,
+            output_truncated: false,
+            expanded: false,
             tail: None,
         };
         let f0 = tool_card_lines(&card, 0, theme).remove(0);
@@ -1161,5 +1371,65 @@ mod tests {
             f0.spans[0].content, f1.spans[0].content,
             "动画帧应随 tick 变化"
         );
+    }
+
+    #[test]
+    fn running_card_shows_live_output_tail() {
+        let theme = theme::Theme::omp();
+        let card = ToolCard {
+            id: "c".into(),
+            name: "bash".into(),
+            detail: Some("bash: cargo test".into()),
+            state: ToolCardState::Running,
+            output: Some(
+                "progress 1\nprogress 2\nprogress 3\nprogress 4\nprogress 5\nprogress 6\nprogress 7\n"
+                    .into(),
+            ),
+            output_truncated: false,
+            expanded: false,
+            tail: None,
+        };
+        let lines = tool_card_lines(&card, 0, theme);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("[+展开]"), "有输出时显示展开提示");
+        // 折叠态只显示最后 6 行实时输出。
+        assert!(text.contains("progress 7"), "最新输出可见: {text}");
+        assert!(
+            !text.contains("progress 1"),
+            "折叠态不显示早期输出: {text}"
+        );
+    }
+
+    #[test]
+    fn expanded_card_shows_full_output() {
+        let theme = theme::Theme::omp();
+        let card = ToolCard {
+            id: "c".into(),
+            name: "bash".into(),
+            detail: None,
+            state: ToolCardState::Done {
+                status: crate::tool::outcome::ToolStatus::Succeeded,
+                duration_ms: 10,
+                exit_code: Some(0),
+            },
+            output: Some("第一行\n第二行\n第三行\n".into()),
+            output_truncated: false,
+            expanded: true,
+            tail: None,
+        };
+        let lines = tool_card_lines(&card, 0, theme);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("[−]"), "展开态提示收起");
+        assert!(
+            text.contains("第一行") && text.contains("第三行"),
+            "展开显示全部输出: {text}"
+        );
+        assert!(text.contains("✓"), "成功状态图标");
     }
 }

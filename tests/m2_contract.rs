@@ -85,6 +85,8 @@ async fn cancellation_kills_entire_process_tree() {
         cancel: cancel.clone(),
         artifacts_root: ctx.artifacts_root.clone(),
         session_id: ctx.session_id.clone(),
+        call_id: ctx.call_id,
+        output_tx: None,
         scan_snapshots: ctx.scan_snapshots.clone(),
         shell_path: ctx.shell_path.clone(),
         snapshot_store: ctx.snapshot_store.clone(),
@@ -270,4 +272,51 @@ async fn bash_output_lands_in_artifact_and_readable_via_opaque_ref() {
     let text = read_outcome.model_text();
     assert!(text.contains("line-1"), "{text}");
     assert!(text.contains("line-50"), "{text}");
+}
+
+/// 实时输出链路：output_tx 订阅时，bash 执行中收到增量流事件（UI 卡片实时输出）。
+#[tokio::test]
+async fn bash_streams_live_output_through_output_tx() {
+    point_host_at_real_tpi();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut ctx = test_tool_context(&workspace);
+    ctx.artifacts_root = config.artifacts_root.clone();
+    ctx.call_id = tpi::ids::ToolCallId::new_v7();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tpi::tool::ToolStreamEvent>();
+    ctx.output_tx = Some(tx);
+
+    let args = BashArgs {
+        command: r#"powershell.exe -NoProfile -Command "1..20 | ForEach-Object { Write-Output ('s-' + \$_); Start-Sleep -Milliseconds 50 }""#.into(),
+        cwd: ".".into(),
+        timeout_ms: 30_000,
+    };
+    let call_id = ctx.call_id;
+    let mut handle = tokio::spawn(async move { bash(args, &ctx).await });
+
+    // 执行结束前就能收到流事件（实时性）；事件携带正确的 call_id。
+    let mut received = String::new();
+    let mut live_seen = false;
+    loop {
+        tokio::select! {
+            Some(event) = rx.recv() => {
+                assert_eq!(event.call_id, call_id, "流事件必须携带工具调用 id");
+                received.push_str(&event.text);
+                live_seen = true;
+            }
+            result = &mut handle => {
+                // bash 完成：drain 残余流事件（可能仍在 channel 中）。
+                while let Ok(event) = rx.try_recv() {
+                    received.push_str(&event.text);
+                }
+                let outcome = result.expect("bash completes");
+                assert_eq!(outcome.status, ToolStatus::Succeeded);
+                break;
+            }
+        }
+    }
+    assert!(live_seen, "执行完成前必须能收到增量输出（实时链路）");
+    // 流事件与最终输出一致（stdout 全部到达）。
+    assert!(received.contains("s-20"), "流事件应包含最后一行: {received}");
 }

@@ -94,6 +94,18 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
         timeout_ms: args.timeout_ms,
         env: Default::default(),
     };
+    // 实时输出：进程层读帧时转发到 UI 通道（call_id 匹配工具卡片）。
+    let stream_sink = ctx.output_tx.as_ref().map(|tx| {
+        let call_id = ctx.call_id;
+        let tx = tx.clone();
+        move |stream: u8, bytes: &[u8]| {
+            let _ = tx.send(crate::tool::ToolStreamEvent {
+                call_id,
+                stream,
+                text: String::from_utf8_lossy(bytes).into_owned(),
+            });
+        }
+    });
     let result = crate::process::run_in_host(
         &run_args,
         &std::path::PathBuf::from(&run_args.program),
@@ -102,6 +114,7 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
         timeout,
         &ctx.session_id,
         artifact.as_mut(),
+        stream_sink.as_ref().map(|sink| sink as &(dyn Fn(u8, &[u8]) + Sync)),
     )
     .await;
     let record = artifact.and_then(|writer| writer.finish().ok());

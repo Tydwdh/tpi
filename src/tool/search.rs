@@ -119,7 +119,7 @@ pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
     let mut scanned_bytes = 0u64;
     let mut stop_reason = StopReason::Complete;
 
-    'scan: for entry in WalkBuilder::new(&root, ctx) {
+    'scan: for entry in WalkBuilder::new(&root) {
         let Ok(entry) = entry else { continue };
         let Ok(meta) = entry.metadata() else { continue };
         if entry.depth() == 0 {
@@ -224,7 +224,7 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
     const MAX_OUTPUT_BYTES: usize = 32 * 1024;
     let mut output_bytes = 0usize;
 
-    'scan: for entry in WalkBuilder::new(&root, ctx) {
+    'scan: for entry in WalkBuilder::new(&root) {
         let Ok(entry) = entry else { continue };
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
@@ -382,7 +382,6 @@ cursor: {cursor}"
     };
     outcome
 }
-
 fn truncate_line(line: &str, max_chars: usize) -> String {
     if line.chars().count() <= max_chars {
         line.to_string()
@@ -405,7 +404,7 @@ struct WalkBuilder {
 }
 
 impl WalkBuilder {
-    fn new(root: &Utf8PathBuf, _ctx: &ToolContext) -> Self {
+    fn new(root: &Utf8PathBuf) -> Self {
         let mut builder = ignore::WalkBuilder::new(root.as_std_path());
         builder
             .hidden(true)
@@ -427,5 +426,65 @@ impl Iterator for WalkBuilder {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
+    }
+}
+
+/// workspace 文件索引（`@` 引用补全用；跟随 .gitignore、不跟随 symlink，有界）。
+///
+/// 相对路径、按目录优先排序（`dir/` 条目在前，便于 @ 逐级下钻）。
+pub fn index_files(root: &Utf8PathBuf, limit: usize) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    let mut dirs: Vec<String> = Vec::new();
+    for entry in WalkBuilder::new(root) {
+        let Ok(entry) = entry else { continue };
+        let Ok(meta) = entry.metadata() else { continue };
+        if entry.depth() == 0 {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(root.as_std_path()) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if meta.is_dir() {
+            dirs.push(format!("{relative}/"));
+        } else {
+            files.push(relative);
+        }
+        if dirs.len() + files.len() >= limit {
+            break;
+        }
+    }
+    dirs.extend(files);
+    dirs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_files_lists_relative_paths_dirs_first_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(root.join("ignored.txt"), "x\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        let files = index_files(&root, 100);
+        // 目录优先（@ 引用逐级下钻）；路径为相对形式。
+        assert!(files.contains(&"src/".to_string()), "{files:?}");
+        assert!(files.contains(&"src/main.rs".to_string()), "{files:?}");
+        assert!(!files.contains(&"ignored.txt".to_string()), ".gitignore 生效: {files:?}");
+
+        // 有界。
+        for i in 0..300 {
+            std::fs::write(root.join(format!("f{i:03}.txt")), "x\n").unwrap();
+        }
+        let files = index_files(&root, 50);
+        assert_eq!(files.len(), 50, "索引必须受 limit 约束");
     }
 }

@@ -91,6 +91,14 @@ pub enum RuntimeEvent {
         exit_code: Option<i32>,
         tail: String,
     },
+    /// 工具执行中的实时输出增量（bash stdout/stderr；TUI 卡片运行中可见）。
+    ToolOutputDelta {
+        call_id: ToolCallId,
+        stream: u8,
+        text: String,
+    },
+    /// 上下文占用投影（每次请求前发送；TUI 绘制用量条）。
+    ContextUsage { projected: u64, usable: u64 },
     /// `update_plan` 提交后的独立 UI 状态；不作为聊天流水的一部分。
     PlanUpdated { plan: crate::tool::plan::Plan },
 }
@@ -227,6 +235,18 @@ pub async fn run<P: Provider>(
             reasoning: config.model.reasoning.clone(),
             context_window: config.model.context_window,
         };
+        // 上下文占用投影（TUI 用量条；请求前发送）。
+        if let Some(window) = config.model.context_window {
+            let usable = crate::context::usable_input(
+                window,
+                config.model.max_output_tokens.unwrap_or(0) as u64,
+                config.safety_reserve_tokens,
+            );
+            let projected = crate::context::estimate_messages(&messages);
+            let _ = ui
+                .send(RuntimeEvent::ContextUsage { projected, usable })
+                .await;
+        }
         let (event_tx, mut event_rx) = mpsc::channel(crate::provider::EVENT_CHANNEL_CAPACITY);
 
         // 必须在 provider 请求进行时消费 channel：等请求结束后再 drain 不但不是真正
@@ -545,6 +565,21 @@ error: invalid_arguments
 
         // 并行执行（§12.2 第 3 条：同 wave 无冲突 calls）。
         // 无进展判定在构造 future 前同步完成（futures 不借用 progress/session）。
+        // 实时输出通道：工具执行中 bash 增量 → 本 task 转发 → ui_tx。
+        let (output_tx, mut output_rx) =
+            tokio::sync::mpsc::unbounded_channel::<tool::ToolStreamEvent>();
+        let ui_for_stream = ui.clone();
+        let stream_forwarder = tokio::spawn(async move {
+            while let Some(event) = output_rx.recv().await {
+                let _ = ui_for_stream
+                    .send(RuntimeEvent::ToolOutputDelta {
+                        call_id: event.call_id,
+                        stream: event.stream,
+                        text: event.text,
+                    })
+                    .await;
+            }
+        });
         // 本 wave 内写工具的 backup 清理路径（index → backup 路径）。
         let mut backup_cleanup: std::collections::HashMap<usize, std::path::PathBuf> =
             std::collections::HashMap::new();
@@ -560,6 +595,8 @@ error: invalid_arguments
                 cancel: cancel.clone(),
                 artifacts_root: config.artifacts_root.clone(),
                 session_id: session.session_id().to_string(),
+                call_id: calls[source_index].call_id,
+                output_tx: Some(output_tx.clone()),
                 scan_snapshots: scan_snapshots.clone(),
                 shell_path: config.shell_path.clone(),
                 snapshot_store: snapshot_store.clone(),
@@ -621,6 +658,8 @@ error: invalid_arguments
                     cancel: cancel.clone(),
                     artifacts_root: config.artifacts_root.clone(),
                     session_id: session.session_id().to_string(),
+                    call_id: calls[index].call_id,
+                    output_tx: None,
                     scan_snapshots: scan_snapshots.clone(),
                     shell_path: config.shell_path.clone(),
                     snapshot_store: snapshot_store.clone(),
@@ -679,6 +718,7 @@ error: invalid_arguments
             }
             results.insert(index, outcome);
         }
+        stream_forwarder.abort();
     }
 
     // 4. 按原 call index 回填（§12.2 第 6 条）。
