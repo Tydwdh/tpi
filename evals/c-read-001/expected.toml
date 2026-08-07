@@ -1,0 +1,9 @@
+name = "c-read-001"
+suite = "core"
+title = "阅读 C 代码定位越界（无编译器）"
+timeout_sec = 900
+
+[[verify]]
+type = "file_contains"
+path = 'buffer.c'
+contains = 'dst_cap - 1'

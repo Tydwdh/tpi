@@ -1,0 +1,10 @@
+name = "python-fix-004"
+suite = "core"
+title = "修复正则捕获 bug（Python）"
+timeout_sec = 900
+
+[[verify]]
+type = "bash"
+command = 'python extract_test.py'
+expect_exit = 0
+expect_stdout_contains = ['all tests passed']

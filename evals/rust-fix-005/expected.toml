@@ -1,0 +1,15 @@
+name = "rust-fix-005"
+suite = "core"
+title = "修复并发求和 bug（结果不稳定）"
+timeout_sec = 900
+
+[[verify]]
+type = "bash"
+command = 'cargo build'
+expect_exit = 0
+expect_stdout_contains = ['Finished']
+[[verify]]
+type = "bash"
+command = './target/debug/rust_fix_005.exe'
+expect_exit = 0
+expect_stdout_contains = ['total=499500000']

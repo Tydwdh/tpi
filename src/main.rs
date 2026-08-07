@@ -14,7 +14,7 @@
 //! ```
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
@@ -76,6 +76,28 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// 自动评测（Eval Harness：真实 coding task + 可重置 repo + 验收断言）。
+    ///
+    /// 会调用真实 provider（产生费用）——仅在你显式运行时发生。
+    Eval {
+        /// 任务 ID（evals/<id>/；与 --suite 互斥）。
+        task: Option<String>,
+        /// 运行整个套件（expected.toml 的 suite 字段；与 task 互斥）。
+        #[arg(long)]
+        suite: Option<String>,
+        /// 列出全部任务（不运行、不花钱）。
+        #[arg(long)]
+        list: bool,
+        /// 列出全部套件（不运行、不花钱）。
+        #[arg(long)]
+        list_suites: bool,
+        /// 结果目录（默认 ~/.tpi/evals/results）。
+        #[arg(long)]
+        results: Option<PathBuf>,
+        /// evals 根目录（默认 <workspace>/evals）。
+        #[arg(long)]
+        evals: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -133,6 +155,103 @@ fn with_input_echo<T>(echo: bool, f: impl FnOnce() -> T) -> T {
         let _ = echo;
         f()
     }
+}
+
+/// `tpi eval` 入口（Eval Harness）。
+///
+/// - `--list` / `--list-suites`：不运行、不花钱；
+/// - 运行模式调用真实 provider（花钱），串行执行任务。
+fn run_eval_cli(
+    cwd: Option<&Path>,
+    task: Option<&str>,
+    suite: Option<&str>,
+    list: bool,
+    list_suites: bool,
+    results: Option<&Path>,
+    evals: Option<&Path>,
+) -> Result<(), String> {
+    let workspace_root = current_workspace_root(cwd)?;
+    let evals_root = evals
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| workspace_root.join(tpi::eval::EVALS_DIR).into());
+
+    // 只读模式：列出任务/套件（不初始化日志/配置）。
+    if list_suites {
+        for suite in tpi::eval::list_suites(&evals_root)? {
+            println!("{suite}");
+        }
+        return Ok(());
+    }
+    if list {
+        for task in tpi::eval::discover(&evals_root)? {
+            println!(
+                "{} [{}] {}",
+                task.id,
+                if task.expected.suite.is_empty() {
+                    "-"
+                } else {
+                    &task.expected.suite
+                },
+                task.expected.title.as_deref().unwrap_or("(no title)")
+            );
+        }
+        return Ok(());
+    }
+
+    // 运行模式：需要配置与 provider 凭据。
+    let tasks = tpi::eval::discover(&evals_root)?;
+    let selected: Vec<tpi::eval::TaskEntry> = if let Some(task_id) = task {
+        tasks.into_iter().filter(|t| t.id == task_id).collect()
+    } else if let Some(suite_name) = suite {
+        tasks
+            .into_iter()
+            .filter(|t| t.expected.suite == suite_name)
+            .collect()
+    } else {
+        return Err("请指定任务 ID 或 --suite（或 --list 查看全部任务）".into());
+    };
+    if selected.is_empty() {
+        let what = task
+            .map(|t| format!("任务 {t}"))
+            .or_else(|| suite.map(|s| format!("套件 {s}")))
+            .unwrap_or_default();
+        return Err(format!("{what} 不存在（--list 查看）"));
+    }
+
+    // 配置与日志（复用用户 provider 配置；评测 session 独立）。
+    init_logging()?;
+    let config = config::load(&workspace_root, None)?;
+    let results_dir = results
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| tpi::config::tpi_home().join(tpi::eval::RESULTS_DIR));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let mut passed = 0usize;
+        let mut failed = 0usize;
+        for task in &selected {
+            println!("==== eval {} ====", task.id);
+            match tpi::eval::run_task(task, &results_dir, &config).await {
+                Ok(result) => {
+                    print!("{}", tpi::eval::render_summary(&result));
+                    if result.success && result.verification_passed {
+                        passed += 1;
+                    } else {
+                        failed += 1;
+                    }
+                }
+                Err(error) => {
+                    println!("task 运行失败: {error}");
+                    failed += 1;
+                }
+            }
+        }
+        println!("==== 汇总: pass={passed} fail={failed} ====");
+        Ok::<(), String>(())
+    })
 }
 
 /// P2：`tpi prune`——清理 ~/.tpi 下超过 N 天的 session/artifact 文件。
@@ -320,9 +439,29 @@ fn run(cli: Cli) -> Result<(), String> {
         return prune_old_data(*older_than, *dry_run);
     }
 
+    // Eval Harness：`tpi eval`（真实 provider，花钱——仅在显式运行时）。
+    if let Some(Command::Eval {
+        task,
+        suite,
+        list,
+        list_suites,
+        results,
+        evals,
+    }) = &cli.command
+    {
+        return run_eval_cli(
+            cli.cwd.as_deref(),
+            task.as_deref(),
+            suite.as_deref(),
+            *list,
+            *list_suites,
+            results.as_deref(),
+            evals.as_deref(),
+        );
+    }
+
     // 日志（§19.2）：tracing 写 ~/.tpi/logs/tpi.log，不污染 stdout。
     init_logging()?;
-
     let workspace_root: Utf8PathBuf = current_workspace_root(cli.cwd.as_deref())?;
     let mut config = config::load(&workspace_root, cli.model.as_deref())?;
     // §1.2：`--inline` 覆盖 `[ui] mode`（兼容模式，仅特殊终端环境使用）。
@@ -442,6 +581,40 @@ mod tests {
             Some(Command::Prune {
                 older_than: 7,
                 dry_run: true
+            })
+        ));
+    }
+
+    /// Eval Harness：`tpi eval` 子命令形态。
+    #[test]
+    fn eval_subcommand_parses() {
+        assert!(matches!(
+            Cli::parse_from(["tpi", "eval", "rust-fix-001"]).command,
+            Some(Command::Eval {
+                task: Some(t),
+                suite: None,
+                list: false,
+                list_suites: false,
+                ..
+            }) if t == "rust-fix-001"
+        ));
+        assert!(matches!(
+            Cli::parse_from(["tpi", "eval", "--suite", "core"]).command,
+            Some(Command::Eval {
+                task: None,
+                suite: Some(s),
+                ..
+            }) if s == "core"
+        ));
+        assert!(matches!(
+            Cli::parse_from(["tpi", "eval", "--list"]).command,
+            Some(Command::Eval { list: true, .. })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["tpi", "eval", "--list-suites"]).command,
+            Some(Command::Eval {
+                list_suites: true,
+                ..
             })
         ));
     }

@@ -1,0 +1,19 @@
+name = "git-task-001"
+suite = "core"
+title = "恢复被破坏的 git 工作区"
+timeout_sec = 900
+
+[[verify]]
+type = "bash"
+command = 'python src/main.py'
+expect_exit = 0
+expect_stdout_contains = ['hello']
+[[verify]]
+type = "file_contains"
+path = 'README.md'
+contains = 'Demo Project'
+[[verify]]
+type = "bash"
+command = 'git status --porcelain'
+expect_exit = 0
+base_commit = "bc711c9647cb1e3f5217e3f15569cf6b43a5a396"

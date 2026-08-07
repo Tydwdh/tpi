@@ -1,0 +1,14 @@
+name = "refactor-001"
+suite = "core"
+title = "消除重复代码（Rust）"
+timeout_sec = 900
+
+[[verify]]
+type = "bash"
+command = 'cargo test'
+expect_exit = 0
+expect_stdout_contains = ['test result: ok']
+[[verify]]
+type = "file_contains"
+path = 'src/lib.rs'
+contains = 'fn stats'

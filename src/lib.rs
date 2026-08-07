@@ -9,6 +9,7 @@ pub mod auth;
 pub mod config;
 pub mod context;
 pub mod doctor;
+pub mod eval;
 pub mod ids;
 pub mod process;
 pub mod provider;

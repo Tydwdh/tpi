@@ -1,0 +1,10 @@
+name = "rust-fix-004"
+suite = "core"
+title = "修复 String 类型错误（编译+测试）"
+timeout_sec = 900
+
+[[verify]]
+type = "bash"
+command = 'cargo test'
+expect_exit = 0
+expect_stdout_contains = ['test result: ok']

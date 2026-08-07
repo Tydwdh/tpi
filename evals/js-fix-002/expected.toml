@@ -1,0 +1,10 @@
+name = "js-fix-002"
+suite = "core"
+title = "修复异步时序 bug（JavaScript）"
+timeout_sec = 900
+
+[[verify]]
+type = "bash"
+command = 'node fetch_order_test.js'
+expect_exit = 0
+expect_stdout_contains = ['all tests passed']

@@ -1,0 +1,10 @@
+name = "feature-005"
+suite = "core"
+title = "实现 debounce（JavaScript，测试先行）"
+timeout_sec = 900
+
+[[verify]]
+type = "bash"
+command = 'node debounce_test.js'
+expect_exit = 0
+expect_stdout_contains = ['all tests passed']

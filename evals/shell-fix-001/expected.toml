@@ -1,0 +1,10 @@
+name = "shell-fix-001"
+suite = "core"
+title = "修复 bash 参数解析 bug"
+timeout_sec = 900
+
+[[verify]]
+type = "bash"
+command = 'bash greet_test.sh'
+expect_exit = 0
+expect_stdout_contains = ['all tests passed']

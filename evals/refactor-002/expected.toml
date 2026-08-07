@@ -1,0 +1,14 @@
+name = "refactor-002"
+suite = "core"
+title = "消除魔法数字重复（Python）"
+timeout_sec = 900
+
+[[verify]]
+type = "bash"
+command = 'python pricing_test.py'
+expect_exit = 0
+expect_stdout_contains = ['all tests passed']
+[[verify]]
+type = "file_contains"
+path = 'pricing.py'
+contains = 'TAX_RATE'

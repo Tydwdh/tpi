@@ -1,0 +1,10 @@
+name = "python-fix-003"
+suite = "core"
+title = "修复 dict.get 默认值 bug（Python）"
+timeout_sec = 900
+
+[[verify]]
+type = "bash"
+command = 'python counter_test.py'
+expect_exit = 0
+expect_stdout_contains = ['all tests passed']
