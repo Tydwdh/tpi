@@ -458,10 +458,10 @@ fn wrap_lines_with_hits(
     let mut cur_w = 0usize;
     let mut cur_hit: Option<HitTarget> = None;
     let flush = |out: &mut Vec<Line<'static>>,
-                     out_hits: &mut Vec<Option<HitTarget>>,
-                     cur: &mut Vec<Span<'static>>,
-                     cur_w: &mut usize,
-                     cur_hit: &mut Option<HitTarget>| {
+                 out_hits: &mut Vec<Option<HitTarget>>,
+                 cur: &mut Vec<Span<'static>>,
+                 cur_w: &mut usize,
+                 cur_hit: &mut Option<HitTarget>| {
         if !cur.is_empty() {
             out.push(Line::from(std::mem::take(cur)));
             out_hits.push(cur_hit.clone());
@@ -556,9 +556,9 @@ fn build_transcript_text(
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut hits: Vec<Option<HitTarget>> = Vec::new();
     let push_hit = |lines: &mut Vec<Line<'static>>,
-                        hits: &mut Vec<Option<HitTarget>>,
-                        line: Line<'static>,
-                        hit: Option<HitTarget>| {
+                    hits: &mut Vec<Option<HitTarget>>,
+                    line: Line<'static>,
+                    hit: Option<HitTarget>| {
         lines.push(line);
         hits.push(hit);
     };
@@ -595,38 +595,55 @@ fn build_transcript_text(
                     if view.reasoning_visible {
                         for (i, s) in line.text.split('\n').enumerate() {
                             let prefix = if i == 0 { "思考 " } else { "    " };
-                            push_hit(&mut out, &mut hits, Line::styled(
-                                format!("{prefix}{s}"),
+                            push_hit(
+                                &mut out,
+                                &mut hits,
+                                Line::styled(
+                                    format!("{prefix}{s}"),
+                                    Style::default()
+                                        .fg(theme.muted)
+                                        .add_modifier(Modifier::ITALIC),
+                                ),
+                                Some(HitTarget::Reasoning(entry_index)),
+                            );
+                        }
+                    } else {
+                        push_hit(
+                            &mut out,
+                            &mut hits,
+                            Line::styled(
+                                "◇ 思考 · 已折叠（Alt+T 展开 · 点击查看）",
                                 Style::default()
                                     .fg(theme.muted)
                                     .add_modifier(Modifier::ITALIC),
-                            ), Some(HitTarget::Reasoning(entry_index)));
-                        }
-                    } else {
-                        push_hit(&mut out, &mut hits, Line::styled(
-                            "◇ 思考 · 已折叠（Alt+T 展开 · 点击查看）",
-                            Style::default()
-                                .fg(theme.muted)
-                                .add_modifier(Modifier::ITALIC),
-                        ), Some(HitTarget::Reasoning(entry_index)));
+                            ),
+                            Some(HitTarget::Reasoning(entry_index)),
+                        );
                     }
                 }
                 LineKind::Tool => {
                     for (i, s) in line.text.split('\n').enumerate() {
                         let prefix = if i == 0 { "工具 " } else { "    " };
-                        push_hit(&mut out, &mut hits, Line::styled(
-                            format!("{prefix}{s}"),
-                            Style::default().fg(theme.info),
-                        ), None);
+                        push_hit(
+                            &mut out,
+                            &mut hits,
+                            Line::styled(format!("{prefix}{s}"), Style::default().fg(theme.info)),
+                            None,
+                        );
                     }
                 }
                 LineKind::System => {
                     for (i, s) in line.text.split('\n').enumerate() {
                         let prefix = if i == 0 { "系统 " } else { "    " };
-                        push_hit(&mut out, &mut hits, Line::styled(
-                            format!("{prefix}{s}"),
-                            Style::default().fg(theme.warning),
-                        ), None);
+                        push_hit(
+                            &mut out,
+                            &mut hits,
+                            Line::styled(
+                                format!("{prefix}{s}"),
+                                Style::default().fg(theme.warning),
+                            ),
+                            None,
+                        );
                     }
                 }
             },
@@ -888,12 +905,7 @@ fn tool_card_lines(
             body_lines
         } else {
             // 整改 A3：折叠态实时输出只保留最后 3 行。
-            body_lines
-                .iter()
-                .rev()
-                .take(3)
-                .copied()
-                .collect::<Vec<_>>()
+            body_lines.iter().rev().take(3).copied().collect::<Vec<_>>()
         };
         for s in shown {
             let style = if card.expanded {
@@ -1157,7 +1169,9 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
     if let Some(command) = &overlay.command {
         content.push(Line::styled(
             "Command",
-            Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
         ));
         for line in command.split('\n') {
             content.push(Line::styled(
@@ -1170,7 +1184,9 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
     if !overlay.body.is_empty() {
         content.push(Line::styled(
             "Output",
-            Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
         ));
         for line in overlay.body.split('\n') {
             content.push(Line::styled(
@@ -1179,10 +1195,7 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
             ));
         }
     } else {
-        content.push(Line::styled(
-            "（无输出）",
-            Style::default().fg(theme.muted),
-        ));
+        content.push(Line::styled("（无输出）", Style::default().fg(theme.muted)));
     }
     if overlay.body_truncated {
         content.push(Line::styled(

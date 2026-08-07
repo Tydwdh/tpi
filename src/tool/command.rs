@@ -114,7 +114,9 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
         timeout,
         &ctx.session_id,
         artifact.as_mut(),
-        stream_sink.as_ref().map(|sink| sink as &(dyn Fn(u8, &[u8]) + Sync)),
+        stream_sink
+            .as_ref()
+            .map(|sink| sink as &(dyn Fn(u8, &[u8]) + Sync)),
     )
     .await;
     let record = artifact.and_then(|writer| writer.finish().ok());
@@ -173,7 +175,10 @@ error: process_isolation_unavailable
     //（模型读完整输出的唯一入口是 `read @artifact/...`）。
     if let Some(reference) = &artifact_ref {
         outcome.model_payload.artifact = Some(reference.clone());
-        outcome.model_payload.output.push_str(&format!("\nartifact: {reference}"));
+        outcome
+            .model_payload
+            .output
+            .push_str(&format!("\nartifact: {reference}"));
     }
     outcome.artifacts = artifact_ref.into_iter().collect();
     outcome

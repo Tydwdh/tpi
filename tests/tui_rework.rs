@@ -8,11 +8,9 @@
 //! - 历史详情走 Overlay，不重写 scrollback；
 //! - scroll lock 期间新输出不强制拉回底部。
 
-use tpi::tui::model::{
-    Entry, LineKind, MAX_CARD_OUTPUT, ToolCard, ToolCardState, ViewModel,
-};
-use tpi::tui::{draw_to_test_backend, HitTarget};
 use tpi::tool::outcome::ToolStatus;
+use tpi::tui::model::{Entry, LineKind, MAX_CARD_OUTPUT, ToolCard, ToolCardState, ViewModel};
+use tpi::tui::{HitTarget, draw_to_test_backend};
 
 fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
     // 宽字符（中文等）的第二个 cell 占位符是空/空格：去掉以还原连续文本。
@@ -61,12 +59,31 @@ fn tool_card(id: &str, status: ToolStatus, output: Option<&str>) -> ToolCard {
 #[test]
 fn one_call_id_never_renders_two_cards() {
     let mut view = ViewModel::default();
-    view.begin_tool("call-1", "bash", Some("cargo test".into()), Some("cargo test".into()));
+    view.begin_tool(
+        "call-1",
+        "bash",
+        Some("cargo test".into()),
+        Some("cargo test".into()),
+    );
     view.append_tool_output("call-1", "running...\n");
-    view.finish_tool("call-1", "bash", ToolStatus::Succeeded, 3600, Some(0), "ok\n");
+    view.finish_tool(
+        "call-1",
+        "bash",
+        ToolStatus::Succeeded,
+        3600,
+        Some(0),
+        "ok\n",
+    );
     assert_eq!(card_rows(&view, "call-1"), 1, "同一 call_id 只能有一张卡");
     // 多次 finish（防御）也不追加新卡。
-    view.finish_tool("call-1", "bash", ToolStatus::Succeeded, 3600, Some(0), "ok\n");
+    view.finish_tool(
+        "call-1",
+        "bash",
+        ToolStatus::Succeeded,
+        3600,
+        Some(0),
+        "ok\n",
+    );
     assert_eq!(card_rows(&view, "call-1"), 1);
 }
 
@@ -79,27 +96,23 @@ fn long_command_stays_single_line_with_ellipsis() {
     view.finish_tool("c", "bash", ToolStatus::Succeeded, 113, Some(0), "");
     let buffer = draw_to_test_backend(&view, 80, 12);
     let text = buffer_text(&buffer);
-    assert!(
-        text.contains('…'),
-        "超长命令必须 ellipsis: {text}"
-    );
+    assert!(text.contains('…'), "超长命令必须 ellipsis: {text}");
     assert!(text.contains("113ms"), "metadata 仍可见: {text}");
     // 单行验证：卡片在 buffer 中只占 1 行（整卡高度 12 - 其他区域）。
-    let first_row = buffer.content()
+    let first_row = buffer
+        .content()
         .chunks(buffer.area().width as usize)
         .enumerate()
         .find(|(_, row)| row.iter().any(|c| c.symbol() == "✓"))
         .map(|(i, _)| i)
         .expect("卡片行存在");
-    let next_row = buffer.content()
+    let next_row = buffer
+        .content()
         .chunks(buffer.area().width as usize)
         .nth(first_row + 1)
         .map(|row| row.iter().any(|c| c.symbol() != " "))
         .unwrap_or(false);
-    assert!(
-        !next_row,
-        "卡片主行必须只占 1 个 visual line"
-    );
+    assert!(!next_row, "卡片主行必须只占 1 个 visual line");
 }
 
 /// 13.3：Reasoning flood——20KB reasoning 折叠后只占 1 行。
@@ -132,7 +145,10 @@ fn output_flood_does_not_grow_transcript() {
     let Entry::Tool(card) = &view.transcript[0] else {
         panic!();
     };
-    assert!(card.output.as_ref().unwrap().len() <= MAX_CARD_OUTPUT, "UI 有界");
+    assert!(
+        card.output.as_ref().unwrap().len() <= MAX_CARD_OUTPUT,
+        "UI 有界"
+    );
     let buffer = draw_to_test_backend(&view, 80, 12);
     let text = buffer_text(&buffer);
     assert!(
@@ -174,7 +190,10 @@ fn detail_opens_overlay_not_inline_rewrite() {
     view.open_tool_overlay("c");
     let overlay = view.overlay.as_ref().expect("overlay 打开");
     assert!(overlay.title.contains("failed"));
-    assert_eq!(overlay.command.as_deref(), Some("git diff --stat\n第二行命令"));
+    assert_eq!(
+        overlay.command.as_deref(),
+        Some("git diff --stat\n第二行命令")
+    );
     assert!(overlay.body.contains("stdout-b"));
     // Esc 关闭后原 transcript 未被改写（卡片仍是原样）。
     view.close_overlay();
@@ -201,7 +220,10 @@ fn reasoning_hit_opens_overlay() {
 fn layout_works_at_80_120_180_columns() {
     let mut view = ViewModel::default();
     view.push_line(LineKind::User, "你好，请修复这个问题");
-    let long = format!("cargo run --example demo -- --verbose {}", "参数".repeat(30));
+    let long = format!(
+        "cargo run --example demo -- --verbose {}",
+        "参数".repeat(30)
+    );
     view.begin_tool("c", "bash", Some(long.clone()), Some(long));
     view.finish_tool("c", "bash", ToolStatus::Succeeded, 2500, Some(0), "");
     view.push_stream_delta(LineKind::Assistant, "已完成修复。");
@@ -213,8 +235,7 @@ fn layout_works_at_80_120_180_columns() {
         assert!(text.contains("已完成修复"), "assistant 正文: {width}");
         assert!(text.contains("2.5s"), "metadata: {width}");
         // 卡片主行单行（✓ 行之后无连续工具输出行）。
-        let rows: Vec<&[ratatui::buffer::Cell]> =
-            buffer.content().chunks(width as usize).collect();
+        let rows: Vec<&[ratatui::buffer::Cell]> = buffer.content().chunks(width as usize).collect();
         let card_row = rows
             .iter()
             .position(|row| row.iter().any(|c| c.symbol() == "✓"))
@@ -247,7 +268,11 @@ fn scroll_lock_keeps_position_and_counts() {
         view.transcript_scroll, locked_scroll,
         "scroll lock 期间位置不被拉回"
     );
-    assert!(view.pending_below >= 2, "新消息计数: {}", view.pending_below);
+    assert!(
+        view.pending_below >= 2,
+        "新消息计数: {}",
+        view.pending_below
+    );
     view.follow_tail();
     assert_eq!(view.transcript_scroll, 0);
     assert_eq!(view.pending_below, 0);

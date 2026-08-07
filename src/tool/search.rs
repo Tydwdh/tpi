@@ -588,7 +588,10 @@ mod tests {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.depth())
             .collect();
-        assert!(depths.iter().any(|d| *d > 2), "无限制时可达深层: {depths:?}");
+        assert!(
+            depths.iter().any(|d| *d > 2),
+            "无限制时可达深层: {depths:?}"
+        );
     }
 
     /// P0-13 行为面：list depth=2 不返回深层路径。
@@ -609,14 +612,10 @@ mod tests {
             &ctx,
         );
         let output = outcome.model_payload.output;
-        assert!(
-            output.contains("top.txt"),
-            "depth 2 内文件应列出: {output}"
-        );
+        assert!(output.contains("top.txt"), "depth 2 内文件应列出: {output}");
         assert!(
             !output.contains("d.txt"),
             "depth 2 之外的路径不得出现: {output}"
         );
     }
 }
-

@@ -71,7 +71,9 @@ pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
         session_id: "doctor".into(),
         call_id: crate::ids::ToolCallId::new_v7(),
         output_tx: None,
-        scan_snapshots: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        scan_snapshots: std::sync::Arc::new(
+            std::sync::Mutex::new(std::collections::HashMap::new()),
+        ),
         shell_path: None,
         snapshot_store: std::sync::Arc::new(std::sync::Mutex::new(
             crate::tool::edit::SnapshotStore::new(64, 8),

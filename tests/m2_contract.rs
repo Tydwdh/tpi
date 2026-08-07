@@ -215,7 +215,8 @@ async fn list_and_search_respect_budget_and_cursor() {
         &ctx,
     );
     let text2 = page2.model_text();
-    assert!(text2.contains("items: "), "{text2}");    let shown: usize = text2
+    assert!(text2.contains("items: "), "{text2}");
+    let shown: usize = text2
         .lines()
         .find_map(|line| {
             line.strip_prefix("items: ")
@@ -238,7 +239,8 @@ async fn bash_output_lands_in_artifact_and_readable_via_opaque_ref() {
     // 输出 50 行（超过模型预算的 tail 之外也有完整内容在 artifact）。
     // bash 包装：双引号内 \$_ 转义，避免 bash 展开 PowerShell 变量。
     let args = BashArgs {
-        command: "powershell.exe -NoProfile -Command \"1..50 | ForEach-Object { 'line-' + \\$_ }\"".into(),
+        command: "powershell.exe -NoProfile -Command \"1..50 | ForEach-Object { 'line-' + \\$_ }\""
+            .into(),
         cwd: ".".into(),
         timeout_ms: 30_000,
     };
@@ -318,5 +320,8 @@ async fn bash_streams_live_output_through_output_tx() {
     }
     assert!(live_seen, "执行完成前必须能收到增量输出（实时链路）");
     // 流事件与最终输出一致（stdout 全部到达）。
-    assert!(received.contains("s-20"), "流事件应包含最后一行: {received}");
+    assert!(
+        received.contains("s-20"),
+        "流事件应包含最后一行: {received}"
+    );
 }

@@ -91,9 +91,7 @@ pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan
         });
     }
 
-    let previous_items: Vec<PlanItem> = previous
-        .map(|plan| plan.items.clone())
-        .unwrap_or_default();
+    let previous_items: Vec<PlanItem> = previous.map(|plan| plan.items.clone()).unwrap_or_default();
 
     let mut items: Vec<PlanItem> = Vec::new();
     // 1. 消失的旧项 → Completed（保持旧顺序排在前；已 Completed 的不重复追加）。
@@ -126,7 +124,9 @@ pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan
         }
     }
     if !assigned
-        && let Some(first) = items.iter_mut().find(|item| item.status == PlanStatus::Pending)
+        && let Some(first) = items
+            .iter_mut()
+            .find(|item| item.status == PlanStatus::Pending)
     {
         first.status = PlanStatus::InProgress;
     }

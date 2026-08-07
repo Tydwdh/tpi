@@ -8,7 +8,7 @@ mod fixtures;
 
 use camino::Utf8PathBuf;
 use fixtures::test_tool_context;
-use tpi::tool::files::{write, WriteArgs};
+use tpi::tool::files::{WriteArgs, write};
 use tpi::tool::outcome::ToolStatus;
 
 /// P2：write 支持 revision-bound 整体重写（此前只能新建文件）。
@@ -36,7 +36,12 @@ fn p2_write_rewrite_requires_matching_revision() {
         &ctx,
         Some(&plan),
     );
-    assert_eq!(outcome.status, ToolStatus::Failed, "{}", outcome.model_text());
+    assert_eq!(
+        outcome.status,
+        ToolStatus::Failed,
+        "{}",
+        outcome.model_text()
+    );
     assert!(
         outcome.model_text().contains("already_exists"),
         "已存在文件必须明确拒绝: {}",
@@ -54,7 +59,12 @@ fn p2_write_rewrite_requires_matching_revision() {
         &ctx,
         Some(&plan),
     );
-    assert_eq!(outcome.status, ToolStatus::Failed, "{}", outcome.model_text());
+    assert_eq!(
+        outcome.status,
+        ToolStatus::Failed,
+        "{}",
+        outcome.model_text()
+    );
     assert!(
         outcome.model_text().contains("stale_revision"),
         "{}",
@@ -72,7 +82,12 @@ fn p2_write_rewrite_requires_matching_revision() {
         &ctx,
         Some(&plan),
     );
-    assert_eq!(outcome.status, ToolStatus::Succeeded, "{}", outcome.model_text());
+    assert_eq!(
+        outcome.status,
+        ToolStatus::Succeeded,
+        "{}",
+        outcome.model_text()
+    );
     let text = outcome.model_text();
     assert!(text.contains("rewritten: true"), "{text}");
     assert!(text.contains(&current), "previous_revision: {text}");

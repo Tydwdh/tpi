@@ -104,7 +104,7 @@ fn with_input_echo<T>(echo: bool, f: impl FnOnce() -> T) -> T {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Console::{
-            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, STD_INPUT_HANDLE,
+            ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
         };
         unsafe {
             let handle = GetStdHandle(STD_INPUT_HANDLE);
@@ -146,14 +146,15 @@ fn prune_old_data(older_than_days: u64, dry_run: bool) -> Result<(), String> {
         }
         for entry in walk_files(&root) {
             let Ok(meta) = entry.metadata() else { continue };
-            let Ok(modified) = meta.modified() else { continue };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
             if modified < cutoff {
                 if dry_run {
                     println!("[dry-run] {}", entry.display());
                 } else {
-                    std::fs::remove_file(&entry).map_err(|e| {
-                        format!("删除 {} 失败: {e}", entry.display())
-                    })?;
+                    std::fs::remove_file(&entry)
+                        .map_err(|e| format!("删除 {} 失败: {e}", entry.display()))?;
                 }
                 removed += 1;
             }

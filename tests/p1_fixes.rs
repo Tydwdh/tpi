@@ -59,9 +59,7 @@ async fn p1_1_cancel_keeps_history_consistent_with_session() {
     )
     .expect("create session");
     let (tx, mut rx) = mpsc::channel(16);
-    let drain = tokio::spawn(async move {
-        while rx.recv().await.is_some() {}
-    });
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
     let outcome = agent::run(
         &mut provider,
@@ -79,10 +77,7 @@ async fn p1_1_cancel_keeps_history_consistent_with_session() {
 
     drain.abort();
     assert_eq!(outcome.reason, CompletionReason::Cancelled);
-    assert!(
-        !outcome.assistant_text.is_empty(),
-        "已到达的内容必须保留"
-    );
+    assert!(!outcome.assistant_text.is_empty(), "已到达的内容必须保留");
 
     // session 事实：已提交 assistant 内容。
     let events = tpi::session::read_events(session.path()).unwrap();
@@ -95,10 +90,9 @@ async fn p1_1_cancel_keeps_history_consistent_with_session() {
 
     // P1-1：outcome.messages 必须与 session 一致（含该 assistant 消息）。
     assert!(
-        outcome
-            .messages
-            .iter()
-            .any(|m| matches!(m, ChatMessage::Assistant { content, .. } if content == "partial answer")),
+        outcome.messages.iter().any(
+            |m| matches!(m, ChatMessage::Assistant { content, .. } if content == "partial answer")
+        ),
         "outcome.messages 必须包含已提交的 assistant 内容（与 session 一致）: {:?}",
         outcome.messages
     );
@@ -128,9 +122,7 @@ async fn p1_2_max_tool_calls_has_own_reason() {
     )
     .expect("create session");
     let (tx, mut rx) = mpsc::channel(16);
-    let drain = tokio::spawn(async move {
-        while rx.recv().await.is_some() {}
-    });
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
     let outcome = agent::run(
         &mut provider,
@@ -179,9 +171,7 @@ async fn p1_4_context_overflow_stops_run_cleanly() {
     config.model.max_output_tokens = Some(100);
     config.safety_reserve_tokens = 0;
 
-    let mut provider = FakeProvider::scripted_loop(Box::new(|_request| {
-        FakeResponse::text("done")
-    }));
+    let mut provider = FakeProvider::scripted_loop(Box::new(|_request| FakeResponse::text("done")));
     let mut session = SessionLog::create(
         &config.sessions_root,
         workspace.as_std_path(),
@@ -189,9 +179,7 @@ async fn p1_4_context_overflow_stops_run_cleanly() {
     )
     .expect("create session");
     let (tx, mut rx) = mpsc::channel(16);
-    let drain = tokio::spawn(async move {
-        while rx.recv().await.is_some() {}
-    });
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
     let outcome = agent::run(
         &mut provider,
@@ -258,7 +246,9 @@ async fn p1_10_manual_compaction_runs_at_next_boundary() {
 
     let mut provider = FakeProvider::scripted_loop(Box::new(|request| {
         if request.tools.is_empty() {
-            FakeResponse::text("Goal: g\nConstraints: c\nDecisions: d\nCompleted: e\nIn progress: f\nNext exact action: g\nRelevant files and revisions: h\nVerification status: i\nFailed attempts and why: j")
+            FakeResponse::text(
+                "Goal: g\nConstraints: c\nDecisions: d\nCompleted: e\nIn progress: f\nNext exact action: g\nRelevant files and revisions: h\nVerification status: i\nFailed attempts and why: j",
+            )
         } else {
             FakeResponse::text("done")
         }
@@ -270,9 +260,7 @@ async fn p1_10_manual_compaction_runs_at_next_boundary() {
     )
     .expect("create session");
     let (tx, mut rx) = mpsc::channel(16);
-    let drain = tokio::spawn(async move {
-        while rx.recv().await.is_some() {}
-    });
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
     // 历史足够大（压缩显著缩小），force=true 无条件压缩。
     let history = vec![
@@ -301,7 +289,9 @@ async fn p1_10_manual_compaction_runs_at_next_boundary() {
     assert_eq!(outcome.reason, CompletionReason::Stop);
     let events = tpi::session::read_events(session.path()).unwrap();
     assert!(
-        events.iter().any(|e| matches!(e, SessionEvent::CompactionCommitted { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::CompactionCommitted { .. })),
         "force 压缩必须提交 CompactionCommitted（context_window=None 时自动压缩不会触发）: {events:?}"
     );
 }

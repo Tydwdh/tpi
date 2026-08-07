@@ -44,7 +44,7 @@ fn invalid_revision_is_rejected() {
 ///（agent 层清理，见 walking_skeleton 的全流程无残留断言）。
 #[test]
 fn edit_commit_cleans_up_temp() {
-    use tpi::tool::edit::{apply_edit, commit_edit, prepare_commit, revision_of, Replacement};
+    use tpi::tool::edit::{Replacement, apply_edit, commit_edit, prepare_commit, revision_of};
     let dir = tempfile::tempdir().unwrap();
     let path = camino::Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
     let original = "fn main() {}\n";
@@ -68,10 +68,7 @@ fn edit_commit_cleans_up_temp() {
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|n| n.starts_with(".tpi-") && n.ends_with(".tmp") && n.contains("edit"))
         .collect();
-    assert!(
-        leftovers.is_empty(),
-        "commit 后 temp 未清理: {leftovers:?}"
-    );
+    assert!(leftovers.is_empty(), "commit 后 temp 未清理: {leftovers:?}");
     // backup 必须仍在（崩溃恢复判定依赖它；§10.7 第 6 步）。
     assert!(
         plan.backup_path.unwrap().exists(),
@@ -93,5 +90,8 @@ fn write_new_file_cleans_up_temp() {
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|n| n.contains(".tmp"))
         .collect();
-    assert!(leftovers.is_empty(), "write 后目录残留临时文件: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "write 后目录残留临时文件: {leftovers:?}"
+    );
 }

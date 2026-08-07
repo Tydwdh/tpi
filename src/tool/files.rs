@@ -336,7 +336,8 @@ pub fn write(
             &display_path(&ctx.workspace_root, &path),
         );
     }
-    match edit::write_new_file(&path, args.content.as_bytes(), plan) {        Ok(revision) => {
+    match edit::write_new_file(&path, args.content.as_bytes(), plan) {
+        Ok(revision) => {
             let output = format!(
                 "status: succeeded\ntool: write\npath: {}\nrevision: {}",
                 display_path(&ctx.workspace_root, &path),
@@ -391,8 +392,7 @@ fn rewrite_with_revision(
             };
             let output = format!(
                 "status: succeeded\ntool: write\npath: {display_path}\nrewritten: true\nprevious_revision: {}\ncurrent_revision: {}{diff_summary}",
-                result.previous_revision,
-                result.current_revision,
+                result.previous_revision, result.current_revision,
             );
             ToolOutcome::succeeded("write", output)
         }
@@ -406,8 +406,12 @@ fn failed_outcome(tool: &str, error: EditError) -> ToolOutcome {
         EditError::StaleRevision { current, .. } => format!(
             "\nhint: 文件已变化（current_revision {current}）。请重新 read 该文件获取最新 revision，再基于它提交 edit。"
         ),
-        EditError::NoMatch { .. } => "\nhint: old_text 在文件中不存在；请先 read 确认实际内容，再调整 old_text。".into(),
-        EditError::MultipleMatches { .. } => "\nhint: old_text 出现多次；请包含更多上下文使匹配唯一。".into(),
+        EditError::NoMatch { .. } => {
+            "\nhint: old_text 在文件中不存在；请先 read 确认实际内容，再调整 old_text。".into()
+        }
+        EditError::MultipleMatches { .. } => {
+            "\nhint: old_text 出现多次；请包含更多上下文使匹配唯一。".into()
+        }
         EditError::Overlap { .. } => "\nhint: 多个 replacement 重叠；请拆分为独立批次。".into(),
         _ => String::new(),
     };

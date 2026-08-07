@@ -69,8 +69,8 @@ pub fn set_allow_private_web_targets_for_tests(allow: bool) {
 }
 
 fn web_fetch_client() -> reqwest::Client {
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(
-        |attempt| {
+    let mut builder =
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
             // P0-10：redirect 逐跳校验（此前 Policy::limited 自动跟随，
             // 私有/loopback 目标直接可达）。
             if let Err(error) = redirect_allowed(attempt.url()) {
@@ -78,8 +78,7 @@ fn web_fetch_client() -> reqwest::Client {
             } else {
                 attempt.follow()
             }
-        },
-    ));
+        }));
     if allow_private_web_targets() {
         builder = builder.no_proxy();
     }
@@ -394,7 +393,9 @@ pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
     {
         let port = url.port_or_known_default().unwrap_or(80);
         if let Ok(addresses) = tokio::net::lookup_host((host, port)).await {
-            let blocked = addresses.map(|addr| addr.ip()).find(|ip| is_blocked_ip(*ip));
+            let blocked = addresses
+                .map(|addr| addr.ip())
+                .find(|ip| is_blocked_ip(*ip));
             if let Some(ip) = blocked {
                 return ToolOutcome::failed(
                     "web_fetch",
@@ -544,7 +545,10 @@ pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
     // §8.4：artifact 引用进结构化字段与模型可见文本（完整正文的唯一读取入口）。
     if let Some(reference) = &artifact {
         outcome.model_payload.artifact = Some(reference.clone());
-        outcome.model_payload.output.push_str(&format!("\nartifact: {reference}"));
+        outcome
+            .model_payload
+            .output
+            .push_str(&format!("\nartifact: {reference}"));
     }
     outcome.artifacts = artifact.into_iter().collect();
     outcome.session_metadata = ToolMetadata {

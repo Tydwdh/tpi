@@ -253,7 +253,14 @@ fn plan_invariants_enforced() {
         tpi::tool::plan::PlanStatus::InProgress
     );
     // 空 items 清空计划（不保留 Completed）。
-    let cleared = build_plan(&UpdatePlanArgs { explanation: None, items: vec![] }, Some(&next)).unwrap();
+    let cleared = build_plan(
+        &UpdatePlanArgs {
+            explanation: None,
+            items: vec![],
+        },
+        Some(&next),
+    )
+    .unwrap();
     assert!(cleared.items.is_empty());
 }
 

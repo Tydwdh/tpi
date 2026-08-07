@@ -350,9 +350,12 @@ impl ViewModel {
     pub fn append_tool_output(&mut self, id: impl Into<String>, text: impl Into<String>) {
         let id = id.into();
         let text = text.into();
-        if let Some(Entry::Tool(card)) = self.transcript.iter_mut().rev().find(|entry| {
-            matches!(entry, Entry::Tool(card) if card.id == id)
-        }) {
+        if let Some(Entry::Tool(card)) = self
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|entry| matches!(entry, Entry::Tool(card) if card.id == id))
+        {
             let current = card.output.get_or_insert_with(String::new);
             if current.len() + text.len() > MAX_CARD_OUTPUT {
                 card.output_truncated = true;
@@ -684,10 +687,7 @@ fn bound_output(output: &str) -> String {
         return output.to_string();
     }
     // “…” 是 3 字节 UTF-8，截断窗口相应减 3，保证总长不超过 MAX_CARD_OUTPUT。
-    format!(
-        "…{}",
-        &output[output.len() - (MAX_CARD_OUTPUT - 3)..]
-    )
+    format!("…{}", &output[output.len() - (MAX_CARD_OUTPUT - 3)..])
 }
 
 #[cfg(test)]
@@ -879,7 +879,14 @@ mod tests {
         // 运行中实时输出累积。
         view.append_tool_output("call-1", "line-1\n");
         view.append_tool_output("call-1", "line-2\n");
-        view.finish_tool("call-1", "bash", ToolStatus::Succeeded, 42, Some(0), "line-1\nline-2\n");
+        view.finish_tool(
+            "call-1",
+            "bash",
+            ToolStatus::Succeeded,
+            42,
+            Some(0),
+            "line-1\nline-2\n",
+        );
         let Entry::Tool(card) = &view.transcript[0] else {
             panic!();
         };
@@ -979,10 +986,7 @@ mod p1_message_cap_tests {
             line.text.len(),
             MAX_MESSAGE_CHARS
         );
-        assert!(
-            line.text.contains("truncated"),
-            "截断必须带标记"
-        );
+        assert!(line.text.contains("truncated"), "截断必须带标记");
     }
 
     /// P1-9：reasoning 同样有界。
@@ -1055,10 +1059,30 @@ mod p2_card_nav_tests {
         let mut view = view_with_two_cards();
         view.open_tool_overlay("call-1");
         view.cycle_tool_overlay(1);
-        assert_eq!(view.overlay.as_ref().and_then(|o| o.tool_id.clone()).as_deref(), Some("call-2"));
+        assert_eq!(
+            view.overlay
+                .as_ref()
+                .and_then(|o| o.tool_id.clone())
+                .as_deref(),
+            Some("call-2")
+        );
         view.cycle_tool_overlay(1);
-        assert_eq!(view.overlay.as_ref().and_then(|o| o.tool_id.clone()).as_deref(), Some("call-1"), "循环回绕");
+        assert_eq!(
+            view.overlay
+                .as_ref()
+                .and_then(|o| o.tool_id.clone())
+                .as_deref(),
+            Some("call-1"),
+            "循环回绕"
+        );
         view.cycle_tool_overlay(-1);
-        assert_eq!(view.overlay.as_ref().and_then(|o| o.tool_id.clone()).as_deref(), Some("call-2"), "反向");
+        assert_eq!(
+            view.overlay
+                .as_ref()
+                .and_then(|o| o.tool_id.clone())
+                .as_deref(),
+            Some("call-2"),
+            "反向"
+        );
     }
 }

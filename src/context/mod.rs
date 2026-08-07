@@ -41,7 +41,6 @@ pub fn estimate_request(
     total
 }
 
-
 fn estimate_message(message: &ChatMessage) -> u64 {
     match message {
         ChatMessage::System(text) | ChatMessage::User(text) => estimate_tokens(text),
@@ -117,7 +116,14 @@ pub fn prune_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
 /// 避免模型失去完整输出入口（如 `artifact: @artifact/...`）。
 fn prune_tool_output(content: &str) -> String {
     let digest = blake3::hash(content.as_bytes());
-    let tail: Vec<&str> = content.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: Vec<&str> = content
+        .lines()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     let mut key_lines: Vec<&str> = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim_start();
@@ -240,10 +246,7 @@ mod tests {
         );
         assert!(pruned.contains("status: succeeded"), "status 必须保留");
         assert!(pruned.contains("exit_code: 0"), "exit_code 必须保留");
-        assert!(
-            pruned.contains("final tail line"),
-            "尾部诊断保留"
-        );
+        assert!(pruned.contains("final tail line"), "尾部诊断保留");
         assert!(
             pruned.matches("line of filler content").count() <= 7,
             "非关键内容只允许出现在 tail 8 行内（实际 {} 行）",
