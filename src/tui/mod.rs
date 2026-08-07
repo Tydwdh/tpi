@@ -16,7 +16,11 @@
 //!   代码块、列表、引用、链接；按条目版本缓存渲染结果，流式增量只失效最后一条。
 
 pub mod editor;
+pub mod effect;
+pub mod event;
 pub mod model;
+pub mod reducer;
+pub mod state;
 pub mod terminal;
 pub mod text;
 pub mod theme;

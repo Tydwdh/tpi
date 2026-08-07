@@ -17,13 +17,15 @@ use camino::Utf8PathBuf;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{self, DeltaKind, RuntimeEvent};
+use crate::agent;
 use crate::config::Config;
 use crate::ids::{RunId, SessionId};
 use crate::provider::openai_compat::OpenAiCompatClient;
 use crate::provider::{ChatMessage, Provider};
 use crate::session::{self, SessionEvent, SessionLog};
-use crate::tui::{Renderer, model::LineKind, model::ViewModel};
+use crate::tui::effect::UiEffect;
+use crate::tui::state::UiState;
+use crate::tui::{Renderer, model::LineKind, model::StatusLine, model::ViewModel};
 use ratatui::crossterm::event::Event;
 
 /// P0-4：系统消息 + 立即重绘。
@@ -202,8 +204,9 @@ async fn interactive_loop<P: Provider>(
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 ) -> Result<(), String> {
     use crate::tui::SLASH_COMMANDS;
-    use crate::tui::editor::Editor;
+    use crate::tui::event::UiEvent;
     use crate::tui::model::LineKind;
+    use crate::tui::state::UiState;
     use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
     let mut renderer = Renderer::new(
@@ -226,19 +229,16 @@ async fn interactive_loop<P: Provider>(
         LineKind::System,
         "TPI：/help 查看命令与快捷键 · Ctrl-C 取消当前 run",
     );
-    let mut editor = Editor::new();
-    // 排队语义（§12 稳定化任务书）：运行中输入先存 pending_message，
+    // §26-27：UiState 是 UI 单一事实源；交互循环只做
+    // event → reducer → effects → draw（T3）。
+    let mut ui_state = UiState::new(view);
+    // 排队语义（§12 稳定化任务书）：运行中输入先存 ui_state.pending_message，
     // 当前 run 完成后由主循环作为下一条消息提交——不是 run 内的
     // boundary steering。
-    let mut pending_message: Option<String> = if initial_prompt.is_empty() {
-        None
-    } else {
-        Some(initial_prompt.to_string())
-    };
-    let mut pending_session: Option<String> = None;
-    // P1-10：手动 /compact 请求（下一次 run 开始时在完整边界压缩一次）。
-    let mut force_compaction = false;
-    renderer.draw(&view).map_err(|e| e.to_string())?;
+    if !initial_prompt.is_empty() {
+        ui_state.pending_message = Some(initial_prompt.to_string());
+    }
+    renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
 
     // `@` 文件索引：后台扫描一次（跟随 .gitignore，有界 2000），不阻塞启动。
     // P0-3：不用一次性 channel + select 分支——sender drop 后 `recv()` 每次
@@ -278,61 +278,46 @@ async fn interactive_loop<P: Provider>(
                 match event {
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                         need_draw = true;
-                        handle_key(
-                            key,
-                            &mut editor,
-                            &mut view,
-                            &mut pending_message,
-                            &mut pending_session,
-                        );
+                        let effects = crate::tui::reducer::update(&mut ui_state, UiEvent::Key(key));
+                        for effect in effects {
+                            execute_ui_effect(effect, &mut ui_state, current_cancel.clone());
+                        }
                     }
                     Some(Event::Paste(text)) => {
                         need_draw = true;
-                        editor.insert_str(&text);
-                        refresh_menus(&mut view);
+                        crate::tui::reducer::update(&mut ui_state, UiEvent::Paste(text));
                     }
-                    // 鼠标：滚轮翻页、点击工具卡片展开（空闲态）。
+                    // 鼠标：滚轮翻页、点击工具卡片展开（空闲态）；
+                    // hit-test 依赖 Renderer，在 app 层解析后送语义化事件。
                     Some(Event::Mouse(mouse)) => {
                         use ratatui::crossterm::event::MouseEventKind;
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                if view.overlay.is_some() {
-                                    if let Some(overlay) = &mut view.overlay {
-                                        overlay.scroll = overlay.scroll.saturating_sub(3);
-                                    }
-                                } else {
-                                    view.scroll_up(3);
-                                }
-                                need_draw = true;
-                            }
-                            MouseEventKind::ScrollDown => {
-                                if view.overlay.is_some() {
-                                    if let Some(overlay) = &mut view.overlay {
-                                        overlay.scroll = overlay.scroll.saturating_add(3);
-                                    }
-                                } else {
-                                    view.scroll_down(3);
-                                }
-                                need_draw = true;
-                            }
+                        let event = match mouse.kind {
+                            MouseEventKind::ScrollUp => Some(UiEvent::MouseScrollUp),
+                            MouseEventKind::ScrollDown => Some(UiEvent::MouseScrollDown),
                             MouseEventKind::Down(_) => {
-                                if view.overlay.is_some() {
+                                if ui_state.view.overlay.is_some() {
                                     // Overlay 打开时点击外部不动作。
+                                    None
                                 } else if let Some(target) =
                                     renderer.hit_target(mouse.column, mouse.row)
                                 {
                                     match target {
                                         crate::tui::HitTarget::Tool(id) => {
-                                            view.open_tool_overlay(id);
+                                            Some(UiEvent::ClickTool(id))
                                         }
                                         crate::tui::HitTarget::Reasoning(index) => {
-                                            view.open_reasoning_overlay(index);
+                                            Some(UiEvent::ClickReasoning(index))
                                         }
                                     }
-                                    need_draw = true;
+                                } else {
+                                    None
                                 }
                             }
-                            _ => {}
+                            _ => None,
+                        };
+                        if let Some(event) = event {
+                            need_draw = true;
+                            crate::tui::reducer::update(&mut ui_state, event);
                         }
                     }
                     Some(Event::Resize(_, _)) => {
@@ -346,41 +331,41 @@ async fn interactive_loop<P: Provider>(
 
         // `@` 文件索引就绪（P0-3：共享状态顺带检查，不占 select 分支）。
         if let Some(files) = file_index.lock().unwrap().take() {
-            view.file_index = files;
+            ui_state.view.file_index = files;
             need_draw = true;
         }
 
         // 空闲时不重绘：否则没有任何状态变化也会以 60 FPS 占用终端和 CPU。
         if need_draw {
-            view.input = editor.text().to_string();
-            view.input_cursor = editor.cursor;
-            renderer.draw(&view).map_err(|e| e.to_string())?;
+            renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
         }
 
         // 会话恢复选择（/sessions 菜单 Enter）。
-        if let Some(session_id) = pending_session.take() {
+        if let Some(session_id) = ui_state.pending_session.take() {
             match parse_session_id(&session_id) {
                 Ok(id) => match resume_session(&config.sessions_root, &config.workspace_root, id) {
                     Ok((new_session, new_history)) => {
                         *session = new_session;
                         *history = new_history;
-                        view.push_line(
+                        ui_state.view.push_line(
                             LineKind::System,
                             format!("已恢复 session {id}（对话历史已加载）"),
                         );
                     }
                     Err(error) => {
-                        view.push_line(LineKind::System, format!("恢复失败: {error}"));
+                        ui_state
+                            .view
+                            .push_line(LineKind::System, format!("恢复失败: {error}"));
                     }
                 },
-                Err(error) => view.push_line(LineKind::System, error),
+                Err(error) => ui_state.view.push_line(LineKind::System, error),
             }
-            view.menu = None;
-            renderer.draw(&view).map_err(|e| e.to_string())?;
+            ui_state.view.menu = None;
+            renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
         }
 
         // 有提交的消息：运行。
-        if let Some(message) = pending_message.take() {
+        if let Some(message) = ui_state.pending_message.take() {
             match message.as_str() {
                 "/quit" | "/exit" => break,
                 "/settings" => {
@@ -395,7 +380,7 @@ async fn interactive_loop<P: Provider>(
                         "未配置 key"
                     };
                     push_system_line(
-                        &mut view,
+                        &mut ui_state.view,
                         &mut renderer,
                         format!(
                             "配置来源: {}\nworkspace: {}\nsessions: {}\nartifacts: {}\nshell: {shell}\nweb_search: Brave（{brave_key}）\n自动打开浏览器: {}\n保留 token: {}",
@@ -415,7 +400,7 @@ async fn interactive_loop<P: Provider>(
                 }
                 "/model" => {
                     push_system_line(
-                        &mut view,
+                        &mut ui_state.view,
                         &mut renderer,
                         format!(
                             "primary:\n  名称: {}\n  provider: {}\n  base_url: {}\n  reasoning: {}\n  max_output_tokens: {}\n  context_window: {}\n  api_key_env: {}",
@@ -453,7 +438,7 @@ async fn interactive_loop<P: Provider>(
                          Ctrl+U 清空 · Ctrl+A/E 行首/行尾 · PgUp/PgDn 翻页 · \
                          滚轮滚动 · 点击工具卡片展开 · Ctrl-C 取消 run",
                     );
-                    push_system_line(&mut view, &mut renderer, text)?;
+                    push_system_line(&mut ui_state.view, &mut renderer, text)?;
                     continue;
                 }
                 "/session" => {
@@ -466,7 +451,7 @@ async fn interactive_loop<P: Provider>(
                         ),
                         None => "尚无 session（第一条消息后创建）".to_string(),
                     };
-                    push_system_line(&mut view, &mut renderer, info)?;
+                    push_system_line(&mut ui_state.view, &mut renderer, info)?;
                     continue;
                 }
                 "/sessions" => {
@@ -476,7 +461,7 @@ async fn interactive_loop<P: Provider>(
                             Ok(sessions) => sessions,
                             Err(error) => {
                                 push_system_line(
-                                    &mut view,
+                                    &mut ui_state.view,
                                     &mut renderer,
                                     format!("无法列出 session: {error}"),
                                 )?;
@@ -485,13 +470,13 @@ async fn interactive_loop<P: Provider>(
                         };
                     if sessions.is_empty() {
                         push_system_line(
-                            &mut view,
+                            &mut ui_state.view,
                             &mut renderer,
                             "当前 workspace 没有历史 session".to_string(),
                         )?;
                         continue;
                     }
-                    view.menu = Some(crate::tui::model::MenuView {
+                    ui_state.view.menu = Some(crate::tui::model::MenuView {
                         items: sessions
                             .iter()
                             .map(|(id, modified, count, preview)| {
@@ -512,7 +497,7 @@ async fn interactive_loop<P: Provider>(
                         kind: crate::tui::model::MenuKind::Session,
                     });
                     push_system_line(
-                        &mut view,
+                        &mut ui_state.view,
                         &mut renderer,
                         "会话列表：↑/↓ 选择，Enter 恢复（Esc 关闭）".to_string(),
                     )?;
@@ -521,20 +506,24 @@ async fn interactive_loop<P: Provider>(
                 "/new" => {
                     *session = None;
                     history.clear();
-                    push_system_line(&mut view, &mut renderer, "已开始新会话".to_string())?;
+                    push_system_line(
+                        &mut ui_state.view,
+                        &mut renderer,
+                        "已开始新会话".to_string(),
+                    )?;
                     continue;
                 }
                 "/cancel" => {
                     if let Some(cancel) = current_cancel.lock().unwrap().clone() {
                         cancel.cancel();
                         push_system_line(
-                            &mut view,
+                            &mut ui_state.view,
                             &mut renderer,
                             "已发送取消（§11.5：保留 session）".to_string(),
                         )?;
                     } else {
                         push_system_line(
-                            &mut view,
+                            &mut ui_state.view,
                             &mut renderer,
                             "当前没有正在运行的 run".to_string(),
                         )?;
@@ -548,7 +537,7 @@ async fn interactive_loop<P: Provider>(
                         .clone()
                         .unwrap_or_else(|| "未配置（默认）".to_string());
                     push_system_line(
-                        &mut view,
+                        &mut ui_state.view,
                         &mut renderer,
                         format!(
                             "reasoning: {value}\n说明: 透传给 provider 的推理设置（§18.1 [model.primary] reasoning）；\n未配置时使用 provider 默认。",
@@ -561,13 +550,13 @@ async fn interactive_loop<P: Provider>(
                         Some(log) => last_edit_diff(log),
                         None => "尚无 session".to_string(),
                     };
-                    push_system_line(&mut view, &mut renderer, diff)?;
+                    push_system_line(&mut ui_state.view, &mut renderer, diff)?;
                     continue;
                 }
                 "/doctor" => {
                     // P2：TUI 内环境检查（与 `tpi doctor` 同一份报告）。
                     push_system_line(
-                        &mut view,
+                        &mut ui_state.view,
                         &mut renderer,
                         crate::doctor::render_report(&config.workspace_root),
                     )?;
@@ -575,9 +564,9 @@ async fn interactive_loop<P: Provider>(
                 }
                 "/compact" => {
                     // P1-10：手动压缩——在下一次 run 开始时的完整边界执行。
-                    force_compaction = true;
+                    ui_state.force_compaction = true;
                     push_system_line(
-                        &mut view,
+                        &mut ui_state.view,
                         &mut renderer,
                         "将在下一次 run 开始时执行手动压缩（压缩旧历史为摘要）".to_string(),
                     )?;
@@ -585,8 +574,8 @@ async fn interactive_loop<P: Provider>(
                 }
                 _ => {}
             }
-            view.push_line(LineKind::User, message.clone());
-            renderer.draw(&view).map_err(|e| e.to_string())?;
+            ui_state.view.push_line(LineKind::User, message.clone());
+            renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
 
             if session.is_none() {
                 *session = Some(create_session(
@@ -601,14 +590,10 @@ async fn interactive_loop<P: Provider>(
                 config,
                 history,
                 message,
-                &mut view,
+                &mut ui_state,
                 &mut renderer,
-                &mut editor,
                 &mut key_rx,
-                &mut pending_message,
-                &mut pending_session,
                 current_cancel.clone(),
-                &mut force_compaction,
             )
             .await
             {
@@ -616,22 +601,22 @@ async fn interactive_loop<P: Provider>(
                 Err(error) => {
                     // 交互模式：run 失败（provider/工具基础设施）不得杀死整个 TUI。
                     // 显示实际错误并保留 session，用户可以继续对话。
-                    view.status = crate::tui::model::StatusLine::Idle;
-                    view.turn = 0;
-                    view.push_line(
+                    ui_state.view.status = crate::tui::model::StatusLine::Idle;
+                    ui_state.view.turn = 0;
+                    ui_state.view.push_line(
                         LineKind::System,
                         format!("run 失败，session 已保留：{error}"),
                     );
-                    renderer.draw(&view).map_err(|e| e.to_string())?;
+                    renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
                     *session = Some(session_log);
                     continue;
                 }
             };
-            view.add_usage(&outcome.usage);
+            ui_state.view.add_usage(&outcome.usage);
             // P0-1：outcome.messages 是完整 context（含旧历史），必须 replace。
             merge_outcome_history(history, &outcome);
             *session = Some(session_log);
-            view.push_line(LineKind::System, "─".repeat(40));
+            ui_state.view.push_line(LineKind::System, "─".repeat(40));
         }
     }
 
@@ -639,231 +624,26 @@ async fn interactive_loop<P: Provider>(
     Ok(())
 }
 
-/// 输入变化后重建菜单：`@` 文件菜单优先（维护中不触碰），否则斜杠命令菜单。
-fn refresh_menus(view: &mut ViewModel) {
-    if view.has_at_token() {
-        view.refresh_at_menu();
-    } else {
-        view.refresh_command_menu();
-    }
-}
-
-/// 处理单个按键事件（空闲与运行中共用）。
-///
-/// 对标成熟 TUI Agent：Alt+Enter 换行、↑/↓ 输入历史（命令菜单打开时改为选择）、
-/// Tab 补全斜杠命令、Esc 关闭菜单、Alt+T 思考折叠、Ctrl+U 清空、Ctrl+A/E 行首/行尾。
-#[allow(clippy::too_many_arguments)]
-/// editor 变更后同步输入投影（P0-5：Editor 是输入事实源，view.input 只是投影）。
-fn sync_input(editor: &crate::tui::editor::Editor, view: &mut ViewModel) {
-    view.input = editor.text().to_string();
-    view.input_cursor = editor.cursor;
-}
-
-fn handle_key(
-    key: ratatui::crossterm::event::KeyEvent,
-    editor: &mut crate::tui::editor::Editor,
-    view: &mut ViewModel,
-    pending: &mut Option<String>,
-    pending_session: &mut Option<String>,
+/// 执行 reducer 返回的跨边界效果（§27：app 层执行 effect）。
+fn execute_ui_effect(
+    effect: UiEffect,
+    ui_state: &mut UiState,
+    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 ) {
-    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
-    match key.code {
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-            editor.insert_char('\n');
-            sync_input(editor, view);
+    match effect {
+        UiEffect::CancelRun => {
+            if let Some(cancel) = current_cancel.lock().unwrap().clone() {
+                cancel.cancel();
+            }
+            ui_state
+                .view
+                .push_line(LineKind::System, "已发送取消（Esc）；保留 session");
         }
-        KeyCode::Enter => {
-            // 命令菜单打开时先补全为选中命令（Claude Code 式菜单交互）。
-            if view.menu.is_some()
-                && let Some((label, kind)) = view.selected_menu_item()
-            {
-                match kind {
-                    crate::tui::model::MenuKind::Session => {
-                        // 会话恢复由交互循环执行（需要重建 SessionLog/history）。
-                        *pending_session = Some(label);
-                        view.menu = None;
-                        return;
-                    }
-                    _ => view.complete_menu_command(),
-                }
-            }
-            let text = {
-                // P0-5：菜单补全结果先写回 editor（输入事实源），再提交。
-                // 无菜单时 view.input 与 editor 文本一致，set_text 无副作用。
-                editor.set_text(view.input.clone());
-                sync_input(editor, view);
-                editor.submit()
-            };
-            if !text.is_empty() {
-                *pending = Some(text);
-            }
-            refresh_menus(view);
-        }
-        KeyCode::Tab => {
-            if view.menu.is_some() {
-                if let Some(menu) = view.menu.as_mut()
-                    && menu.items.len() > 1
-                {
-                    menu.selected = (menu.selected + 1) % menu.items.len();
-                }
-                view.complete_menu_command();
-                // P0-5：补全结果写回 editor（它是输入事实源）。
-                editor.set_text(view.input.clone());
-                sync_input(editor, view);
-            }
-        }
-        KeyCode::Esc => {
-            if view.overlay.is_some() {
-                view.close_overlay();
-            } else {
-                view.menu = None;
-            }
-        }
-        KeyCode::Backspace => {
-            editor.backspace();
-            sync_input(editor, view);
-            view.refresh_command_menu();
-        }
-        KeyCode::Delete => {
-            editor.delete();
-            sync_input(editor, view);
-            view.refresh_command_menu();
-        }
-        KeyCode::Left => {
-            if key.modifiers.contains(KeyModifiers::ALT) {
-                // P2：按词向左移动。
-                editor.move_word_left();
-            } else {
-                editor.move_left();
-            }
-            sync_input(editor, view);
-        }
-        KeyCode::Right => {
-            if key.modifiers.contains(KeyModifiers::ALT) {
-                // P2：按词向右移动。
-                editor.move_word_right();
-            } else {
-                editor.move_right();
-            }
-            sync_input(editor, view);
-        }
-        KeyCode::Home => editor.home(),
-        KeyCode::End => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                // 整改 C：Ctrl+End 恢复 follow-tail（scroll lock 中）。
-                view.follow_tail();
-            } else {
-                editor.end();
-            }
-        }
-        KeyCode::Up => {
-            if view.menu.is_some() {
-                if let Some(menu) = view.menu.as_mut()
-                    && !menu.items.is_empty()
-                {
-                    menu.selected = (menu.selected + menu.items.len() - 1) % menu.items.len();
-                }
-            } else {
-                editor.history_up();
-                sync_input(editor, view);
-                view.refresh_command_menu();
-            }
-        }
-        KeyCode::Down => {
-            if view.menu.is_some() {
-                if let Some(menu) = view.menu.as_mut()
-                    && !menu.items.is_empty()
-                {
-                    menu.selected = (menu.selected + 1) % menu.items.len();
-                }
-            } else {
-                editor.history_down();
-                sync_input(editor, view);
-                view.refresh_command_menu();
-            }
-        }
-        KeyCode::PageUp => {
-            if let Some(overlay) = &mut view.overlay {
-                overlay.scroll = overlay.scroll.saturating_sub(10);
-            } else {
-                view.scroll_up(8);
-            }
-        }
-        KeyCode::PageDown => {
-            if let Some(overlay) = &mut view.overlay {
-                overlay.scroll = overlay.scroll.saturating_add(10);
-            } else {
-                view.scroll_down(8);
-            }
-        }
-        KeyCode::Char(c) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
-                return; // Ctrl-C 由 ctrl_c handler 处理。
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'u' {
-                editor.clear();
-                sync_input(editor, view);
-                view.refresh_command_menu();
-                return;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'a' {
-                editor.home();
-                return;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'e' {
-                editor.end();
-                return;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'w' {
-                // P2：删除前一个词。
-                editor.delete_word_back();
-                sync_input(editor, view);
-                view.refresh_command_menu();
-                return;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'k' {
-                // P2：删除到行尾。
-                editor.delete_to_end();
-                sync_input(editor, view);
-                view.refresh_command_menu();
-                return;
-            }
-            if key.modifiers.contains(KeyModifiers::ALT) && c == 't' {
-                view.reasoning_visible = !view.reasoning_visible;
-                return;
-            }
-            if key.modifiers.contains(KeyModifiers::ALT) && c == 'e' {
-                // 打开最近一张工具卡片的详情 Overlay（鼠标点击的键盘等价）。
-                view.open_last_tool_overlay();
-                return;
-            }
-            if key.modifiers.contains(KeyModifiers::ALT) && c == 'o' {
-                // P2：打开最近一张失败工具卡片的详情。
-                view.open_failed_tool_overlay();
-                return;
-            }
-            if key.modifiers.contains(KeyModifiers::ALT) && c == '[' {
-                // P2：在工具卡片间向前切换 Overlay。
-                view.cycle_tool_overlay(-1);
-                return;
-            }
-            if key.modifiers.contains(KeyModifiers::ALT) && c == ']' {
-                // P2：在工具卡片间向后切换 Overlay。
-                view.cycle_tool_overlay(1);
-                return;
-            }
-            editor.insert_char(c);
-            sync_input(editor, view);
-            view.refresh_command_menu();
-        }
-        _ => {}
+        // Quit / ResumeSession 由交互主循环处理（/quit 与 /sessions 菜单）。
+        UiEffect::Quit | UiEffect::ResumeSession(_) => {}
     }
 }
 
-/// 执行一次 run 并驱动 renderer（§16.1：事件 → ViewModel → 16 ms 帧合并 → draw）。
-///
-/// 运行期间：键盘事件仍被处理（可输入下一条消息/翻页/折叠思考），
-/// 动画时钟独立推进 spinner（§16.1：活动时 60 FPS，静止时不空转）。
 #[allow(clippy::too_many_arguments)]
 async fn run_interactive<P: Provider>(
     provider: &mut P,
@@ -871,28 +651,26 @@ async fn run_interactive<P: Provider>(
     config: &Config,
     history: &[ChatMessage],
     message: String,
-    view: &mut ViewModel,
+    ui_state: &mut UiState,
     renderer: &mut Renderer,
-    editor: &mut crate::tui::editor::Editor,
     key_rx: &mut mpsc::Receiver<Event>,
-    pending_message: &mut Option<String>,
-    pending_session: &mut Option<String>,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
-    // P1-10：手动 /compact 请求（读取后清零）。
-    force_compaction: &mut bool,
 ) -> Result<agent::AgentOutcome, String> {
-    use crate::tui::model::{LineKind, StatusLine};
-    use ratatui::crossterm::event::{KeyCode, KeyEventKind};
+    use crate::tui::effect::UiEffect;
+    use crate::tui::event::UiEvent;
+    use crate::tui::model::LineKind;
+    use ratatui::crossterm::event::KeyEventKind;
     let cancel = CancellationToken::new();
     *current_cancel.lock().unwrap() = Some(cancel.clone());
-    view.status = StatusLine::Running {
+    ui_state.view.status = StatusLine::Running {
         turn: 0,
         tool: "正在连接模型".into(),
     };
+    ui_state.running = true;
     let (ui_tx, mut ui_rx) = mpsc::channel(128);
 
-    let force = *force_compaction;
-    *force_compaction = false;
+    let force = ui_state.force_compaction;
+    ui_state.force_compaction = false;
     let run_future = agent::run(
         provider,
         session,
@@ -913,131 +691,81 @@ async fn run_interactive<P: Provider>(
     let outcome = loop {
         tokio::select! {
             event = ui_rx.recv() => {
-                match event {
-                    Some(RuntimeEvent::AssistantDelta { kind, text, .. }) => {
-                        match kind {
-                            DeltaKind::Text => view.push_stream_delta(LineKind::Assistant, &text),
-                            DeltaKind::Reasoning => view.push_stream_delta(LineKind::Reasoning, &text),
-                        }
-                    }
-                    Some(RuntimeEvent::ToolStarted { call_id, name, target, command }) => {
-                        view.begin_tool(call_id.to_string(), name.clone(), Some(target), command);
-                        if let StatusLine::Running { tool, .. } = &mut view.status {
-                            *tool = name;
-                        }
-                    }
-                    Some(RuntimeEvent::ToolCompleted { call_id, name, status, duration_ms, exit_code, tail }) => {
-                        view.finish_tool(call_id.to_string(), name, status, duration_ms, exit_code, tail);
-                    }
-                    Some(RuntimeEvent::ToolOutputDelta { call_id, stream: _stream, text }) => {
-                        view.append_tool_output(call_id.to_string(), text);
-                    }
-                    Some(RuntimeEvent::ContextUsage { projected, usable }) => {
-                        view.context_usage = Some((projected, usable));
-                    }
-                    Some(RuntimeEvent::BudgetWarning) => {
-                        // P1-3：接近 wall-time 预算（此前只写日志，用户看不到）。
-                        view.push_line(
-                            LineKind::System,
-                            "⚠ 接近 wall-time 预算：run 即将被取消，请尽快收敛或保存进度".to_string(),
-                        );
-                    }
-                    Some(RuntimeEvent::TurnStarted { turn }) => {
-                        view.turn = turn;
-                        view.status = StatusLine::Running {
-                            turn,
-                            tool: "模型生成中".into(),
-                        };
-                    }
-                    Some(RuntimeEvent::PlanUpdated { plan }) => {
-                        view.plan = Some(plan);
-                    }
-                    None => {}
+                if let Some(event) = event {
+                    // Agent 事件 → reducer（纯状态转换；T3）。
+                    crate::tui::reducer::update(ui_state, UiEvent::Agent(event));
                 }
                 if renderer.should_draw() {
-                    renderer.draw(view).map_err(|e| e.to_string())?;
+                    renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
                 }
             }
             _ = ticker.tick() => {
-                view.anim_tick += 1;
+                crate::tui::reducer::update(ui_state, UiEvent::Tick);
                 if renderer.should_draw() {
-                    renderer.draw(view).map_err(|e| e.to_string())?;
+                    renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
                 }
             }
             key = key_rx.recv() => {
                 match key {
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                        if key.code == KeyCode::Esc && view.overlay.is_some() {
-                            // 详情 Overlay 优先：Esc 关闭 Overlay，不打断 run。
-                            view.close_overlay();
-                        } else if key.code == KeyCode::Esc && view.menu.is_none() {
-                            // §6.2：Esc 打断当前 run（等价 Ctrl-C，保留 session）。
-                            // 命令补全菜单打开时 Esc 仍由 handle_key 关闭菜单。
-                            cancel.cancel();
-                            view.push_line(LineKind::System, "已发送取消（Esc）；保留 session");
-                        } else {
-                            handle_key(key, editor, view, pending_message, pending_session);
+                        // 键盘事件 → reducer；Esc 取消语义在 reducer 内
+                        // 依据 running 状态决策（§6.2 保留 session）。
+                        let effects = crate::tui::reducer::update(ui_state, UiEvent::Key(key));
+                        for effect in effects {
+                            match effect {
+                                UiEffect::CancelRun => {
+                                    cancel.cancel();
+                                    ui_state.view.push_line(
+                                        LineKind::System,
+                                        "已发送取消（Esc）；保留 session",
+                                    );
+                                }
+                                UiEffect::Quit | UiEffect::ResumeSession(_) => {
+                                    // run 中不会产生（reducer 仅空闲时产生）。
+                                }
+                            }
                         }
-                        view.input = editor.text().to_string();
-                        view.input_cursor = editor.cursor;
-                        refresh_menus(view);
-                        renderer.draw(view).map_err(|e| e.to_string())?;
+                        renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
                     }
                     Some(Event::Paste(text)) => {
-                        editor.insert_str(&text);
-                        view.refresh_command_menu();
-                        view.input = editor.text().to_string();
-                        view.input_cursor = editor.cursor;
-                        refresh_menus(view);
-                        renderer.draw(view).map_err(|e| e.to_string())?;
+                        crate::tui::reducer::update(ui_state, UiEvent::Paste(text));
+                        renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
                     }
-                    // 鼠标：滚轮翻页；点击工具卡片展开/折叠。
+                    // 鼠标：滚轮翻页；点击工具卡片展开/折叠（hit-test 在 app 层）。
                     Some(Event::Mouse(mouse)) => {
                         use ratatui::crossterm::event::MouseEventKind;
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                if view.overlay.is_some() {
-                                    if let Some(overlay) = &mut view.overlay {
-                                        overlay.scroll = overlay.scroll.saturating_sub(3);
-                                    }
-                                } else {
-                                    view.scroll_up(3);
-                                }
-                                renderer.draw(view).map_err(|e| e.to_string())?;
-                            }
-                            MouseEventKind::ScrollDown => {
-                                if view.overlay.is_some() {
-                                    if let Some(overlay) = &mut view.overlay {
-                                        overlay.scroll = overlay.scroll.saturating_add(3);
-                                    }
-                                } else {
-                                    view.scroll_down(3);
-                                }
-                                renderer.draw(view).map_err(|e| e.to_string())?;
-                            }
+                        let event = match mouse.kind {
+                            MouseEventKind::ScrollUp => Some(UiEvent::MouseScrollUp),
+                            MouseEventKind::ScrollDown => Some(UiEvent::MouseScrollDown),
                             MouseEventKind::Down(_) => {
-                                if view.overlay.is_some() {
+                                if ui_state.view.overlay.is_some() {
                                     // Overlay 打开时点击外部不动作。
+                                    None
                                 } else if let Some(target) =
                                     renderer.hit_target(mouse.column, mouse.row)
                                 {
                                     match target {
                                         crate::tui::HitTarget::Tool(id) => {
-                                            view.open_tool_overlay(id);
+                                            Some(UiEvent::ClickTool(id))
                                         }
                                         crate::tui::HitTarget::Reasoning(index) => {
-                                            view.open_reasoning_overlay(index);
+                                            Some(UiEvent::ClickReasoning(index))
                                         }
                                     }
-                                    renderer.draw(view).map_err(|e| e.to_string())?;
+                                } else {
+                                    None
                                 }
                             }
-                            _ => {}
+                            _ => None,
+                        };
+                        if let Some(event) = event {
+                            crate::tui::reducer::update(ui_state, event);
+                            renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
                         }
                     }
                     Some(Event::Resize(_, _)) => {
                         renderer.autoresize().map_err(|e| e.to_string())?;
-                        renderer.draw(view).map_err(|e| e.to_string())?;
+                        renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
                     }
                     _ => {}
                 }
@@ -1046,26 +774,27 @@ async fn run_interactive<P: Provider>(
         }
     };
     *current_cancel.lock().unwrap() = None;
+    ui_state.running = false;
     let outcome = outcome.map_err(|failure| failure.to_string())?;
     match outcome.reason {
         crate::session::CompletionReason::Error => {
-            view.push_line(
+            ui_state.view.push_line(
                 LineKind::System,
                 "run 以 Error 结束（长度限制/内容过滤/协议错误，见 session 记录）",
             );
         }
         crate::session::CompletionReason::ContextOverflow => {
             // P1-4：压缩与 prune 后仍超窗口——明确提示而不是让请求失败。
-            view.push_line(
+            ui_state.view.push_line(
                 LineKind::System,
                 "上下文仍超出模型窗口（压缩后仍无法容纳）。请 /new 开启新会话，或检查配置中的 context_window。",
             );
         }
         _ => {}
     }
-    view.status = StatusLine::Idle;
-    view.turn = 0;
-    renderer.draw(view).map_err(|e| e.to_string())?;
+    ui_state.view.status = StatusLine::Idle;
+    ui_state.view.turn = 0;
+    renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
     Ok(outcome)
 }
 
@@ -1303,7 +1032,6 @@ fn fmt_time(t: std::time::SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::editor::Editor;
     use crate::tui::model::ViewModel;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -1405,44 +1133,35 @@ mod tests {
 
     /// P0-5 回归：Tab 补全必须同步到 editor（此前只改 view.input，
     /// 主循环 `view.input = editor.text()` 会把补全结果覆盖掉，Enter 提交原文）。
+    /// T3：走 reducer 单向流（UiEvent::Key → UiState）。
     #[test]
     fn menu_completion_syncs_editor_text() {
-        let mut editor = Editor::new();
-        let mut view = ViewModel::default();
-        let mut pending: Option<String> = None;
-        let mut pending_session: Option<String> = None;
+        use crate::tui::event::UiEvent;
+        use crate::tui::reducer;
+        let mut state = UiState::new(ViewModel::default());
         for ch in "/set".chars() {
-            handle_key(
-                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
-                &mut editor,
-                &mut view,
-                &mut pending,
-                &mut pending_session,
+            reducer::update(
+                &mut state,
+                UiEvent::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
             );
         }
-        assert!(view.menu.is_some(), "输入 /set 应弹出命令菜单");
-        handle_key(
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            &mut editor,
-            &mut view,
-            &mut pending,
-            &mut pending_session,
+        assert!(state.view.menu.is_some(), "输入 /set 应弹出命令菜单");
+        reducer::update(
+            &mut state,
+            UiEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
         );
         assert_eq!(
-            editor.text(),
+            state.editor.text(),
             "/settings",
             "Tab 补全必须同步 editor（当前: {}）",
-            editor.text()
+            state.editor.text()
         );
-        handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut editor,
-            &mut view,
-            &mut pending,
-            &mut pending_session,
+        reducer::update(
+            &mut state,
+            UiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         );
         assert_eq!(
-            pending.as_deref(),
+            state.pending_message.as_deref(),
             Some("/settings"),
             "Enter 提交的必须是补全后的命令"
         );
