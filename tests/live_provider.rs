@@ -54,6 +54,7 @@ async fn live_provider_smoke_opt_in() {
         tx,
         CancellationToken::new(),
         true,
+        false,
     )
     .await
     .expect("live run succeeds");

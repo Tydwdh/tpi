@@ -45,8 +45,8 @@ base_url = "https://<你的端点>/v1"   # 从当前 Pi 配置迁入，不硬编
 reasoning = "max"
 max_output_tokens = 16384
 context_window = 1000000
-supports_tools = true
-reasoning_field = "reasoning_content"
+# 注意：supports_tools / reasoning_field 尚未实现（P1-11：配置示例与实现对齐）；
+# 工具支持与 reasoning 字段名当前按 openai-compat 固定约定（§18.1）。
 # api_key_env = "TPI_API_KEY"   # 环境变量显式覆盖（§18.4）
 
 [shell]

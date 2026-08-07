@@ -83,6 +83,59 @@ impl Editor {
         self.cursor = 0;
     }
 
+    /// P2（编辑器增强）：删除光标前一个“词”（空白或标点分隔的连续非空白段）。
+    pub fn delete_word_back(&mut self) {
+        let before = &self.text[..self.cursor];
+        let chars: Vec<(usize, char)> = before.char_indices().collect();
+        let mut end = chars.len();
+        // 先跳过尾部空白。
+        while end > 0 && chars[end - 1].1.is_whitespace() {
+            end -= 1;
+        }
+        // 再删除一个非空白词。
+        while end > 0 && !chars[end - 1].1.is_whitespace() {
+            end -= 1;
+        }
+        let new_cursor = chars.get(end).map(|(i, _)| *i).unwrap_or(0);
+        self.text.drain(new_cursor..self.cursor);
+        self.cursor = new_cursor;
+    }
+
+    /// P2（编辑器增强）：删除光标到行尾。
+    pub fn delete_to_end(&mut self) {
+        self.text.truncate(self.cursor);
+    }
+
+    /// P2（编辑器增强）：按“词”向左移动（跳过词间空白，停在词首）。
+    pub fn move_word_left(&mut self) {
+        let before = &self.text[..self.cursor];
+        let chars: Vec<(usize, char)> = before.char_indices().collect();
+        let mut i = chars.len();
+        while i > 0 && chars[i - 1].1.is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].1.is_whitespace() {
+            i -= 1;
+        }
+        self.cursor = chars.get(i).map(|(pos, _)| *pos).unwrap_or(0);
+    }
+
+    /// P2（编辑器增强）：按“词”向右移动（停在下一个词首）。
+    pub fn move_word_right(&mut self) {
+        let after = &self.text[self.cursor..];
+        let chars: Vec<(usize, char)> = after.char_indices().collect();
+        let mut i = 0;
+        // 跳过当前词。
+        while i < chars.len() && !chars[i].1.is_whitespace() {
+            i += 1;
+        }
+        // 跳过词间空白，停在下一个词首。
+        while i < chars.len() && chars[i].1.is_whitespace() {
+            i += 1;
+        }
+        self.cursor += chars.get(i).map(|(pos, _)| *pos).unwrap_or(after.len());
+    }
+
     pub fn end(&mut self) {
         self.cursor = self.text.len();
     }
@@ -234,5 +287,54 @@ mod tests {
         editor.insert_str("重复");
         editor.submit();
         assert_eq!(editor.history.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod p2_word_edit_tests {
+    use super::*;
+
+    #[test]
+    fn delete_word_back_removes_last_word() {
+        let mut e = Editor::new();
+        e.set_text("修复 bug 并提交".to_string());
+        e.end();
+        // 中文连续段（无空白分隔）整体是一个词。
+        e.delete_word_back();
+        assert_eq!(e.text, "修复 bug ");
+        e.delete_word_back();
+        assert_eq!(e.text, "修复 ");
+        e.delete_word_back();
+        assert_eq!(e.text, "");
+        // 空输入不再变化（不 panic）。
+        e.delete_word_back();
+        assert_eq!(e.text, "");
+    }
+
+    #[test]
+    fn delete_to_end_keeps_prefix() {
+        let mut e = Editor::new();
+        e.set_text("abcdef".to_string());
+        e.cursor = 2;
+        e.delete_to_end();
+        assert_eq!(e.text, "ab");
+        assert_eq!(e.cursor, 2);
+    }
+
+    #[test]
+    fn move_word_left_right_respects_boundaries() {
+        let mut e = Editor::new();
+        e.set_text("aaa bbb ccc".to_string());
+        e.end();
+        e.move_word_left();
+        assert_eq!(e.cursor, 8, "停在下一个词首: {}", e.text);
+        e.move_word_left();
+        assert_eq!(e.cursor, 4);
+        e.move_word_left();
+        assert_eq!(e.cursor, 0);
+        e.move_word_right();
+        assert_eq!(e.cursor, 4);
+        e.move_word_right();
+        assert_eq!(e.cursor, 8);
     }
 }

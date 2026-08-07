@@ -235,19 +235,32 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         if meta.len() > MAX_FILE_BYTES || meta.len() == 0 {
             continue;
         }
-        // binary 检测：读头 8 KiB 查 NUL。
-        let head = match std::fs::read(entry.path()) {
-            Ok(head) => head,
+        // binary 检测：只读头 8 KiB 查 NUL（P1-8：不整文件读入内存）。
+        let mut file = match std::fs::File::open(entry.path()) {
+            Ok(file) => file,
             Err(_) => continue,
         };
-        if head.iter().take(8192).any(|&b| b == 0) {
-            continue;
+        {
+            use std::io::Read;
+            let mut head = [0u8; 8192];
+            let n = file.read(&mut head).unwrap_or(0);
+            if head[..n].contains(&0) {
+                continue;
+            }
         }
-        let text = String::from_utf8_lossy(&head);
+        // head 读取已消费文件内容（小文件可能已到 EOF）：回退到文件头再流式读。
+        {
+            use std::io::{Seek, SeekFrom};
+            let _ = file.seek(SeekFrom::Start(0));
+        }
+        // 流式按行匹配（P1-8：大文件不整读，内存峰值恒定）。
         let relative_path = relative(&root, entry.path());
-        for (line_idx, line) in text.lines().enumerate() {
-            if pattern.is_match(line) {
-                let line = truncate_line(line, MAX_LINE_CHARS);
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(file);
+        for (line_idx, line) in reader.lines().enumerate() {
+            let Ok(line) = line else { break };
+            if pattern.is_match(&line) {
+                let line = truncate_line(&line, MAX_LINE_CHARS);
                 let item = format!("{}:{}: {}", relative_path, line_idx + 1, line);
                 output_bytes += item.len();
                 items.push(item);
@@ -307,16 +320,23 @@ fn finish_scan(
     let cursor = crate::ids::EventId::new_v7().to_string();
     {
         let mut store = ctx.scan_snapshots.lock().unwrap();
-        // 有界：最多保留 16 个 snapshot。
-        if store.len() >= 16 {
-            let oldest = store.keys().next().cloned();
-            if let Some(oldest) = oldest {
-                store.remove(&oldest);
-            }
-        }
+        // 有界：最多保留 16 个 snapshot（P1-6：按 cursor 有序淘汰最旧，
+        // 此前 HashMap keys().next() 顺序不可预测，cursor 可能意外失效）。
+        evict_oldest_snapshot(&mut store);
         store.insert(cursor.clone(), snapshot);
     }
     page(&cursor, ctx)
+}
+
+/// P1-6：snapshot 有界淘汰——淘汰 cursor 字典序最小的一项。
+/// cursor 是 UUIDv7（时间前缀有序），字典序最小 ≈ 最旧。
+pub fn evict_oldest_snapshot(store: &mut std::collections::HashMap<String, ScanSnapshot>) {
+    const MAX_SNAPSHOTS: usize = 16;
+    if store.len() >= MAX_SNAPSHOTS
+        && let Some(oldest) = store.keys().min().cloned()
+    {
+        store.remove(&oldest);
+    }
 }
 
 /// 翻页：从 snapshot 取 offset 窗口（不重新扫描，§8.4）。
@@ -513,6 +533,34 @@ mod tests {
         }
         let files = index_files(&root, 50);
         assert_eq!(files.len(), 50, "索引必须受 limit 约束");
+    }
+
+    /// P1-6：snapshot 有界淘汰按 cursor（UUIDv7 字典序≈时间序）取最小，
+    /// 不能依赖 HashMap 无序迭代（cursor 意外失效会打断翻页）。
+    #[test]
+    fn snapshot_eviction_removes_oldest_cursor() {
+        let mut store = std::collections::HashMap::new();
+        // 插入 16 个（达到上限）后继续插入必须淘汰最小的 key。
+        for i in 0..16u32 {
+            store.insert(
+                format!("00000000-0000-7000-8000-{i:012}"),
+                ScanSnapshot {
+                    tool: "list".into(),
+                    items: vec![],
+                    scanned_files: 0,
+                    scanned_bytes: 0,
+                    elapsed_ms: 0,
+                    stop_reason: "complete".into(),
+                },
+            );
+        }
+        evict_oldest_snapshot(&mut store);
+        assert_eq!(store.len(), 15, "达到上限时淘汰一个");
+        assert!(
+            !store.contains_key("00000000-0000-7000-8000-000000000000"),
+            "必须淘汰字典序最小（最旧）的 cursor"
+        );
+        assert!(store.contains_key("00000000-0000-7000-8000-000000000001"));
     }
 
     /// P0-13：list 的 max_depth 必须让 ignore 在指定深度停止遍历

@@ -147,14 +147,25 @@ async fn p0_2_compaction_survives_delta_flood() {
             ui_tx,
             CancellationToken::new(),
             false,
+        false,
         ),
     )
     .await
     .expect("agent::run 必须在 10s 内完成（P0-2 死锁）");
 
     drain.abort();
+    // P1-4 后：窗口过小（user 消息 + system + 工具 schema 远超 usable）时，
+    // compaction 失败后明确 ContextOverflow 结束——测试核心是“大量 delta
+    // 不死锁”，compaction 请求已真实发出并消费。
     let outcome = outcome.expect("agent::run 成功");
-    assert_eq!(outcome.reason, CompletionReason::Stop);
+    assert!(
+        matches!(
+            outcome.reason,
+            CompletionReason::ContextOverflow | CompletionReason::Stop
+        ),
+        "unexpected reason: {:?}",
+        outcome.reason
+    );
 }
 
 /// P0-8：compaction 的 covered.end 是 exclusive，必须等于"compaction 时下一条

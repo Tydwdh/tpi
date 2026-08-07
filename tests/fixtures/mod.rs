@@ -33,6 +33,7 @@ pub fn test_config(workspace_root: &Utf8PathBuf) -> Config {
         web_summary_model: "none".into(),
         system_prompt_extra: None,
         source: "test".into(),
+        ui_theme: "omp".into(),
     }
 }
 

@@ -81,6 +81,8 @@ pub const MIN_KEEP_TURNS: usize = 2;
 ///
 /// 超过 800 token 的工具输出替换为 `digest + 尾部 8 行`（tail 保留错误相关诊断）；
 /// 失败诊断、实际 diff、用户约束和当前计划保留更高权重。
+/// P1-5：结构化关键行（status/program/exit_code/artifact/error）不在 tail 时
+/// 显式保留——否则模型会失去 artifact 引用等恢复入口。
 pub fn prune_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     const MAX_TOOL_OUTPUT_TOKENS: u64 = 800;
     messages
@@ -92,29 +94,10 @@ pub fn prune_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
                 content,
             } => {
                 if estimate_tokens(&content) > MAX_TOOL_OUTPUT_TOKENS {
-                    let digest = blake3::hash(content.as_bytes());
                     ChatMessage::Tool {
                         tool_call_id,
                         name,
-                        content: format!(
-                            "[output pruned: {} tokens, digest {}]\n{}{}",
-                            estimate_tokens(&content),
-                            &digest.to_hex()[..16],
-                            content
-                                .lines()
-                                .rev()
-                                .take(8)
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .rev()
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                            if content.lines().count() > 8 {
-                                "\n--- tail ---"
-                            } else {
-                                ""
-                            }
-                        ),
+                        content: prune_tool_output(&content),
                     }
                 } else {
                     ChatMessage::Tool {
@@ -127,6 +110,41 @@ pub fn prune_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
             other => other,
         })
         .collect()
+}
+
+/// P1-5：单条工具输出的确定性缩略——digest + 结构化关键行 + 尾部 8 行。
+/// 关键行（artifact/error/status/exit_code/program）即使不在尾部也保留，
+/// 避免模型失去完整输出入口（如 `artifact: @artifact/...`）。
+fn prune_tool_output(content: &str) -> String {
+    let digest = blake3::hash(content.as_bytes());
+    let tail: Vec<&str> = content.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
+    let mut key_lines: Vec<&str> = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let is_key = trimmed.starts_with("status:")
+            || trimmed.starts_with("program:")
+            || trimmed.starts_with("exit_code:")
+            || trimmed.starts_with("artifact:")
+            || trimmed.starts_with("error:");
+        if is_key && !tail.contains(&line) && !key_lines.contains(&line) {
+            key_lines.push(line);
+        }
+    }
+    let mut out = format!(
+        "[output pruned: {} tokens, digest {}]",
+        estimate_tokens(content),
+        &digest.to_hex()[..16]
+    );
+    if !key_lines.is_empty() {
+        out.push('\n');
+        out.push_str(&key_lines.join("\n"));
+    }
+    out.push('\n');
+    out.push_str(&tail.join("\n"));
+    if content.lines().count() > 8 {
+        out.push_str("\n--- tail ---");
+    }
+    out
 }
 
 /// Compaction summary schema（§15.4 固定字段）。
@@ -202,6 +220,34 @@ mod tests {
         assert!(
             with_many > estimate,
             "tool schema 必须计入: {with_many} vs {estimate}"
+        );
+    }
+
+    /// P1-5：prune 后结构化关键行（artifact 引用/error/status）必须保留，
+    /// 即使它们不在尾部 8 行内——否则模型失去完整输出入口。
+    #[test]
+    fn prune_keeps_structured_key_lines() {
+        // 构造 >800 token 的输出：artifact 引用在中间（不在尾部）。
+        let mut content = String::from(
+            "status: succeeded\ntool: bash\nprogram: bash\nexit_code: 0\nartifact: @artifact/abc123\n\n",
+        );
+        content.push_str(&"line of filler content\n".repeat(200));
+        content.push_str("final tail line\n");
+        let pruned = prune_tool_output(&content);
+        assert!(
+            pruned.contains("artifact: @artifact/abc123"),
+            "artifact 引用必须保留: {pruned}"
+        );
+        assert!(pruned.contains("status: succeeded"), "status 必须保留");
+        assert!(pruned.contains("exit_code: 0"), "exit_code 必须保留");
+        assert!(
+            pruned.contains("final tail line"),
+            "尾部诊断保留"
+        );
+        assert!(
+            pruned.matches("line of filler content").count() <= 7,
+            "非关键内容只允许出现在 tail 8 行内（实际 {} 行）",
+            pruned.matches("line of filler content").count()
         );
     }
 }

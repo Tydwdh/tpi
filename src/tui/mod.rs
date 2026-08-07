@@ -58,7 +58,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("new", "开始新会话"),
     ("cancel", "取消当前 run"),
     ("thinking", "查看推理设置"),
-    ("diff", "查看最近文件 diff"),
+    ("diff", "查看本轮全部文件 diff"),
+    ("doctor", "环境检查（config/模型/API key/Git Bash）"),
     ("compact", "手动压缩上下文"),
 ];
 
@@ -113,7 +114,8 @@ struct FramePlan {
 
 impl Renderer {
     /// 初始化终端（raw mode + 隐藏光标 + inline viewport + 同步更新支持）。
-    pub fn new() -> std::io::Result<Self> {
+    /// P2：主题由配置注入（`[ui] theme`）。
+    pub fn new(theme: theme::Theme) -> std::io::Result<Self> {
         ratatui::crossterm::terminal::enable_raw_mode()?;
         // 鼠标：点击工具卡片展开、滚轮翻页（键盘线程的 event::read 会收到）。
         let _ = ratatui::crossterm::execute!(
@@ -147,7 +149,7 @@ impl Renderer {
             activity_rows: height,
             last_draw: None,
             coalesced_events: 0,
-            theme: theme::Theme::omp(),
+            theme,
             scrollback: true,
             committed_lines: 0,
             md_cache: HashMap::new(),
@@ -304,7 +306,7 @@ impl Drop for Renderer {
 
 impl Default for Renderer {
     fn default() -> Self {
-        Self::new().expect("renderer init")
+        Self::new(theme::Theme::omp()).expect("renderer init")
     }
 }
 

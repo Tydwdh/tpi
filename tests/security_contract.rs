@@ -40,6 +40,7 @@ fn write_through_workspace_junction_is_blocked() {
         WriteArgs {
             path: "link/escaped.txt".into(),
             content: "x".into(),
+            revision: None,
         },
         &ctx,
         Some(&plan),
@@ -130,6 +131,7 @@ fn write_rejects_outside_workspace() {
         WriteArgs {
             path: "../../escape.txt".into(),
             content: "x".into(),
+            revision: None,
         },
         &ctx,
         None,

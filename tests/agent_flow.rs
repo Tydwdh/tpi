@@ -38,6 +38,7 @@ async fn finish_stop_without_tool_calls_completes_run_without_second_request() {
         tx,
         CancellationToken::new(),
         true,
+        false,
     )
     .await
     .expect("run succeeds");
@@ -102,6 +103,7 @@ async fn tool_call_loop_terminates_and_reports_completion() {
         tx,
         CancellationToken::new(),
         true,
+        false,
     )
     .await
     .expect("run succeeds");
@@ -157,6 +159,7 @@ async fn usage_accumulates_across_turns() {
         tx,
         CancellationToken::new(),
         true,
+        false,
     )
     .await
     .expect("run succeeds");
@@ -204,6 +207,7 @@ async fn context_usage_event_sent_before_requests() {
         tx,
         CancellationToken::new(),
         true,
+        false,
     )
     .await
     .expect("run succeeds");

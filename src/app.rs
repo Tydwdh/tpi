@@ -169,6 +169,7 @@ pub async fn run_prompt_once<P: Provider>(
         ui_tx,
         cancel.clone(),
         false,
+        false,
     )
     .await
     .map_err(|failure| failure.to_string())?;
@@ -196,7 +197,8 @@ async fn interactive_loop<P: Provider>(
     use crate::tui::model::LineKind;
     use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
-    let mut renderer = Renderer::new().map_err(|e| format!("初始化终端失败: {e}"))?;
+    let mut renderer = Renderer::new(crate::tui::theme::Theme::named(&config.ui_theme))
+        .map_err(|e| format!("初始化终端失败: {e}"))?;
     let mut view = ViewModel {
         model_name: config.model.name.clone(),
         workspace: config
@@ -217,6 +219,8 @@ async fn interactive_loop<P: Provider>(
         Some(initial_prompt.to_string())
     };
     let mut pending_session: Option<String> = None;
+    // P1-10：手动 /compact 请求（下一次 run 开始时在完整边界压缩一次）。
+    let mut force_compaction = false;
     renderer.draw(&view).map_err(|e| e.to_string())?;
 
     // `@` 文件索引：后台扫描一次（跟随 .gitignore，有界 2000），不阻塞启动。
@@ -464,11 +468,18 @@ async fn interactive_loop<P: Provider>(
                     view.menu = Some(crate::tui::model::MenuView {
                         items: sessions
                             .iter()
-                            .map(|(id, modified, count)| {
-                                (
-                                    id.to_string(),
-                                    format!("{} · {} 事件", fmt_time(*modified), count),
-                                )
+                            .map(|(id, modified, count, preview)| {
+                                let label = if preview.is_empty() {
+                                    format!("{} · {} 事件", fmt_time(*modified), count)
+                                } else {
+                                    format!(
+                                        "{} · {} 事件 · {}",
+                                        fmt_time(*modified),
+                                        count,
+                                        preview
+                                    )
+                                };
+                                (id.to_string(), label)
                             })
                             .collect(),
                         selected: 0,
@@ -531,11 +542,22 @@ async fn interactive_loop<P: Provider>(
                     push_system_line(&mut view, &mut renderer, diff)?;
                     continue;
                 }
-                "/compact" => {
+                "/doctor" => {
+                    // P2：TUI 内环境检查（与 `tpi doctor` 同一份报告）。
                     push_system_line(
                         &mut view,
                         &mut renderer,
-                        "compaction 会在上下文超过预算时自动在完整边界执行（§15.4）；运行中的自动压缩状态见状态栏。".to_string(),
+                        crate::doctor::render_report(&config.workspace_root),
+                    )?;
+                    continue;
+                }
+                "/compact" => {
+                    // P1-10：手动压缩——在下一次 run 开始时的完整边界执行。
+                    force_compaction = true;
+                    push_system_line(
+                        &mut view,
+                        &mut renderer,
+                        "将在下一次 run 开始时执行手动压缩（压缩旧历史为摘要）".to_string(),
                     )?;
                     continue;
                 }
@@ -564,6 +586,7 @@ async fn interactive_loop<P: Provider>(
                 &mut pending_message,
                 &mut pending_session,
                 current_cancel.clone(),
+                &mut force_compaction,
             )
             .await
             {
@@ -683,8 +706,24 @@ fn handle_key(
             sync_input(editor, view);
             view.refresh_command_menu();
         }
-        KeyCode::Left => editor.move_left(),
-        KeyCode::Right => editor.move_right(),
+        KeyCode::Left => {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                // P2：按词向左移动。
+                editor.move_word_left();
+            } else {
+                editor.move_left();
+            }
+            sync_input(editor, view);
+        }
+        KeyCode::Right => {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                // P2：按词向右移动。
+                editor.move_word_right();
+            } else {
+                editor.move_right();
+            }
+            sync_input(editor, view);
+        }
         KeyCode::Home => editor.home(),
         KeyCode::End => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -752,6 +791,20 @@ fn handle_key(
                 editor.end();
                 return;
             }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'w' {
+                // P2：删除前一个词。
+                editor.delete_word_back();
+                sync_input(editor, view);
+                view.refresh_command_menu();
+                return;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'k' {
+                // P2：删除到行尾。
+                editor.delete_to_end();
+                sync_input(editor, view);
+                view.refresh_command_menu();
+                return;
+            }
             if key.modifiers.contains(KeyModifiers::ALT) && c == 't' {
                 view.reasoning_visible = !view.reasoning_visible;
                 return;
@@ -759,6 +812,21 @@ fn handle_key(
             if key.modifiers.contains(KeyModifiers::ALT) && c == 'e' {
                 // 打开最近一张工具卡片的详情 Overlay（鼠标点击的键盘等价）。
                 view.open_last_tool_overlay();
+                return;
+            }
+            if key.modifiers.contains(KeyModifiers::ALT) && c == 'o' {
+                // P2：打开最近一张失败工具卡片的详情。
+                view.open_failed_tool_overlay();
+                return;
+            }
+            if key.modifiers.contains(KeyModifiers::ALT) && c == '[' {
+                // P2：在工具卡片间向前切换 Overlay。
+                view.cycle_tool_overlay(-1);
+                return;
+            }
+            if key.modifiers.contains(KeyModifiers::ALT) && c == ']' {
+                // P2：在工具卡片间向后切换 Overlay。
+                view.cycle_tool_overlay(1);
                 return;
             }
             editor.insert_char(c);
@@ -787,6 +855,8 @@ async fn run_interactive<P: Provider>(
     pending_message: &mut Option<String>,
     pending_session: &mut Option<String>,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    // P1-10：手动 /compact 请求（读取后清零）。
+    force_compaction: &mut bool,
 ) -> Result<agent::AgentOutcome, String> {
     use crate::tui::model::{LineKind, StatusLine};
     use ratatui::crossterm::event::{KeyCode, KeyEventKind};
@@ -798,6 +868,8 @@ async fn run_interactive<P: Provider>(
     };
     let (ui_tx, mut ui_rx) = mpsc::channel(128);
 
+    let force = *force_compaction;
+    *force_compaction = false;
     let run_future = agent::run(
         provider,
         session,
@@ -807,6 +879,7 @@ async fn run_interactive<P: Provider>(
         ui_tx,
         cancel.clone(),
         true,
+        force,
     );
     tokio::pin!(run_future);
 
@@ -838,6 +911,13 @@ async fn run_interactive<P: Provider>(
                     }
                     Some(RuntimeEvent::ContextUsage { projected, usable }) => {
                         view.context_usage = Some((projected, usable));
+                    }
+                    Some(RuntimeEvent::BudgetWarning) => {
+                        // P1-3：接近 wall-time 预算（此前只写日志，用户看不到）。
+                        view.push_line(
+                            LineKind::System,
+                            "⚠ 接近 wall-time 预算：run 即将被取消，请尽快收敛或保存进度".to_string(),
+                        );
                     }
                     Some(RuntimeEvent::TurnStarted { turn }) => {
                         view.turn = turn;
@@ -944,11 +1024,21 @@ async fn run_interactive<P: Provider>(
     };
     *current_cancel.lock().unwrap() = None;
     let outcome = outcome.map_err(|failure| failure.to_string())?;
-    if outcome.reason == crate::session::CompletionReason::Error {
-        view.push_line(
-            LineKind::System,
-            "run 以 Error 结束（长度限制/内容过滤/协议错误，见 session 记录）",
-        );
+    match outcome.reason {
+        crate::session::CompletionReason::Error => {
+            view.push_line(
+                LineKind::System,
+                "run 以 Error 结束（长度限制/内容过滤/协议错误，见 session 记录）",
+            );
+        }
+        crate::session::CompletionReason::ContextOverflow => {
+            // P1-4：压缩与 prune 后仍超窗口——明确提示而不是让请求失败。
+            view.push_line(
+                LineKind::System,
+                "上下文仍超出模型窗口（压缩后仍无法容纳）。请 /new 开启新会话，或检查配置中的 context_window。",
+            );
+        }
+        _ => {}
     }
     view.status = StatusLine::Idle;
     view.turn = 0;
@@ -963,14 +1053,31 @@ fn last_edit_diff(log: &SessionLog) -> String {
         Ok(events) => events,
         Err(_) => return "读取 session 失败".to_string(),
     };
-    for event in events.iter().rev() {
-        if let SessionEvent::ToolCompleted { outcome, .. } = event
-            && outcome.session_metadata.tool == "edit"
-        {
-            return outcome.model_payload.output.clone();
-        }
+    // P2：/diff 聚合本 run 内所有成功的 edit（此前只返回最近一次）。
+    // 输出每个文件的 model output（含 unified diff 与 revision 信息）。
+    let diffs: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolCompleted { outcome, .. }
+                if outcome.session_metadata.tool == "edit"
+                    && outcome.status == crate::tool::outcome::ToolStatus::Succeeded =>
+            {
+                Some(outcome.model_payload.output.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    if diffs.is_empty() {
+        return "本轮还没有成功的 edit（写文件请用 edit 工具）".to_string();
     }
-    "本轮还没有 edit".to_string()
+    let mut out = String::new();
+    for (i, diff) in diffs.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\n---\n\n");
+        }
+        out.push_str(diff);
+    }
+    out
 }
 
 fn spawn_ctrl_c_handler(current_cancel: Arc<Mutex<Option<CancellationToken>>>) {
@@ -1117,21 +1224,22 @@ fn latest_session_id(
     let sessions = list_sessions(sessions_root, workspace_root)?;
     sessions
         .first()
-        .map(|(id, _, _)| *id)
+        .map(|(id, _, _, _)| *id)
         .ok_or_else(|| "当前 workspace 没有历史 session".into())
 }
 
-/// 列出当前 workspace 的全部 session（按修改时间倒序）：(id, 最后修改, 事件数)。
+/// 列出当前 workspace 的全部 session（按修改时间倒序）：
+/// (id, 最后修改, 事件数, 首条用户消息预览)。
 fn list_sessions(
     sessions_root: &std::path::Path,
     workspace_root: &Utf8PathBuf,
-) -> Result<Vec<(SessionId, std::time::SystemTime, usize)>, String> {
+) -> Result<Vec<(SessionId, std::time::SystemTime, usize, String)>, String> {
     let workspace_id = session::workspace_id_for(workspace_root.as_std_path());
     let dir = sessions_root.join(&workspace_id);
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut entries: Vec<(std::time::SystemTime, SessionId, usize)> = Vec::new();
+    let mut entries: Vec<(std::time::SystemTime, SessionId, usize, String)> = Vec::new();
     for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let Ok(entry) = entry else { continue };
         if entry.path().extension().map(|e| e == "jsonl").unwrap_or(false)
@@ -1140,14 +1248,50 @@ fn list_sessions(
             && let Some(name) = entry.path().file_stem().and_then(|s| s.to_str())
             && let Ok(id) = parse_session_id(name)
         {
-            let count = crate::session::read_events(&entry.path())
-                .map(|events| events.len())
-                .unwrap_or(0);
-            entries.push((modified, id, count));
+            let count = count_jsonl_lines(&entry.path());
+            // P2：首条用户消息预览（只解析事件头；列表辨识用）。
+            let preview = first_user_preview(&entry.path());
+            entries.push((modified, id, count, preview));
         }
     }
-    entries.sort_by_key(|(time, _, _)| std::cmp::Reverse(*time));
-    Ok(entries.into_iter().map(|(t, id, n)| (id, t, n)).collect())
+    entries.sort_by_key(|(time, _, _, _)| std::cmp::Reverse(*time));
+    Ok(entries
+        .into_iter()
+        .map(|(t, id, n, p)| (id, t, n, p))
+        .collect())
+}
+
+/// P2：从 session 文件提取首条用户消息摘要（≤40 字符，单行）。
+fn first_user_preview(path: &std::path::Path) -> String {
+    use crate::session::read_events;
+    let Ok(events) = read_events(path) else {
+        return String::new();
+    };
+    for event in events {
+        if let SessionEvent::UserSubmitted { content } = event {
+            let one_line = content.lines().next().unwrap_or_default();
+            let truncated: String = one_line.chars().take(40).collect();
+            return if one_line.chars().count() > 40 {
+                format!("{truncated}…")
+            } else {
+                truncated
+            };
+        }
+    }
+    String::new()
+}
+
+/// P1-13：事件数 = JSONL 行数（每行一个事件，§14.2）；只数行不 serde 解析，
+/// session 增多时 `/sessions` 列表仍保持轻量（此前对每个文件解析全部事件）。
+fn count_jsonl_lines(path: &std::path::Path) -> usize {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    std::io::BufReader::new(file)
+        .lines()
+        .filter(|line| line.as_ref().is_ok_and(|l| !l.trim().is_empty()))
+        .count()
 }
 
 /// 会话列表展示用的时间格式（HH:MM:SS 或 MM-DD HH:MM）。
@@ -1173,6 +1317,96 @@ mod tests {
     use crate::tui::editor::Editor;
     use crate::tui::model::ViewModel;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// P1-13：事件数 = JSONL 行数（不 serde 解析全部事件）。
+    #[test]
+    fn count_jsonl_lines_counts_events_not_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, "{}\n{}\n\n{}\n").unwrap();
+        assert_eq!(count_jsonl_lines(&path), 3, "空行不计，行数即事件数");
+        std::fs::write(&path, "this is not json\n").unwrap();
+        assert_eq!(count_jsonl_lines(&path), 1, "损坏行仍计入（列表展示用）");
+    }
+
+    /// P2：/sessions 预览——首条用户消息摘要（≤40 字符、单行）。
+    #[test]
+    fn first_user_preview_is_bounded_and_single_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let mut log = crate::session::SessionLog::create(
+            &dir.path().join("sessions"),
+            workspace.as_std_path(),
+            crate::ids::RunId::new_v7(),
+        )
+        .unwrap();
+        log.append_event(&SessionEvent::UserSubmitted {
+            content: format!("{}\n第二行", "长消息".repeat(20)),
+        })
+        .unwrap();
+        log.append_event(&SessionEvent::UserSubmitted {
+            content: "later".into(),
+        })
+        .unwrap();
+        let preview = first_user_preview(log.path());
+        assert!(preview.chars().count() <= 41, "预览必须截断: {preview}");
+        assert!(!preview.contains('\n'), "预览必须单行: {preview}");
+        assert!(preview.ends_with('…'), "超长必须带省略号");
+    }
+
+    /// P2：/diff 聚合本 run 内所有成功的 edit（此前只返回最近一次）。
+    #[test]
+    fn last_edit_diff_aggregates_all_successful_edits() {
+        use crate::tool::outcome::{ModelPayload, StoredToolOutcome, ToolMetadata, ToolStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let mut log = crate::session::SessionLog::create(
+            &dir.path().join("sessions"),
+            workspace.as_std_path(),
+            crate::ids::RunId::new_v7(),
+        )
+        .unwrap();
+        let edit_outcome = |output: &str, status: ToolStatus| StoredToolOutcome {
+            status,
+            model_payload: ModelPayload {
+                status,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: output.to_string(),
+                effect: None,
+                artifact: None,
+            },
+            session_metadata: ToolMetadata {
+                tool: "edit".into(),
+                target: Some("a.rs".into()),
+                ..Default::default()
+            },
+        };
+        // 成功 1（带 diff）、失败（不应出现）、成功 2。
+        log.append_event(&SessionEvent::ToolCompleted {
+            call_id: crate::ids::ToolCallId::new_v7(),
+            outcome: edit_outcome("diff-one", ToolStatus::Succeeded),
+        })
+        .unwrap();
+        log.append_event(&SessionEvent::ToolCompleted {
+            call_id: crate::ids::ToolCallId::new_v7(),
+            outcome: edit_outcome("diff-failed", ToolStatus::Failed),
+        })
+        .unwrap();
+        log.append_event(&SessionEvent::ToolCompleted {
+            call_id: crate::ids::ToolCallId::new_v7(),
+            outcome: edit_outcome("diff-two", ToolStatus::Succeeded),
+        })
+        .unwrap();
+        let text = last_edit_diff(&log);
+        assert!(text.contains("diff-one"), "第一个成功 edit 必须出现: {text}");
+        assert!(text.contains("diff-two"), "第二个成功 edit 必须出现: {text}");
+        assert!(
+            !text.contains("diff-failed"),
+            "失败的 edit 不得出现在聚合里: {text}"
+        );
+    }
 
     /// P0-5 回归：Tab 补全必须同步到 editor（此前只改 view.input，
     /// 主循环 `view.input = editor.text()` 会把补全结果覆盖掉，Enter 提交原文）。

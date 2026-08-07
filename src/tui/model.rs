@@ -56,6 +56,9 @@ pub struct ToolCard {
 
 /// 卡片输出上限（UI 内存与渲染预算；完整输出仍可通过 read @artifact 读取）。
 pub const MAX_CARD_OUTPUT: usize = 32 * 1024;
+/// P1-9：assistant/reasoning 单条消息上限（工具卡输出另有 MAX_CARD_OUTPUT）。
+/// 超出丢弃中段并标记 truncated，防止 transcript 无限膨胀。
+pub const MAX_MESSAGE_CHARS: usize = 256 * 1024;
 /// 命令上限（overlay 展示用；正常命令远小于此）。
 pub const MAX_CARD_COMMAND: usize = 8 * 1024;
 
@@ -93,6 +96,8 @@ pub struct OverlayState {
     pub body_truncated: bool,
     /// Overlay 内滚动偏移（行）。
     pub scroll: u16,
+    /// 对应工具卡 id（P2：Alt+[/Alt+] 卡片间切换用；reasoning overlay 为 None）。
+    pub tool_id: Option<String>,
 }
 
 impl OverlayState {
@@ -128,6 +133,7 @@ impl OverlayState {
             body_truncated: card.output_truncated,
             body,
             scroll: 0,
+            tool_id: Some(card.id.clone()),
         }
     }
 
@@ -139,6 +145,7 @@ impl OverlayState {
             body: text.to_string(),
             body_truncated: false,
             scroll: 0,
+            tool_id: None,
         }
     }
 }
@@ -269,7 +276,24 @@ impl ViewModel {
         let version = self.alloc_version();
         match self.transcript.last_mut() {
             Some(Entry::Message(line)) if line.kind == kind => {
-                line.text.push_str(text);
+                // P1-9：单条消息有界（超出丢弃中段并标记，防 transcript 膨胀）。
+                if line.text.len() < MAX_MESSAGE_CHARS {
+                    let room = MAX_MESSAGE_CHARS - line.text.len();
+                    if text.len() <= room {
+                        line.text.push_str(text);
+                    } else {
+                        // 截断到 UTF-8 字符边界，避免切出非法字节。
+                        let mut end = room;
+                        while !text.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        line.text.push_str(&text[..end]);
+                        line.text.push_str("…[truncated]");
+                    }
+                } else if !line.text.contains("truncated") {
+                    // 已满后仍来内容：标记一次，后续静默丢弃。
+                    line.text.push_str("\n…[truncated]");
+                }
                 line.version = version; // 文本变化 → 渲染缓存失效
             }
             _ => {
@@ -377,6 +401,44 @@ impl ViewModel {
                 return;
             }
         }
+    }
+
+    /// P2：打开最近一张失败/被拒/取消的工具卡片 Overlay（Alt+O）。
+    pub fn open_failed_tool_overlay(&mut self) {
+        for entry in self.transcript.iter().rev() {
+            if let Entry::Tool(card) = entry {
+                let failed = matches!(
+                    &card.state,
+                    ToolCardState::Done { status, .. } if *status != ToolStatus::Succeeded
+                );
+                if failed {
+                    self.overlay = Some(OverlayState::for_tool(card));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// P2：在工具卡片之间切换详情 Overlay（Alt+[ / Alt+]）。
+    pub fn cycle_tool_overlay(&mut self, direction: i32) {
+        let ids: Vec<String> = self
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Tool(card) => Some(card.id.clone()),
+                _ => None,
+            })
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let current = self.overlay.as_ref().and_then(|o| o.tool_id.clone());
+        let pos = current
+            .as_ref()
+            .and_then(|id| ids.iter().position(|x| x == id))
+            .unwrap_or(0);
+        let next = (pos as i32 + direction).rem_euclid(ids.len() as i32) as usize;
+        self.open_tool_overlay(ids[next].clone());
     }
 
     /// 按 id 打开工具卡片详情 Overlay（鼠标点击）。
@@ -890,5 +952,113 @@ mod tests {
         view.input = "@no-such-file".into();
         view.refresh_at_menu();
         assert!(view.menu.is_none());
+    }
+}
+
+#[cfg(test)]
+mod p1_message_cap_tests {
+    use super::*;
+
+    /// P1-9：assistant 流式消息超过 MAX_MESSAGE_CHARS 时必须截断并标记，
+    /// 不能无限膨胀（此前工具输出有上限而消息没有）。
+    #[test]
+    fn stream_delta_is_bounded_for_messages() {
+        let mut view = ViewModel::default();
+        let chunk = "a".repeat(1024);
+        let total_chunks = (MAX_MESSAGE_CHARS / 1024) + 10;
+        for _ in 0..total_chunks {
+            view.push_stream_delta(LineKind::Assistant, &chunk);
+        }
+        let entry = view.transcript.last().unwrap();
+        let Entry::Message(line) = entry else {
+            panic!("最后一条应是消息");
+        };
+        assert!(
+            line.text.len() <= MAX_MESSAGE_CHARS + 32,
+            "消息必须被截断: {} > {}",
+            line.text.len(),
+            MAX_MESSAGE_CHARS
+        );
+        assert!(
+            line.text.contains("truncated"),
+            "截断必须带标记"
+        );
+    }
+
+    /// P1-9：reasoning 同样有界。
+    #[test]
+    fn stream_reasoning_is_bounded() {
+        let mut view = ViewModel::default();
+        for _ in 0..(MAX_MESSAGE_CHARS / 1024 + 10) {
+            view.push_stream_delta(LineKind::Reasoning, &"r".repeat(1024));
+        }
+        let entry = view.transcript.last().unwrap();
+        let Entry::Message(line) = entry else {
+            panic!("最后一条应是消息");
+        };
+        assert!(line.text.len() <= MAX_MESSAGE_CHARS + 32);
+    }
+}
+
+#[cfg(test)]
+mod p2_card_nav_tests {
+    use super::*;
+
+    fn view_with_two_cards() -> ViewModel {
+        let mut view = ViewModel::default();
+        // 卡 1：成功。
+        view.begin_tool(
+            String::from("call-1"),
+            String::from("read"),
+            Some(String::from("a.rs")),
+            None,
+        );
+        view.finish_tool(
+            String::from("call-1"),
+            String::from("read"),
+            ToolStatus::Succeeded,
+            10,
+            None,
+            String::from("ok"),
+        );
+        // 卡 2：失败。
+        view.begin_tool(
+            String::from("call-2"),
+            String::from("bash"),
+            Some(String::from("ls")),
+            Some(String::from("ls")),
+        );
+        view.finish_tool(
+            String::from("call-2"),
+            String::from("bash"),
+            ToolStatus::Failed,
+            20,
+            Some(1),
+            String::from("boom"),
+        );
+        view
+    }
+
+    /// P2：Alt+O 打开最近一张失败卡片（跳过成功卡片）。
+    #[test]
+    fn failed_tool_overlay_skips_success_cards() {
+        let mut view = view_with_two_cards();
+        view.open_failed_tool_overlay();
+        let overlay = view.overlay.expect("失败卡片必须可打开");
+        assert_eq!(overlay.tool_id.as_deref(), Some("call-2"));
+        assert!(overlay.title.contains("failed"), "{overlay:?}");
+    }
+
+    /// P2：Alt+[ / Alt+] 在卡片间循环切换。
+    #[test]
+    fn cycle_tool_overlay_wraps_around() {
+        let mut view = view_with_two_cards();
+        view.open_tool_overlay("call-1");
+        view.cycle_tool_overlay(1);
+        assert_eq!(view.overlay.as_ref().and_then(|o| o.tool_id.clone()).as_deref(), Some("call-2"));
+        view.cycle_tool_overlay(1);
+        assert_eq!(view.overlay.as_ref().and_then(|o| o.tool_id.clone()).as_deref(), Some("call-1"), "循环回绕");
+        view.cycle_tool_overlay(-1);
+        assert_eq!(view.overlay.as_ref().and_then(|o| o.tool_id.clone()).as_deref(), Some("call-2"), "反向");
     }
 }

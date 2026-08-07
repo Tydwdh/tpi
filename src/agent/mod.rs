@@ -101,6 +101,8 @@ pub enum RuntimeEvent {
     },
     /// 上下文占用投影（每次请求前发送；TUI 绘制用量条）。
     ContextUsage { projected: u64, usable: u64 },
+    /// 接近 wall-time 预算（P1-3：TUI 状态栏/系统行提示，此前只写日志）。
+    BudgetWarning,
     /// `update_plan` 提交后的独立 UI 状态；不作为聊天流水的一部分。
     PlanUpdated { plan: crate::tool::plan::Plan },
 }
@@ -122,6 +124,8 @@ pub async fn run<P: Provider>(
     ui: mpsc::Sender<RuntimeEvent>,
     cancel: CancellationToken,
     interactive: bool,
+    // P1-10：手动 `/compact`——无条件在第一个完整边界执行一次压缩。
+    force_compaction: bool,
 ) -> Result<AgentOutcome, RunFailure> {
     let run_id = session.run_id();
     let request_id = RequestId::new_v7();
@@ -151,6 +155,15 @@ pub async fn run<P: Provider>(
 
     let mut messages: Vec<ChatMessage> = history.to_vec();
     messages.push(ChatMessage::User(user_message.clone()));
+    // P1-10：手动 /compact——在第一个完整边界无条件执行一次压缩。
+    // 失败（历史不足/不显著）不中断 run，只记录日志。
+    if force_compaction
+        && messages.len() > 1
+        && let Err(error) =
+            compact_turn(provider, &mut messages, session, config, &cancel).await
+    {
+        tracing::warn!(error = %error, "manual compaction failed");
+    }
     // list/search 分页 snapshot（session 作用域，§8.4）。
     let scan_snapshots: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, crate::tool::search::ScanSnapshot>>,
@@ -172,10 +185,12 @@ pub async fn run<P: Provider>(
     // §12.3：确定性无进展检测（不调用额外模型）。
     let mut progress = crate::agent::scheduler::ProgressTracker::default();
     // §12.4：wall-clock watchdog（实时主动取消）。
+    // P1-3：接近预算时向 TUI 发送 BudgetWarning（此前只写日志）。
+    let warn_ui = ui.clone();
     let (watchdog, _wall) =
-        crate::agent::limits::spawn_watchdog(&config.limits, cancel.clone(), || {
-            // 接近预算：状态栏提示由 UI 消费（此处仅记录）。
+        crate::agent::limits::spawn_watchdog(&config.limits, cancel.clone(), move || {
             tracing::info!("run approaching wall-time budget");
+            let _ = warn_ui.try_send(RuntimeEvent::BudgetWarning);
         });
     // §15.4：同一阈值区间内 compaction 失败后不反复调用模型。
     let mut compaction_failed = false;
@@ -209,16 +224,26 @@ pub async fn run<P: Provider>(
             if crate::context::should_compact(projected, usable) && !compaction_failed {
                 match compact_turn(provider, &mut messages, session, config, &cancel).await {
                     Ok(()) => {
-                        // §15.4 第 6 条：compaction 成功后若仍无法容纳（窗口过小），
-                        // 明确停止尝试，避免无限循环；继续执行并提示用户。
-                        let after = crate::context::estimate_messages(&messages);
+                        // P1-4：compaction 成功后若仍无法容纳（窗口过小），
+                        // 不再发起普通请求（必然 length error），明确结束并提示用户。
+                        let system_prompt = system_prompt_text(
+                            config,
+                            current_plan.lock().unwrap().as_ref(),
+                        );
+                        let after = crate::context::estimate_request(
+                            &system_prompt,
+                            &messages,
+                            &tool_defs,
+                        );
                         if after > usable {
-                            compaction_failed = true;
-                            tracing::warn!(
-                                projected = after,
-                                usable,
-                                "context window too small even after compaction; stopping compaction attempts"
-                            );
+                            session
+                                .append_event(&SessionEvent::RunCompleted {
+                                    reason: CompletionReason::ContextOverflow,
+                                    usage: usage_total,
+                                })
+                                .and_then(|_| session.sync_data())
+                                .map_err(|e| RunFailure::Session(e.to_string()))?;
+                            break 'run_loop CompletionReason::ContextOverflow;
                         }
                     }
                     Err(error) => {
@@ -227,6 +252,26 @@ pub async fn run<P: Provider>(
                         tracing::warn!(error = %error, "compaction failed; not retrying in this band");
                         // 确定性 prune 兜底（§15.3：只影响投影）。
                         messages = crate::context::prune_messages(messages);
+                        // P1-4：prune 后仍超窗口（如 user 消息本身巨大）→ 明确结束。
+                        let system_prompt = system_prompt_text(
+                            config,
+                            current_plan.lock().unwrap().as_ref(),
+                        );
+                        let after = crate::context::estimate_request(
+                            &system_prompt,
+                            &messages,
+                            &tool_defs,
+                        );
+                        if after > usable {
+                            session
+                                .append_event(&SessionEvent::RunCompleted {
+                                    reason: CompletionReason::ContextOverflow,
+                                    usage: usage_total,
+                                })
+                                .and_then(|_| session.sync_data())
+                                .map_err(|e| RunFailure::Session(e.to_string()))?;
+                            break 'run_loop CompletionReason::ContextOverflow;
+                        }
                     }
                 }
             }
@@ -272,16 +317,27 @@ pub async fn run<P: Provider>(
                     let response = match result {
                         Ok(response) => response,
                         Err(crate::provider::ProviderError::Cancelled) => {
+                            // 先收完 provider 返回前已入队的残余 delta（与 Ok 分支一致），
+                            // 否则取消时已到达的文本可能丢失（P1-1 测试场景）。
+                            while let Ok(event) = event_rx.try_recv() {
+                                forward_provider_event(event, request_id, &mut content, &ui).await;
+                            }
                             // §6.2/§11.5：取消（Esc/Ctrl-C）是正常结束——提交已到达的内容，
                             // 记录 Cancelled 原因并保留 session，而不是让 run 以错误退出。
                             if !content.is_empty() {
                                 assistant_text = content.clone();
                                 session
                                     .append_event(&SessionEvent::AssistantMessageCommitted {
-                                        message: AssistantMessage { content },
+                                        message: AssistantMessage { content: content.clone() },
                                     })
                                     .and_then(|_| session.sync_data())
                                     .map_err(|e| RunFailure::Session(e.to_string()))?;
+                                // P1-1：已提交 session 的内容必须同步进 outcome.messages，
+                                // 否则继续对话时模型上下文与 session 事实不一致。
+                                messages.push(ChatMessage::Assistant {
+                                    content: content.clone(),
+                                    tool_calls: Vec::new(),
+                                });
                             }
                             session
                                 .append_event(&SessionEvent::RunCompleted {
@@ -350,14 +406,16 @@ pub async fn run<P: Provider>(
             )
             .await?;
             if batch == BatchEnd::BudgetExceeded {
+                // P1-2：工具预算超限用独立 reason（此前归为 Error，
+                // 用户/模型会误以为是协议错误）。
                 session
                     .append_event(&SessionEvent::RunCompleted {
-                        reason: CompletionReason::Error,
+                        reason: CompletionReason::MaxToolCalls,
                         usage: usage_total,
                     })
                     .and_then(|_| session.sync_data())
                     .map_err(|e| RunFailure::Session(e.to_string()))?;
-                break 'run_loop CompletionReason::Error;
+                break 'run_loop CompletionReason::MaxToolCalls;
             }
             continue;
         }
@@ -809,7 +867,12 @@ fn repeated_outcome(tool: &str, action_key: &str) -> ToolOutcome {
 tool: {tool}
 error: repeated_without_progress
 action: {action_key}
-note: 相同动作已连续出现且无进展；请先读取相关文件或改变方法。"
+note: 相同动作已连续出现且无进展；请先读取相关文件或改变方法。
+suggestions:
+  - 使用 list 或 search 定位/确认文件与目录
+  - 检查路径是否拼写错误
+  - 如果是测试失败，读取完整输出（@artifact 引用）
+  - 改用不同的实现路径或先制定/更新计划"
             ),
             effect: None,
             artifact: None,
@@ -1134,6 +1197,16 @@ mod tests {
         assert_eq!(range.start, EventId::from_u128(1));
         let range = compaction_covered_range(126);
         assert_eq!(range.end, EventId::from_u128(127));
+    }
+
+    /// P2：no-progress 拒绝输出必须带 suggestions（可恢复引导）。
+    #[test]
+    fn repeated_outcome_includes_suggestions() {
+        let outcome = repeated_outcome("read", "read src/main.rs");
+        let text = outcome.model_payload.output;
+        assert!(text.contains("repeated_without_progress"), "{text}");
+        assert!(text.contains("suggestions:"), "必须带下一步建议: {text}");
+        assert!(text.contains("list 或 search"), "{text}");
     }
 
     /// P0-11：backup 只允许在工具成功时删除；失败（含 commit_recovery_failed，

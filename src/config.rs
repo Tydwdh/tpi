@@ -25,6 +25,15 @@ pub struct ConfigFile {
     pub agent: AgentFile,
     pub shell: ShellFile,
     pub context: ContextFile,
+    pub ui: UiFile,
+}
+
+/// §16.3 [ui] 配置（P2：主题可选，默认 omp）。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct UiFile {
+    /// 主题名：omp / dark / light（未知值回退 omp）。
+    pub theme: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -99,6 +108,8 @@ pub struct Config {
     pub system_prompt_extra: Option<String>,
     /// 配置来源（`/settings` 展示用）。
     pub source: String,
+    /// §16.3 [ui] theme：omp / dark / light（P2：主题可选，默认 omp）。
+    pub ui_theme: String,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +189,15 @@ pub fn load(workspace_root: &Utf8PathBuf, cli_model: Option<&str>) -> Result<Con
     };
 
     let system_prompt_extra = read_system_md(&home.join("SYSTEM.md"));
+    // P1-12：workspace 项目规则（AGENTS.md）——叠加在个人全局规则之后，
+    // 注入时标明来源（§18.2：项目级约束进入 system prompt）。
+    let system_prompt_extra = match read_system_md(workspace_root.join("AGENTS.md").as_std_path()) {
+        Some(project_rules) => Some(match system_prompt_extra {
+            Some(global) => format!("{global}\n\n[project rule: AGENTS.md]\n{project_rules}"),
+            None => format!("[project rule: AGENTS.md]\n{project_rules}"),
+        }),
+        None => system_prompt_extra,
+    };
 
     Ok(Config {
         model: ModelConfig {
@@ -231,6 +251,7 @@ pub fn load(workspace_root: &Utf8PathBuf, cli_model: Option<&str>) -> Result<Con
         web_summary_model: "none".into(),
         system_prompt_extra,
         source,
+        ui_theme: merged.ui.theme.clone().unwrap_or_else(|| "omp".to_string()),
     })
 }
 
@@ -260,6 +281,9 @@ fn merge(home: ConfigFile, workspace: ConfigFile) -> ConfigFile {
                 .context
                 .safety_reserve_tokens
                 .or(home.context.safety_reserve_tokens),
+        },
+        ui: UiFile {
+            theme: workspace.ui.theme.or(home.ui.theme),
         },
     }
 }
@@ -315,6 +339,31 @@ pub fn read_api_key(config: &Config) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camino::Utf8PathBuf;
+
+    /// P1-12：workspace 的 AGENTS.md 项目规则必须注入 system_prompt_extra
+    ///（此前只读取 ~/.tpi/SYSTEM.md，项目级约束进不了 system prompt）。
+    #[test]
+    fn workspace_agents_md_is_injected() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // 最小模型配置（load 拒绝无模型）。
+        std::fs::write(
+            home.join("config.toml"),
+            "[model.primary]\nprovider = \"test\"\nname = \"m\"\nbase_url = \"https://example.invalid/v1\"\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "永远使用 LF 换行\n").unwrap();
+        unsafe {
+            std::env::set_var("TPI_HOME", &home);
+        }
+        let config = load(&workspace, None).expect("load");
+        let extra = config.system_prompt_extra.expect("AGENTS.md 必须注入");
+        assert!(extra.contains("[project rule: AGENTS.md]"), "{extra}");
+        assert!(extra.contains("LF 换行"), "{extra}");
+    }
 
     #[test]
     fn merge_is_field_level_not_block_level() {

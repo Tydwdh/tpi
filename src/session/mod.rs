@@ -58,7 +58,11 @@ pub struct CompactSummary {
 pub enum CompletionReason {
     Stop,
     MaxTurns,
+    /// 工具调用预算超限（P1-2：与 Error 区分，UI 可明确提示）。
+    MaxToolCalls,
     Cancelled,
+    /// 压缩与 prune 后上下文仍超出模型窗口（P1-4：不再发起必然失败的请求）。
+    ContextOverflow,
     /// 长度限制、内容过滤或协议错误。
     Error,
 }

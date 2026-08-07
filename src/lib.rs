@@ -7,6 +7,7 @@ pub mod agent;
 pub mod app;
 pub mod auth;
 pub mod config;
+pub mod doctor;
 pub mod context;
 pub mod ids;
 pub mod process;

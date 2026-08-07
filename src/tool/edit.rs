@@ -840,11 +840,14 @@ impl SnapshotStore {
     }
 
     /// 记录一个快照（§10.1：read 保存完整 snapshot）。
+    /// P1-7：同 path 更新时 move-to-back——活跃文件不能因为最早插入被淘汰
+    /// （此前 order 只在首次插入时 push_back，不是真 LRU）。
     pub fn record(&mut self, snapshot: FileSnapshot) {
         let path = snapshot.path.clone();
-        if !self.versions.contains_key(&path) {
-            self.order.push_back(path.clone());
+        if let Some(pos) = self.order.iter().position(|p| *p == path) {
+            self.order.remove(pos);
         }
+        self.order.push_back(path.clone());
         let entry = self.versions.entry(path.clone()).or_default();
         entry.retain(|old| old.revision != snapshot.revision);
         entry.push_front(snapshot);
@@ -1077,5 +1080,57 @@ mod tests {
         assert_eq!(window.total_lines, 5);
         assert!(window.truncated);
         assert_eq!(window.text, "2\n3");
+    }
+}
+
+#[cfg(test)]
+mod p1_lru_tests {
+    use super::*;
+
+    fn snapshot(path: &str, tag: &str) -> (FileSnapshot, String) {
+        let logical_lf_text: Arc<str> = Arc::from(format!("content-{tag}"));
+        let raw: Arc<[u8]> = Arc::from(logical_lf_text.as_bytes().to_vec());
+        let logical_len = logical_lf_text.len();
+        let revision = revision_of(&raw);
+        (
+            FileSnapshot {
+                path: Utf8PathBuf::from(path),
+                raw,
+                logical_lf_text,
+                revision: revision.clone(),
+                has_bom: false,
+                line_ending: LineEnding::Lf,
+                // 单调映射：0..=logical_len → 0..=logical_len（LF 文本无转换）。
+                logical_to_raw: (0..=logical_len).collect(),
+            },
+            revision,
+        )
+    }
+
+    /// P1-7：SnapshotStore 必须是真 LRU——同 path 更新刷新淘汰顺序。
+    /// 此前 order 只在首次插入时 push_back，活跃文件会被最早插入者挤掉。
+    #[test]
+    fn record_refreshes_lru_order_on_path_update() {
+        let mut store = SnapshotStore::new(2, 4);
+        let (a1, _rev_a1) = snapshot("a.txt", "r1");
+        let (b1, rev_b1) = snapshot("b.txt", "r1");
+        let (a2, rev_a2) = snapshot("a.txt", "r2");
+        let (c1, rev_c1) = snapshot("c.txt", "r1");
+        store.record(a1);
+        store.record(b1);
+        // a.txt 更新（最近使用）。
+        store.record(a2);
+        // 新 path c.txt：淘汰最久未使用——修复前淘汰 a（插入序），
+        // 修复后淘汰 b（LRU：a 最近被刷新）。
+        store.record(c1);
+        assert!(
+            store.get(&Utf8PathBuf::from("a.txt"), &rev_a2).is_some(),
+            "最近使用的 a.txt 必须保留（真 LRU）"
+        );
+        assert!(
+            store.get(&Utf8PathBuf::from("b.txt"), &rev_b1).is_none(),
+            "最久未使用的 b.txt 应被淘汰"
+        );
+        assert!(store.get(&Utf8PathBuf::from("c.txt"), &rev_c1).is_some());
     }
 }

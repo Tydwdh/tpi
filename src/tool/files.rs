@@ -39,6 +39,11 @@ fn default_line_count() -> usize {
 pub struct WriteArgs {
     pub path: String,
     pub content: String,
+    /// P2：revision-bound 重写——目标已存在时必须提供当前 revision；
+    /// 与当前一致则整体重写（不再强制走 edit 提供完整 old_text），
+    /// 不一致则拒绝（stale_revision）。新建文件时忽略。
+    #[serde(default)]
+    pub revision: Option<String>,
 }
 
 pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
@@ -281,8 +286,57 @@ pub fn write(
             },
         );
     };
-    match edit::write_new_file(&path, args.content.as_bytes(), plan) {
-        Ok(revision) => {
+    // P2：revision-bound 重写——已存在文件必须带匹配的当前 revision。
+    // （新建路径直接走 write_new_file。）
+    if path.as_std_path().exists() {
+        let Some(expected) = args.revision.as_deref() else {
+            return ToolOutcome::failed(
+                "write",
+                ModelPayload {
+                    status: ToolStatus::Failed,
+                    program: None,
+                    exit_code: None,
+                    duration_ms: 0,
+                    output: format!(
+                        "status: failed\ntool: write\nerror: already_exists\n\n{} 已存在；整体重写必须提供当前 revision（先 read 获取，或改用 edit）。",
+                        display_path(&ctx.workspace_root, &path),
+                    ),
+                    effect: None,
+                    artifact: None,
+                },
+            );
+        };
+        let current = match std::fs::read(path.as_std_path()) {
+            Ok(raw) => crate::tool::edit::revision_of(&raw),
+            Err(e) => {
+                return failed_outcome(
+                    "write",
+                    crate::tool::edit::EditError::Io {
+                        path: path.clone(),
+                        message: format!("read for revision: {e}"),
+                    },
+                );
+            }
+        };
+        if current != expected {
+            return failed_outcome(
+                "write",
+                crate::tool::edit::EditError::StaleRevision {
+                    path: path.clone(),
+                    current,
+                    expected: expected.to_string(),
+                },
+            );
+        }
+        // revision 匹配：按重写流程提交（保留目标文件，带 backup 恢复语义）。
+        return rewrite_with_revision(
+            &path,
+            args.content.as_bytes(),
+            plan,
+            &display_path(&ctx.workspace_root, &path),
+        );
+    }
+    match edit::write_new_file(&path, args.content.as_bytes(), plan) {        Ok(revision) => {
             let output = format!(
                 "status: succeeded\ntool: write\npath: {}\nrevision: {}",
                 display_path(&ctx.workspace_root, &path),
@@ -300,7 +354,63 @@ pub fn write(
     }
 }
 
+/// P2：revision 匹配的整体重写——复用 edit 的提交/恢复语义
+/// （ReplaceFileW + backup + 校验；§10.7），而不是裸写覆盖。
+fn rewrite_with_revision(
+    path: &Utf8PathBuf,
+    content: &[u8],
+    plan: &crate::tool::edit::CommitPlan,
+    display_path: &str,
+) -> ToolOutcome {
+    let previous_raw = match std::fs::read(path.as_std_path()) {
+        Ok(raw) => raw,
+        Err(e) => {
+            return failed_outcome(
+                "write",
+                crate::tool::edit::EditError::Io {
+                    path: path.clone(),
+                    message: format!("read for rewrite: {e}"),
+                },
+            );
+        }
+    };
+    let result = crate::tool::edit::EditResult {
+        previous_revision: crate::tool::edit::revision_of(&previous_raw),
+        current_revision: crate::tool::edit::revision_of(content),
+        applied: 1,
+        previous_raw,
+        new_raw: content.to_vec(),
+    };
+    match crate::tool::edit::commit_edit(&result, path, plan) {
+        Ok(()) => {
+            let diff = crate::tool::edit::unified_diff(&result);
+            let diff_summary = if diff.is_empty() {
+                String::new()
+            } else {
+                format!("\ndiff:\n{diff}")
+            };
+            let output = format!(
+                "status: succeeded\ntool: write\npath: {display_path}\nrewritten: true\nprevious_revision: {}\ncurrent_revision: {}{diff_summary}",
+                result.previous_revision,
+                result.current_revision,
+            );
+            ToolOutcome::succeeded("write", output)
+        }
+        Err(error) => failed_outcome("write", error),
+    }
+}
+
 fn failed_outcome(tool: &str, error: EditError) -> ToolOutcome {
+    // P2：给模型明确的下一步动作，而不是只拒绝（“硬拒绝”→“可恢复引导”）。
+    let hint = match &error {
+        EditError::StaleRevision { current, .. } => format!(
+            "\nhint: 文件已变化（current_revision {current}）。请重新 read 该文件获取最新 revision，再基于它提交 edit。"
+        ),
+        EditError::NoMatch { .. } => "\nhint: old_text 在文件中不存在；请先 read 确认实际内容，再调整 old_text。".into(),
+        EditError::MultipleMatches { .. } => "\nhint: old_text 出现多次；请包含更多上下文使匹配唯一。".into(),
+        EditError::Overlap { .. } => "\nhint: 多个 replacement 重叠；请拆分为独立批次。".into(),
+        _ => String::new(),
+    };
     ToolOutcome::failed(
         tool,
         ModelPayload {
@@ -309,7 +419,7 @@ fn failed_outcome(tool: &str, error: EditError) -> ToolOutcome {
             exit_code: None,
             duration_ms: 0,
             output: format!(
-                "status: failed\ntool: {tool}\nerror: {}\n\n{error}",
+                "status: failed\ntool: {tool}\nerror: {}\n\n{error}{hint}",
                 error.code()
             ),
             effect: None,
