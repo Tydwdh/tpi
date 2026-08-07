@@ -10,6 +10,7 @@ use tpi::tui::effect::UiEffect;
 use tpi::tui::event::UiEvent;
 use tpi::tui::model::{LineKind, StatusLine, ViewModel};
 use tpi::tui::reducer;
+use tpi::tui::scroll::ScrollMode;
 use tpi::tui::state::UiState;
 
 fn key(code: KeyCode) -> UiEvent {
@@ -288,4 +289,87 @@ fn up_down_moves_within_multiline_then_falls_back_to_history() {
     // ↓ 从历史向下：历史语义（到底后清空回空输入）。
     reducer::update(&mut s, key(KeyCode::Down));
     assert_eq!(s.editor.text(), "", "历史向下到底 = 空输入");
+}
+
+#[test]
+fn ctrl_f_search_finds_and_jumps_without_moving_on_close() {
+    let mut s = state();
+    s.view.push_line(LineKind::User, "修复 stale_revision 问题");
+    s.view
+        .push_line(LineKind::Assistant, "好的，这是 stale_revision 的修复");
+    s.view.push_line(LineKind::System, "无关内容");
+    // Ctrl+F 打开搜索。
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+    );
+    assert!(s.view.search.is_some(), "Ctrl+F 打开搜索");
+    // 输入关键词。
+    for ch in "stale".chars() {
+        reducer::update(
+            &mut s,
+            UiEvent::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+        );
+    }
+    let search = s.view.search.as_ref().unwrap();
+    assert_eq!(search.hits.len(), 2, "两条消息命中");
+    // 搜索命中 → Locked 锚定（§14：命中后进入 Locked）。
+    assert!(
+        s.view.scroll_mode != ScrollMode::Follow,
+        "命中后必须 Locked"
+    );
+    // Enter 下一个命中。
+    let locked_before = s.view.scroll_mode;
+    reducer::update(&mut s, key(KeyCode::Enter));
+    let ScrollMode::Locked(after) = s.view.scroll_mode else {
+        panic!();
+    };
+    let ScrollMode::Locked(before) = locked_before else {
+        panic!();
+    };
+    assert_ne!(after.entry_id, before.entry_id, "Enter 跳到下一个命中");
+    // Esc 关闭搜索：不强制跳回底部（保持 Locked）。
+    reducer::update(&mut s, key(KeyCode::Esc));
+    assert!(s.view.search.is_none());
+    assert!(
+        s.view.scroll_mode != ScrollMode::Follow,
+        "关闭搜索不得跳回底部（§14）"
+    );
+}
+
+#[test]
+fn alt_up_down_jumps_between_user_turns() {
+    let mut s = state();
+    s.view.push_line(LineKind::User, "第一个问题");
+    s.view.push_line(LineKind::Assistant, "回答一");
+    s.view.push_line(LineKind::User, "第二个问题");
+    s.view.push_line(LineKind::Assistant, "回答二");
+    // Alt+Up：从尾部（layout_top None → 末尾 user）跳到上一个 User。
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+    );
+    let ScrollMode::Locked(anchor) = s.view.scroll_mode else {
+        panic!("跳转后必须 Locked");
+    };
+    // 第二个 User 是第 3 个 entry（id 3）。
+    assert_eq!(anchor.entry_id.0, 3, "Alt+Up 应跳到最近的 User entry");
+    // 再 Alt+Up → 第一个 User。
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+    );
+    let ScrollMode::Locked(anchor) = s.view.scroll_mode else {
+        panic!();
+    };
+    assert_eq!(anchor.entry_id.0, 1);
+    // Alt+Down → 回到第二个 User。
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)),
+    );
+    let ScrollMode::Locked(anchor) = s.view.scroll_mode else {
+        panic!();
+    };
+    assert_eq!(anchor.entry_id.0, 3);
 }

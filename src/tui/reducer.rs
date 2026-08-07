@@ -21,9 +21,61 @@ fn refresh_menus(state: &mut UiState) {
     }
 }
 
+/// 搜索模式的按键路由（§14）：字符/Backspace 更新 query；Enter/F3 下一个；
+/// Shift+Enter 上一个；Esc 关闭（不强制跳回底部）。
+fn handle_search_key(
+    state: &mut UiState,
+    key: KeyEvent,
+    effects: &mut Vec<UiEffect>,
+) -> Vec<UiEffect> {
+    match key.code {
+        KeyCode::Char(c) => {
+            if c == 'f' && key.modifiers.contains(KeyModifiers::CONTROL) {
+                // Ctrl+F 已打开：无操作。
+            } else {
+                let mut query = state
+                    .view
+                    .search
+                    .as_ref()
+                    .map(|s| s.query.clone())
+                    .unwrap_or_default();
+                query.push(c);
+                state.view.update_search_query(&query);
+            }
+        }
+        KeyCode::Backspace => {
+            let mut query = state
+                .view
+                .search
+                .as_ref()
+                .map(|s| s.query.clone())
+                .unwrap_or_default();
+            query.pop();
+            state.view.update_search_query(&query);
+        }
+        KeyCode::Enter => {
+            let forward = !key.modifiers.contains(KeyModifiers::SHIFT);
+            state.view.search_jump(forward);
+        }
+        KeyCode::F(3) => {
+            state.view.search_jump(true);
+        }
+        KeyCode::Esc => {
+            state.view.search = None;
+        }
+        _ => {}
+    }
+    std::mem::take(effects)
+}
+
 /// 处理单个按键事件（空闲与运行中共用；行为与迁移前的 handle_key 一致）。
+/// 键盘路由优先级（§11）：Overlay > Modal > Search > Menu > Composer。
 fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
     let mut effects = Vec::new();
+    // §14：搜索打开时按键路由进搜索（输入/跳转/关闭）。
+    if state.view.overlay.is_none() && state.view.modal.is_none() && state.view.search.is_some() {
+        return handle_search_key(state, key, &mut effects);
+    }
     match key.code {
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
             state.editor.insert_char('\n');
@@ -122,6 +174,13 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.editor.end();
             }
         }
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+            // §13：Alt+Up 跳到上一条 User entry（基于 EntryId 查找）。
+            state.view.jump_to_user_turn(false);
+        }
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+            state.view.jump_to_user_turn(true);
+        }
         KeyCode::Up => {
             if state.view.menu.is_some() {
                 if let Some(menu) = state.view.menu.as_mut()
@@ -200,6 +259,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 // §23：Ctrl+J 换行（终端 LF 常映射为 Enter，此处兜底）。
                 state.editor.insert_char('\n');
                 state.sync_input();
+                return effects;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'f' {
+                // §14：Ctrl+F 打开转录搜索。
+                state.view.open_search();
                 return effects;
             }
             if key.modifiers.contains(KeyModifiers::ALT) && c == 't' {

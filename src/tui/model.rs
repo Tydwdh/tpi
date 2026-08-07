@@ -86,6 +86,54 @@ pub enum ToolCardState {
     },
 }
 
+/// 转录搜索（TUI v2 §14）：Ctrl+F 打开；命中 → Locked 锚定 + 循环跳转。
+/// 搜索范围：User/Assistant/Reasoning/System 消息文本、工具 target/name/tail。
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    pub query: String,
+    /// 命中的 entry（按出现顺序）。
+    pub hits: Vec<EntryId>,
+    /// 当前命中位置（hits 下标）。
+    pub index: usize,
+}
+
+impl SearchState {
+    pub fn open() -> Self {
+        Self::default()
+    }
+
+    /// 重新计算命中（大小写不敏感）；返回是否无命中。
+    pub fn recompute(&mut self, transcript: &[Entry]) {
+        let query = self.query.to_lowercase();
+        self.hits.clear();
+        self.index = 0;
+        if query.is_empty() {
+            return;
+        }
+        for entry in transcript {
+            let hit = match entry {
+                Entry::Message { line, .. } => line.text.to_lowercase().contains(&query),
+                Entry::Tool { card, .. } => {
+                    card.name.to_lowercase().contains(&query)
+                        || card
+                            .target
+                            .as_deref()
+                            .map(|t| t.to_lowercase().contains(&query))
+                            .unwrap_or(false)
+                        || card
+                            .tail
+                            .as_deref()
+                            .map(|t| t.to_lowercase().contains(&query))
+                            .unwrap_or(false)
+                }
+            };
+            if hit {
+                self.hits.push(entry.id());
+            }
+        }
+    }
+}
+
 /// 操作型 UI Modal（TUI v2 §42/§61）：/help /settings /doctor /session
 /// /sessions /diff 等输出进 Modal，不污染 transcript。
 /// 与 Overlay 的区别：Overlay 是“内容详情”，Modal 是“操作面板”。
@@ -295,6 +343,8 @@ pub struct ViewModel {
     pub overlay: Option<OverlayState>,
     /// 操作型 Modal（None = 关闭；§42：/help /settings /doctor 等不污染 transcript）。
     pub modal: Option<ModalState>,
+    /// 转录搜索（None = 关闭；§14 Ctrl+F）。
+    pub search: Option<SearchState>,
     pub next_version: u64,
     pub next_entry_id: u64,
 }
@@ -326,6 +376,7 @@ impl Default for ViewModel {
             file_index: Vec::new(),
             overlay: None,
             modal: None,
+            search: None,
             next_version: 1,
             next_entry_id: 1,
         }
@@ -470,6 +521,84 @@ impl ViewModel {
         self.scroll_mode = ScrollMode::Follow;
         self.transcript_scroll = 0;
         self.pending_below = 0;
+    }
+
+    /// 打开搜索（§14）；Esc 关闭时不强制跳回底部。
+    pub fn open_search(&mut self) {
+        self.search = Some(SearchState::open());
+    }
+
+    /// 更新搜索词并重新计算命中；命中时锁定到第一个命中。
+    pub fn update_search_query(&mut self, query: &str) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        search.query = query.to_string();
+        search.recompute(&self.transcript);
+        if let Some(first) = search.hits.first().copied() {
+            self.lock_to(first, 0);
+        }
+    }
+
+    /// 跳到下一个/上一个命中（循环；§14 Enter/F3 与 Shift+Enter）。
+    pub fn search_jump(&mut self, forward: bool) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        if search.hits.is_empty() {
+            return;
+        }
+        if forward {
+            search.index = (search.index + 1) % search.hits.len();
+        } else {
+            search.index = (search.index + search.hits.len() - 1) % search.hits.len();
+        }
+        let id = search.hits[search.index];
+        self.lock_to(id, 0);
+    }
+
+    /// 跳到上一个/下一个 User turn（§13：基于 EntryId 查找，不是视觉行）。
+    /// 返回是否找到（无 User 消息时 false）。
+    pub fn jump_to_user_turn(&mut self, forward: bool) -> bool {
+        let user_ids: Vec<EntryId> = self
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Message { id, line } if line.kind == LineKind::User => Some(*id),
+                _ => None,
+            })
+            .collect();
+        if user_ids.is_empty() {
+            return false;
+        }
+        // 基准：Locked 锚点 entry > 视口顶部 entry > 末尾（不依赖布局刷新）。
+        let base = match self.scroll_mode {
+            ScrollMode::Locked(anchor) => Some(anchor.entry_id),
+            ScrollMode::Follow => self.layout_top.map(|(e, _)| e),
+        }
+        .or_else(|| self.transcript.last().map(Entry::id))
+        .unwrap_or(EntryId(0));
+        let target = if forward {
+            // 第一个位于基准之后的 User；无 → 循环到第一个。
+            user_ids
+                .iter()
+                .find(|id| **id > base)
+                .copied()
+                .or_else(|| user_ids.first().copied())
+        } else {
+            // 最后一个位于基准之前的 User；无 → 循环到最后一个。
+            user_ids
+                .iter()
+                .rev()
+                .find(|id| **id < base)
+                .copied()
+                .or_else(|| user_ids.last().copied())
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        self.lock_to(target, 0);
+        true
     }
 
     /// 进入 Locked 并锚定到指定行（§3.2：滚动/搜索跳转后新输出不动视口）。

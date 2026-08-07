@@ -346,6 +346,32 @@ fn render_frame(
         draw_modal(frame, Rect::new(x, y, w, h), view, theme);
     }
 
+    // 搜索框（§14：Ctrl+F；悬浮在转录区顶部）。
+    if let Some(search) = &view.search {
+        let w = area.width.clamp(24, 56);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = trans_area.y;
+        let hit_info = if search.query.is_empty() {
+            String::from("输入关键词搜索 transcript")
+        } else if search.hits.is_empty() {
+            String::from("无命中")
+        } else {
+            format!(
+                "{}/{} · Enter/F3 下一个 · Shift+Enter 上一个",
+                search.index + 1,
+                search.hits.len()
+            )
+        };
+        let line = Line::from(vec![
+            Span::styled("🔍 ", Style::default().fg(theme.info)),
+            Span::styled(search.query.clone(), Style::default().fg(theme.text)),
+            Span::styled("  ", Style::default()),
+            Span::styled(hit_info, Style::default().fg(theme.muted)),
+        ]);
+        frame.render_widget(ratatui::widgets::Clear, Rect::new(x, y, w, 1));
+        frame.render_widget(Paragraph::new(line), Rect::new(x, y, w, 1));
+    }
+
     // 详情 Overlay（整改 B：覆盖显示，不重写 scrollback；Esc 关闭）。
     if view.overlay.is_some() {
         let w = area.width.min(88).saturating_sub(4).max(40);
