@@ -68,15 +68,25 @@ impl std::fmt::Display for BudgetKind {
 /// ephemeral 运行时事件（§4.3：不逐 token 写盘）。
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
+    /// 每次实际 provider 请求前发送，供 TUI 更新运行状态。
+    TurnStarted { turn: u32 },
     AssistantDelta {
         request_id: RequestId,
         kind: DeltaKind,
         text: String,
     },
-    ToolProgress {
+    /// 工具真正启动前发送（TUI 创建运行中的工具卡片）。
+    ToolStarted { call_id: ToolCallId, name: String },
+    /// 工具终态（TUI 更新卡片状态/耗时；失败时附带关键输出 tail）。
+    ToolCompleted {
         call_id: ToolCallId,
-        chunk: String,
+        name: String,
+        status: ToolStatus,
+        duration_ms: u64,
+        tail: String,
     },
+    /// `update_plan` 提交后的独立 UI 状态；不作为聊天流水的一部分。
+    PlanUpdated { plan: crate::tool::plan::Plan },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +177,7 @@ pub async fn run<P: Provider>(
             break CompletionReason::MaxTurns;
         }
         turn += 1;
+        let _ = ui.send(RuntimeEvent::TurnStarted { turn }).await;
 
         // §15.4：compaction 检查（只在下一次请求前；完整 boundary 之后）。
         if let Some(context_window) = config.model.context_window {
@@ -213,48 +224,33 @@ pub async fn run<P: Provider>(
         };
         let (event_tx, mut event_rx) = mpsc::channel(crate::provider::EVENT_CHANNEL_CAPACITY);
 
-        let response = provider
-            .stream(request, event_tx, cancel.clone())
-            .await
-            .map_err(|e| {
-                session
-                    .append_event(&SessionEvent::RunCompleted {
-                        reason: CompletionReason::Error,
-                        usage: usage_total,
-                    })
-                    .ok();
-                RunFailure::Provider(e.to_string())
-            })?;
-
-        // 消费剩余流事件并汇总文本。
+        // 必须在 provider 请求进行时消费 channel：等请求结束后再 drain 不但不是真正
+        // streaming，达到 channel 容量时还会让 provider 与 agent 相互等待。
+        let stream = provider.stream(request, event_tx, cancel.clone());
+        tokio::pin!(stream);
         let mut content = String::new();
-        while let Some(event) = event_rx.recv().await {
-            match event {
-                ProviderEvent::TextDelta(text) => {
-                    content.push_str(&text);
-                    let _ = ui
-                        .send(RuntimeEvent::AssistantDelta {
-                            request_id,
-                            kind: DeltaKind::Text,
-                            text,
-                        })
-                        .await;
+        let response = loop {
+            tokio::select! {
+                Some(event) = event_rx.recv() => {
+                    forward_provider_event(event, request_id, &mut content, &ui).await;
                 }
-                ProviderEvent::ReasoningDelta(text) => {
-                    // §15.5：reasoning 只在 UI 展示，不进入 durable facts。
-                    let _ = ui
-                        .send(RuntimeEvent::AssistantDelta {
-                            request_id,
-                            kind: DeltaKind::Reasoning,
-                            text,
-                        })
-                        .await;
+                result = &mut stream => {
+                    let response = result.map_err(|e| {
+                        session.append_event(&SessionEvent::RunCompleted {
+                            reason: CompletionReason::Error,
+                            usage: usage_total,
+                        }).ok();
+                        RunFailure::Provider(e.to_string())
+                    })?;
+                    // provider 返回后仍可能有已经入队的末尾 delta；这些发送都已完成，
+                    // 因而非阻塞 drain 即可，也不会依赖 future 内部 Sender 的析构时机。
+                    while let Ok(event) = event_rx.try_recv() {
+                        forward_provider_event(event, request_id, &mut content, &ui).await;
+                    }
+                    break response;
                 }
-                ProviderEvent::ToolCallStarted { .. }
-                | ProviderEvent::ToolArgumentsDelta { .. } => {}
-                ProviderEvent::Usage(_) => {}
             }
-        }
+        };
         usage_total = response.usage;
 
         // 5. 原子提交 assistant message（durable boundary，§14.2）。
@@ -326,6 +322,40 @@ pub async fn run<P: Provider>(
         messages,
         assistant_text,
     })
+}
+
+/// 把 provider 的单个增量同时投影到 session 待提交内容和 TUI。
+async fn forward_provider_event(
+    event: ProviderEvent,
+    request_id: RequestId,
+    content: &mut String,
+    ui: &mpsc::Sender<RuntimeEvent>,
+) {
+    match event {
+        ProviderEvent::TextDelta(text) => {
+            content.push_str(&text);
+            let _ = ui
+                .send(RuntimeEvent::AssistantDelta {
+                    request_id,
+                    kind: DeltaKind::Text,
+                    text,
+                })
+                .await;
+        }
+        ProviderEvent::ReasoningDelta(text) => {
+            // §15.5：reasoning 只在 UI 展示，不进入 durable facts。
+            let _ = ui
+                .send(RuntimeEvent::AssistantDelta {
+                    request_id,
+                    kind: DeltaKind::Reasoning,
+                    text,
+                })
+                .await;
+        }
+        ProviderEvent::ToolCallStarted { .. }
+        | ProviderEvent::ToolArgumentsDelta { .. }
+        | ProviderEvent::Usage(_) => {}
+    }
 }
 
 /// batch 执行结果（§12.4：预算超限时明确结束）。
@@ -476,6 +506,16 @@ error: invalid_arguments
             );
             let blocked = progress.should_block(&action_key, &state_stamp);
 
+            // 工具真正启动前通知 TUI；长命令不再等执行结束才出现反馈。
+            if tool != BuiltinTool::UpdatePlan {
+                let _ = ui
+                    .send(RuntimeEvent::ToolStarted {
+                        call_id: calls[source_index].call_id,
+                        name: calls[source_index].name.clone(),
+                    })
+                    .await;
+            }
+
             let plan = write_tool_plan(tool, &calls[source_index], &config.workspace_root);
             futures.push(async move {
                 if blocked {
@@ -531,9 +571,10 @@ error: invalid_arguments
                 && let Some(plan) = current_plan.lock().unwrap().clone()
             {
                 session
-                    .append_event(&SessionEvent::PlanReplaced { plan })
+                    .append_event(&SessionEvent::PlanReplaced { plan: plan.clone() })
                     .and_then(|_| session.sync_data())
                     .map_err(|e| RunFailure::Session(e.to_string()))?;
+                let _ = ui.send(RuntimeEvent::PlanUpdated { plan }).await;
             }
             // §12.3：edit/write 成功 → workspace epoch 增加（允许基于新状态重试）。
             if outcome.status == ToolStatus::Succeeded
@@ -544,12 +585,17 @@ error: invalid_arguments
             session
                 .complete_tool(calls[index].call_id, &outcome)
                 .map_err(|e| RunFailure::Session(e.to_string()))?;
-            let _ = ui
-                .send(RuntimeEvent::ToolProgress {
-                    call_id: calls[index].call_id,
-                    chunk: format!("← {} {}", calls[index].name, outcome.status_name()),
-                })
-                .await;
+            if calls[index].name != "update_plan" {
+                let _ = ui
+                    .send(RuntimeEvent::ToolCompleted {
+                        call_id: calls[index].call_id,
+                        name: calls[index].name.clone(),
+                        status: outcome.status,
+                        duration_ms: outcome.model_payload.duration_ms,
+                        tail: outcome.model_payload.output.clone(),
+                    })
+                    .await;
+            }
             results.insert(index, outcome);
         }
     }

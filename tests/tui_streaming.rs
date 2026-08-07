@@ -1,14 +1,50 @@
-//! M5 TUI 稳定性契约（§20.3、§21 M5）。
+//! M5 TUI 稳定性契约（§20.3、§21 M5）+ M6+ 渲染回归。
 //!
 //! - 初始化后 streaming path 不包含 CSI 全屏清除序列；
 //! - 一个 frame 至多一次 stdout flush；
 //! - 100-500 deltas/s 时按 16 ms 合并，而不是 delta 数量等于 draw 次数；
-//! - 高速流式输出期间不发全屏 clear，动画仍按目标帧率更新。
+//! - 高速流式输出期间不发全屏 clear，动画仍按目标帧率更新；
+//! - inline scrollback 窗口语义（§16.1）：活动区只显示尾部，旧行提交到 scrollback；
+//! - 工具卡片（§16.2）、思考折叠、命令菜单、Markdown 渲染。
 
 use std::time::Duration;
 
+use ratatui::buffer::Buffer;
+use ratatui::style::Modifier;
+
+use tpi::tool::outcome::ToolStatus;
 use tpi::tui::model::{LineKind, ViewModel};
 use tpi::tui::{FRAME_INTERVAL, draw_captured_bytes, draw_to_test_backend};
+
+/// 把 TestBackend buffer 拼成文本：跳过空 cell，并跳过宽字符的延续 cell
+/// （ratatui 0.30 中延续 cell 与空白 cell 都是单个空格，需按前一字符宽度识别）。
+fn buffer_text(buffer: &Buffer) -> String {
+    let width = buffer.area().width as usize;
+    let content = buffer.content();
+    let mut out = String::new();
+    for (i, cell) in content.iter().enumerate() {
+        let col = i % width;
+        let symbol = cell.symbol();
+        if symbol.is_empty() {
+            continue;
+        }
+        if symbol == " " && col > 0 {
+            // 前一 cell 是宽字符（display width > 1）→ 当前是其延续 cell，跳过。
+            let prev = content[i - 1]
+                .symbol()
+                .chars()
+                .next()
+                .map(unicode_width::UnicodeWidthChar::width)
+                .unwrap_or(None)
+                .unwrap_or(0);
+            if prev > 1 {
+                continue;
+            }
+        }
+        out.push_str(symbol);
+    }
+    out
+}
 
 /// §20.3：初始化后 streaming path 不包含 CSI 全屏清除序列。
 #[test]
@@ -40,9 +76,14 @@ fn frame_flushes_stdout_once() {
     }
     let bytes = draw_captured_bytes(&view);
     assert!(!bytes.is_empty());
-    // 一次 draw 的输出以单个结束序列收尾（Ratatui 渲染完整性）。
+    // 一次 draw 是完整的 CSI 帧：inline viewport 先输出换行占位（打开 viewport），
+    // 随后是 CSI 终端定位序列；不得是裸文本或全屏清除。
     let text = String::from_utf8_lossy(&bytes);
-    assert!(text.starts_with("\x1b["), "帧以 CSI 序列开始（终端定位）");
+    assert!(
+        text.contains("\x1b["),
+        "帧包含 CSI 序列（终端定位）: {:?}",
+        &text[..text.len().min(64)]
+    );
 }
 
 /// §20.3：16 ms 帧合并——高频 delta 不逐条重绘。
@@ -88,7 +129,8 @@ fn streaming_never_clears_full_screen() {
     }
 }
 
-/// §20.3：中文与长 tool output 渲染不崩溃，内容完整。
+/// §20.3：中文与长 tool output 渲染不崩溃；窗口语义下尾部内容可见
+/// （§16.1：长输出提交到 scrollback，最后一条 assistant 消息保留在活动区）。
 #[test]
 fn chinese_and_long_tool_output_render_completely() {
     let mut view = ViewModel {
@@ -101,23 +143,17 @@ fn chinese_and_long_tool_output_render_completely() {
         LineKind::Tool,
         format!("→ run cargo test\n{}", "x".repeat(2000)),
     );
-    view.push_line(LineKind::Assistant, "已修复。");
+    view.push_line(LineKind::Assistant, "已修复这个中文 bug。");
     let buffer = draw_to_test_backend(&view, 80, 20);
-    let rendered: String = buffer
-        .content()
-        .iter()
-        .filter(|cell| !cell.symbol().is_empty())
-        .map(|cell| cell.symbol().to_string())
-        .collect();
+    let rendered = buffer_text(&buffer);
     // 双宽字符在 buffer 中占两个 cell（TestBackend 语义），逐字检查渲染完整性。
     assert!(
-        rendered.contains('你') && rendered.contains('好'),
-        "中文必须正确渲染: {rendered:?}"
+        rendered.contains('修') && rendered.contains('复'),
+        "长输出后末尾消息必须渲染（窗口语义）: {rendered:?}"
     );
-    // 长输出不崩溃且尾部内容可见（有界转录区域）。
     assert!(
-        rendered.contains('已') && rendered.contains('修') && rendered.contains('复'),
-        "末尾消息必须渲染: {rendered:?}"
+        rendered.contains('中') && rendered.contains('文'),
+        "中文必须正确渲染: {rendered:?}"
     );
 }
 
@@ -136,4 +172,151 @@ fn editor_supports_paste_and_unicode() {
     editor.home();
     editor.insert_str("/settings ");
     assert_eq!(editor.text(), "/settings 你好世界");
+}
+
+/// 输入历史：↑/↓ 浏览已提交消息。
+#[test]
+fn editor_history_navigates_submitted_prompts() {
+    let mut editor = tpi::tui::editor::Editor::new();
+    editor.insert_str("第一条");
+    editor.submit();
+    editor.insert_str("第二条");
+    editor.submit();
+    editor.history_up();
+    assert_eq!(editor.text(), "第二条");
+    editor.history_up();
+    assert_eq!(editor.text(), "第一条");
+    editor.history_down();
+    assert_eq!(editor.text(), "第二条");
+    editor.history_down();
+    assert!(editor.text().is_empty());
+}
+
+/// §16.2：用户消息带 `you` 标签与细紫红左 rail。
+#[test]
+fn user_message_has_you_label() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::User, "你好");
+    let buffer = draw_to_test_backend(&view, 80, 12);
+    let rendered = buffer_text(&buffer);
+    assert!(
+        rendered.contains("you"),
+        "用户消息必须带 you 标签: {rendered:?}"
+    );
+}
+
+/// §16.2：工具卡片——运行中 spinner，成功后 ✓ + 耗时。
+#[test]
+fn tool_card_renders_running_and_done_states() {
+    let mut view = ViewModel::default();
+    view.begin_tool("c1", "run cargo test");
+    view.anim_tick = 0;
+    let buffer = draw_to_test_backend(&view, 80, 12);
+    let rendered = buffer_text(&buffer);
+    assert!(
+        rendered.contains('⠋') && rendered.contains("run cargo test"),
+        "运行中卡片显示 spinner 与工具名: {rendered:?}"
+    );
+
+    view.finish_tool("c1", "run cargo test", ToolStatus::Succeeded, 2345, "");
+    let buffer = draw_to_test_backend(&view, 80, 12);
+    let rendered = buffer_text(&buffer);
+    assert!(
+        rendered.contains('✓') && rendered.contains("2.3s"),
+        "成功后卡片显示 ✓ 与耗时: {rendered:?}"
+    );
+}
+
+/// §16.2：失败工具卡片保留红色关键 tail。
+#[test]
+fn failed_tool_card_shows_status_and_tail() {
+    let mut view = ViewModel::default();
+    view.begin_tool("c1", "cargo test");
+    view.finish_tool(
+        "c1",
+        "cargo test",
+        ToolStatus::Failed,
+        500,
+        "exit_code: 1\n失败输出",
+    );
+    let buffer = draw_to_test_backend(&view, 80, 12);
+    let rendered = buffer_text(&buffer);
+    assert!(rendered.contains('✗'), "失败卡片显示 ✗: {rendered:?}");
+    assert!(
+        rendered.contains("失败输出"),
+        "失败 tail 保留: {rendered:?}"
+    );
+}
+
+/// §16.2：thinking 可折叠——Alt+T 后只显示折叠提示行。
+#[test]
+fn reasoning_can_be_folded() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::Reasoning, "内部推理过程");
+    let buffer = draw_to_test_backend(&view, 80, 12);
+    assert!(buffer_text(&buffer).contains("内部推理过程"));
+
+    view.reasoning_visible = false;
+    let buffer = draw_to_test_backend(&view, 80, 12);
+    let rendered = buffer_text(&buffer);
+    assert!(
+        rendered.contains("已折叠"),
+        "折叠后显示提示行: {rendered:?}"
+    );
+    assert!(!rendered.contains("内部推理过程"));
+}
+
+/// Markdown 渲染：assistant 消息中加粗/行内代码进入 buffer 且带样式。
+#[test]
+fn assistant_markdown_bold_and_code_are_styled() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::Assistant, "**加粗** 和 `code`");
+    let buffer = draw_to_test_backend(&view, 80, 12);
+    let rendered = buffer_text(&buffer);
+    assert!(rendered.contains("加粗") && rendered.contains("code"));
+    // 加粗 cell 必须带 BOLD 修饰。
+    let bold = buffer
+        .content()
+        .iter()
+        .any(|cell| cell.symbol() == "加" && cell.style().add_modifier.contains(Modifier::BOLD));
+    assert!(bold, "加粗文本必须带 BOLD 修饰");
+}
+
+/// 命令补全菜单：输入 `/` 前缀时弹出匹配命令与中文说明。
+#[test]
+fn command_menu_pops_up_with_matches() {
+    let mut view = ViewModel::default();
+    view.input = "/set".into();
+    view.refresh_command_menu();
+    let buffer = draw_to_test_backend(&view, 80, 14);
+    let rendered = buffer_text(&buffer);
+    assert!(
+        rendered.contains("/settings") && rendered.contains("查看生效配置"),
+        "菜单显示匹配命令与说明: {rendered:?}"
+    );
+}
+
+/// §16.2：计划条不出现在 transcript 流水，而是独立区域。
+#[test]
+fn plan_renders_as_compact_strip() {
+    use tpi::tool::plan::{Plan, PlanItem, PlanStatus};
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::User, "请实现功能");
+    view.plan = Some(Plan {
+        explanation: None,
+        items: vec![
+            PlanItem {
+                text: "第一步".into(),
+                status: PlanStatus::InProgress,
+            },
+            PlanItem {
+                text: "第二步".into(),
+                status: PlanStatus::Pending,
+            },
+        ],
+    });
+    let buffer = draw_to_test_backend(&view, 80, 14);
+    let rendered = buffer_text(&buffer);
+    assert!(rendered.contains("计划"), "计划条必须渲染: {rendered:?}");
+    assert!(rendered.contains("第一步"));
 }

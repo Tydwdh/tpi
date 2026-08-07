@@ -46,7 +46,12 @@ async fn finish_stop_without_tool_calls_completes_run_without_second_request() {
     assert_eq!(outcome.reason, CompletionReason::Stop);
     assert_eq!(outcome.assistant_text, "done");
 
-    // 流事件已送达 UI 通道。
+    // 每个真实请求先通知 UI 更新运行状态，随后流文本送达。
+    let started = rx.recv().await.expect("turn started");
+    assert!(matches!(
+        started,
+        agent::RuntimeEvent::TurnStarted { turn: 1 }
+    ));
     let event = rx.recv().await.expect("one text delta");
     assert!(matches!(
         event,
