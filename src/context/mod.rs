@@ -58,9 +58,8 @@ pub const MIN_KEEP_TURNS: usize = 2;
 
 /// 大 tool output 缩略（§15.3：pruning 只影响投影）。
 ///
-/// - run/bash 输出替换为 `status + command + exit + digest`；
-/// - read 正文在相关 revision 未变化且后续已有引用时缩成 path/range/revision；
-/// - 失败诊断、实际 diff、用户约束和当前计划保留更高权重。
+/// 超过 800 token 的工具输出替换为 `digest + 尾部 8 行`（tail 保留错误相关诊断）；
+/// 失败诊断、实际 diff、用户约束和当前计划保留更高权重。
 pub fn prune_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     const MAX_TOOL_OUTPUT_TOKENS: u64 = 800;
     messages

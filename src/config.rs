@@ -249,7 +249,7 @@ fn merge(home: ConfigFile, workspace: ConfigFile) -> ConfigFile {
             primary: workspace.model.primary.or(home.model.primary),
         },
         agent: AgentFile {
-            limits: workspace.agent.limits.or(home.agent.limits),
+            limits: merge_limits(home.agent.limits, workspace.agent.limits),
         },
         shell: ShellFile {
             path: workspace.shell.path.or(home.shell.path),
@@ -261,6 +261,26 @@ fn merge(home: ConfigFile, workspace: ConfigFile) -> ConfigFile {
                 .safety_reserve_tokens
                 .or(home.context.safety_reserve_tokens),
         },
+    }
+}
+
+/// §18.1：配置合并是字段级，不是块级——workspace 只定义部分字段时，
+/// home 的同块其余字段必须保留（否则 workspace 定义一项会静默丢弃 home 全部设置）。
+fn merge_limits(
+    home: Option<AgentLimitsFile>,
+    workspace: Option<AgentLimitsFile>,
+) -> Option<AgentLimitsFile> {
+    match (home, workspace) {
+        (Some(home), Some(workspace)) => Some(AgentLimitsFile {
+            max_model_turns: workspace.max_model_turns.or(home.max_model_turns),
+            max_tool_calls: workspace.max_tool_calls.or(home.max_tool_calls),
+            max_wall_time_minutes: workspace.max_wall_time_minutes.or(home.max_wall_time_minutes),
+            max_parallel_tools: workspace.max_parallel_tools.or(home.max_parallel_tools),
+            max_identical_no_progress: workspace
+                .max_identical_no_progress
+                .or(home.max_identical_no_progress),
+        }),
+        (home, workspace) => home.or(workspace),
     }
 }
 
@@ -290,4 +310,76 @@ pub fn read_api_key(config: &Config) -> Result<String, String> {
         "未找到 API key：请设置环境变量 {} 或运行 `tpi auth set {}` 写入凭据（§18.4）",
         config.model.api_key_env, config.model.provider
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_is_field_level_not_block_level() {
+        let home = ConfigFile {
+            agent: AgentFile {
+                limits: Some(AgentLimitsFile {
+                    max_model_turns: Some(100),
+                    max_tool_calls: Some(200),
+                    max_wall_time_minutes: None,
+                    max_parallel_tools: None,
+                    max_identical_no_progress: None,
+                }),
+            },
+            ..ConfigFile::default()
+        };
+        // workspace 只定义 max_parallel_tools：home 的其他 limits 字段必须保留。
+        let workspace = ConfigFile {
+            agent: AgentFile {
+                limits: Some(AgentLimitsFile {
+                    max_model_turns: None,
+                    max_tool_calls: None,
+                    max_wall_time_minutes: None,
+                    max_parallel_tools: Some(2),
+                    max_identical_no_progress: None,
+                }),
+            },
+            ..ConfigFile::default()
+        };
+        let merged = merge(home, workspace);
+        let limits = merged.agent.limits.expect("limits present");
+        assert_eq!(
+            limits.max_model_turns,
+            Some(100),
+            "home 的 max_model_turns 不得被 workspace 的整块覆盖丢弃"
+        );
+        assert_eq!(limits.max_tool_calls, Some(200));
+        assert_eq!(limits.max_parallel_tools, Some(2));
+    }
+
+    #[test]
+    fn shell_and_context_merge_field_level() {
+        let home = ConfigFile {
+            shell: ShellFile {
+                kind: Some("git-bash".into()),
+                path: Some(r"C:\git\bash.exe".into()),
+            },
+            context: ContextFile {
+                safety_reserve_tokens: Some(4096),
+            },
+            ..ConfigFile::default()
+        };
+        let workspace = ConfigFile {
+            shell: ShellFile {
+                kind: None,
+                path: Some(r"D:\bash.exe".into()),
+            },
+            ..ConfigFile::default()
+        };
+        let merged = merge(home, workspace);
+        assert_eq!(merged.shell.kind.as_deref(), Some("git-bash"));
+        assert_eq!(merged.shell.path.as_deref(), Some(r"D:\bash.exe"));
+        assert_eq!(
+            merged.context.safety_reserve_tokens,
+            Some(4096),
+            "workspace 未设置 context 时 home 的值必须保留"
+        );
+    }
 }

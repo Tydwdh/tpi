@@ -96,11 +96,19 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
                 truncated = true;
             }
             let revision_header = edit::format_revision_header(&window.revision);
+            // 空文件/超界窗口没有返回行：不显示 "1-0" 这类无效区间。
+            let line_range = if window.returned_lines == 0 {
+                "0".to_string()
+            } else {
+                format!(
+                    "{}-{}",
+                    window.start_line,
+                    window.start_line + window.returned_lines - 1
+                )
+            };
             let output = format!(
-                "{revision_header}\npath: {}\nlines: {}-{} of {}{}\n\n{}",
+                "{revision_header}\npath: {}\nlines: {line_range} of {}{}\n\n{}",
                 display_path(&ctx.workspace_root, &path),
-                window.start_line,
-                window.start_line + window.returned_lines - 1,
                 window.total_lines,
                 if truncated { " (truncated)" } else { "" },
                 text,

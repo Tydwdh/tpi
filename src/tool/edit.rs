@@ -642,6 +642,8 @@ pub fn commit_edit(
         &result.previous_revision,
         &revision_of(&result.new_raw),
     )?;
+    // §10.7 第 6 步：temp 立即清理；backup 是崩溃恢复判定（effect=committed）的
+    // 现场证据，必须保留到 ToolCompleted 持久化之后（由 agent 层清理，见 execute_batch）。
     let _ = std::fs::remove_file(temp_path);
     Ok(())
 }
@@ -815,6 +817,8 @@ pub fn write_new_file(
 #[derive(Debug)]
 pub struct SnapshotStore {
     versions: std::collections::HashMap<Utf8PathBuf, std::collections::VecDeque<FileSnapshot>>,
+    /// 插入顺序（淘汰最旧 path 用；HashMap 迭代序随机，不能当作 LRU）。
+    order: std::collections::VecDeque<Utf8PathBuf>,
     max_paths: usize,
     max_versions_per_path: usize,
 }
@@ -829,6 +833,7 @@ impl SnapshotStore {
     pub fn new(max_paths: usize, max_versions_per_path: usize) -> Self {
         Self {
             versions: Default::default(),
+            order: Default::default(),
             max_paths,
             max_versions_per_path,
         }
@@ -837,15 +842,18 @@ impl SnapshotStore {
     /// 记录一个快照（§10.1：read 保存完整 snapshot）。
     pub fn record(&mut self, snapshot: FileSnapshot) {
         let path = snapshot.path.clone();
+        if !self.versions.contains_key(&path) {
+            self.order.push_back(path.clone());
+        }
         let entry = self.versions.entry(path.clone()).or_default();
         entry.retain(|old| old.revision != snapshot.revision);
         entry.push_front(snapshot);
         while entry.len() > self.max_versions_per_path {
             entry.pop_back();
         }
-        // 淘汰最旧 path（插入顺序近似 LRU）。
+        // 淘汰最旧 path（按插入顺序）。
         while self.versions.len() > self.max_paths {
-            if let Some(oldest) = self.versions.keys().next().cloned() {
+            if let Some(oldest) = self.order.pop_front() {
                 self.versions.remove(&oldest);
             } else {
                 break;
@@ -867,6 +875,7 @@ impl SnapshotStore {
 
     pub fn clear(&mut self) {
         self.versions.clear();
+        self.order.clear();
     }
 }
 

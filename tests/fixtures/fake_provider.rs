@@ -17,6 +17,8 @@ pub struct FakeResponse {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish: FinishReason,
+    /// 本次请求返回的 usage（默认 0；usage 累加测试用）。
+    pub usage: Usage,
 }
 
 impl FakeResponse {
@@ -25,6 +27,7 @@ impl FakeResponse {
             text: text.to_string(),
             tool_calls: Vec::new(),
             finish: FinishReason::Stop,
+            usage: Usage::default(),
         }
     }
 
@@ -33,7 +36,17 @@ impl FakeResponse {
             text: String::new(),
             tool_calls,
             finish: FinishReason::ToolCalls,
+            usage: Usage::default(),
         }
+    }
+
+    /// 带 usage 的响应（usage 累加测试用）。
+    pub fn with_usage(mut self, input: u64, output: u64) -> Self {
+        self.usage = Usage {
+            input_tokens: input,
+            output_tokens: output,
+        };
+        self
     }
 }
 
@@ -138,7 +151,7 @@ impl Provider for FakeProvider {
         }
         Ok(ProviderResponse {
             finish_reason: response.finish,
-            usage: Usage::default(),
+            usage: response.usage,
             tool_calls: response.tool_calls,
         })
     }

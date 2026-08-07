@@ -13,7 +13,7 @@ use tpi::tool::outcome::ToolStatus;
 use tpi::tool::web::{WebFetchArgs, WebSearchArgs, web_fetch, web_search};
 
 /// 串行化依赖全局 allow_private 测试开关的两个 web_fetch 测试（并行互相覆盖会死锁）。
-static WEB_FETCH_TESTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static WEB_FETCH_TESTS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// §17：未配置 Brave key → 明确 unavailable（不自动切换到其他服务）。
 #[tokio::test]
@@ -48,7 +48,7 @@ async fn web_search_without_key_is_explicitly_unavailable() {
 /// allow_private 测试开关，并行时互相覆盖会导致 accept 死锁）。
 #[tokio::test]
 async fn web_fetch_failure_is_explicit() {
-    let _guard = WEB_FETCH_TESTS_LOCK.lock().unwrap();
+    let _guard = WEB_FETCH_TESTS_LOCK.lock().await;
     tpi::tool::web::set_allow_private_web_targets_for_tests(false);
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
@@ -67,7 +67,7 @@ async fn web_fetch_failure_is_explicit() {
 /// §17：web_fetch 对 HTML 做转换，正文有界。
 #[tokio::test]
 async fn web_fetch_converts_html_and_bounds_body() {
-    let _guard = WEB_FETCH_TESTS_LOCK.lock().unwrap();
+    let _guard = WEB_FETCH_TESTS_LOCK.lock().await;
     tpi::tool::web::set_allow_private_web_targets_for_tests(true);
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();

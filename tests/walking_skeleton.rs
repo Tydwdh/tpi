@@ -159,6 +159,18 @@ async fn fake_provider_drives_full_read_edit_verify_loop() {
     assert_eq!(edit_started.len(), 2);
     assert_eq!(edit_started[0].1.tool, "edit");
     assert!(edit_started[0].1.expected_revision.starts_with("b3:"));
+
+    // §10.7 第 6 步：ToolCompleted 持久化后 backup 已清理，工作区无 .tpi-*.tmp 残留。
+    let leftovers: Vec<String> = std::fs::read_dir(&workspace)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(".tpi-") && n.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "完整 agent 流程后工作区残留临时文件: {leftovers:?}"
+    );
 }
 
 /// 崩溃后 session 可读且写工具不自动重放（§4.3/§14.2/§20.2 场景 13）。

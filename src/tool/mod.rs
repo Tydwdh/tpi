@@ -272,18 +272,36 @@ pub fn resolve_workspace_path(
         return Err(PathResolveError::OutsideWorkspace);
     }
 
-    // 已存在路径：canonicalize 防止 symlink 逃逸。
-    if normalized.exists() {
-        let ws_canonical = std::fs::canonicalize(workspace_root.as_std_path())
-            .unwrap_or_else(|_| workspace_norm.clone());
-        if let Ok(canonical) = std::fs::canonicalize(&normalized)
-            && !canonical.starts_with(&ws_canonical)
-        {
-            return Err(PathResolveError::OutsideWorkspace);
-        }
+    // 已存在路径：canonicalize 防止 symlink 逃逸；
+    // 不存在路径（写新文件）：canonicalize 最近存在的祖先，防止经 junction/symlink 写穿
+    //（§9.1：例如 `write workspace/link/new.txt` 借 workspace 内 junction 逃逸到外部）。
+    let ws_canonical = std::fs::canonicalize(workspace_root.as_std_path())
+        .unwrap_or_else(|_| workspace_norm.clone());
+    if let Some(canonical) = canonical_ancestor(&normalized)
+        && !canonical.starts_with(&ws_canonical)
+    {
+        return Err(PathResolveError::OutsideWorkspace);
     }
 
     Utf8PathBuf::from_path_buf(normalized).map_err(|_| PathResolveError::Invalid)
+}
+
+/// 对路径本身做 canonicalize；失败时逐级向上解析最近存在的祖先。
+///
+/// 目标尚不存在时（create 场景）`canonicalize` 返回 Err；此时必须解析其父链上
+/// 最近存在的目录（可能是 junction/symlink），否则写穿检查被静默跳过。
+fn canonical_ancestor(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        match std::fs::canonicalize(&current) {
+            Ok(canonical) => return Some(canonical),
+            Err(_) => {
+                if !current.pop() {
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 /// artifact 引用组件校验（禁止路径分隔符与 `..`）。

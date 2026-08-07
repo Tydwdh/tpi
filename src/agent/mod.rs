@@ -282,7 +282,9 @@ pub async fn run<P: Provider>(
                 }
             }
         };
-        usage_total = response.usage;
+        // provider 返回的 usage 是本次请求的用量；跨轮累加（§2.2/§12.4）。
+        usage_total.input_tokens += response.usage.input_tokens;
+        usage_total.output_tokens += response.usage.output_tokens;
 
         // 5. 原子提交 assistant message（durable boundary，§14.2）。
         if !content.is_empty() {
@@ -543,6 +545,9 @@ error: invalid_arguments
 
         // 并行执行（§12.2 第 3 条：同 wave 无冲突 calls）。
         // 无进展判定在构造 future 前同步完成（futures 不借用 progress/session）。
+        // 本 wave 内写工具的 backup 清理路径（index → backup 路径）。
+        let mut backup_cleanup: std::collections::HashMap<usize, std::path::PathBuf> =
+            std::collections::HashMap::new();
         let mut futures = Vec::with_capacity(wave.len());
         for call in &wave {
             let source_index = call.source_index;
@@ -582,6 +587,11 @@ error: invalid_arguments
             }
 
             let plan = write_tool_plan(tool, &calls[source_index], &config.workspace_root);
+            // §10.7 第 6 步：backup 保留到 ToolCompleted 持久化之后；
+            // 记录清理路径（成功后删除），崩溃恢复窗口依赖 backup 存在。
+            if let Some(backup) = plan.as_ref().and_then(|p| p.backup_path.as_ref()) {
+                backup_cleanup.insert(source_index, backup.clone());
+            }
             futures.push(async move {
                 if blocked {
                     let outcome = repeated_outcome(tool.name(), &action_key);
@@ -651,6 +661,10 @@ error: invalid_arguments
             session
                 .complete_tool(calls[index].call_id, &outcome)
                 .map_err(|e| RunFailure::Session(e.to_string()))?;
+            // §10.7 第 6 步：ToolCompleted 已持久化，崩溃恢复窗口关闭，删除 backup。
+            if let Some(backup) = backup_cleanup.remove(&index) {
+                let _ = std::fs::remove_file(backup);
+            }
             if calls[index].name != "update_plan" {
                 let _ = ui
                     .send(RuntimeEvent::ToolCompleted {
@@ -786,6 +800,9 @@ async fn compact_turn<P: Provider>(
         ));
     }
     let seq = session.seq();
+    // covered.end 是 **exclusive**（= compaction 时下一条事件的 seq）：
+    // 覆盖 seq 1..=seq-1 的全部事件。恢复端 session_to_messages 用
+    // `index < covered.end - 1` 跳过这些事件，两处 off-by-one 必须同步修改。
     session
         .append_event(&SessionEvent::CompactionCommitted {
             covered: crate::session::EventRange {

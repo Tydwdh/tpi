@@ -65,8 +65,9 @@ impl std::fmt::Display for PlanError {
 
 /// 从模型参数构造新计划（§13：完整替换；状态由 runtime 推断）。
 ///
-/// 状态推断：与旧计划 diff——新 items 中消失的旧项视为 Completed；
-/// 第一个非 Completed 项为 InProgress；空 items 清空计划。
+/// 状态推断：与旧计划 diff——新 items 中消失的旧项保留并标记 Completed；
+/// 重新提交的旧项保持旧状态；新项为 InProgress 候选；
+/// 唯一 InProgress 取第一个非 Completed 项；空 items 清空计划。
 pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan, PlanError> {
     let mut texts: Vec<String> = Vec::with_capacity(args.items.len());
     for raw in &args.items {
@@ -82,22 +83,38 @@ pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan
     if texts.len() > MAX_PLAN_ITEMS {
         return Err(PlanError::TooManyItems { count: texts.len() });
     }
+    // 空提交：清空计划（Completed 也不保留）。
+    if texts.is_empty() {
+        return Ok(Plan {
+            explanation: args.explanation.clone(),
+            items: Vec::new(),
+        });
+    }
 
-    let previous_texts: Vec<String> = previous
-        .map(|plan| plan.items.iter().map(|item| item.text.clone()).collect())
+    let previous_items: Vec<PlanItem> = previous
+        .map(|plan| plan.items.clone())
         .unwrap_or_default();
 
-    let mut items: Vec<PlanItem> = Vec::with_capacity(texts.len());
+    let mut items: Vec<PlanItem> = Vec::new();
+    // 1. 消失的旧项 → Completed（保持旧顺序排在前；已 Completed 的不重复追加）。
+    for old in &previous_items {
+        if old.status != PlanStatus::Completed && !texts.contains(&old.text) {
+            items.push(PlanItem {
+                text: old.text.clone(),
+                status: PlanStatus::Completed,
+            });
+        }
+    }
+    // 2. 提交项：重新提交的旧项保持旧状态（Completed 是终态）；新项 → InProgress 候选。
     for text in texts {
-        let status = if !previous_texts.contains(&text) {
-            // 新项：首个为 InProgress（若无已完成项在前面）。
-            PlanStatus::InProgress
-        } else {
-            PlanStatus::Pending
+        let status = match previous_items.iter().find(|item| item.text == text) {
+            Some(old) => old.status,
+            None => PlanStatus::InProgress,
         };
         items.push(PlanItem { text, status });
     }
-    // 唯一 InProgress：第一个未完成项；其余 InProgress 降级为 Pending。
+    // 3. 唯一 InProgress：第一个 InProgress 之外的其余降级 Pending；
+    //    若没有 InProgress（全部 Completed 或重新激活场景），取第一个 Pending。
     let mut assigned = false;
     for item in &mut items {
         if item.status == PlanStatus::InProgress {
@@ -108,8 +125,14 @@ pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan
             }
         }
     }
-    if !assigned && !items.is_empty() {
-        items[0].status = PlanStatus::InProgress;
+    if !assigned
+        && let Some(first) = items.iter_mut().find(|item| item.status == PlanStatus::Pending)
+    {
+        first.status = PlanStatus::InProgress;
+    }
+    // 4. 最终计划（含 Completed）也不得超过上限。
+    if items.len() > MAX_PLAN_ITEMS {
+        return Err(PlanError::TooManyItems { count: items.len() });
     }
 
     Ok(Plan {
@@ -233,4 +256,69 @@ pub fn plan_snapshot(plan: Option<&Plan>) -> String {
         out.push_str(&format!("{marker} {}\n", item.text));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_items_become_completed() {
+        // 初始计划：两项。
+        let previous = build_plan(
+            &UpdatePlanArgs {
+                explanation: None,
+                items: vec!["a".into(), "b".into()],
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(previous.items.len(), 2);
+        assert_eq!(previous.items[0].status, PlanStatus::InProgress);
+        assert_eq!(previous.items[1].status, PlanStatus::Pending);
+
+        // 提交时移除 "a"（隐含完成）：§13 "新 items 中消失的旧项视为 Completed"。
+        let next = build_plan(
+            &UpdatePlanArgs {
+                explanation: None,
+                items: vec!["b".into()],
+            },
+            Some(&previous),
+        )
+        .unwrap();
+        assert_eq!(
+            next.items.len(),
+            2,
+            "消失的旧项必须保留并标记 Completed，而不是被丢弃"
+        );
+        assert_eq!(next.items[0].text, "a");
+        assert_eq!(next.items[0].status, PlanStatus::Completed);
+        assert_eq!(next.items[1].text, "b");
+        assert_eq!(next.items[1].status, PlanStatus::InProgress);
+    }
+
+    #[test]
+    fn plan_status_transitions_keep_single_in_progress() {
+        let plan = build_plan(
+            &UpdatePlanArgs {
+                explanation: None,
+                items: vec!["a".into(), "b".into(), "c".into()],
+            },
+            None,
+        )
+        .unwrap();
+        // 完成 a（移除），进行 b（保留）。
+        let next = build_plan(
+            &UpdatePlanArgs {
+                explanation: None,
+                items: vec!["b".into(), "c".into()],
+            },
+            Some(&plan),
+        )
+        .unwrap();
+        assert_eq!(next.items[0].status, PlanStatus::Completed);
+        assert_eq!(next.items[1].status, PlanStatus::InProgress);
+        assert_eq!(next.items[2].status, PlanStatus::Pending);
+        validate_invariants(&next).unwrap();
+    }
 }

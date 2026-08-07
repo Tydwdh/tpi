@@ -165,6 +165,9 @@ pub fn build_waves(calls: Vec<PreparedCall>, max_parallel: usize) -> Vec<Vec<Pre
 }
 
 /// 把 read call 放入与写锁不冲突的 wave；当前 wave 满或冲突时开新 wave。
+///
+/// WorkspaceUnknown（bash）影响整个 workspace：其 wave 是"隔离点"，
+/// 后续 call 不得并入该 wave（只能开新 wave；新 wave 之间仍可正常合并）。
 fn push_with_conflict_check(
     waves: &mut Vec<Vec<PreparedCall>>,
     call: PreparedCall,
@@ -172,7 +175,10 @@ fn push_with_conflict_check(
     check_conflicts: bool,
 ) {
     if let Some(wave) = waves.last_mut() {
-        let fits = wave.len() < max_parallel;
+        let last_is_unknown_wave = wave
+            .iter()
+            .any(|other| matches!(other.access, ToolAccess::WorkspaceUnknown));
+        let fits = wave.len() < max_parallel && !last_is_unknown_wave;
         let no_conflict = if check_conflicts {
             let empty: Vec<ResourceLock> = Vec::new();
             let locks = match &call.access {

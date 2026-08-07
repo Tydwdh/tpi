@@ -156,6 +156,12 @@ error: process_isolation_unavailable
         stdout_bytes: &result.stdout,
         stderr_bytes: &result.stderr,
     });
+    // §8.4：opaque 引用必须同时进入结构化字段与模型可见文本
+    //（模型读完整输出的唯一入口是 `read @artifact/...`）。
+    if let Some(reference) = &artifact_ref {
+        outcome.model_payload.artifact = Some(reference.clone());
+        outcome.model_payload.output.push_str(&format!("\nartifact: {reference}"));
+    }
     outcome.artifacts = artifact_ref.into_iter().collect();
     outcome
 }

@@ -666,10 +666,24 @@ fn spawn_ctrl_c_handler(current_cancel: Arc<Mutex<Option<CancellationToken>>>) {
                 }
             } else {
                 // 空闲时 Ctrl-C：退出（§11.5 第二次快速 Ctrl-C 的简化）。
+                // process::exit 不执行析构，必须显式恢复终端，否则残留 raw mode（无回显）。
+                restore_terminal_on_exit();
                 std::process::exit(130);
             }
         }
     });
+}
+
+/// 退出前恢复终端（inline TUI 打开过 raw mode；process::exit 不触发 Drop）。
+fn restore_terminal_on_exit() {
+    use std::io::Write;
+    let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::cursor::Show,
+        ratatui::crossterm::style::ResetColor,
+    );
+    let _ = std::io::stdout().flush();
 }
 
 fn create_session(

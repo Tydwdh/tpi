@@ -72,6 +72,60 @@ fn waves_parallelize_reads_and_serialize_writes() {
     assert!(waves[2][0].source_index == 3);
 }
 
+/// §12.1/§12.2：WorkspaceUnknown（bash）独占 wave，后续任何工具不得并入其 wave。
+#[test]
+fn bash_serializes_all_following_tools() {
+    let bash_call = |index: usize| PreparedCall {
+        source_index: index,
+        tool: tpi::tool::BuiltinTool::Bash,
+        args: tpi::tool::ValidatedArgs::Bash(tpi::tool::command::BashArgs {
+            command: "echo hi".into(),
+            cwd: ".".into(),
+            timeout_ms: 1000,
+        }),
+        access: ToolAccess::WorkspaceUnknown,
+        action_key: format!("b{index}"),
+    };
+    let file_read = |index: usize, path: &str| PreparedCall {
+        source_index: index,
+        tool: tpi::tool::BuiltinTool::Read,
+        args: tpi::tool::ValidatedArgs::Read(tpi::tool::files::ReadArgs {
+            path: path.into(),
+            start_line: 1,
+            line_count: 10,
+        }),
+        access: ToolAccess::Resources(vec![tpi::agent::scheduler::ResourceLock {
+            resource: tpi::agent::scheduler::ResourceId::File(
+                tpi::agent::scheduler::FileScope::Exact(camino::Utf8PathBuf::from(path)),
+            ),
+            mode: tpi::agent::scheduler::AccessMode::Read,
+        }]),
+        action_key: format!("r{index}"),
+    };
+
+    // bash → read → bash → edit：每个 bash 独占 wave，后续调用不得并入。
+    let calls = vec![
+        bash_call(0),
+        file_read(1, "a.rs"),
+        bash_call(2),
+        file_write(3, "b.rs"),
+    ];
+    let waves = build_waves(calls, 4);
+    // 期望：wave0=[bash0] wave1=[read] wave2=[bash2] wave3=[write]
+    assert_eq!(
+        waves.len(),
+        4,
+        "bash 必须独占 wave，后续工具不得与其并行: {waves:?}"
+    );
+    for wave in &waves {
+        assert_eq!(wave.len(), 1, "每个 wave 必须单元素: {waves:?}");
+    }
+    assert_eq!(waves[0][0].source_index, 0);
+    assert_eq!(waves[1][0].source_index, 1);
+    assert_eq!(waves[2][0].source_index, 2);
+    assert_eq!(waves[3][0].source_index, 3);
+}
+
 fn file_write(index: usize, path: &str) -> PreparedCall {
     PreparedCall {
         source_index: index,
@@ -174,7 +228,7 @@ fn plan_invariants_enforced() {
     .unwrap_err();
     assert!(error.to_string().contains("重复"));
 
-    // 完整替换：新计划不含旧项时旧项视为完成，唯一 InProgress。
+    // 完整替换：新计划不含旧项时，消失的旧项保留并标记 Completed（§13 注释语义）。
     let previous = build_plan(
         &UpdatePlanArgs {
             explanation: None,
@@ -191,11 +245,16 @@ fn plan_invariants_enforced() {
         Some(&previous),
     )
     .unwrap();
-    assert_eq!(next.items.len(), 1);
+    assert_eq!(next.items.len(), 3);
+    assert_eq!(next.items[0].status, tpi::tool::plan::PlanStatus::Completed);
+    assert_eq!(next.items[1].status, tpi::tool::plan::PlanStatus::Completed);
     assert_eq!(
-        next.items[0].status,
+        next.items[2].status,
         tpi::tool::plan::PlanStatus::InProgress
     );
+    // 空 items 清空计划（不保留 Completed）。
+    let cleared = build_plan(&UpdatePlanArgs { explanation: None, items: vec![] }, Some(&next)).unwrap();
+    assert!(cleared.items.is_empty());
 }
 
 /// §13 + §15.4 集成：update_plan 替换完整计划、计划注入后续请求；

@@ -123,3 +123,57 @@ async fn tool_call_loop_terminates_and_reports_completion() {
     assert_eq!(completed[0].status, tpi::tool::outcome::ToolStatus::Failed);
     assert!(completed[0].model_payload.output.contains("not_found"));
 }
+
+/// §2.2/§12.4：多轮 tool-call 循环的 usage 必须跨请求累加（RunCompleted 记录总用量）。
+#[tokio::test]
+async fn usage_accumulates_across_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = FakeProvider::new(vec![
+        // 第一轮：工具调用（usage 100+20）。
+        FakeResponse::with_tool_calls(vec![fixtures::fake_provider::tool_call(
+            "read",
+            serde_json::json!({"path": "missing.txt"}),
+        )])
+        .with_usage(100, 20),
+        // 第二轮：最终回答（usage 80+10）。
+        FakeResponse::text("done").with_usage(80, 10),
+    ]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, _rx) = mpsc::channel(16);
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        &[],
+        "hi".into(),
+        tx,
+        CancellationToken::new(),
+        true,
+    )
+    .await
+    .expect("run succeeds");
+
+    assert_eq!(outcome.reason, CompletionReason::Stop);
+    // 总用量 = 100+20 + 80+10 = 180 input / 30 output（覆盖式赋值时只剩第二轮 80/10）。
+    assert_eq!(outcome.usage.input_tokens, 180, "input 必须跨轮累加");
+    assert_eq!(outcome.usage.output_tokens, 30, "output 必须跨轮累加");
+
+    let events = read_events(session.path()).expect("read session");
+    let completed = events
+        .iter()
+        .find_map(|e| match e {
+            SessionEvent::RunCompleted { usage, .. } => Some(*usage),
+            _ => None,
+        })
+        .expect("run completed event");
+    assert_eq!(completed.input_tokens, 180, "session 记录的 usage 必须累加");
+    assert_eq!(completed.output_tokens, 30);
+}

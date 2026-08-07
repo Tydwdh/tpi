@@ -471,6 +471,11 @@ pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
         body,
     );
     let mut outcome = ToolOutcome::succeeded("web_fetch", output);
+    // §8.4：artifact 引用进结构化字段与模型可见文本（完整正文的唯一读取入口）。
+    if let Some(reference) = &artifact {
+        outcome.model_payload.artifact = Some(reference.clone());
+        outcome.model_payload.output.push_str(&format!("\nartifact: {reference}"));
+    }
     outcome.artifacts = artifact.into_iter().collect();
     outcome.session_metadata = ToolMetadata {
         tool: "web_fetch".into(),

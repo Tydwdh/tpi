@@ -10,7 +10,51 @@ use tpi::tool::web::{WebFetchArgs, validate_fetch_url, web_fetch};
 use tpi::tool::{resolve_workspace_path, validate_artifact_component};
 
 /// 串行化依赖全局 allow_private 测试开关的两个 web_fetch 测试（并行互相覆盖会失败/死锁）。
-static WEB_FETCH_TESTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static WEB_FETCH_TESTS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// §9.1：workspace 内 junction/symlink 指向外部时，写入不得穿过链接逃逸。
+///
+/// 目标路径不存在时 `canonicalize` 会失败；必须解析最近存在的祖先再判定。
+#[cfg(windows)]
+#[test]
+fn write_through_workspace_junction_is_blocked() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let junction = workspace.join("link");
+    // 创建指向 workspace 外部的 junction（无需管理员权限）。
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(outside.path())
+        .status()
+        .expect("mklink runs");
+    assert!(status.success(), "mklink /J 创建 junction 失败");
+
+    let ctx = test_tool_context(&workspace);
+    // 目标文件不存在：canonicalize 失败时必须解析最近存在祖先（junction 本身）。
+    // write 需要 commit plan（write-ahead 契约），临时文件也落在 link 目录内。
+    let target = workspace.join("link").join("escaped.txt");
+    let plan = tpi::tool::edit::prepare_commit(&target);
+    let outcome = write(
+        WriteArgs {
+            path: "link/escaped.txt".into(),
+            content: "x".into(),
+        },
+        &ctx,
+        Some(&plan),
+    );
+    assert_eq!(
+        outcome.status,
+        ToolStatus::Rejected,
+        "通过 junction 写穿 workspace 必须被拒绝: {}",
+        outcome.model_text()
+    );
+    assert!(
+        !outside.path().join("escaped.txt").exists(),
+        "外部目录不得被写入"
+    );
+}
 
 #[test]
 fn resolve_workspace_path_rejects_parent_escape() {
@@ -93,16 +137,16 @@ fn write_rejects_outside_workspace() {
     assert_eq!(outcome.status, ToolStatus::Rejected);
 }
 
-#[test]
-fn web_fetch_blocks_private_targets_by_default() {
-    let _guard = WEB_FETCH_TESTS_LOCK.lock().unwrap();
+#[tokio::test]
+async fn web_fetch_blocks_private_targets_by_default() {
+    let _guard = WEB_FETCH_TESTS_LOCK.lock().await;
     assert!(validate_fetch_url("http://127.0.0.1:8080/").is_err());
     assert!(validate_fetch_url("http://192.168.0.1/").is_err());
 }
 
 #[tokio::test]
 async fn web_fetch_localhost_is_blocked_without_test_override() {
-    let _guard = WEB_FETCH_TESTS_LOCK.lock().unwrap();
+    let _guard = WEB_FETCH_TESTS_LOCK.lock().await;
     tpi::tool::web::set_allow_private_web_targets_for_tests(false);
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
@@ -120,7 +164,7 @@ async fn web_fetch_localhost_is_blocked_without_test_override() {
 
 #[tokio::test]
 async fn web_fetch_allows_localhost_when_test_override_enabled() {
-    let _guard = WEB_FETCH_TESTS_LOCK.lock().unwrap();
+    let _guard = WEB_FETCH_TESTS_LOCK.lock().await;
     tpi::tool::web::set_allow_private_web_targets_for_tests(true);
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();

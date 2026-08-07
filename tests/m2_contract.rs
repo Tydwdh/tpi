@@ -213,8 +213,7 @@ async fn list_and_search_respect_budget_and_cursor() {
         &ctx,
     );
     let text2 = page2.model_text();
-    assert!(text2.contains("items: "), "{text2}");
-    let shown: usize = text2
+    assert!(text2.contains("items: "), "{text2}");    let shown: usize = text2
         .lines()
         .find_map(|line| {
             line.strip_prefix("items: ")
@@ -246,6 +245,11 @@ async fn bash_output_lands_in_artifact_and_readable_via_opaque_ref() {
     assert!(
         !outcome.artifacts.is_empty(),
         "bash 必须产出 artifact（§8.4）"
+    );
+    // §8.4：artifact 引用必须出现在 model_payload（模型能感知引用才能 `read @artifact`）。
+    assert!(
+        outcome.model_payload.artifact.is_some(),
+        "model_payload.artifact 必须携带 opaque 引用（模型读完整输出的唯一入口）"
     );
     let artifact = &outcome.artifacts[0];
     assert_eq!(artifact.session, ctx.session_id);

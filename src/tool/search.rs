@@ -60,6 +60,9 @@ pub struct SearchArgs {
 /// 一次扫描的有界有序结果 snapshot（§8.4：cursor 指向 snapshot + offset）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanSnapshot {
+    /// 生成快照的工具（list/search；翻页结果按原工具名标记）。
+    #[serde(default)]
+    pub tool: String,
     pub items: Vec<String>,
     pub scanned_files: u64,
     pub scanned_bytes: u64,
@@ -164,6 +167,7 @@ pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
         scanned_bytes,
         started,
         stop_reason,
+        "list",
     )
 }
 
@@ -278,6 +282,7 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         scanned_bytes,
         started,
         stop_reason,
+        "search",
     )
 }
 
@@ -288,9 +293,11 @@ fn finish_scan(
     scanned_bytes: u64,
     started: Instant,
     stop_reason: StopReason,
+    tool: &'static str,
 ) -> ToolOutcome {
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let snapshot = ScanSnapshot {
+        tool: tool.to_string(),
         items,
         scanned_files,
         scanned_bytes,
@@ -367,9 +374,9 @@ cursor: {cursor}"
             None => String::new(),
         },
     );
-    let mut outcome = ToolOutcome::succeeded("list", output);
+    let mut outcome = ToolOutcome::succeeded(&snapshot.tool, output);
     outcome.session_metadata = ToolMetadata {
-        tool: "list".into(),
+        tool: snapshot.tool.clone(),
         target: Some(snapshot_id),
         ..Default::default()
     };

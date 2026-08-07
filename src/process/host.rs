@@ -52,8 +52,8 @@ pub fn run_host() -> i32 {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            // spawn 失败：发 Exit(特殊码 126，模拟 shell 语义) 并退出。
-            let payload = (-2i32).to_le_bytes().to_vec(); // 126 的占位，实际用 -2 表示 spawn 失败
+            // spawn 失败：发 Exit(码 -2，进程不可能返回的哨兵值) 并退出。
+            let payload = (-2i32).to_le_bytes().to_vec();
             write_message(MSG_EXIT, &payload);
             eprintln!("process-host: spawn failed: {error}");
             return 1;
@@ -129,13 +129,17 @@ fn read_start_spec() -> Option<StartSpec> {
 }
 
 /// 写一条 framed 消息到 stdout。
+///
+/// header 与 payload 必须**一次** write_all 完成：两个 pump 线程与主线程
+/// 并发写同一 stdout，分两次调用会被其他线程的写入插到中间（帧撕裂），
+/// 主进程 read_frame 会把拼接的帧解析成损坏数据。
 fn write_message(kind: u8, payload: &[u8]) {
     let mut stdout = std::io::stdout().lock();
-    let mut header = [0u8; 5];
-    header[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    header[4] = kind;
-    let _ = stdout.write_all(&header);
-    let _ = stdout.write_all(payload);
+    let mut message = Vec::with_capacity(5 + payload.len());
+    message.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    message.push(kind);
+    message.extend_from_slice(payload);
+    let _ = stdout.write_all(&message);
     let _ = stdout.flush();
 }
 

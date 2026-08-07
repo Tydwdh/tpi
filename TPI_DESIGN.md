@@ -1083,6 +1083,8 @@ Web 属于 v1 后段，不阻塞核心 Agent。初始搜索后端固定为 Brave
 
 如未配置 Brave key，`web_search` 明确 unavailable；不得自动切换到抓取搜索结果页面或另一付费服务。`web_summary` 默认关闭；若以后启用，模型必须由用户固定，并在调用前后显示角色与成本。
 
+SSRF 防护的显式逃生门：设置环境变量 `TPI_WEB_FETCH_ALLOW_PRIVATE=1` 可允许 `web_fetch` 访问 loopback/私网地址（本机开发、访问内网服务时使用）；集成测试用 `set_allow_private_web_targets_for_tests` 切换同一开关。该逃生门需要本地执行权（能设置环境变量已等同拥有本地 shell），不影响默认拒绝语义；文档化以避免被误认为未公开后门。
+
 ## 18. 配置、命令和凭据
 
 ### 18.1 配置优先级
