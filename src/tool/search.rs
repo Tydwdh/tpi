@@ -501,7 +501,6 @@ mod tests {
                 crate::tool::edit::SnapshotStore::new(16, 4),
             )),
             current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            web_brave_key_env: "TPI_BRAVE_API_KEY".into(),
             interactive: false,
         }
     }

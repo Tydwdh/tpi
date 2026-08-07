@@ -1,6 +1,7 @@
 //! M6 验收契约（§21 M6、§17）。
 //!
-//! - 未配置 Brave key 时 `web_search` 明确 unavailable，不切换到其他服务（§17）；
+//! - `web_search` 使用免费 DuckDuckGo 端点（无需 API key，零配置；§17）；
+//!   解析器契约在此 + src/tool/web.rs 单测覆盖（广告过滤、uddg 链接还原）；
 //! - 不打开浏览器、不调用隐藏模型（§17）；
 //! - `web_fetch` 有界（redirect/body/timeout）且 HTML 转换（§17）；
 //! - release profile 已配置（`cargo install --path . --locked` 可用）。
@@ -10,22 +11,50 @@ mod fixtures;
 use camino::Utf8PathBuf;
 use fixtures::test_tool_context;
 use tpi::tool::outcome::ToolStatus;
-use tpi::tool::web::{WebFetchArgs, WebSearchArgs, web_fetch, web_search};
+use tpi::tool::web::{WebFetchArgs, WebSearchArgs, parse_ddg_results, web_fetch};
 
 /// 串行化依赖全局 allow_private 测试开关的两个 web_fetch 测试（并行互相覆盖会死锁）。
 static WEB_FETCH_TESTS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// §17：未配置 Brave key → 明确 unavailable（不自动切换到其他服务）。
+/// §17：web_search 免费方案（无 key）——解析器对真实端点 fixture 的契约。
+#[test]
+fn web_search_is_keyless_ddg_parser() {
+    // fixture 来自真实 html.duckduckgo.com 响应（1 广告 + 4 完整结果 + 1 截断残片）。
+    let html = include_str!("fixtures/ddg_results.html");
+    let hits = parse_ddg_results(html);
+    assert_eq!(hits.len(), 4, "广告与不完整块必须被过滤（§17：不展示广告）");
+    assert!(
+        hits.iter().any(|h| h.url == "https://rust-lang.org/"),
+        "必须包含 rust-lang.org（uddg 还原）: {:?}",
+        hits.iter().map(|h| h.url.as_str()).collect::<Vec<_>>()
+    );
+    assert!(hits.iter().all(|h| h.url.starts_with("http")));
+}
+
+/// §17：web_search 对人机验证页返回明确错误而非乱码（解析层判定）。
+#[test]
+fn web_search_challenge_page_is_detected() {
+    let challenge = "<div class=\"anomaly-modal\">Unfortunately, bots use DuckDuckGo too.</div>";
+    assert!(tpi::tool::web::is_ddg_bot_challenge(challenge));
+}
+
+/// §17：真实端点 opt-in 冒烟（免费、无 key；默认忽略）。
+///
+/// 运行条件：`TPI_RUN_LIVE_TESTS=1`。DDG 对异常流量可能返回人机验证页，
+/// 此时测试应报告失败而非假装成功。
 #[tokio::test]
-async fn web_search_without_key_is_explicitly_unavailable() {
+#[ignore = "live DDG search: set TPI_RUN_LIVE_TESTS=1"]
+async fn live_ddg_search_returns_results() {
+    if std::env::var("TPI_RUN_LIVE_TESTS").as_deref() != Ok("1") {
+        eprintln!("skip: TPI_RUN_LIVE_TESTS != 1");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-    let mut ctx = test_tool_context(&workspace);
-    // 指向一个必然不存在的环境变量。
-    ctx.web_brave_key_env = "TPI_NO_SUCH_BRAVE_KEY".into();
-    let outcome = web_search(
+    let ctx = test_tool_context(&workspace);
+    let outcome = tpi::tool::web::web_search(
         WebSearchArgs {
-            query: "rust".into(),
+            query: "rust programming language".into(),
             count: 5,
             freshness: None,
             domains: None,
@@ -33,12 +62,11 @@ async fn web_search_without_key_is_explicitly_unavailable() {
         &ctx,
     )
     .await;
-    assert_eq!(outcome.status, ToolStatus::Failed);
-    let text = outcome.model_text();
-    assert!(text.contains("unavailable"));
-    assert!(
-        text.contains("不自动切换到其他服务"),
-        "必须明确声明不切换到其他服务（§17）: {text}"
+    assert_eq!(
+        outcome.status,
+        ToolStatus::Succeeded,
+        "{}",
+        outcome.model_text()
     );
 }
 

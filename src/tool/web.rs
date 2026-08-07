@@ -1,11 +1,12 @@
 //! Web 工具（文档 §17、§8.1 P1）。
 //!
-//! - `web_search`：Brave Web Search API；只调用标准 Web Search endpoint，
-//!   不调用其 LLM/Answers endpoint（§17：避免隐藏模型成本）。
+//! - `web_search`：DuckDuckGo HTML 端点（免费、无需 API key，社区 skills 通用
+//!   方案，参考 pi-web-access 的无 key 思路）；结果只用于发现来源，
+//!   不调用 LLM/Answers endpoint（§17：避免隐藏模型成本）。
 //! - `web_fetch`：reqwest 限制 redirect、响应体大小和 timeout；HTML 用
 //!   html2text 转换；正文有界（§8.4：48 KiB）。
 //! - 不打开浏览器、不自动 fetch 全部结果、不调用 summary model（§17）。
-//! - 未配置 Brave key 时明确 `unavailable`，不自动切换到抓取结果页面。
+//! - DDG 可能对异常流量返回人机验证页：此时明确报错，不静默降级（§17）。
 
 use std::net::IpAddr;
 
@@ -26,13 +27,19 @@ pub const SEARCH_RAW_LIMIT: usize = 2 * 1024 * 1024;
 /// 请求超时。
 pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// 浏览器 UA（DDG HTML 端点对无 UA/简单 UA 请求返回人机验证页）。
+const DDG_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// DDG HTML 端点（免费、无需 API key）。
+const DDG_HTML_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct WebSearchArgs {
     pub query: String,
     /// 结果数（默认 5，上限 20）。
     #[serde(default = "default_count")]
     pub count: u32,
-    /// freshness（如 "pd_1w" 或 ISO 日期；透传给 Brave）。
+    /// freshness（"pd_1d"/"pd_1w"/"pd_1m"/"pd_1y";透传给 DDG 的 df 参数）。
     #[serde(default)]
     pub freshness: Option<String>,
     /// 限制搜索域（拼接为 site: 过滤）。
@@ -179,26 +186,10 @@ async fn read_bounded_bytes(response: reqwest::Response, limit: usize) -> Result
 }
 
 /// web_search（§17：只用于发现来源；结果摘要不是最终证据）。
-pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
-    let api_key_env = &ctx.web_brave_key_env;
-    let api_key = std::env::var(api_key_env).ok();
-    let Some(api_key) = api_key else {
-        return ToolOutcome::failed(
-            "web_search",
-            ModelPayload {
-                status: ToolStatus::Failed,
-                program: None,
-                exit_code: None,
-                duration_ms: 0,
-                output: format!(
-                    "status: failed\ntool: web_search\nerror: unavailable\n\n未配置 Brave key（环境变量 {api_key_env}）。不自动切换到其他服务（§17）。"
-                ),
-                effect: None,
-                artifact: None,
-            },
-        );
-    };
-
+///
+/// 免费方案：DuckDuckGo HTML 端点（无需 API key，零配置）。
+/// DDG 可能对异常流量返回人机验证页——此时返回明确错误，不静默降级。
+pub async fn web_search(args: WebSearchArgs, _ctx: &ToolContext) -> ToolOutcome {
     let mut query = args.query.clone();
     if let Some(domains) = &args.domains {
         for domain in domains {
@@ -206,20 +197,16 @@ pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
         }
     }
     let count = args.count.clamp(1, 20);
-    let mut url = format!(
-        "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
-        urlencode(&query),
-        count
-    );
-    if let Some(freshness) = &args.freshness {
-        url.push_str(&format!("&freshness={}", urlencode(freshness)));
+    let mut url = format!("{DDG_HTML_ENDPOINT}?q={}", urlencode(&query));
+    if let Some(df) = args.freshness.as_deref().and_then(ddg_freshness) {
+        url.push_str(&format!("&df={df}"));
     }
 
     let client = reqwest::Client::new();
     let response = match client
         .get(&url)
-        .header("X-Subscription-Token", &api_key)
-        .header("Accept", "application/json")
+        .header(reqwest::header::USER_AGENT, DDG_USER_AGENT)
+        .header(reqwest::header::ACCEPT, "text/html")
         .timeout(FETCH_TIMEOUT)
         .send()
         .await
@@ -294,41 +281,51 @@ pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
         );
     }
 
-    let parsed: Result<BraveResponse, _> = serde_json::from_str(&body);
-    let results = match parsed {
-        Ok(parsed) => parsed.web.results,
-        Err(error) => {
-            return ToolOutcome::failed(
-                "web_search",
-                ModelPayload {
-                    status: ToolStatus::Failed,
-                    program: None,
-                    exit_code: None,
-                    duration_ms: 0,
-                    output: format!(
-                        "status: failed\ntool: web_search\nerror: parse_failed\n\n{error}"
-                    ),
-                    effect: None,
-                    artifact: None,
-                },
-            );
-        }
-    };
+    if is_ddg_bot_challenge(&body) {
+        return ToolOutcome::failed(
+            "web_search",
+            ModelPayload {
+                status: ToolStatus::Failed,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: "status: failed\ntool: web_search\nerror: bot_challenge\n\nDuckDuckGo 返回了人机验证页（疑似流量异常）。稍后重试，或换用其他查询。"
+                    .into(),
+                effect: None,
+                artifact: None,
+            },
+        );
+    }
+
+    let hits = parse_ddg_results(&body);
+    if hits.is_empty() {
+        return ToolOutcome::failed(
+            "web_search",
+            ModelPayload {
+                status: ToolStatus::Failed,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: "status: failed\ntool: web_search\nerror: no_results\n\n没有找到结果（或结果页结构与预期不符）。".into(),
+                effect: None,
+                artifact: None,
+            },
+        );
+    }
 
     let mut output = String::from("status: succeeded\ntool: web_search\n");
     output.push_str(&format!(
         "query: {}\nresults: {}\n\n",
         args.query,
-        results.len()
+        hits.len().min(count as usize)
     ));
-    for (index, result) in results.iter().enumerate() {
+    for (index, hit) in hits.iter().take(count as usize).enumerate() {
         output.push_str(&format!(
-            "{}. {}\n   url: {}\n   snippet: {}\n   age: {}\n\n",
+            "{}. {}\n   url: {}\n   snippet: {}\n\n",
             index + 1,
-            result.title,
-            result.url,
-            result.description,
-            result.age.as_deref().unwrap_or("-"),
+            hit.title,
+            hit.url,
+            hit.snippet,
         ));
     }
     ToolOutcome::succeeded("web_search", output).with_metadata(ToolMetadata {
@@ -338,25 +335,186 @@ pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
     })
 }
 
-#[derive(Deserialize)]
-struct BraveResponse {
-    web: BraveWeb,
+/// DDG 的 df 参数（Brave freshness 语法 → DDG）。
+fn ddg_freshness(value: &str) -> Option<&'static str> {
+    match value {
+        "pd_1d" => Some("d"),
+        "pd_1w" => Some("w"),
+        "pd_1m" => Some("m"),
+        "pd_1y" => Some("y"),
+        _ => None,
+    }
 }
 
-#[derive(Deserialize)]
-struct BraveWeb {
-    #[serde(default)]
-    results: Vec<BraveResult>,
+/// DDG HTML 端点的人机验证页特征（anomaly challenge / bot challenge）。
+pub fn is_ddg_bot_challenge(html: &str) -> bool {
+    html.contains("anomaly-modal")
+        || html.contains("challenge-form")
+        || html.contains("bot-captcha")
+        || html.contains("Unfortunately, bots use DuckDuckGo too")
 }
 
-#[derive(Deserialize)]
-struct BraveResult {
-    title: String,
-    url: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    age: Option<String>,
+/// 解析出的 DDG 结果（免费端点）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DdgHit {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+/// 解析 DDG HTML 端点返回的结果页（纯函数，便于离线测试）。
+///
+/// 结构（html.duckduckgo.com 无 JS 版，多年稳定）：
+/// `<div class="result ...">` 每块一个结果；广告块含 `result--ad`；
+/// 标题 `<a class="result__a" href="//duckduckgo.com/l/?uddg=...">`；
+/// 摘要 `<a class="result__snippet" href="...">`。链接经 uddg 参数还原。
+pub fn parse_ddg_results(html: &str) -> Vec<DdgHit> {
+    let mut hits = Vec::new();
+    for block in html.split("class=\"result ") {
+        if block.find("result__a").is_none() {
+            continue;
+        }
+        if block.contains("result--ad") {
+            continue; // 广告（§17：不展示广告结果）。
+        }
+        let Some((title, raw_href)) = extract_link(block, "result__a") else {
+            continue;
+        };
+        let url = decode_ddg_href(raw_href);
+        if url.is_empty() {
+            continue;
+        }
+        let snippet = extract_link(block, "result__snippet")
+            .map(|(text, _)| text)
+            .unwrap_or_default();
+        hits.push(DdgHit {
+            title,
+            url,
+            snippet,
+        });
+    }
+    hits
+}
+
+/// 在结果块中提取 class 含 `class_name` 的 `<a>` 的文本与 href。
+fn extract_link(block: &str, class_name: &str) -> Option<(String, String)> {
+    let class_marker = format!("class=\"{class_name}\"");
+    let marker = block.find(&class_marker)?;
+    let anchor_start = block[..marker].rfind("<a ")?;
+    let after_class = &block[marker + class_marker.len()..];
+    let tag_end = after_class.find('>')?;
+    let attrs = &after_class[..tag_end];
+    // href 可能出现在 class 之前（<a href=".." class="result__a"）或之后。
+    let href = extract_href_attr(&format!("{} {}", &block[anchor_start..marker], attrs));
+    // `>` 的绝对位置 = marker 之后 + tag_end；内容从其后一个字节开始。
+    let inner_start = marker + class_marker.len() + tag_end + 1;
+    let inner = &block[inner_start..];
+    let close = inner.find("</a>")?;
+    let text = strip_tags(&inner[..close]);
+    Some((text, href))
+}
+
+fn extract_href_attr(segment: &str) -> String {
+    let Some(start) = segment.find("href=\"") else {
+        return String::new();
+    };
+    let rest = &segment[start + 6..];
+    let end = rest.find('"').unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// 去掉标签、解码常见 HTML 实体、折叠空白。
+fn strip_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    let mut decoded = decode_html_entities(&out);
+    decoded = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+    decoded.trim().to_string()
+}
+
+/// 解码常见 HTML 实体（&amp; &lt; &gt; &quot; &#39; &nbsp; &#<n>; &#x<n>;）。
+fn decode_html_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'&'
+            && let Some(end) = text[i..].find(';')
+        {
+            let entity = &text[i + 1..i + end];
+            let decoded = match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" | "#39" => Some('\''),
+                "nbsp" => Some(' '),
+                _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                    u32::from_str_radix(&entity[2..], 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                }
+                _ if entity.starts_with('#') => {
+                    entity[1..].parse::<u32>().ok().and_then(char::from_u32)
+                }
+                _ => None,
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                i += end + 1;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// 还原 DDG 跳转链接：`//duckduckgo.com/l/?uddg=<urlencoded>&rut=...` → 真实 URL。
+/// 非跳转链接原样返回（补全协议相对链接）。
+fn decode_ddg_href(href: String) -> String {
+    let decoded_entities = decode_html_entities(&href);
+    let decoded = percent_decode(&decoded_entities);
+    if let Some(uddg_start) = decoded.find("uddg=") {
+        let value = &decoded[uddg_start + 5..];
+        let value = value.split('&').next().unwrap_or("");
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+    if let Some(rest) = decoded.strip_prefix("//") {
+        return format!("https://{rest}");
+    }
+    decoded
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// web_fetch（§17：限制 redirect、响应体大小和 timeout；HTML 转换）。
@@ -664,5 +822,88 @@ mod tests {
         let html = b"<html><body><h1>Hello</h1></body></html>";
         let text = convert_response_body(html, "text/html");
         assert!(text.contains("Hello"));
+    }
+
+    // ---- DDG 免费端点解析（§17 无 key 方案）----
+
+    /// 真实端点 fixture：6 个块（1 广告 + 5 普通），5 个 snippet，含 uddg 链接。
+    fn fixture() -> String {
+        include_str!("../../tests/fixtures/ddg_results.html").to_string()
+    }
+
+    #[test]
+    fn parses_ddg_fixture_skips_ads_and_decodes_links() {
+        let hits = parse_ddg_results(&fixture());
+        // fixture：1 广告块 + 4 完整普通结果 + 1 截断残片（第 5 个结果的头部）。
+        assert_eq!(hits.len(), 4, "广告块与不完整块必须被过滤，剩 4 个真实结果");
+        // uddg 重定向参数必须还原为真实 URL（百分号解码 + 实体解码）。
+        let rust = hits.iter().find(|h| h.title.contains("Rust")).unwrap();
+        assert_eq!(rust.url, "https://rust-lang.org/");
+        // 摘要非空。
+        assert!(
+            hits.iter().all(|h| !h.snippet.is_empty()),
+            "普通结果都应有 snippet"
+        );
+        // 标题不含标签与实体。
+        for hit in &hits {
+            assert!(
+                !hit.title.contains('<') && !hit.title.contains("&amp;"),
+                "标题必须已清理: {}",
+                hit.title
+            );
+            assert!(
+                hit.url.starts_with("https://") || hit.url.starts_with("http://"),
+                "URL 必须为绝对地址: {}",
+                hit.url
+            );
+        }
+    }
+
+    #[test]
+    fn parses_ddg_empty_and_challenge_pages() {
+        assert!(parse_ddg_results("<html><body>nothing</body></html>").is_empty());
+        assert!(parse_ddg_results("no result blocks at all").is_empty());
+        assert!(is_ddg_bot_challenge("<div class=\"anomaly-modal\">"));
+        assert!(!is_ddg_bot_challenge(fixture().as_str()));
+    }
+
+    #[test]
+    fn decode_ddg_href_handles_plain_and_protocol_relative() {
+        assert_eq!(
+            decode_ddg_href(
+                "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%3Fb%3D1&amp;rut=x".into()
+            ),
+            "https://example.com/a?b=1"
+        );
+        assert_eq!(
+            decode_ddg_href("//example.org/page".into()),
+            "https://example.org/page"
+        );
+        assert_eq!(
+            decode_ddg_href("https://plain.example/x".into()),
+            "https://plain.example/x"
+        );
+    }
+
+    #[test]
+    fn strip_tags_decodes_entities_and_normalizes_whitespace() {
+        assert_eq!(
+            strip_tags("  Foo <b>bar</b> &amp; baz\nqux  "),
+            "Foo bar & baz qux"
+        );
+        assert_eq!(
+            strip_tags("caf\u{e9} &#x2764; &quot;x&quot; &#39;y&#39;"),
+            "caf\u{e9} \u{2764} \"x\" 'y'"
+        );
+    }
+
+    #[test]
+    fn ddg_freshness_maps_brave_syntax() {
+        assert_eq!(ddg_freshness("pd_1d"), Some("d"));
+        assert_eq!(ddg_freshness("pd_1w"), Some("w"));
+        assert_eq!(ddg_freshness("pd_1m"), Some("m"));
+        assert_eq!(ddg_freshness("pd_1y"), Some("y"));
+        assert_eq!(ddg_freshness("2025-01-01..2025-02-01"), None);
+        assert_eq!(ddg_freshness(""), None);
     }
 }

@@ -79,7 +79,6 @@ pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
             crate::tool::edit::SnapshotStore::new(64, 8),
         )),
         current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        web_brave_key_env: "BRAVE_API_KEY".into(),
         interactive: false,
     };
     let bash = crate::tool::command::locate_git_bash(&ctx);

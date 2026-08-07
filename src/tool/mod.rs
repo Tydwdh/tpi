@@ -75,7 +75,7 @@ impl BuiltinTool {
                 "Replace the whole short plan atomically (max 7 unique items). Only for complex multi-step tasks; simple tasks do not need a plan. It is a progress state, not an extra workflow."
             }
             BuiltinTool::WebSearch => {
-                "Search the web (Brave) to discover sources. Returns title, URL, snippet and age. Results are for discovery only; never opens a browser and never calls a summary model."
+                "Search the web (DuckDuckGo, free, no API key) to discover sources. Returns title, URL and snippet. Results are for discovery only; never opens a browser and never calls a summary model."
             }
             BuiltinTool::WebFetch => {
                 "Fetch a URL and convert HTML to plain text (bounded body). Returns final URL, status, content type, title and body; full body is stored as artifact."
@@ -203,8 +203,6 @@ pub struct ToolContext {
     pub snapshot_store: std::sync::Arc<std::sync::Mutex<crate::tool::edit::SnapshotStore>>,
     /// 当前原子短计划（§13；agent loop 持有，update_plan 原子替换）。
     pub current_plan: std::sync::Arc<std::sync::Mutex<Option<crate::tool::plan::Plan>>>,
-    /// Brave API key 的环境变量名（§17；未配置时 web_search 明确 unavailable）。
-    pub web_brave_key_env: String,
     /// 交互模式（`-p` 为 false；§11 移除 ask_user 后仅保留供未来交互原语使用）。
     pub interactive: bool,
 }

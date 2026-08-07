@@ -380,11 +380,6 @@ async fn interactive_loop<P: Provider>(
                         .as_ref()
                         .map(|p| p.to_string())
                         .unwrap_or_else(|| "未配置（自动查找 Git Bash）".to_string());
-                    let brave_key = if std::env::var(&config.web_brave_key_env).is_ok() {
-                        "已配置 key"
-                    } else {
-                        "未配置 key"
-                    };
                     ui_state.view.open_modal(
                         "/settings",
                         format!(
@@ -393,7 +388,7 @@ workspace: {}
 sessions: {}
 artifacts: {}
 shell: {shell}
-web_search: Brave（{brave_key}）
+web_search: DuckDuckGo（免费，无需 API key）
 自动打开浏览器: {}
 保留 token: {}",
                             config.source,

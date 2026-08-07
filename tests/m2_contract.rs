@@ -91,7 +91,6 @@ async fn cancellation_kills_entire_process_tree() {
         shell_path: ctx.shell_path.clone(),
         snapshot_store: ctx.snapshot_store.clone(),
         current_plan: ctx.current_plan.clone(),
-        web_brave_key_env: ctx.web_brave_key_env.clone(),
         interactive: true,
     };
     let handle = tokio::spawn(async move { bash(args, &run_ctx).await });

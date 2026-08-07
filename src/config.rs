@@ -99,8 +99,7 @@ pub struct Config {
     pub shell_path: Option<Utf8PathBuf>,
     /// §15.4：compaction 触发阈值的 safety reserve。
     pub safety_reserve_tokens: u64,
-    /// §17：Brave API key 环境变量名（未配置时 web_search 明确 unavailable）。
-    pub web_brave_key_env: String,
+    /// §17：web_search 使用免费 DuckDuckGo 端点（无需 API key）。
     /// §17：绝不自动打开浏览器（v1 固定 false）。
     pub auto_open_browser: bool,
     /// §17：web_summary 默认关闭。
@@ -249,7 +248,6 @@ pub fn load(workspace_root: &Utf8PathBuf, cli_model: Option<&str>) -> Result<Con
         artifacts_root: home.join("artifacts"),
         shell_path: merged.shell.path.as_deref().map(Utf8PathBuf::from),
         safety_reserve_tokens: merged.context.safety_reserve_tokens.unwrap_or(8192),
-        web_brave_key_env: "BRAVE_API_KEY".into(),
         auto_open_browser: false,
         web_summary_model: "none".into(),
         system_prompt_extra,

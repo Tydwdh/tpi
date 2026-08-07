@@ -29,7 +29,6 @@ pub fn test_config(workspace_root: &Utf8PathBuf) -> Config {
         shell_path: None,
         safety_reserve_tokens: 8192,
         ui_mode: Default::default(),
-        web_brave_key_env: "TPI_BRAVE_API_KEY".into(),
         auto_open_browser: false,
         web_summary_model: "none".into(),
         system_prompt_extra: None,
@@ -65,7 +64,6 @@ pub fn test_tool_context(workspace_root: &Utf8PathBuf) -> tpi::tool::ToolContext
             tpi::tool::edit::SnapshotStore::default(),
         )),
         current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        web_brave_key_env: "TPI_BRAVE_API_KEY".into(),
         interactive: true,
     }
 }

@@ -673,7 +673,6 @@ error: invalid_arguments
                 shell_path: config.shell_path.clone(),
                 snapshot_store: snapshot_store.clone(),
                 current_plan: current_plan.clone(),
-                web_brave_key_env: config.web_brave_key_env.clone(),
                 interactive,
             };
             // §12.3：StateStamp（access footprint revisions + workspace epoch）。
@@ -738,7 +737,6 @@ error: invalid_arguments
                     shell_path: config.shell_path.clone(),
                     snapshot_store: snapshot_store.clone(),
                     current_plan: current_plan.clone(),
-                    web_brave_key_env: config.web_brave_key_env.clone(),
                     interactive,
                 };
                 format!(
