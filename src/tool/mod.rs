@@ -5,9 +5,9 @@
 //! 插件 ABI 或 `dyn Tool` 层。
 //!
 //! M1 范围（§21 M1）：`read`、`edit`、`write`。
-//! M2：`list`、`search`、`bash`。M4：`update_plan`、`ask_user`。M6：`web_search`、`web_fetch`。
+//! M2：`list`、`search`、`bash`。M4：`update_plan`。M6：`web_search`、`web_fetch`。
+//! §11（稳定化任务书）：ask_user 已移除——需要用户决定时模型直接输出问题并结束 run。
 
-pub mod ask;
 pub mod command;
 pub mod edit;
 pub mod files;
@@ -32,7 +32,6 @@ pub enum BuiltinTool {
     Write,
     Bash,
     UpdatePlan,
-    AskUser,
     WebSearch,
     WebFetch,
 }
@@ -47,7 +46,6 @@ impl BuiltinTool {
             BuiltinTool::Write => "write",
             BuiltinTool::Bash => "bash",
             BuiltinTool::UpdatePlan => "update_plan",
-            BuiltinTool::AskUser => "ask_user",
             BuiltinTool::WebSearch => "web_search",
             BuiltinTool::WebFetch => "web_fetch",
         }
@@ -75,9 +73,6 @@ impl BuiltinTool {
             }
             BuiltinTool::UpdatePlan => {
                 "Replace the whole short plan atomically (max 7 unique items). Only for complex multi-step tasks; simple tasks do not need a plan. It is a progress state, not an extra workflow."
-            }
-            BuiltinTool::AskUser => {
-                "Ask the user one blocking question when different choices would materially change the outcome. Must be the only tool in its batch. In non-interactive mode returns interactive_input_unavailable."
             }
             BuiltinTool::WebSearch => {
                 "Search the web (Brave) to discover sources. Returns title, URL, snippet and age. Results are for discovery only; never opens a browser and never calls a summary model."
@@ -111,9 +106,6 @@ impl BuiltinTool {
             }
             BuiltinTool::UpdatePlan => {
                 serde_json::to_value(schemars::schema_for!(plan::UpdatePlanArgs)).unwrap()
-            }
-            BuiltinTool::AskUser => {
-                serde_json::to_value(schemars::schema_for!(ask::AskUserArgs)).unwrap()
             }
             BuiltinTool::WebSearch => {
                 serde_json::to_value(schemars::schema_for!(web::WebSearchArgs)).unwrap()
@@ -153,9 +145,6 @@ impl BuiltinTool {
             BuiltinTool::UpdatePlan => serde_json::from_str::<plan::UpdatePlanArgs>(arguments)
                 .map(ValidatedArgs::UpdatePlan)
                 .map_err(|e| format!("invalid update_plan args: {e}")),
-            BuiltinTool::AskUser => serde_json::from_str::<ask::AskUserArgs>(arguments)
-                .map(ValidatedArgs::AskUser)
-                .map_err(|e| format!("invalid ask_user args: {e}")),
             BuiltinTool::WebSearch => serde_json::from_str::<web::WebSearchArgs>(arguments)
                 .map(ValidatedArgs::WebSearch)
                 .map_err(|e| format!("invalid web_search args: {e}")),
@@ -176,7 +165,6 @@ pub enum ValidatedArgs {
     Write(files::WriteArgs),
     Bash(command::BashArgs),
     UpdatePlan(plan::UpdatePlanArgs),
-    AskUser(ask::AskUserArgs),
     WebSearch(web::WebSearchArgs),
     WebFetch(web::WebFetchArgs),
 }
@@ -217,7 +205,7 @@ pub struct ToolContext {
     pub current_plan: std::sync::Arc<std::sync::Mutex<Option<crate::tool::plan::Plan>>>,
     /// Brave API key 的环境变量名（§17；未配置时 web_search 明确 unavailable）。
     pub web_brave_key_env: String,
-    /// 交互模式（`-p` 为 false；ask_user 在非交互模式拒绝）。
+    /// 交互模式（`-p` 为 false；§11 移除 ask_user 后仅保留供未来交互原语使用）。
     pub interactive: bool,
 }
 
@@ -371,7 +359,6 @@ pub async fn execute(
         (BuiltinTool::Bash, ValidatedArgs::Bash(args)) => command::bash(args, ctx).await,
         // §13：update_plan 是原生同步控制操作，不进入普通调度队列。
         (BuiltinTool::UpdatePlan, ValidatedArgs::UpdatePlan(args)) => plan::update_plan(args, ctx),
-        (BuiltinTool::AskUser, ValidatedArgs::AskUser(args)) => ask::ask_user(args, ctx),
         (BuiltinTool::WebSearch, ValidatedArgs::WebSearch(args)) => {
             web::web_search(args, ctx).await
         }
@@ -391,7 +378,6 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
         BuiltinTool::Write,
         BuiltinTool::Bash,
         BuiltinTool::UpdatePlan,
-        BuiltinTool::AskUser,
         BuiltinTool::WebSearch,
         BuiltinTool::WebFetch,
     ]

@@ -77,11 +77,10 @@ pub fn tool_access(
             file_lock(FileScope::Exact(path), AccessMode::Write)
         }
         (BuiltinTool::Bash, _) => ToolAccess::WorkspaceUnknown,
-        // update_plan / ask_user 是原生同步控制操作（§13）：不进入普通调度队列。
-        (BuiltinTool::UpdatePlan, _)
-        | (BuiltinTool::AskUser, _)
-        | (BuiltinTool::WebSearch, _)
-        | (BuiltinTool::WebFetch, _) => ToolAccess::Pure,
+        // update_plan 是原生同步控制操作（§13）：不进入普通调度队列。
+        (BuiltinTool::UpdatePlan, _) | (BuiltinTool::WebSearch, _) | (BuiltinTool::WebFetch, _) => {
+            ToolAccess::Pure
+        }
         _ => ToolAccess::Pure,
     }
 }
@@ -227,7 +226,6 @@ pub fn observation_key(status: &str, bounded_payload: &str) -> String {
 #[derive(Debug, Default)]
 pub struct ProgressTracker {
     known_workspace_epoch: u64,
-    instruction_epoch: u64,
     last: Option<RepeatKey>,
     repeat_count: u32,
 }
@@ -243,11 +241,6 @@ impl ProgressTracker {
     /// 相关文件 revision 变化后允许重试（§12.3：edit/write 成功或观察到新 revision 时增加）。
     pub fn bump_workspace_epoch(&mut self) {
         self.known_workspace_epoch += 1;
-    }
-
-    /// 新用户 steering 增加 instruction epoch（基于新意图显式重试）。
-    pub fn bump_instruction_epoch(&mut self) {
-        self.instruction_epoch += 1;
     }
 
     pub fn workspace_epoch(&self) -> u64 {

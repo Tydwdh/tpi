@@ -65,7 +65,6 @@ pub struct PrimaryModelFile {
     pub reasoning: Option<String>,
     pub max_output_tokens: Option<u32>,
     pub context_window: Option<u64>,
-    pub supports_tools: Option<bool>,
     /// 从环境变量读取 API key 的变量名（默认 TPI_API_KEY）。
     pub api_key_env: Option<String>,
 }
@@ -298,7 +297,9 @@ fn merge_limits(
         (Some(home), Some(workspace)) => Some(AgentLimitsFile {
             max_model_turns: workspace.max_model_turns.or(home.max_model_turns),
             max_tool_calls: workspace.max_tool_calls.or(home.max_tool_calls),
-            max_wall_time_minutes: workspace.max_wall_time_minutes.or(home.max_wall_time_minutes),
+            max_wall_time_minutes: workspace
+                .max_wall_time_minutes
+                .or(home.max_wall_time_minutes),
             max_parallel_tools: workspace.max_parallel_tools.or(home.max_parallel_tools),
             max_identical_no_progress: workspace
                 .max_identical_no_progress

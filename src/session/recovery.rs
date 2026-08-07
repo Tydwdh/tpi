@@ -86,7 +86,7 @@ pub fn recover(path: &Path) -> std::io::Result<RecoveryOutcome> {
 /// 纯读工具无副作用，记为 not_applied。
 fn classify_effect(tool_name: &str, recovery: Option<&RecoveryMetadata>) -> Effect {
     match tool_name {
-        "read" | "list" | "search" | "web_search" | "web_fetch" | "update_plan" | "ask_user" => {
+        "read" | "list" | "search" | "web_search" | "web_fetch" | "update_plan" => {
             Effect::NotApplied
         }
         _ => {
