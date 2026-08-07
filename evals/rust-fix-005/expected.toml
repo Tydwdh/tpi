@@ -7,7 +7,7 @@ timeout_sec = 900
 type = "bash"
 command = 'cargo build'
 expect_exit = 0
-expect_stdout_contains = ['Finished']
+expect_stderr_contains = ['Finished']
 [[verify]]
 type = "bash"
 command = './target/debug/rust_fix_005.exe'

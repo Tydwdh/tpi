@@ -7,7 +7,7 @@ timeout_sec = 900
 type = "bash"
 command = 'cargo test'
 expect_exit = 0
-expect_stderr_contains = ['test result: ok']
+expect_stdout_contains = ['test result: ok']
 [[verify]]
 type = "file_contains"
 path = 'src/lib.rs'
