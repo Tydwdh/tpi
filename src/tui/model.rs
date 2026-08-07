@@ -7,9 +7,12 @@
 //! 「工具卡片」（单行 icon name duration status，§16.2），
 //! 支持思考折叠（Alt+T）、命令补全菜单与累积 token 用量。
 
+use std::collections::HashMap;
+
 use crate::session::Usage;
 use crate::tool::outcome::ToolStatus;
 use crate::tool::plan::Plan;
+use crate::tui::scroll::{EntryId, ScrollAnchor, ScrollMode};
 
 /// 转录行类型（§16.2：普通工具可见、plan call 隐藏由 UI 策略决定）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,10 +154,21 @@ impl OverlayState {
 }
 
 /// 转录条目：消息或工具卡片（保持原始出现顺序）。
+///
+/// 每个条目带稳定 [`EntryId`]（TUI v2 §4.1）：trim/折叠不会改变 id，
+/// 滚动锚点与搜索命中都基于它，而不是 Vec index。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
-    Message(TranscriptLine),
-    Tool(ToolCard),
+    Message { id: EntryId, line: TranscriptLine },
+    Tool { id: EntryId, card: ToolCard },
+}
+
+impl Entry {
+    pub fn id(&self) -> EntryId {
+        match self {
+            Entry::Message { id, .. } | Entry::Tool { id, .. } => *id,
+        }
+    }
 }
 
 /// 状态栏内容（§16.2）。
@@ -198,10 +212,19 @@ pub struct ViewModel {
     pub workspace: String,
     /// 当前正在运行的 turn 数。
     pub turn: u32,
-    /// 距离转录末尾的逻辑行数。0 表示跟随最新输出；翻页时增大。
+    /// 滚动模式（TUI v2 §3）：Follow = 尾部；Locked = 锚定 EntryId + row。
+    pub scroll_mode: ScrollMode,
+    /// 兼容字段：距转录末尾的逻辑行数（0 = 跟随）。TUI v2 起
+    /// Locked 的事实源是 [`scroll_mode`]，本字段仅保留给旧测试/旧语义。
     pub transcript_scroll: u16,
     /// scroll lock 期间到达的新条目数（footer 提示；End/Ctrl+End 清空）。
     pub pending_below: u64,
+    /// 最近一次布局的视口顶部行（renderer 写回；滚动操作的基础，§4）。
+    pub layout_top: Option<(EntryId, usize)>,
+    /// 各 entry 最近一次布局的 visual 高度（renderer 写回；滚动跨 entry 用）。
+    pub entry_heights: HashMap<EntryId, usize>,
+    /// 最近一次布局的转录区高度（PageUp/PageDown 按 viewport-2 移动，§10）。
+    pub transcript_rows: u16,
     /// 思考内容是否展开（Alt+T 切换，§16.2：thinking 可折叠）。
     pub reasoning_visible: bool,
     /// 本会话累计 token 用量（AgentOutcome.usage 累积，§16.2：无 pricing 时显示 usage）。
@@ -218,6 +241,7 @@ pub struct ViewModel {
     /// 详情 Overlay（None = 关闭；打开时 Esc 关闭、PgUp/PgDn 滚动）。
     pub overlay: Option<OverlayState>,
     pub next_version: u64,
+    pub next_entry_id: u64,
 }
 
 impl Default for ViewModel {
@@ -231,8 +255,12 @@ impl Default for ViewModel {
             model_name: "?".into(),
             workspace: String::new(),
             turn: 0,
+            scroll_mode: ScrollMode::Follow,
             transcript_scroll: 0,
             pending_below: 0,
+            layout_top: None,
+            entry_heights: HashMap::new(),
+            transcript_rows: 0,
             reasoning_visible: false,
             input_tokens: 0,
             output_tokens: 0,
@@ -242,6 +270,7 @@ impl Default for ViewModel {
             file_index: Vec::new(),
             overlay: None,
             next_version: 1,
+            next_entry_id: 1,
         }
     }
 }
@@ -258,14 +287,25 @@ impl ViewModel {
         v
     }
 
+    /// 分配稳定条目 ID（§4.1：trim/折叠不影响）。
+    fn alloc_entry_id(&mut self) -> EntryId {
+        let id = EntryId(self.next_entry_id);
+        self.next_entry_id += 1;
+        id
+    }
+
     /// 追加转录行。
     pub fn push_line(&mut self, kind: LineKind, text: impl Into<String>) {
         let version = self.alloc_version();
-        self.transcript.push(Entry::Message(TranscriptLine {
-            kind,
-            text: text.into(),
-            version,
-        }));
+        let id = self.alloc_entry_id();
+        self.transcript.push(Entry::Message {
+            id,
+            line: TranscriptLine {
+                kind,
+                text: text.into(),
+                version,
+            },
+        });
         self.note_new_content();
         self.trim_transcript();
     }
@@ -275,7 +315,7 @@ impl ViewModel {
     pub fn push_stream_delta(&mut self, kind: LineKind, text: &str) {
         let version = self.alloc_version();
         match self.transcript.last_mut() {
-            Some(Entry::Message(line)) if line.kind == kind => {
+            Some(Entry::Message { line, .. }) if line.kind == kind => {
                 // P1-9：单条消息有界（超出丢弃中段并标记，防 transcript 膨胀）。
                 if line.text.len() < MAX_MESSAGE_CHARS {
                     let room = MAX_MESSAGE_CHARS - line.text.len();
@@ -294,30 +334,106 @@ impl ViewModel {
                 line.version = version; // 文本变化 → 渲染缓存失效
             }
             _ => {
-                self.transcript.push(Entry::Message(TranscriptLine {
-                    kind,
-                    text: text.to_string(),
-                    version,
-                }));
+                let id = self.alloc_entry_id();
+                self.transcript.push(Entry::Message {
+                    id,
+                    line: TranscriptLine {
+                        kind,
+                        text: text.to_string(),
+                        version,
+                    },
+                });
                 self.note_new_content();
                 self.trim_transcript();
             }
         }
         // 整改 C：不再强制拉回底部——用户滚动查看历史时新输出只计数。
-        // 跟随模式（scroll==0）保持跟随；scroll lock 时累计 pending。
+        // Follow 模式保持跟随；Locked 时累计 pending（§16）。
     }
 
-    /// 整改 C：scroll lock 期间的新条目计数（footer 提示“↓ N 条新消息”）。
+    /// 整改 C + TUI v2 §16：Locked 期间的新条目计数（footer 提示）。
     fn note_new_content(&mut self) {
-        if self.transcript_scroll > 0 {
+        if self.scroll_mode != ScrollMode::Follow {
             self.pending_below += 1;
+        }
+        // 兼容投影：Locked 时保持非零（旧测试/旧渲染读 transcript_scroll）。
+        self.transcript_scroll = if self.scroll_mode == ScrollMode::Follow {
+            0
+        } else {
+            self.transcript_scroll.max(1)
+        };
+    }
+
+    /// 恢复 follow-tail（End/Ctrl+End，§3.1）：回到底部并清空新消息计数。
+    pub fn follow_tail(&mut self) {
+        self.scroll_mode = ScrollMode::Follow;
+        self.transcript_scroll = 0;
+        self.pending_below = 0;
+    }
+
+    /// 进入 Locked 并锚定到指定行（§3.2：滚动/搜索跳转后新输出不动视口）。
+    pub fn lock_to(&mut self, entry: EntryId, row_in_entry: usize) {
+        self.scroll_mode = ScrollMode::Locked(ScrollAnchor {
+            entry_id: entry,
+            row_in_entry,
+        });
+        self.transcript_scroll = self.transcript_scroll.max(1);
+    }
+
+    /// 向历史滚动（§10：每步 delta 行）。
+    /// 基准：Locked 时 = 当前锚点（连续滚动自然累积，不依赖布局刷新）；
+    /// Follow 时 = 最近布局的视口顶部行（§3.2 进入 Locked）。
+    pub fn scroll_up(&mut self, lines: u16) {
+        let delta = lines.max(1) as usize;
+        let base = self.scroll_base();
+        if let Some((entry, row)) = base {
+            let ids: Vec<EntryId> = self.transcript.iter().map(Entry::id).collect();
+            let heights = self.current_heights(&ids);
+            let top_row = crate::tui::scroll::row_of(&ids, &heights, entry, row);
+            let new_top =
+                crate::tui::scroll::move_by_rows(&ids, &heights, top_row, -(delta as isize));
+            self.lock_to(new_top.0, new_top.1);
         }
     }
 
-    /// 恢复 follow-tail（End/Ctrl+End）：回到底部并清空新消息计数。
-    pub fn follow_tail(&mut self) {
-        self.transcript_scroll = 0;
-        self.pending_below = 0;
+    pub fn scroll_down(&mut self, lines: u16) {
+        let delta = lines.max(1) as usize;
+        if self.scroll_mode == ScrollMode::Follow {
+            return; // 已是最新，无可下滚。
+        }
+        if let Some((entry, row)) = self.scroll_base() {
+            let ids: Vec<EntryId> = self.transcript.iter().map(Entry::id).collect();
+            let heights = self.current_heights(&ids);
+            let top_row = crate::tui::scroll::row_of(&ids, &heights, entry, row);
+            let total: usize = heights.iter().sum();
+            let area = self.transcript_rows as usize;
+            // 到底后保持 Locked（End 显式回 Follow，§10）。
+            let new_top = crate::tui::scroll::move_by_rows(&ids, &heights, top_row, delta as isize);
+            let new_row = crate::tui::scroll::row_of(&ids, &heights, new_top.0, new_top.1);
+            if new_row + area >= total {
+                // 已到最底：仍 Locked（不自动 Follow），但清空 pending。
+                self.pending_below = 0;
+            }
+            self.lock_to(new_top.0, new_top.1);
+        }
+    }
+
+    /// 滚动基准行：Locked = 当前锚点；Follow = 最近布局的视口顶部行
+    /// （无布局信息时锚定最早条目）。
+    fn scroll_base(&self) -> Option<(EntryId, usize)> {
+        match self.scroll_mode {
+            ScrollMode::Locked(anchor) => Some((anchor.entry_id, anchor.row_in_entry)),
+            ScrollMode::Follow => self
+                .layout_top
+                .or_else(|| self.transcript.first().map(|e| (e.id(), 0))),
+        }
+    }
+
+    /// 平行高度表（entry_heights 缓存，缺失的 entry 按 1 行估算）。
+    fn current_heights(&self, ids: &[EntryId]) -> Vec<usize> {
+        ids.iter()
+            .map(|id| self.entry_heights.get(id).copied().unwrap_or(1))
+            .collect()
     }
 
     /// 工具开始：追加一张运行中的卡片（整改 A2：一个 call 一张卡，原地更新）。
@@ -328,17 +444,21 @@ impl ViewModel {
         target: Option<String>,
         command: Option<String>,
     ) {
-        self.transcript.push(Entry::Tool(ToolCard {
-            id: id.into(),
-            name: name.into(),
-            target,
-            command,
-            state: ToolCardState::Running,
-            output: None,
-            output_truncated: false,
-            expanded: false,
-            tail: None,
-        }));
+        let entry_id = self.alloc_entry_id();
+        self.transcript.push(Entry::Tool {
+            id: entry_id,
+            card: ToolCard {
+                id: id.into(),
+                name: name.into(),
+                target,
+                command,
+                state: ToolCardState::Running,
+                output: None,
+                output_truncated: false,
+                expanded: false,
+                tail: None,
+            },
+        });
         self.note_new_content();
         self.trim_transcript();
     }
@@ -347,11 +467,11 @@ impl ViewModel {
     pub fn append_tool_output(&mut self, id: impl Into<String>, text: impl Into<String>) {
         let id = id.into();
         let text = text.into();
-        if let Some(Entry::Tool(card)) = self
+        if let Some(Entry::Tool { card, .. }) = self
             .transcript
             .iter_mut()
             .rev()
-            .find(|entry| matches!(entry, Entry::Tool(card) if card.id == id))
+            .find(|entry| matches!(entry, Entry::Tool { card, .. } if card.id == id))
         {
             let current = card.output.get_or_insert_with(String::new);
             if current.len() + text.len() > MAX_CARD_OUTPUT {
@@ -376,7 +496,7 @@ impl ViewModel {
     pub fn toggle_expand(&mut self, id: impl Into<String>) {
         let id = id.into();
         for entry in self.transcript.iter_mut().rev() {
-            if let Entry::Tool(card) = entry
+            if let Entry::Tool { card, .. } = entry
                 && card.id == id
             {
                 card.expanded = !card.expanded;
@@ -388,7 +508,7 @@ impl ViewModel {
     /// 切换最后一张卡片展开（Alt+E 键盘兜底）。
     pub fn toggle_last_tool_expanded(&mut self) {
         for entry in self.transcript.iter_mut().rev() {
-            if let Entry::Tool(card) = entry {
+            if let Entry::Tool { card, .. } = entry {
                 card.expanded = !card.expanded;
                 return;
             }
@@ -398,7 +518,7 @@ impl ViewModel {
     /// 打开最近一张工具卡片的详情 Overlay（Alt+E）。
     pub fn open_last_tool_overlay(&mut self) {
         for entry in self.transcript.iter().rev() {
-            if let Entry::Tool(card) = entry {
+            if let Entry::Tool { card, .. } = entry {
                 self.overlay = Some(OverlayState::for_tool(card));
                 return;
             }
@@ -408,7 +528,7 @@ impl ViewModel {
     /// P2：打开最近一张失败/被拒/取消的工具卡片 Overlay（Alt+O）。
     pub fn open_failed_tool_overlay(&mut self) {
         for entry in self.transcript.iter().rev() {
-            if let Entry::Tool(card) = entry {
+            if let Entry::Tool { card, .. } = entry {
                 let failed = matches!(
                     &card.state,
                     ToolCardState::Done { status, .. } if *status != ToolStatus::Succeeded
@@ -427,7 +547,7 @@ impl ViewModel {
             .transcript
             .iter()
             .filter_map(|entry| match entry {
-                Entry::Tool(card) => Some(card.id.clone()),
+                Entry::Tool { card, .. } => Some(card.id.clone()),
                 _ => None,
             })
             .collect();
@@ -447,7 +567,7 @@ impl ViewModel {
     pub fn open_tool_overlay(&mut self, id: impl Into<String>) {
         let id = id.into();
         for entry in self.transcript.iter().rev() {
-            if let Entry::Tool(card) = entry
+            if let Entry::Tool { card, .. } = entry
                 && card.id == id
             {
                 self.overlay = Some(OverlayState::for_tool(card));
@@ -457,8 +577,11 @@ impl ViewModel {
     }
 
     /// 打开 reasoning 原文 Overlay（点击折叠的 reasoning 行）。
-    pub fn open_reasoning_overlay(&mut self, index: usize) {
-        let Some(Entry::Message(line)) = self.transcript.get(index) else {
+    pub fn open_reasoning_overlay(&mut self, id: EntryId) {
+        let Some(line) = self.transcript.iter().find_map(|entry| match entry {
+            Entry::Message { id: eid, line } if *eid == id => Some(line),
+            _ => None,
+        }) else {
             return;
         };
         if line.kind != LineKind::Reasoning {
@@ -487,7 +610,7 @@ impl ViewModel {
         let tail = tail.into();
         // 从后往前找（同一 run 内 call_id 唯一；防御性支持乱序完成）。
         for entry in self.transcript.iter_mut().rev() {
-            if let Entry::Tool(card) = entry
+            if let Entry::Tool { card, .. } = entry
                 && card.id == id
             {
                 card.name = name;
@@ -510,49 +633,46 @@ impl ViewModel {
             }
         }
         // 未找到（理论上不会：ToolStarted 先于 ToolCompleted）——兜底追加终态卡片。
-        self.transcript.push(Entry::Tool(ToolCard {
-            id,
-            name,
-            target: None,
-            command: None,
-            state: ToolCardState::Done {
-                status,
-                duration_ms,
-                exit_code,
+        let entry_id = self.alloc_entry_id();
+        self.transcript.push(Entry::Tool {
+            id: entry_id,
+            card: ToolCard {
+                id,
+                name,
+                target: None,
+                command: None,
+                state: ToolCardState::Done {
+                    status,
+                    duration_ms,
+                    exit_code,
+                },
+                output: if tail.is_empty() {
+                    None
+                } else {
+                    Some(bound_output(&tail))
+                },
+                output_truncated: tail.len() > MAX_CARD_OUTPUT,
+                expanded: false,
+                tail: if status == ToolStatus::Succeeded {
+                    None
+                } else {
+                    Some(bound_tail(&tail))
+                },
             },
-            output: if tail.is_empty() {
-                None
-            } else {
-                Some(bound_output(&tail))
-            },
-            output_truncated: tail.len() > MAX_CARD_OUTPUT,
-            expanded: false,
-            tail: if status == ToolStatus::Succeeded {
-                None
-            } else {
-                Some(bound_tail(&tail))
-            },
-        }));
+        });
         self.trim_transcript();
     }
 
-    /// 有界转录（防止长会话内存无限增长）。
+    /// 有界转录（防止长会话内存无限增长）。trim 不改变 EntryId（§4.1）；
+    /// 锚点 entry 被 trim 后由布局侧回退到最早现存 entry（scroll.rs，§68）。
     fn trim_transcript(&mut self) {
         if self.transcript.len() > 2000 {
             let keep = self.transcript.len() - 2000;
+            let removed: Vec<EntryId> = self.transcript[..keep].iter().map(Entry::id).collect();
             self.transcript.drain(..keep);
-        }
-    }
-
-    /// 向历史滚动。滚动量是离底部的距离，因而新输出可以自然回到底部。
-    pub fn scroll_up(&mut self, lines: u16) {
-        self.transcript_scroll = self.transcript_scroll.saturating_add(lines);
-    }
-
-    pub fn scroll_down(&mut self, lines: u16) {
-        self.transcript_scroll = self.transcript_scroll.saturating_sub(lines);
-        if self.transcript_scroll == 0 {
-            self.pending_below = 0;
+            for id in removed {
+                self.entry_heights.remove(&id);
+            }
         }
     }
 
@@ -703,7 +823,7 @@ mod tests {
         view.push_stream_delta(LineKind::Assistant, "你");
         view.push_stream_delta(LineKind::Assistant, "好");
         assert_eq!(view.transcript.len(), 1);
-        let Entry::Message(line) = &view.transcript[0] else {
+        let Entry::Message { line, .. } = &view.transcript[0] else {
             panic!("assistant delta 必须是消息条目");
         };
         assert_eq!(line.text, "你好");
@@ -714,12 +834,12 @@ mod tests {
         let mut view = ViewModel::default();
         view.push_stream_delta(LineKind::Assistant, "a");
         let v1 = match &view.transcript[0] {
-            Entry::Message(line) => line.version,
+            Entry::Message { line, .. } => line.version,
             _ => panic!(),
         };
         view.push_stream_delta(LineKind::Assistant, "b");
         let v2 = match &view.transcript[0] {
-            Entry::Message(line) => line.version,
+            Entry::Message { line, .. } => line.version,
             _ => panic!(),
         };
         assert_ne!(v1, v2);
@@ -727,14 +847,29 @@ mod tests {
 
     #[test]
     fn new_output_returns_to_follow_mode() {
-        // 整改 C：scroll lock 期间新输出不再强制拉回底部，只计数。
+        // 整改 C + TUI v2：scroll lock 期间新输出不再强制拉回底部，只计数。
         let mut view = ViewModel::default();
+        // 模拟已布局（layout_top + 高度表；scroll_up 基于它移动锚点）。
+        view.push_line(LineKind::Assistant, "a");
+        view.push_line(LineKind::Assistant, "b");
+        view.layout_top = Some((EntryId(1), 0));
+        view.entry_heights.insert(EntryId(1), 1);
+        view.entry_heights.insert(EntryId(2), 1);
         view.scroll_up(20);
-        view.push_stream_delta(LineKind::Assistant, "new");
-        assert_eq!(view.transcript_scroll, 20, "scroll lock 保持");
+        assert_eq!(
+            view.scroll_mode,
+            ScrollMode::Locked(ScrollAnchor {
+                entry_id: EntryId(1),
+                row_in_entry: 0,
+            }),
+            "scroll lock 保持（锚定最早行）"
+        );
+        assert_eq!(view.transcript_scroll, 1, "兼容投影：Locked 非零");
+        view.push_line(LineKind::Assistant, "new");
         assert_eq!(view.pending_below, 1, "新条目计数");
         // Ctrl+End 恢复跟随并清空计数。
         view.follow_tail();
+        assert_eq!(view.scroll_mode, ScrollMode::Follow);
         assert_eq!(view.transcript_scroll, 0);
         assert_eq!(view.pending_below, 0);
     }
@@ -752,7 +887,7 @@ mod tests {
             Some(2),
             "exit_code: 1\n错误详情",
         );
-        let Entry::Tool(card) = &view.transcript[0] else {
+        let Entry::Tool { card, .. } = &view.transcript[0] else {
             panic!("call-1 必须是卡片");
         };
         assert_eq!(card.name, "bash");
@@ -771,7 +906,7 @@ mod tests {
         );
         assert!(card.tail.as_deref().unwrap_or("").contains("错误详情"));
         // 未完成的 call-2 保持 Running。
-        let Entry::Tool(card2) = &view.transcript[1] else {
+        let Entry::Tool { card: card2, .. } = &view.transcript[1] else {
             panic!("call-2 必须是卡片");
         };
         assert_eq!(card2.state, ToolCardState::Running);
@@ -789,7 +924,7 @@ mod tests {
             Some(0),
             "大量输出",
         );
-        let Entry::Tool(card) = &view.transcript[0] else {
+        let Entry::Tool { card, .. } = &view.transcript[0] else {
             panic!();
         };
         assert_eq!(
@@ -808,7 +943,7 @@ mod tests {
         let mut view = ViewModel::default();
         view.begin_tool("c", "bash", None, None);
         view.finish_tool("c", "bash", ToolStatus::Failed, 0, None, "x".repeat(10_000));
-        let Entry::Tool(card) = &view.transcript[0] else {
+        let Entry::Tool { card, .. } = &view.transcript[0] else {
             panic!();
         };
         assert!(card.tail.as_ref().unwrap().chars().count() <= 241);
@@ -890,7 +1025,7 @@ mod tests {
             Some(0),
             "line-1\nline-2\n",
         );
-        let Entry::Tool(card) = &view.transcript[0] else {
+        let Entry::Tool { card, .. } = &view.transcript[0] else {
             panic!();
         };
         // 成功也保留完整输出（此前被丢弃）。
@@ -899,12 +1034,12 @@ mod tests {
         assert!(!card.expanded);
         // 展开切换。
         view.toggle_expand("call-1");
-        let Entry::Tool(card) = &view.transcript[0] else {
+        let Entry::Tool { card, .. } = &view.transcript[0] else {
             panic!();
         };
         assert!(card.expanded);
         view.toggle_last_tool_expanded();
-        let Entry::Tool(card) = &view.transcript[0] else {
+        let Entry::Tool { card, .. } = &view.transcript[0] else {
             panic!();
         };
         assert!(!card.expanded, "Alt+E 再次切换回折叠");
@@ -916,7 +1051,7 @@ mod tests {
         view.begin_tool("c", "bash", None, None);
         let big = "x".repeat(40 * 1024);
         view.append_tool_output("c", &big);
-        let Entry::Tool(card) = &view.transcript[0] else {
+        let Entry::Tool { card, .. } = &view.transcript[0] else {
             panic!();
         };
         assert!(card.output_truncated, "超过预算必须标记截断");
@@ -980,7 +1115,7 @@ mod p1_message_cap_tests {
             view.push_stream_delta(LineKind::Assistant, &chunk);
         }
         let entry = view.transcript.last().unwrap();
-        let Entry::Message(line) = entry else {
+        let Entry::Message { line, .. } = entry else {
             panic!("最后一条应是消息");
         };
         assert!(
@@ -1000,7 +1135,7 @@ mod p1_message_cap_tests {
             view.push_stream_delta(LineKind::Reasoning, &"r".repeat(1024));
         }
         let entry = view.transcript.last().unwrap();
-        let Entry::Message(line) = entry else {
+        let Entry::Message { line, .. } = entry else {
             panic!("最后一条应是消息");
         };
         assert!(line.text.len() <= MAX_MESSAGE_CHARS + 32);

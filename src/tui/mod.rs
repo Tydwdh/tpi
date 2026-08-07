@@ -20,6 +20,7 @@ pub mod effect;
 pub mod event;
 pub mod model;
 pub mod reducer;
+pub mod scroll;
 pub mod state;
 pub mod terminal;
 pub mod text;
@@ -35,6 +36,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use model::{Entry, LineKind, StatusLine, ToolCard, ToolCardState, TranscriptLine, ViewModel};
+use scroll::{EntryId, ScrollMode};
 
 /// 帧合并间隔（§16.1：100-500 deltas/s 时按 16 ms 合并，而不是 delta 数量等于 draw 次数）。
 pub const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
@@ -72,8 +74,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
 pub enum HitTarget {
     /// 工具卡片（按 call_id 打开详情）。
     Tool(String),
-    /// 折叠的 reasoning 行（按 transcript entry index 打开原文）。
-    Reasoning(usize),
+    /// 折叠的 reasoning 行（按稳定 EntryId 打开原文，§4.1）。
+    Reasoning(EntryId),
 }
 
 /// stdout 的唯一所有者（§3.2 不变量 11、§16.1）。
@@ -161,7 +163,7 @@ impl Renderer {
     }
 
     /// 渲染一帧（唯一的 stdout 写入路径；§16.1 以帧为单位合并模型增量）。
-    pub fn draw(&mut self, view: &ViewModel) -> std::io::Result<()> {
+    pub fn draw(&mut self, view: &mut ViewModel) -> std::io::Result<()> {
         let theme = self.theme;
         let mode = self.driver.mode();
         let mut cache = std::mem::take(&mut self.md_cache);
@@ -263,7 +265,7 @@ impl Default for Renderer {
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     frame: &mut ratatui::Frame,
-    view: &ViewModel,
+    view: &mut ViewModel,
     theme: theme::Theme,
     cache: &mut HashMap<u64, Vec<Line<'static>>>,
     cache_width: &mut u16,
@@ -354,12 +356,15 @@ fn render_frame(
     }
 }
 
-/// 转录窗口规划（纯函数，可单测）：
-/// - 窗口 = 距底部 `scroll` 行的最后 `area_h` 行（跟随模式 scroll=0 显示最新内容）；
-/// - 跟随模式下，窗口之上的闭合行交给调用方提交到 scrollback（overflow）；
-/// - `reset_committed`（resize）时不做提交，提交位置重置为窗口起点。
+/// 转录窗口规划（TUI v2 §3-4、§57）：
+/// - Follow：窗口 = 尾部 `area_h` 行；跟随模式下窗口之上的闭合行交给调用方
+///   提交到 scrollback（overflow，仅 inline）；
+/// - Locked(anchor)：窗口顶部 = 锚点行（§3.2：新输出不动视口）；锚点 entry
+///   被 trim 时回退最早现存 entry（§68）；窗口越界时 clamp；
+/// - 布局后写回 layout_top / entry_heights / transcript_rows（renderer 写回，
+///   滚动操作的基础，§4.3 resize 保持语义位置）。
 fn plan_window(
-    view: &ViewModel,
+    view: &mut ViewModel,
     theme: theme::Theme,
     width: u16,
     area_h: u16,
@@ -367,20 +372,64 @@ fn plan_window(
     reset_committed: bool,
     cache: &mut HashMap<u64, Vec<Line<'static>>>,
 ) -> FramePlan {
-    let (logical, hits) = build_transcript_text(view, theme, cache, width as usize);
-    let (wrapped, wrapped_hits) = wrap_lines_with_hits(logical, hits, width as usize);
-    let total = wrapped.len();
-    let area_h = area_h as usize;
-    let scroll = view.transcript_scroll as usize;
-    let window_bottom = total.saturating_sub(scroll);
-    let window_start = window_bottom.saturating_sub(area_h);
-    let window = wrapped[window_start..window_bottom].to_vec();
-    let row_hits = wrapped_hits[window_start..window_bottom].to_vec();
+    let width = width.max(1) as usize;
+    // 按 entry 构建逻辑行（entry → wrapped 行 + hits）。
+    let per_entry = build_transcript_text(view, theme, cache, width);
+    let ids: Vec<EntryId> = view.transcript.iter().map(Entry::id).collect();
+    let mut wrapped_by_entry: Vec<(EntryId, Vec<Line<'static>>, Vec<Option<HitTarget>>)> =
+        Vec::with_capacity(per_entry.len());
+    let mut heights: Vec<usize> = Vec::with_capacity(per_entry.len());
+    for (id, logical, hits) in per_entry {
+        let (wrapped, wrapped_hits) = wrap_lines_with_hits(logical, hits, width);
+        heights.push(wrapped.len());
+        wrapped_by_entry.push((id, wrapped, wrapped_hits));
+    }
+    // 写回高度表（滚动跨 entry 定位用；§4）。
+    for (id, height) in ids.iter().zip(heights.iter()) {
+        view.entry_heights.insert(*id, *height);
+    }
+
+    let area_h = area_h.max(1) as usize;
+    let window_start =
+        crate::tui::scroll::window_start_row(&ids, &heights, &view.scroll_mode, area_h);
+    // 写回布局结果：视口顶部行 + 视口高度（renderer 写回，滚动基础）。
+    view.layout_top = Some(crate::tui::scroll::locate_row(&ids, &heights, window_start));
+    view.transcript_rows = area_h as u16;
+
+    // 按全局行切片：逐 entry 取窗口内的行。
+    let mut window: Vec<Line<'static>> = Vec::new();
+    let mut row_hits: Vec<Option<HitTarget>> = Vec::new();
+    let mut cursor = 0usize;
+    for (_, wrapped, wrapped_hits) in &wrapped_by_entry {
+        let start = cursor;
+        let end = cursor + wrapped.len();
+        cursor = end;
+        if end <= window_start || start >= window_start + area_h {
+            continue;
+        }
+        let from = window_start.saturating_sub(start);
+        let to = (window_start + area_h - start).min(wrapped.len());
+        window.extend(wrapped[from..to].iter().cloned());
+        row_hits.extend(wrapped_hits[from..to].iter().cloned());
+    }
     let (overflow, committed_after) = if reset_committed {
         (Vec::new(), window_start)
-    } else if scroll == 0 && window_start > committed {
+    } else if view.scroll_mode == ScrollMode::Follow && window_start > committed {
         // 跟随模式：窗口之上的行已闭合，提交到 scrollback。
-        (wrapped[committed..window_start].to_vec(), window_start)
+        let mut overflow_lines: Vec<Line<'static>> = Vec::new();
+        let mut collected = 0usize;
+        for (_, wrapped, _) in &wrapped_by_entry {
+            let start = collected;
+            let end = collected + wrapped.len();
+            collected = end;
+            if end <= committed || start >= window_start {
+                continue;
+            }
+            let from = committed.saturating_sub(start);
+            let to = (window_start - start).min(wrapped.len());
+            overflow_lines.extend(wrapped[from..to].iter().cloned());
+        }
+        (overflow_lines, window_start)
     } else {
         (Vec::new(), committed)
     };
@@ -495,13 +544,16 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
 
 /// 把转录条目渲染为逻辑行（Message 按类型着色/加 rail；Tool 渲染为卡片）。
 ///
-/// 返回 (lines, hits)：hits 与 lines 等长，工具卡片的行对应卡片 id（鼠标点击展开）。
+/// 返回按 entry 分组的结果：每项 = (EntryId, 逻辑行, 逐行 hits)。
+/// hits 与 lines 等长，工具卡片的行对应卡片 id（鼠标点击展开）。
 fn build_transcript_text(
     view: &ViewModel,
     theme: theme::Theme,
     cache: &mut HashMap<u64, Vec<Line<'static>>>,
     width: usize,
-) -> (Vec<Line<'static>>, Vec<Option<HitTarget>>) {
+) -> Vec<(EntryId, Vec<Line<'static>>, Vec<Option<HitTarget>>)> {
+    let mut groups: Vec<(EntryId, Vec<Line<'static>>, Vec<Option<HitTarget>>)> =
+        Vec::with_capacity(view.transcript.len());
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut hits: Vec<Option<HitTarget>> = Vec::new();
     let push_hit = |lines: &mut Vec<Line<'static>>,
@@ -511,9 +563,12 @@ fn build_transcript_text(
         lines.push(line);
         hits.push(hit);
     };
-    for (entry_index, entry) in view.transcript.iter().enumerate() {
+    for entry in view.transcript.iter() {
+        let entry_id = entry.id();
+        out.clear();
+        hits.clear();
         match entry {
-            Entry::Message(line) => match line.kind {
+            Entry::Message { line, .. } => match line.kind {
                 // §16.2：用户消息细紫红左 rail + 小型 `you` 标签。
                 LineKind::User => {
                     let rendered = cached_markdown(cache, line, theme);
@@ -553,7 +608,7 @@ fn build_transcript_text(
                                         .fg(theme.muted)
                                         .add_modifier(Modifier::ITALIC),
                                 ),
-                                Some(HitTarget::Reasoning(entry_index)),
+                                Some(HitTarget::Reasoning(entry_id)),
                             );
                         }
                     } else {
@@ -566,7 +621,7 @@ fn build_transcript_text(
                                     .fg(theme.muted)
                                     .add_modifier(Modifier::ITALIC),
                             ),
-                            Some(HitTarget::Reasoning(entry_index)),
+                            Some(HitTarget::Reasoning(entry_id)),
                         );
                     }
                 }
@@ -596,7 +651,7 @@ fn build_transcript_text(
                     }
                 }
             },
-            Entry::Tool(card) => {
+            Entry::Tool { card, .. } => {
                 let card_id = card.id.clone();
                 for line in tool_card_lines(card, view.anim_tick, theme, width) {
                     push_hit(
@@ -608,8 +663,13 @@ fn build_transcript_text(
                 }
             }
         }
+        groups.push((
+            entry_id,
+            std::mem::take(&mut out),
+            std::mem::take(&mut hits),
+        ));
     }
-    (out, hits)
+    groups
 }
 
 /// 按条目版本缓存 Markdown 渲染（流式增量只重渲染变化条目，§16.1）。
@@ -1226,13 +1286,17 @@ fn fmt_tokens(n: u64) -> String {
 }
 
 /// 用 TestBackend 渲染一帧（测试与录制用，§20.3）。
-pub fn draw_to_test_backend(view: &ViewModel, width: u16, height: u16) -> ratatui::buffer::Buffer {
+pub fn draw_to_test_backend(
+    view: &mut ViewModel,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
     draw_to_test_backend_mode(view, width, height, terminal::ViewMode::Inline)
 }
 
 /// 用 TestBackend 按指定视口模式渲染一帧（§20.3；fullscreen 验收测试用）。
 pub fn draw_to_test_backend_mode(
-    view: &ViewModel,
+    view: &mut ViewModel,
     width: u16,
     height: u16,
     mode: terminal::ViewMode,
@@ -1267,7 +1331,7 @@ pub fn draw_to_test_backend_mode(
 }
 
 /// 捕获一次 draw 的 stdout 字节（§20.3：验证无全屏清除序列、单次 flush）。
-pub fn draw_captured_bytes(view: &ViewModel) -> Vec<u8> {
+pub fn draw_captured_bytes(view: &mut ViewModel) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     {
         let backend = CrosstermBackend::new(&mut out);
@@ -1322,7 +1386,7 @@ mod tests {
             view.push_line(LineKind::Assistant, format!("line {i}"));
         }
         let mut cache = HashMap::new();
-        let plan = plan_window(&view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let plan = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         // 跟随模式：窗口是最后 4 行，前 6 行提交到 scrollback。
         assert_eq!(plan.window.len(), 4);
         assert_eq!(plan.overflow.len(), 6);
@@ -1337,7 +1401,7 @@ mod tests {
 
         // 第二次调用：无新 overflow。
         let plan2 = plan_window(
-            &view,
+            &mut view,
             theme::Theme::omp(),
             80,
             4,
@@ -1355,10 +1419,13 @@ mod tests {
         for i in 0..10 {
             view.push_line(LineKind::Assistant, format!("line {i}"));
         }
-        view.scroll_up(2);
         let mut cache = HashMap::new();
-        let plan = plan_window(&view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
-        // 翻页：窗口 = [10-2-4, 10-2) = 4..8；不提交。
+        // 先布局一次（Follow 建立 layout_top = 视口顶部行）。
+        let _ = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        // TUI v2：翻页 = 锚点（视口顶部）上移 2 行 → 窗口 [4, 8)。
+        view.scroll_up(2);
+        let plan = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        // Locked：不提交到 scrollback。
         assert_eq!(plan.window.len(), 4);
         assert!(plan.overflow.is_empty());
         assert_eq!(plan.committed_after, 0);
@@ -1369,6 +1436,19 @@ mod tests {
             .collect();
         assert!(window_text.contains("line 5") && window_text.contains("line 7"));
         assert!(!window_text.contains("line 9"));
+        // Locked 保持：新内容不移动视口（§58 场景 A）。
+        view.push_line(LineKind::Assistant, "line 10 new".to_string());
+        let plan3 = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let window_text: String = plan3
+            .window
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            !window_text.contains("line 10 new"),
+            "Locked 时新输出不得移动视口"
+        );
+        assert!(view.pending_below >= 1, "Locked 时新内容必须计数");
     }
 
     #[test]
@@ -1379,11 +1459,11 @@ mod tests {
         }
         let mut cache = HashMap::new();
         // 先提交 6 行。
-        let plan = plan_window(&view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let plan = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         assert_eq!(plan.committed_after, 6);
         // resize：不产生 overflow，提交位置重置为窗口起点。
         let plan2 = plan_window(
-            &view,
+            &mut view,
             theme::Theme::omp(),
             40,
             4,

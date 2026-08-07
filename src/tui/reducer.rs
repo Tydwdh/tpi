@@ -310,8 +310,8 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             state.view.open_tool_overlay(id);
             Vec::new()
         }
-        UiEvent::ClickReasoning(index) => {
-            state.view.open_reasoning_overlay(index);
+        UiEvent::ClickReasoning(id) => {
+            state.view.open_reasoning_overlay(id);
             Vec::new()
         }
         UiEvent::Agent(event) => {

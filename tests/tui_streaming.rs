@@ -54,7 +54,7 @@ fn streaming_path_has_no_full_screen_clear() {
         ..Default::default()
     };
     view.push_line(LineKind::Assistant, "hello");
-    let bytes = draw_captured_bytes(&view);
+    let bytes = draw_captured_bytes(&mut view);
     let text = String::from_utf8_lossy(&bytes);
     // CSI 全屏清除：ESC[2J 或 ESC[1;1H ESC[2J 等。
     assert!(
@@ -74,7 +74,7 @@ fn frame_flushes_stdout_once() {
     for i in 0..50 {
         view.push_line(LineKind::Assistant, format!("line {i}"));
     }
-    let bytes = draw_captured_bytes(&view);
+    let bytes = draw_captured_bytes(&mut view);
     assert!(!bytes.is_empty());
     // 一次 draw 是完整的 CSI 帧：inline viewport 先输出换行占位（打开 viewport），
     // 随后是 CSI 终端定位序列；不得是裸文本或全屏清除。
@@ -102,7 +102,7 @@ fn frame_coalescing_merges_high_frequency_deltas() {
         if start.elapsed() >= FRAME_INTERVAL || i == 0 {
             draws += 1;
             // 模拟一次实际 draw。
-            let _ = draw_to_test_backend(&view, 80, 20);
+            let _ = draw_to_test_backend(&mut view, 80, 20);
         }
     }
     // 事件密集窗口内 draw 次数远小于事件数（不是 delta 数量等于 draw 次数）。
@@ -119,7 +119,7 @@ fn streaming_never_clears_full_screen() {
     for i in 0..200 {
         view.push_line(LineKind::Assistant, format!("streaming line {i}"));
         if i % 10 == 0 {
-            let bytes = draw_captured_bytes(&view);
+            let bytes = draw_captured_bytes(&mut view);
             let text = String::from_utf8_lossy(&bytes);
             assert!(
                 !text.contains("\x1b[2J") && !text.contains("\x1b[3J"),
@@ -144,7 +144,7 @@ fn chinese_and_long_tool_output_render_completely() {
         format!("→ run cargo test\n{}", "x".repeat(2000)),
     );
     view.push_line(LineKind::Assistant, "已修复这个中文 bug。");
-    let buffer = draw_to_test_backend(&view, 80, 20);
+    let buffer = draw_to_test_backend(&mut view, 80, 20);
     let rendered = buffer_text(&buffer);
     // 双宽字符在 buffer 中占两个 cell（TestBackend 语义），逐字检查渲染完整性。
     assert!(
@@ -197,7 +197,7 @@ fn editor_history_navigates_submitted_prompts() {
 fn user_message_has_you_label() {
     let mut view = ViewModel::default();
     view.push_line(LineKind::User, "你好");
-    let buffer = draw_to_test_backend(&view, 80, 12);
+    let buffer = draw_to_test_backend(&mut view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(
         rendered.contains("you"),
@@ -211,7 +211,7 @@ fn tool_card_renders_running_and_done_states() {
     let mut view = ViewModel::default();
     view.begin_tool("c1", "bash", Some("bash: cargo test".into()), None);
     view.anim_tick = 0;
-    let buffer = draw_to_test_backend(&view, 80, 12);
+    let buffer = draw_to_test_backend(&mut view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(
         rendered.contains('⠋') && rendered.contains("bash: cargo test"),
@@ -219,7 +219,7 @@ fn tool_card_renders_running_and_done_states() {
     );
 
     view.finish_tool("c1", "bash", ToolStatus::Succeeded, 2345, Some(0), "");
-    let buffer = draw_to_test_backend(&view, 80, 12);
+    let buffer = draw_to_test_backend(&mut view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(
         rendered.contains('✓') && rendered.contains("2.3s"),
@@ -240,7 +240,7 @@ fn failed_tool_card_shows_status_and_tail() {
         Some(2),
         "exit_code: 1\n失败输出",
     );
-    let buffer = draw_to_test_backend(&view, 80, 12);
+    let buffer = draw_to_test_backend(&mut view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(rendered.contains('✗'), "失败卡片显示 ✗: {rendered:?}");
     assert!(
@@ -260,7 +260,7 @@ fn reasoning_can_be_folded() {
     let mut view = ViewModel::default();
     // 整改 A1：默认折叠（不显示正文）。
     view.push_line(LineKind::Reasoning, "内部推理过程");
-    let buffer = draw_to_test_backend(&view, 80, 12);
+    let buffer = draw_to_test_backend(&mut view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(
         rendered.contains("已折叠"),
@@ -270,7 +270,7 @@ fn reasoning_can_be_folded() {
 
     // Alt+T 展开后显示原文。
     view.reasoning_visible = true;
-    let buffer = draw_to_test_backend(&view, 80, 12);
+    let buffer = draw_to_test_backend(&mut view, 80, 12);
     assert!(buffer_text(&buffer).contains("内部推理过程"));
 }
 
@@ -279,7 +279,7 @@ fn reasoning_can_be_folded() {
 fn assistant_markdown_bold_and_code_are_styled() {
     let mut view = ViewModel::default();
     view.push_line(LineKind::Assistant, "**加粗** 和 `code`");
-    let buffer = draw_to_test_backend(&view, 80, 12);
+    let buffer = draw_to_test_backend(&mut view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(rendered.contains("加粗") && rendered.contains("code"));
     // 加粗 cell 必须带 BOLD 修饰。
@@ -298,7 +298,7 @@ fn command_menu_pops_up_with_matches() {
         ..Default::default()
     };
     view.refresh_command_menu();
-    let buffer = draw_to_test_backend(&view, 80, 14);
+    let buffer = draw_to_test_backend(&mut view, 80, 14);
     let rendered = buffer_text(&buffer);
     assert!(
         rendered.contains("/settings") && rendered.contains("查看生效配置"),
@@ -325,7 +325,7 @@ fn plan_renders_as_compact_strip() {
             },
         ],
     });
-    let buffer = draw_to_test_backend(&view, 80, 14);
+    let buffer = draw_to_test_backend(&mut view, 80, 14);
     let rendered = buffer_text(&buffer);
     assert!(rendered.contains("计划"), "计划条必须渲染: {rendered:?}");
     assert!(rendered.contains("第一步"));

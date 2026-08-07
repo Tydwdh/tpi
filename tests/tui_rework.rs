@@ -25,7 +25,7 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
 fn card_rows(view: &ViewModel, id: &str) -> usize {
     view.transcript
         .iter()
-        .filter(|entry| matches!(entry, Entry::Tool(card) if card.id == id))
+        .filter(|entry| matches!(entry, Entry::Tool { card, .. } if card.id == id))
         .count()
 }
 
@@ -94,7 +94,7 @@ fn long_command_stays_single_line_with_ellipsis() {
     let long = format!("git commit -m \"{}\"", "x".repeat(400));
     view.begin_tool("c", "bash", Some(long.clone()), Some(long));
     view.finish_tool("c", "bash", ToolStatus::Succeeded, 113, Some(0), "");
-    let buffer = draw_to_test_backend(&view, 80, 12);
+    let buffer = draw_to_test_backend(&mut view, 80, 12);
     let text = buffer_text(&buffer);
     assert!(text.contains('…'), "超长命令必须 ellipsis: {text}");
     assert!(text.contains("113ms"), "metadata 仍可见: {text}");
@@ -121,7 +121,7 @@ fn reasoning_flood_collapses_to_one_line() {
     let mut view = ViewModel::default();
     let flood = "reasoning ".repeat(2000); // ~20KB
     view.push_stream_delta(LineKind::Reasoning, &flood);
-    let buffer = draw_to_test_backend(&view, 80, 12);
+    let buffer = draw_to_test_backend(&mut view, 80, 12);
     let text = buffer_text(&buffer);
     assert!(text.contains("已折叠"), "默认折叠: {text}");
     assert!(!text.contains("reasoning"), "正文不进入 transcript: {text}");
@@ -142,14 +142,14 @@ fn output_flood_does_not_grow_transcript() {
     let big = "x".repeat(10 * 1024 * 1024);
     view.append_tool_output("c", &big);
     view.finish_tool("c", "bash", ToolStatus::Succeeded, 100, Some(0), &big);
-    let Entry::Tool(card) = &view.transcript[0] else {
+    let Entry::Tool { card, .. } = &view.transcript[0] else {
         panic!();
     };
     assert!(
         card.output.as_ref().unwrap().len() <= MAX_CARD_OUTPUT,
         "UI 有界"
     );
-    let buffer = draw_to_test_backend(&view, 80, 12);
+    let buffer = draw_to_test_backend(&mut view, 80, 12);
     let text = buffer_text(&buffer);
     assert!(
         text.chars().filter(|c| *c == 'x').count() < 1000,
@@ -169,7 +169,7 @@ fn failure_shows_bounded_tail_only() {
     lines.push_str("error[E0308]: mismatched types\n");
     view.begin_tool("c", "bash", Some("cargo build".into()), None);
     view.finish_tool("c", "bash", ToolStatus::Failed, 3600, Some(101), &lines);
-    let buffer = draw_to_test_backend(&view, 80, 12);
+    let buffer = draw_to_test_backend(&mut view, 80, 12);
     let text = buffer_text(&buffer);
     assert!(text.contains("exit101"), "exit code 明确: {text}");
     // tail 只保留末尾关键内容（bound_tail 240 字符 ≈ 最后 3-4 行），早期行不可见。
@@ -186,7 +186,10 @@ fn detail_opens_overlay_not_inline_rewrite() {
     let mut view = ViewModel::default();
     let mut card = tool_card("c", ToolStatus::Failed, Some("stdout-a\nstdout-b\n"));
     card.command = Some("git diff --stat\n第二行命令".into());
-    view.transcript.push(Entry::Tool(card));
+    view.transcript.push(Entry::Tool {
+        id: tpi::tui::scroll::EntryId(1),
+        card,
+    });
     view.open_tool_overlay("c");
     let overlay = view.overlay.as_ref().expect("overlay 打开");
     assert!(overlay.title.contains("failed"));
@@ -198,7 +201,7 @@ fn detail_opens_overlay_not_inline_rewrite() {
     // Esc 关闭后原 transcript 未被改写（卡片仍是原样）。
     view.close_overlay();
     assert!(view.overlay.is_none());
-    let Entry::Tool(card) = &view.transcript[0] else {
+    let Entry::Tool { card, .. } = &view.transcript[0] else {
         panic!();
     };
     assert_eq!(card.command.as_deref(), Some("git diff --stat\n第二行命令"));
@@ -209,7 +212,8 @@ fn detail_opens_overlay_not_inline_rewrite() {
 fn reasoning_hit_opens_overlay() {
     let mut view = ViewModel::default();
     view.push_line(LineKind::Reasoning, "内部思考原文");
-    view.open_reasoning_overlay(0);
+    let id = view.transcript[0].id();
+    view.open_reasoning_overlay(id);
     let overlay = view.overlay.as_ref().expect("overlay 打开");
     assert!(overlay.body.contains("内部思考原文"));
     assert!(overlay.title.contains("思考"));
@@ -229,7 +233,7 @@ fn layout_works_at_80_120_180_columns() {
     view.push_stream_delta(LineKind::Assistant, "已完成修复。");
 
     for width in [80u16, 120, 180] {
-        let buffer = draw_to_test_backend(&view, width, 16);
+        let buffer = draw_to_test_backend(&mut view, width, 16);
         let text = buffer_text(&buffer);
         assert!(text.contains("你好"), "中文用户消息: {width}");
         assert!(text.contains("已完成修复"), "assistant 正文: {width}");
@@ -285,12 +289,13 @@ fn hit_targets_distinguish_tool_and_reasoning() {
     view.push_line(LineKind::Reasoning, "思考");
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
     view.finish_tool("c1", "bash", ToolStatus::Succeeded, 10, Some(0), "");
-    let buffer = draw_to_test_backend(&view, 80, 20);
+    let buffer = draw_to_test_backend(&mut view, 80, 20);
     // 通过渲染路径验证（间接）：构造渲染并检查 overlay 数据流。
     view.open_last_tool_overlay();
     assert!(view.overlay.as_ref().unwrap().title.contains("bash"));
     view.close_overlay();
-    view.open_reasoning_overlay(0);
+    let reasoning_id = view.transcript[0].id();
+    view.open_reasoning_overlay(reasoning_id);
     assert!(view.overlay.as_ref().unwrap().title.contains("思考"));
     let _ = buffer;
     let _ = HitTarget::Tool("x".into());

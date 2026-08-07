@@ -170,7 +170,7 @@ fn agent_events_drive_view_state() {
             text: "增量二".into(),
         }),
     );
-    let Entry::Message(line) = &s.view.transcript[0] else {
+    let Entry::Message { line, .. } = &s.view.transcript[0] else {
         panic!("assistant 增量必须是消息条目");
     };
     assert_eq!(line.text, "增量一增量二", "同一条消息的流式增量必须合并");
@@ -210,7 +210,7 @@ fn agent_events_drive_view_state() {
         .transcript
         .iter()
         .find_map(|e| match e {
-            Entry::Tool(card) if card.id == call_id.to_string() => Some(card),
+            Entry::Tool { card, .. } if card.id == call_id.to_string() => Some(card),
             _ => None,
         })
         .expect("工具卡片必须存在");
@@ -218,7 +218,7 @@ fn agent_events_drive_view_state() {
     // BudgetWarning 是系统行。
     reducer::update(&mut s, UiEvent::Agent(RuntimeEvent::BudgetWarning));
     assert!(s.view.transcript.iter().any(|e| match e {
-        Entry::Message(line) => line.kind == LineKind::System,
+        Entry::Message { line, .. } => line.kind == LineKind::System,
         _ => false,
     }));
 }

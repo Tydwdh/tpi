@@ -18,8 +18,8 @@ pub enum UiEvent {
     MouseScrollDown,
     /// 鼠标点击命中工具卡片（Renderer hit-test 后）。
     ClickTool(String),
-    /// 鼠标点击命中折叠的 reasoning 行（Renderer hit-test 后）。
-    ClickReasoning(usize),
+    /// 鼠标点击命中折叠的 reasoning 行（Renderer hit-test 后；EntryId §4.1）。
+    ClickReasoning(crate::tui::scroll::EntryId),
     /// bracketed paste 文本。
     Paste(String),
     /// Agent 运行时事件（模型增量/工具生命周期/上下文用量）。

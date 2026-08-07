@@ -238,7 +238,9 @@ async fn interactive_loop<P: Provider>(
     if !initial_prompt.is_empty() {
         ui_state.pending_message = Some(initial_prompt.to_string());
     }
-    renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
+    renderer
+        .draw(&mut ui_state.view)
+        .map_err(|e| e.to_string())?;
 
     // `@` 文件索引：后台扫描一次（跟随 .gitignore，有界 2000），不阻塞启动。
     // P0-3：不用一次性 channel + select 分支——sender drop 后 `recv()` 每次
@@ -305,8 +307,8 @@ async fn interactive_loop<P: Provider>(
                                         crate::tui::HitTarget::Tool(id) => {
                                             Some(UiEvent::ClickTool(id))
                                         }
-                                        crate::tui::HitTarget::Reasoning(index) => {
-                                            Some(UiEvent::ClickReasoning(index))
+                                        crate::tui::HitTarget::Reasoning(id) => {
+                                            Some(UiEvent::ClickReasoning(id))
                                         }
                                     }
                                 } else {
@@ -337,7 +339,9 @@ async fn interactive_loop<P: Provider>(
 
         // 空闲时不重绘：否则没有任何状态变化也会以 60 FPS 占用终端和 CPU。
         if need_draw {
-            renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
         }
 
         // 会话恢复选择（/sessions 菜单 Enter）。
@@ -361,7 +365,9 @@ async fn interactive_loop<P: Provider>(
                 Err(error) => ui_state.view.push_line(LineKind::System, error),
             }
             ui_state.view.menu = None;
-            renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
         }
 
         // 有提交的消息：运行。
@@ -575,7 +581,9 @@ async fn interactive_loop<P: Provider>(
                 _ => {}
             }
             ui_state.view.push_line(LineKind::User, message.clone());
-            renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
 
             if session.is_none() {
                 *session = Some(create_session(
@@ -607,7 +615,9 @@ async fn interactive_loop<P: Provider>(
                         LineKind::System,
                         format!("run 失败，session 已保留：{error}"),
                     );
-                    renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
+                    renderer
+                        .draw(&mut ui_state.view)
+                        .map_err(|e| e.to_string())?;
                     *session = Some(session_log);
                     continue;
                 }
@@ -696,13 +706,13 @@ async fn run_interactive<P: Provider>(
                     crate::tui::reducer::update(ui_state, UiEvent::Agent(event));
                 }
                 if renderer.should_draw() {
-                    renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
+                    renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                 }
             }
             _ = ticker.tick() => {
                 crate::tui::reducer::update(ui_state, UiEvent::Tick);
                 if renderer.should_draw() {
-                    renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
+                    renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                 }
             }
             key = key_rx.recv() => {
@@ -725,11 +735,11 @@ async fn run_interactive<P: Provider>(
                                 }
                             }
                         }
-                        renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
+                        renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }
                     Some(Event::Paste(text)) => {
                         crate::tui::reducer::update(ui_state, UiEvent::Paste(text));
-                        renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
+                        renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }
                     // 鼠标：滚轮翻页；点击工具卡片展开/折叠（hit-test 在 app 层）。
                     Some(Event::Mouse(mouse)) => {
@@ -748,8 +758,8 @@ async fn run_interactive<P: Provider>(
                                         crate::tui::HitTarget::Tool(id) => {
                                             Some(UiEvent::ClickTool(id))
                                         }
-                                        crate::tui::HitTarget::Reasoning(index) => {
-                                            Some(UiEvent::ClickReasoning(index))
+                                        crate::tui::HitTarget::Reasoning(id) => {
+                                            Some(UiEvent::ClickReasoning(id))
                                         }
                                     }
                                 } else {
@@ -760,12 +770,12 @@ async fn run_interactive<P: Provider>(
                         };
                         if let Some(event) = event {
                             crate::tui::reducer::update(ui_state, event);
-                            renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
+                            renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                         }
                     }
                     Some(Event::Resize(_, _)) => {
                         renderer.autoresize().map_err(|e| e.to_string())?;
-                        renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
+                        renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }
                     _ => {}
                 }
@@ -794,7 +804,9 @@ async fn run_interactive<P: Provider>(
     }
     ui_state.view.status = StatusLine::Idle;
     ui_state.view.turn = 0;
-    renderer.draw(&ui_state.view).map_err(|e| e.to_string())?;
+    renderer
+        .draw(&mut ui_state.view)
+        .map_err(|e| e.to_string())?;
     Ok(outcome)
 }
 

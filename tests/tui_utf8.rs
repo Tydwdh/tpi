@@ -32,7 +32,7 @@ fn cjk_emoji_over_card_cap_never_panics_and_stays_bounded() {
     }
     // 单块超大（远超剩余预算）：命中尾部窗口路径。
     view.append_tool_output("c1", multibyte_flood("👨\u{200d}💻", MAX_CARD_OUTPUT * 2));
-    let Entry::Tool(card) = &view.transcript[0] else {
+    let Entry::Tool { card, .. } = &view.transcript[0] else {
         panic!("必须是工具卡片");
     };
     let output = card.output.as_ref().expect("输出必须累积");
@@ -50,7 +50,7 @@ fn cjk_emoji_over_message_cap_never_panics_and_is_valid() {
         &multibyte_flood(unit, MAX_MESSAGE_CHARS - 4),
     );
     view.push_stream_delta(LineKind::Assistant, unit);
-    let Entry::Message(line) = &view.transcript[0] else {
+    let Entry::Message { line, .. } = &view.transcript[0] else {
         panic!("必须是消息条目");
     };
     assert!(
@@ -71,7 +71,7 @@ fn finish_tool_huge_cjk_tail_bounds_without_panic() {
     view.begin_tool("c2", "bash", Some("cmd".into()), Some("cmd".into()));
     let tail = multibyte_flood("错误👨\u{200d}💻中文e\u{301}", MAX_CARD_OUTPUT * 2);
     view.finish_tool("c2", "bash", ToolStatus::Failed, 1000, Some(101), tail);
-    let Entry::Tool(card) = &view.transcript[0] else {
+    let Entry::Tool { card, .. } = &view.transcript[0] else {
         panic!("必须是工具卡片");
     };
     let output = card.output.as_ref().expect("失败必须保留输出");
@@ -92,7 +92,7 @@ fn mixed_ascii_cjk_command_truncation_keeps_utf8() {
         Some("中文命令".repeat(60)),
         Some("中文命令".repeat(60)),
     );
-    let buf = tpi::tui::draw_to_test_backend(&view, 80, 24);
+    let buf = tpi::tui::draw_to_test_backend(&mut view, 80, 24);
     let text: String = buf
         .content()
         .iter()
@@ -110,7 +110,7 @@ fn reasoning_zwj_and_fullwidth_render_safely() {
         LineKind::Reasoning,
         "思考👨\u{200d}💻e\u{301}全角ＡＢＣ".repeat(20),
     );
-    let _buf = tpi::tui::draw_to_test_backend(&view, 60, 20);
+    let _buf = tpi::tui::draw_to_test_backend(&mut view, 60, 20);
 }
 
 #[test]

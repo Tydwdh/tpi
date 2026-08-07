@@ -41,8 +41,8 @@ fn row_texts(buf: &ratatui::buffer::Buffer) -> Vec<String> {
 #[test]
 fn fullscreen_fills_entire_terminal_at_common_sizes() {
     for (w, h) in [(80u16, 24u16), (120, 30), (160, 50)] {
-        let view = busy_view(20);
-        let buf = draw_to_test_backend_mode(&view, w, h, ViewMode::Fullscreen);
+        let mut view = busy_view(20);
+        let buf = draw_to_test_backend_mode(&mut view, w, h, ViewMode::Fullscreen);
         assert_eq!(buf.area().width, w);
         assert_eq!(buf.area().height, h);
         // 最底行必须是 footer（模型名/就绪状态）。
@@ -60,8 +60,8 @@ fn fullscreen_fills_entire_terminal_at_common_sizes() {
 #[test]
 fn fullscreen_transcript_gets_all_remaining_height() {
     // 24 行终端：footer(1) + input(1) + transcript 应占 22 行。
-    let view = busy_view(30);
-    let buf = draw_to_test_backend_mode(&view, 80, 24, ViewMode::Fullscreen);
+    let mut view = busy_view(30);
+    let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
     let texts = row_texts(&buf);
     // 首行应有转录内容（assistant 文本）。
     assert!(
@@ -76,8 +76,8 @@ fn fullscreen_transcript_gets_all_remaining_height() {
 #[test]
 fn fullscreen_small_terminal_degrades_without_panic() {
     // 极小终端（§64：可降级）不得 panic，footer 仍在。
-    let view = busy_view(10);
-    let buf = draw_to_test_backend_mode(&view, 40, 10, ViewMode::Fullscreen);
+    let mut view = busy_view(10);
+    let buf = draw_to_test_backend_mode(&mut view, 40, 10, ViewMode::Fullscreen);
     let texts = row_texts(&buf);
     assert!(!texts.is_empty());
     // 转录区至少 1 行（Min(5) 在极小时让位于固定区，但不得 panic）。
@@ -86,9 +86,9 @@ fn fullscreen_small_terminal_degrades_without_panic() {
 #[test]
 fn fullscreen_resize_keeps_layout_stable() {
     // resize 模拟：同一 view 依次以不同尺寸渲染，不 panic、footer 位置稳定。
-    let view = busy_view(25);
+    let mut view = busy_view(25);
     for (w, h) in [(120u16, 40u16), (70, 25), (160, 50), (80, 24)] {
-        let buf = draw_to_test_backend_mode(&view, w, h, ViewMode::Fullscreen);
+        let buf = draw_to_test_backend_mode(&mut view, w, h, ViewMode::Fullscreen);
         let texts = row_texts(&buf);
         assert!(
             texts
@@ -102,8 +102,8 @@ fn fullscreen_resize_keeps_layout_stable() {
 #[test]
 fn inline_mode_keeps_compat_behavior() {
     // inline 模式保留：活动区有限高，但渲染不 panic。
-    let view = busy_view(30);
-    let buf = draw_to_test_backend_mode(&view, 80, 24, ViewMode::Inline);
+    let mut view = busy_view(30);
+    let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Inline);
     let texts = row_texts(&buf);
     assert!(
         texts
@@ -119,7 +119,7 @@ fn fullscreen_pending_below_hint_renders() {
     let mut view = busy_view(10);
     view.scroll_up(5);
     view.push_line(LineKind::Assistant, "新输出");
-    let buf = draw_to_test_backend_mode(&view, 80, 24, ViewMode::Fullscreen);
+    let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
     let all: String = row_texts(&buf).join("\n");
     assert!(all.contains("条新消息"), "scroll lock 提示应可见: {all:?}");
 }
