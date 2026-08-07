@@ -1,0 +1,147 @@
+//! `__process-host` 模式（§11.5 第 4 步）。
+//!
+//! host 在控制管道（stdin）上阻塞等待 Start spec；创建 target 后，
+//! target 的 stdout/stderr 经 framed 消息转发到 stdout；target 退出后发 Exit 并退出。
+//! host 自身是同步进程（无需 async runtime）。
+
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+
+use serde::Deserialize;
+
+use super::{MSG_EXIT, MSG_OUTPUT, MSG_START, STREAM_STDERR, STREAM_STDOUT};
+
+#[derive(Deserialize)]
+struct StartSpec {
+    program: std::path::PathBuf,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    env: std::collections::HashMap<String, String>,
+}
+
+/// 运行 process-host（返回进程退出码）。
+pub fn run_host() -> i32 {
+    let Some(spec) = read_start_spec() else {
+        eprintln!("process-host: no start spec");
+        return 2;
+    };
+
+    // 创建 target；stdout/stderr piped 给 host 转发。
+    let mut command = Command::new(&spec.program);
+    command
+        .args(&spec.args)
+        .current_dir(&spec.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in &spec.env {
+        command.env(key, value);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            // spawn 失败：发 Exit(特殊码 126，模拟 shell 语义) 并退出。
+            let payload = (-2i32).to_le_bytes().to_vec(); // 126 的占位，实际用 -2 表示 spawn 失败
+            write_message(MSG_EXIT, &payload);
+            eprintln!("process-host: spawn failed: {error}");
+            return 1;
+        }
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // 转发线程：stdout → kind=MSG_OUTPUT/STREAM_STDOUT；stderr → STREAM_STDERR。
+    let stdout_handle = spawn_pump(stdout, STREAM_STDOUT);
+    let stderr_handle = spawn_pump(stderr, STREAM_STDERR);
+
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("process-host: wait failed: {error}");
+            return 1;
+        }
+    };
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+
+    let code = status.code().unwrap_or(1);
+    let payload = code.to_le_bytes().to_vec();
+    write_message(MSG_EXIT, &payload);
+    code
+}
+
+/// 读取 Start spec（framed：`[u32 LE len][u8 kind][payload]`，kind 必须是 MSG_START）。
+fn read_start_spec() -> Option<StartSpec> {
+    let mut stdin = std::io::stdin().lock();
+    let mut header = [0u8; 5];
+    let mut read = 0usize;
+    while read < 5 {
+        match stdin.read(&mut header[read..]) {
+            Ok(0) => return None,
+            Ok(n) => read += n,
+            Err(_) => return None,
+        }
+    }
+    if header[4] != MSG_START {
+        eprintln!("process-host: expected MSG_START, got {}", header[4]);
+        return None;
+    }
+    let len = u32::from_le_bytes(header[..4].try_into().ok()?) as usize;
+    if len > 16 * 1024 * 1024 {
+        eprintln!("process-host: spec too large");
+        return None;
+    }
+    let mut payload = vec![0u8; len];
+    let mut read = 0usize;
+    while read < len {
+        match stdin.read(&mut payload[read..]) {
+            Ok(0) => return None,
+            Ok(n) => read += n,
+            Err(_) => return None,
+        }
+    }
+    serde_json::from_slice(&payload).ok()
+}
+
+/// 写一条 framed 消息到 stdout。
+fn write_message(kind: u8, payload: &[u8]) {
+    let mut stdout = std::io::stdout().lock();
+    let mut header = [0u8; 5];
+    header[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    header[4] = kind;
+    let _ = stdout.write_all(&header);
+    let _ = stdout.write_all(payload);
+    let _ = stdout.flush();
+}
+
+fn spawn_pump<R: std::io::Read + Send + 'static>(
+    stream: Option<R>,
+    stream_kind: u8,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let Some(mut stream) = stream else { return };
+        let mut buffer = [0u8; 8192];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut payload = Vec::with_capacity(n + 1);
+                    payload.push(stream_kind);
+                    payload.extend_from_slice(&buffer[..n]);
+                    write_message(MSG_OUTPUT, &payload);
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}

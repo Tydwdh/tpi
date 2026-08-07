@@ -1,0 +1,66 @@
+//! 测试基础设施（M0/M1 交付项，§21）：fake provider 与 deterministic clock/ID。
+//!
+//! integration tests 通过 `mod fixtures;` 共享本目录。
+//! 夹具函数由不同测试文件按需使用，允许单文件编译单元内未引用。
+#![allow(dead_code)]
+
+pub mod deterministic;
+pub mod fake_provider;
+
+use camino::Utf8PathBuf;
+use tpi::config::{Config, LimitsConfig, ModelConfig};
+
+/// 构造一个最小测试配置（model 名固定，避免"看不见的默认模型"）。
+pub fn test_config(workspace_root: &Utf8PathBuf) -> Config {
+    Config {
+        model: ModelConfig {
+            provider: "test".into(),
+            name: "fake-model".into(),
+            base_url: "https://example.invalid/v1".into(),
+            reasoning: None,
+            max_output_tokens: None,
+            context_window: None,
+            api_key_env: "TPI_TEST_API_KEY".into(),
+        },
+        limits: LimitsConfig::default(),
+        workspace_root: workspace_root.clone(),
+        sessions_root: workspace_root.join(".tpi-test-sessions").into(),
+        artifacts_root: workspace_root.join(".tpi-test-artifacts").into(),
+        shell_path: None,
+        safety_reserve_tokens: 8192,
+        web_brave_key_env: "TPI_BRAVE_API_KEY".into(),
+        auto_open_browser: false,
+        web_summary_model: "none".into(),
+        system_prompt_extra: None,
+        source: "test".into(),
+    }
+}
+
+/// 测试进程不是 tpi.exe；必须显式指向真实 host 二进制（§11.5 单二进制 handshake）。
+pub fn point_host_at_real_tpi() {
+    // Rust 2024：set_var 是 unsafe。
+    unsafe {
+        std::env::set_var("TPI_PROCESS_HOST", env!("CARGO_BIN_EXE_tpi"));
+    }
+}
+
+/// 构造最小工具执行上下文（M2 起字段齐备）。
+pub fn test_tool_context(workspace_root: &Utf8PathBuf) -> tpi::tool::ToolContext {
+    use tpi::tool::search::ScanSnapshot;
+    tpi::tool::ToolContext {
+        workspace_root: workspace_root.clone(),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        artifacts_root: workspace_root.join(".tpi-test-artifacts").into(),
+        session_id: "test-session".into(),
+        scan_snapshots: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            ScanSnapshot,
+        >::new())),
+        shell_path: None,
+        snapshot_store: std::sync::Arc::new(std::sync::Mutex::new(
+            tpi::tool::edit::SnapshotStore::default(),
+        )),
+        current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        web_brave_key_env: "TPI_BRAVE_API_KEY".into(),
+    }
+}

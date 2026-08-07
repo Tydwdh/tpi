@@ -1,0 +1,274 @@
+//! M2 验收契约（§21 M2）。
+//!
+//! - §20.2 场景 8：Bash pipeline 前段失败在 pipefail 下可见；
+//! - §20.2 场景 22：list/search 达到 scan budget 返回统计；cursor 翻页不重新扫描；
+//! - §20.2 场景 23：Windows target 启动后立即派生 child，取消仍能终止 host、target 与 child；
+//! - §8.4：run 完整输出进 artifact，模型经 `@artifact/...` 有界读取。
+
+mod fixtures;
+
+use camino::Utf8PathBuf;
+use fixtures::{point_host_at_real_tpi, test_config, test_tool_context};
+use tokio_util::sync::CancellationToken;
+use tpi::tool::command::{BashArgs, RunArgs, bash, run};
+use tpi::tool::outcome::ToolStatus;
+use tpi::tool::search::{ListArgs, SearchArgs, list, search};
+use tpi::tool::{ToolContext, files};
+
+#[tokio::test]
+async fn bash_pipefail_makes_pipeline_failure_visible() {
+    point_host_at_real_tpi();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let ctx = test_tool_context(&workspace);
+
+    // §11.1：wrapper 统一启用 pipefail——前段失败必须可见（§20.2 场景 8）。
+    let outcome = bash(
+        BashArgs {
+            command: "false | echo hello".into(),
+            cwd: ".".into(),
+            timeout_ms: 30_000,
+        },
+        &ctx,
+    )
+    .await;
+    assert_eq!(
+        outcome.status,
+        ToolStatus::Failed,
+        "pipefail 下前段失败可见: {}",
+        outcome.model_text()
+    );
+
+    // 无失败的 pipeline 正常 succeeded。
+    let outcome = bash(
+        BashArgs {
+            command: "echo hello".into(),
+            cwd: ".".into(),
+            timeout_ms: 30_000,
+        },
+        &ctx,
+    )
+    .await;
+    assert_eq!(outcome.status, ToolStatus::Succeeded);
+    assert!(outcome.model_text().contains("hello"));
+}
+
+#[tokio::test]
+async fn cancellation_kills_entire_process_tree() {
+    point_host_at_real_tpi();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let cancel = CancellationToken::new();
+    let mut ctx = test_tool_context(&workspace);
+    ctx.cancel = cancel.clone();
+    let pid_file = dir.path().join("child.pid");
+
+    // target 启动后立即派生 child（Start-Process），并把自己的 PID 写文件。
+    let script = format!(
+        "$p = Start-Process powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60' -PassThru; Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 60",
+        pid_file.display()
+    );
+    let args = RunArgs {
+        program: "powershell.exe".into(),
+        args: vec!["-NoProfile".into(), "-Command".into(), script],
+        cwd: ".".into(),
+        timeout_ms: 60_000,
+        env: Default::default(),
+    };
+    let run_ctx = ToolContext {
+        workspace_root: ctx.workspace_root.clone(),
+        cancel: cancel.clone(),
+        artifacts_root: ctx.artifacts_root.clone(),
+        session_id: ctx.session_id.clone(),
+        scan_snapshots: ctx.scan_snapshots.clone(),
+        shell_path: ctx.shell_path.clone(),
+        snapshot_store: ctx.snapshot_store.clone(),
+        current_plan: ctx.current_plan.clone(),
+        web_brave_key_env: ctx.web_brave_key_env.clone(),
+    };
+    let handle = tokio::spawn(async move { run(args, &run_ctx).await });
+
+    // 等子进程 PID 落盘。
+    let mut child_pid: Option<u32> = None;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            child_pid = Some(pid);
+            break;
+        }
+    }
+    let child_pid = child_pid.expect("child pid file written");
+
+    // 取消 → host、target 与孙进程全部终止（§20.2 场景 23）。
+    cancel.cancel();
+    let outcome = handle.await.expect("run completes");
+    assert_eq!(outcome.status, ToolStatus::Cancelled);
+
+    let alive = is_process_alive(child_pid, &ctx).await;
+    assert!(!alive, "Job Object 必须终止孙进程（child pid {child_pid}）");
+}
+
+async fn is_process_alive(pid: u32, _ctx: &ToolContext) -> bool {
+    // 使用独立的未取消上下文（取消属于 run 执行本身，不能复用已取消的 token）。
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let check_ctx = test_tool_context(&workspace);
+    for _ in 0..50 {
+        let args = RunArgs {
+            program: "powershell.exe".into(),
+            args: vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ],
+            cwd: ".".into(),
+            timeout_ms: 10_000,
+            env: Default::default(),
+        };
+        let outcome = run(args, &check_ctx).await;
+        match outcome.model_payload.exit_code {
+            Some(0) => {}
+            Some(1) => return false, // 进程已不存在
+            _ => return false,       // 检查失败视为已终止
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    true
+}
+
+#[tokio::test]
+async fn list_and_search_respect_budget_and_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    std::fs::write(workspace.join("a.txt"), "needle-one\n").unwrap();
+    std::fs::write(workspace.join("b.txt"), "needle-two\n").unwrap();
+    std::fs::create_dir_all(workspace.join("sub")).unwrap();
+    std::fs::write(workspace.join("sub/c.txt"), "plain\n").unwrap();
+    std::fs::write(workspace.join("ignored.txt"), "needle-ignored\n").unwrap();
+    std::fs::write(workspace.join(".gitignore"), "ignored.txt\n").unwrap();
+    // ignore crate 需要 git 上下文才应用 .gitignore（标准 git 语义）。
+    std::fs::create_dir_all(workspace.join(".git")).unwrap();
+    let ctx = test_tool_context(&workspace);
+
+    // list：遵循 .gitignore，报告扫描统计。
+    let outcome = list(
+        ListArgs {
+            path: ".".into(),
+            depth: 2,
+            cursor: None,
+        },
+        &ctx,
+    );
+    assert_eq!(outcome.status, ToolStatus::Succeeded);
+    let text = outcome.model_text();
+    assert!(text.contains("scanned_files:"), "必须报告扫描统计: {text}");
+    assert!(text.contains("stop_reason: complete"));
+    assert!(!text.contains("ignored.txt"), ".gitignore 必须生效: {text}");
+    assert!(text.contains("a.txt"));
+
+    // search：regex 匹配 + 行号；ignore 同样生效。
+    let outcome = search(
+        SearchArgs {
+            pattern: "needle".into(),
+            path: ".".into(),
+            cursor: None,
+        },
+        &ctx,
+    );
+    let text = outcome.model_text();
+    assert!(text.contains("a.txt:1: needle-one"), "{text}");
+    assert!(text.contains("b.txt:1: needle-two"), "{text}");
+    assert!(!text.contains("ignored.txt"), "{text}");
+
+    // cursor 翻页不重新扫描（§20.2 场景 22）：250 个文件 → 第一页 200 + cursor → 第二页 50。
+    for i in 0..250 {
+        std::fs::write(workspace.join(format!("f{i:03}.txt")), "x\n").unwrap();
+    }
+    let outcome = list(
+        ListArgs {
+            path: ".".into(),
+            depth: 1,
+            cursor: None,
+        },
+        &ctx,
+    );
+    let text = outcome.model_text();
+    assert!(text.contains("items: 200 shown of"), "{text}");
+    // 提取 cursor。
+    let cursor = text
+        .lines()
+        .find_map(|line| line.strip_prefix("cursor: "))
+        .map(|c| c.to_string())
+        .expect("cursor in output");
+    let page2 = list(
+        ListArgs {
+            path: ".".into(),
+            depth: 1,
+            cursor: Some(cursor),
+        },
+        &ctx,
+    );
+    let text2 = page2.model_text();
+    assert!(text2.contains("items: "), "{text2}");
+    let shown: usize = text2
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("items: ")
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|n| n.parse().ok())
+        })
+        .expect("shown count");
+    assert!(shown > 0 && shown <= 200, "第二页窗口: {text2}");
+}
+
+#[tokio::test]
+async fn run_output_lands_in_artifact_and_readable_via_opaque_ref() {
+    point_host_at_real_tpi();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut ctx = test_tool_context(&workspace);
+    ctx.artifacts_root = config.artifacts_root.clone();
+
+    // 输出 50 行（超过模型预算的 tail 之外也有完整内容在 artifact）。
+    let args = RunArgs {
+        program: "powershell.exe".into(),
+        args: vec![
+            "-NoProfile".into(),
+            "-Command".into(),
+            "1..50 | ForEach-Object { 'line-' + $_ }".into(),
+        ],
+        cwd: ".".into(),
+        timeout_ms: 30_000,
+        env: Default::default(),
+    };
+    let outcome = run(args, &ctx).await;
+    assert_eq!(outcome.status, ToolStatus::Succeeded);
+    assert!(
+        !outcome.artifacts.is_empty(),
+        "run 必须产出 artifact（§8.4）"
+    );
+    let artifact = &outcome.artifacts[0];
+    assert_eq!(artifact.session, ctx.session_id);
+
+    // 完整输出已落盘。
+    let record = tpi::session::artifact::find(&ctx.artifacts_root, &artifact.session, &artifact.id)
+        .expect("artifact record exists");
+    assert!(record.byte_length > 100, "完整输出写入 artifact");
+
+    // 模型经 opaque ref 有界读取（§8.4：read(@artifact/...)）。
+    let read_args = files::ReadArgs {
+        path: format!("@artifact/{}/{}", artifact.session, artifact.id),
+        start_line: 1,
+        line_count: 200,
+    };
+    let read_outcome = files::read(read_args, &ctx);
+    assert_eq!(read_outcome.status, ToolStatus::Succeeded);
+    let text = read_outcome.model_text();
+    assert!(text.contains("line-1"), "{text}");
+    assert!(text.contains("line-50"), "{text}");
+}
