@@ -1,8 +1,9 @@
-//! 行编辑器（§16.2、§21 M5）。
+//! 行编辑器（§16.2、§21 M5；TUI v2 §22 起支持 logical line 导航）。
 //!
 //! 中文 IME 由终端负责；编辑器只维护文本与光标（Unicode 字符边界）。
-//! 控制键：←/→ 移动、Home/End、退格/删除、Enter 提交（由 app 处理）、
-//! Alt+Enter 换行（多行输入）、↑/↓ 历史浏览。
+//! 控制键：←/→ 移动、Home/End（logical line）、退格/删除、Enter 提交
+//! （由 app 处理）、Shift+Enter/Alt+Enter 换行（多行输入）、
+//! ↑/↓ 多行移动（到边界后由调用方进入历史浏览）。
 //!
 //! 历史由编辑器自身维护：submit 时入栈，↑/↓ 替换当前文本。
 
@@ -11,6 +12,8 @@
 pub struct Editor {
     pub text: String,
     pub cursor: usize, // 字节偏移，始终在字符边界
+    /// 多行 ↑/↓ 移动时保持的目标列（display width；§21 Composer v2）。
+    preferred_column: Option<usize>,
     history: Vec<String>,
     history_pos: Option<usize>,
 }
@@ -31,6 +34,90 @@ impl Editor {
     pub fn insert_str(&mut self, s: &str) {
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
+    }
+
+    /// 光标所在 logical line 的字节范围（[start, end)，不含换行符；§22）。
+    pub fn logical_line_bounds(&self) -> (usize, usize) {
+        let before = &self.text[..self.cursor];
+        let start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let after = &self.text[self.cursor..];
+        let end = self.cursor + after.find('\n').unwrap_or(after.len());
+        (start, end)
+    }
+
+    /// 当前光标所在行的 display 列（宽度单位；§22）。
+    fn cursor_col(&self) -> usize {
+        let (start, _) = self.logical_line_bounds();
+        unicode_width::UnicodeWidthStr::width(&self.text[start..self.cursor])
+    }
+
+    /// 在 [start, end) 内按 display 列定位字符偏移（越界 → 行尾）。
+    fn col_to_offset(&self, start: usize, end: usize, col: usize) -> usize {
+        let mut width = 0usize;
+        let mut offset = end;
+        for (i, ch) in self.text[start..end].char_indices() {
+            let w = unicode_width::UnicodeWidthChar::width(ch)
+                .unwrap_or(0)
+                .max(1);
+            if width + w > col {
+                offset = start + i;
+                break;
+            }
+            width += w;
+            offset = start + i + ch.len_utf8();
+        }
+        offset
+    }
+
+    /// 上移一个 logical line（§22、§12：多行 cursor 优先）。
+    /// 返回 false 表示已在第一行——调用方此时进入 prompt history。
+    pub fn move_up(&mut self) -> bool {
+        let (start, _) = self.logical_line_bounds();
+        if start == 0 {
+            self.preferred_column = None;
+            return false;
+        }
+        let prev_end = start - 1; // 跳过行尾 \n
+        let prev_start = self.text[..prev_end]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let column = self.preferred_column.unwrap_or_else(|| self.cursor_col());
+        self.cursor = self.col_to_offset(prev_start, prev_end, column);
+        self.preferred_column = Some(column);
+        true
+    }
+
+    /// 下移一个 logical line（§22）。返回 false 表示已在最后一行。
+    pub fn move_down(&mut self) -> bool {
+        let (_, end) = self.logical_line_bounds();
+        if end == self.text.len() {
+            self.preferred_column = None;
+            return false;
+        }
+        let next_start = end + 1; // 跳过行尾 \n
+        let next_end = self.text[next_start..]
+            .find('\n')
+            .map(|i| next_start + i)
+            .unwrap_or(self.text.len());
+        let column = self.preferred_column.unwrap_or_else(|| self.cursor_col());
+        self.cursor = self.col_to_offset(next_start, next_end, column);
+        self.preferred_column = Some(column);
+        true
+    }
+
+    /// 光标所在 logical line 的起始（§22：Home/Ctrl+A 不再是全文开头）。
+    pub fn home(&mut self) {
+        let (start, _) = self.logical_line_bounds();
+        self.cursor = start;
+        self.preferred_column = None;
+    }
+
+    /// 光标所在 logical line 的末尾（§22：End/Ctrl+E）。
+    pub fn end(&mut self) {
+        let (_, end) = self.logical_line_bounds();
+        self.cursor = end;
+        self.preferred_column = None;
     }
 
     pub fn backspace(&mut self) {
@@ -77,10 +164,6 @@ impl Editor {
                 .unwrap_or(self.text.len());
             self.cursor = next;
         }
-    }
-
-    pub fn home(&mut self) {
-        self.cursor = 0;
     }
 
     /// P2（编辑器增强）：删除光标前一个“词”（空白或标点分隔的连续非空白段）。
@@ -136,20 +219,18 @@ impl Editor {
         self.cursor += chars.get(i).map(|(pos, _)| *pos).unwrap_or(after.len());
     }
 
-    pub fn end(&mut self) {
-        self.cursor = self.text.len();
-    }
-
     /// 整行替换（历史浏览、命令补全用）；光标移到末尾。
     pub fn set_text(&mut self, text: String) {
         self.text = text;
         self.cursor = self.text.len();
+        self.preferred_column = None;
     }
 
     /// 清空输入。
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
+        self.preferred_column = None;
     }
 
     /// 提交当前输入：trim 后返回，清空编辑区并入历史（去重）。
@@ -242,12 +323,56 @@ mod tests {
         editor.insert_str("第一行");
         editor.insert_char('\n');
         editor.insert_str("第二行");
+        // §22：Home 是当前 logical line 首（光标在第二行 → 第二行首）。
         editor.home();
+        assert_eq!(&editor.text[..editor.cursor], "第一行\n");
         editor.move_right();
         editor.insert_char('X');
-        assert_eq!(editor.text, "第X一行\n第二行");
+        assert_eq!(editor.text, "第一行\n第X二行");
         editor.backspace();
         assert_eq!(editor.text, "第一行\n第二行");
+        // §22：End 是当前 logical line 尾。
+        editor.set_text("第一行\n第二行".into());
+        editor.end();
+        assert_eq!(editor.cursor, "第一行\n第二行".len(), "End = 当前行尾");
+        editor.home();
+        assert_eq!(&editor.text[..editor.cursor], "第一行\n", "Home = 当前行首");
+        // 单行输入时 Home/End 与全文语义一致。
+        editor.set_text("abc".into());
+        editor.end();
+        assert_eq!(editor.cursor, 3);
+        editor.home();
+        assert_eq!(editor.cursor, 0, "单行 Home = 全文开头");
+    }
+
+    #[test]
+    fn move_up_down_navigates_logical_lines_with_preferred_column() {
+        let mut editor = Editor::new();
+        editor.insert_str("abc");
+        editor.insert_char('\n');
+        editor.insert_str("abcdef");
+        // 光标在第二行 col 3 → 上移保持 col 3。
+        editor.home();
+        editor.move_right();
+        editor.move_right();
+        editor.move_right();
+        assert_eq!(&editor.text[..editor.cursor], "abc\nabc");
+        assert!(editor.move_up());
+        assert_eq!(&editor.text[..editor.cursor], "abc", "上移保持列");
+        // 到第一行后再上移 → false（调用方进入历史）。
+        assert!(!editor.move_up());
+        // 下移回到第二行同列。
+        assert!(editor.move_down());
+        assert_eq!(&editor.text[..editor.cursor], "abc\nabc");
+        assert!(!editor.move_down(), "最后一行再下移 → false");
+        // 短行 + 大列：clamp 到行尾。
+        let mut editor = Editor::new();
+        editor.insert_str("a");
+        editor.insert_char('\n');
+        editor.insert_str("xxxxx");
+        editor.end();
+        assert!(editor.move_up());
+        assert_eq!(&editor.text[..editor.cursor], "a", "短行 clamp 到行尾");
     }
 
     #[test]

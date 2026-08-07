@@ -1200,7 +1200,8 @@ fn input_area_rows(view: &ViewModel, width: u16) -> u16 {
     }
     let budget = width.saturating_sub(2).max(1) as usize;
     let wrapped = wrap_lines(vec![Line::from(Span::raw(view.input.clone()))], budget);
-    wrapped.len().clamp(1, 4) as u16
+    // §8.2：composer 动态 1..8 行，超过 8 行内部滚动（draw_input 跟随光标）。
+    wrapped.len().clamp(1, 8) as u16
 }
 
 /// 光标在输入区内的 (行, 列)（display-cell 坐标）。

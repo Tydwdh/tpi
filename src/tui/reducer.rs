@@ -29,6 +29,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             state.editor.insert_char('\n');
             state.sync_input();
         }
+        // T6（§23）：Shift+Enter / Ctrl+J 换行（Alt+Enter 兼容保留）。
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.editor.insert_char('\n');
+            state.sync_input();
+        }
         KeyCode::Enter => {
             // 命令菜单打开时先补全为选中命令（Claude Code 式菜单交互）。
             if state.view.menu.is_some()
@@ -121,11 +126,13 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 {
                     menu.selected = (menu.selected + menu.items.len() - 1) % menu.items.len();
                 }
-            } else {
+            } else if !state.editor.move_up() {
+                // §12：到第一 logical line 后才进入 prompt history。
                 state.editor.history_up();
                 state.sync_input();
-                refresh_menus(state);
             }
+            state.sync_input();
+            refresh_menus(state);
         }
         KeyCode::Down => {
             if state.view.menu.is_some() {
@@ -134,11 +141,13 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 {
                     menu.selected = (menu.selected + 1) % menu.items.len();
                 }
-            } else {
+            } else if !state.editor.move_down() {
+                // §12：到最后一个 logical line 后才进入 prompt history。
                 state.editor.history_down();
                 state.sync_input();
-                refresh_menus(state);
             }
+            state.sync_input();
+            refresh_menus(state);
         }
         KeyCode::PageUp => {
             if let Some(overlay) = &mut state.view.overlay {
@@ -182,6 +191,12 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.editor.delete_to_end();
                 state.sync_input();
                 refresh_menus(state);
+                return effects;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'j' {
+                // §23：Ctrl+J 换行（终端 LF 常映射为 Enter，此处兜底）。
+                state.editor.insert_char('\n');
+                state.sync_input();
                 return effects;
             }
             if key.modifiers.contains(KeyModifiers::ALT) && c == 't' {

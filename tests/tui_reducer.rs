@@ -227,3 +227,65 @@ fn agent_events_drive_view_state() {
 }
 
 use tpi::tui::model::Entry;
+
+#[test]
+fn shift_enter_and_ctrl_j_insert_newline_but_plain_enter_submits() {
+    let mut s = state();
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+    );
+    // Shift+Enter 换行（§23）。
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+    );
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+    );
+    assert_eq!(s.editor.text(), "a\nb");
+    // Ctrl+J 换行兜底。
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+    );
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+    );
+    assert_eq!(s.editor.text(), "a\nb\nc");
+    // 普通 Enter 提交（§23：Enter = 提交）。
+    reducer::update(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.pending_message.as_deref(), Some("a\nb\nc"));
+}
+
+#[test]
+fn up_down_moves_within_multiline_then_falls_back_to_history() {
+    let mut s = state();
+    // 先提交一条历史。
+    reducer::update(&mut s, UiEvent::Paste("历史命令".into()));
+    reducer::update(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.pending_message.as_deref(), Some("历史命令"));
+    s.pending_message = None;
+    // 多行输入。
+    reducer::update(&mut s, UiEvent::Paste("第一行\n第二行".into()));
+    s.editor.home();
+    s.sync_input();
+    // §12：↑ 先多行移动（第二行 → 第一行），到边界后才进历史。
+    reducer::update(&mut s, key(KeyCode::Up));
+    assert_eq!(
+        s.editor.text(),
+        "第一行\n第二行",
+        "第二行 ↑ 应移到第一行，不触发历史"
+    );
+    reducer::update(&mut s, key(KeyCode::Up));
+    assert_eq!(
+        s.editor.text(),
+        "历史命令",
+        "第一行再 ↑ 应进入 prompt history"
+    );
+    // ↓ 从历史向下：历史语义（到底后清空回空输入）。
+    reducer::update(&mut s, key(KeyCode::Down));
+    assert_eq!(s.editor.text(), "", "历史向下到底 = 空输入");
+}
