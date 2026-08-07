@@ -1,0 +1,7 @@
+data: {"choices":[{"delta":{"reasoning_content":"先看一下文件结构"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"我先读取这个文件。","tool_calls":[{"index":0,"id":"call_xyz","function":{"name":"read","arguments":"{\"path\":\"probe.txt\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]

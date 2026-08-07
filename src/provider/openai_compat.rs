@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use crate::ids::ToolCallId;
+use crate::provider::trace;
 use crate::provider::{
     ChatMessage, FinishReason, ModelRequest, Provider, ProviderError, ProviderEvent,
     ProviderResponse,
@@ -20,30 +21,32 @@ use tokio_util::sync::CancellationToken;
 /// 重试上限（§7.3：最多重试 2 次）。
 const MAX_RETRIES: u32 = 2;
 
+/// OpenAI-compatible adapter（P0-4：只保存连接级状态）。
+///
+/// 请求级配置（model / reasoning / max_output_tokens / context_window）
+/// 全部来自 [`ModelRequest`]——client 不复制任何请求级字段，避免双事实源
+/// （此前 compaction 的 `max_output_tokens=1024` 被 client 自身字段覆盖）。
 pub struct OpenAiCompatClient {
     base_url: String,
-    model: String,
     api_key: String,
-    reasoning: Option<String>,
-    max_output_tokens: Option<u32>,
     client: reqwest::Client,
 }
 
 impl OpenAiCompatClient {
+    /// `model/reasoning/max_output_tokens/context_window` 是请求级配置，
+    /// 由每次 [`ModelRequest`] 携带；此处仅保留连接级参数（签名保留以便
+    /// 调用方最小改动，多余参数被忽略）。
     pub fn new(
         base_url: String,
-        model: String,
+        _model: String,
         api_key: String,
-        reasoning: Option<String>,
-        max_output_tokens: Option<u32>,
+        _reasoning: Option<String>,
+        _max_output_tokens: Option<u32>,
         _context_window: Option<u64>,
     ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            model,
             api_key,
-            reasoning,
-            max_output_tokens,
             client: reqwest::Client::new(),
         }
     }
@@ -71,10 +74,10 @@ impl OpenAiCompatClient {
         if !tools.is_empty() {
             body.insert("tools".into(), json!(tools));
         }
-        if let Some(reasoning) = self.reasoning.as_deref().or(request.reasoning.as_deref()) {
+        if let Some(reasoning) = &request.reasoning {
             body.insert("reasoning".into(), json!(reasoning));
         }
-        if let Some(max_tokens) = self.max_output_tokens {
+        if let Some(max_tokens) = request.max_output_tokens {
             body.insert("max_tokens".into(), json!(max_tokens));
         }
         body.insert("stream".into(), json!(true));
@@ -100,7 +103,13 @@ fn message_to_json(message: &ChatMessage) -> serde_json::Value {
                     })
                 })
                 .collect();
-            json!({ "role": "assistant", "content": content, "tool_calls": calls })
+            let mut message = json!({ "role": "assistant", "content": content });
+            // 真实 provider 边界（§9）：opencode-go 拒绝 `tool_calls: []`
+            // （要求省略或最小长度 1）。空数组必须省略。
+            if !calls.is_empty() {
+                message["tool_calls"] = json!(calls);
+            }
+            message
         }
         ChatMessage::Tool {
             tool_call_id,
@@ -175,7 +184,8 @@ struct PendingToolCall {
 
 impl Provider for OpenAiCompatClient {
     fn model_name(&self) -> &str {
-        &self.model
+        // P0-4：client 不保存模型（请求级配置）；模型名由 UI 从 config 读取。
+        "openai-compat"
     }
 
     async fn stream(
@@ -187,6 +197,21 @@ impl Provider for OpenAiCompatClient {
         let url = format!("{}/chat/completions", self.base_url);
         let body = self.build_body(&request);
 
+        // §8：provider trace（本地调试；TPI_TRACE_PROVIDER=1）。
+        if trace::enabled() {
+            let mut fields = serde_json::Map::new();
+            fields.insert("url".into(), json!(url));
+            fields.insert("model".into(), json!(request.model));
+            fields.insert("max_output_tokens".into(), json!(request.max_output_tokens));
+            fields.insert("reasoning".into(), json!(request.reasoning));
+            fields.insert("tool_count".into(), json!(request.tools.len()));
+            fields.insert("message_count".into(), json!(request.messages.len()));
+            if trace::include_body() {
+                fields.insert("request_body".into(), body.clone());
+            }
+            trace::log("request_start", fields);
+        }
+
         // §7.3：只在尚未收到任何 response event 前重试。
         for attempt in 0..=MAX_RETRIES {
             let response = self
@@ -195,9 +220,23 @@ impl Provider for OpenAiCompatClient {
                 .map_err(|error| classify_error(error, attempt))?;
             match response {
                 SendResult::Ok(response) => {
+                    let status = response.status();
+                    if trace::enabled() {
+                        let mut fields = serde_json::Map::new();
+                        fields.insert("status".into(), json!(status.as_u16()));
+                        trace::log("response_status", fields);
+                    }
                     return consume_stream(response, events, cancel).await;
                 }
                 SendResult::Retryable { retry_after } => {
+                    if trace::enabled() {
+                        let mut fields = serde_json::Map::new();
+                        fields.insert(
+                            "retry_after_secs".into(),
+                            json!(retry_after.map(|d| d.as_secs())),
+                        );
+                        trace::log("retryable", fields);
+                    }
                     let delay = retry_after.unwrap_or(Duration::from_secs(1));
                     tokio::select! {
                         _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
@@ -245,7 +284,13 @@ impl OpenAiCompatClient {
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
                 return Err(format!("auth ({status_text})"));
             }
-            _ => format!("http {status_text}"),
+            _ => {
+                // §27：4xx/5xx 错误带 provider body（诊断；截断避免刷屏）。
+                // 此前只报 status code，真实 400 的具体原因完全不可见。
+                let body = response.text().await.unwrap_or_default();
+                let snippet: String = body.chars().take(300).collect();
+                format!("http {status_text}: {snippet}")
+            }
         };
         Err(message)
     }
@@ -282,6 +327,12 @@ async fn consume_stream(
         };
         let Some(event) = next else { break };
         let event = event.map_err(|e| ProviderError::Protocol(e.to_string()))?;
+        if trace::enabled() {
+            let mut fields = serde_json::Map::new();
+            fields.insert("event_type".into(), json!(event.event));
+            fields.insert("data_len".into(), json!(event.data.len()));
+            trace::log("sse_event", fields);
+        }
         if event.event == "error" {
             return Err(ProviderError::Protocol(event.data));
         }
@@ -323,6 +374,13 @@ async fn consume_stream(
                 }
                 if let Some(name) = &call.function.as_ref().and_then(|f| f.name.as_ref()) {
                     slot.name = name.to_string();
+                    if trace::enabled() {
+                        let mut fields = serde_json::Map::new();
+                        fields.insert("index".into(), json!(index));
+                        fields.insert("name".into(), json!(name));
+                        fields.insert("provider_id".into(), json!(slot.provider_id));
+                        trace::log("tool_call_started", fields);
+                    }
                     let _ = events
                         .send(ProviderEvent::ToolCallStarted {
                             index: index as u32,
@@ -335,6 +393,12 @@ async fn consume_stream(
                     && !arguments.is_empty()
                 {
                     slot.arguments.push_str(arguments);
+                    if trace::enabled() {
+                        let mut fields = serde_json::Map::new();
+                        fields.insert("index".into(), json!(index));
+                        fields.insert("arguments_len".into(), json!(arguments.len()));
+                        trace::log("tool_arguments_delta", fields);
+                    }
                     let _ = events
                         .send(ProviderEvent::ToolArgumentsDelta {
                             index: index as u32,
@@ -379,7 +443,23 @@ async fn consume_stream(
         })
         .collect::<Result<Vec<_>, ProviderError>>()?;
 
+    // §30 第 11 条：finish=tool_calls 但没有任何完整 call → 明确协议错误
+    // （此前静默返回 Ok，agent 侧看到空 calls 无法推进）。
     let finish_reason = finish_reason.unwrap_or(FinishReason::Error);
+    if finish_reason == FinishReason::ToolCalls && tool_calls.is_empty() {
+        return Err(ProviderError::Protocol(
+            "finish_reason=tool_calls but no tool calls received".into(),
+        ));
+    }
+
+    if trace::enabled() {
+        let mut fields = serde_json::Map::new();
+        fields.insert("finish_reason".into(), json!(format!("{finish_reason:?}")));
+        fields.insert("input_tokens".into(), json!(usage.input_tokens));
+        fields.insert("output_tokens".into(), json!(usage.output_tokens));
+        fields.insert("tool_call_count".into(), json!(tool_calls.len()));
+        trace::log("finish", fields);
+    }
     Ok(ProviderResponse {
         finish_reason,
         usage,
@@ -426,14 +506,42 @@ mod tests {
         assert_eq!(value["content"], "status: ok");
     }
 
+    /// 真实 provider 边界（§9）：assistant 无 tool_calls 时不得输出空数组
+    /// （opencode-go 拒绝 `tool_calls: []`）。
+    #[test]
+    fn assistant_without_tool_calls_omits_the_field() {
+        let message = ChatMessage::Assistant {
+            content: "done".into(),
+            tool_calls: Vec::new(),
+        };
+        let value = message_to_json(&message);
+        assert_eq!(value["role"], "assistant");
+        assert!(
+            value.get("tool_calls").is_none(),
+            "空 tool_calls 必须省略: {value}"
+        );
+
+        let with_calls = ChatMessage::Assistant {
+            content: "reading".into(),
+            tool_calls: vec![crate::provider::ToolCall {
+                call_id: crate::ids::ToolCallId::new_v7(),
+                provider_id: "call_x".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+        };
+        let value = message_to_json(&with_calls);
+        assert_eq!(value["tool_calls"][0]["id"], "call_x");
+    }
+
     #[test]
     fn body_contains_model_and_tools() {
         let client = OpenAiCompatClient::new(
             "https://example.invalid/v1".into(),
-            "test-model".into(),
+            "ignored-model".into(),
             "key".into(),
             None,
-            Some(1024),
+            None,
             None,
         );
         let request = ModelRequest {
@@ -444,7 +552,7 @@ mod tests {
                 description: "read".into(),
                 parameters: serde_json::json!({"type": "object"}),
             }],
-            max_output_tokens: None,
+            max_output_tokens: Some(1024),
             reasoning: None,
             context_window: None,
         };
@@ -452,6 +560,32 @@ mod tests {
         assert_eq!(body["model"], "test-model");
         assert_eq!(body["stream"], true);
         assert_eq!(body["tools"][0]["function"]["name"], "read");
+        // P0-4：max_tokens 只来自 request（client 不再持有请求级配置）。
         assert_eq!(body["max_tokens"], 1024);
+    }
+
+    /// P0-4：client 构造参数（model/reasoning/max_output_tokens）不再影响 body。
+    #[test]
+    fn client_config_never_leaks_into_body() {
+        let client = OpenAiCompatClient::new(
+            "https://example.invalid/v1".into(),
+            "client-model".into(),
+            "key".into(),
+            Some("client-reasoning".into()),
+            Some(999),
+            None,
+        );
+        let request = ModelRequest {
+            model: "request-model".into(),
+            messages: vec![ChatMessage::User("hi".into())],
+            tools: Vec::new(),
+            max_output_tokens: None,
+            reasoning: None,
+            context_window: None,
+        };
+        let body = client.build_body(&request);
+        assert_eq!(body["model"], "request-model");
+        assert!(body.get("max_tokens").is_none(), "{body}");
+        assert!(body.get("reasoning").is_none(), "{body}");
     }
 }

@@ -11,6 +11,7 @@ use crate::session::Usage;
 use tokio_util::sync::CancellationToken;
 
 pub mod openai_compat;
+pub mod trace;
 
 /// Provider 流归一化后的事件（ephemeral，不逐 token 写盘，见 §4.3/§7.1）。
 #[derive(Debug, Clone, PartialEq, Eq)]

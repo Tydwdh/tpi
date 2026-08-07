@@ -1,7 +1,8 @@
 //! 应用层（文档 §4.1）：输入路由、生命周期。
 //!
 //! 活动 run 中的输入路由（§6.2）：
-//! - 普通 Enter：排队到下一个安全 model boundary（steering，M4 起）；
+//! - 普通 Enter：输入排队（pending_message），**当前 run 完成后**作为下一条
+//!   消息提交（§12 稳定化任务书：不是 run 内的 boundary steering）；
 //! - Ctrl-C：取消当前 run，保留 session；空闲时退出。
 //!
 //! M5：Ratatui inline renderer——只有 renderer 写 stdout（§3.2 不变量 11、
@@ -141,6 +142,16 @@ pub async fn run(
     .await
 }
 
+/// 把一次 run 的 outcome 合并进调用方持有的对话历史（P0-1：唯一合并入口）。
+///
+/// `AgentOutcome.messages` 的语义是**完整 context**（agent 从调用方传入的
+/// history 复制构造并逐步追加，compaction 后还可能重建），因此调用方必须
+/// **replace** 而不是 extend——extend 会让旧历史每轮整体重复（token 膨胀、
+/// 模型看到重复 user/tool 信息）。interactive 与 -p 模式共用本入口。
+pub fn merge_outcome_history(history: &mut Vec<ChatMessage>, outcome: &agent::AgentOutcome) {
+    *history = outcome.messages.clone();
+}
+
 /// 非交互单次 run（输出经 stdout，仅最终答案）。
 ///
 /// `pub`：`-p` 模式的执行路径，集成测试直接覆盖（P0-1 死锁回归）。
@@ -157,9 +168,7 @@ pub async fn run_prompt_once<P: Provider>(
     let (ui_tx, mut ui_rx) = mpsc::channel(128);
     // P0-1：`-p` 模式没有 TUI 消费 UI 事件；直接丢弃 rx 会在 channel 满后
     // 让 agent 的 `ui.send().await` 永久等待（挂死）。drain task 持续消费。
-    tokio::spawn(async move {
-        while ui_rx.recv().await.is_some() {}
-    });
+    tokio::spawn(async move { while ui_rx.recv().await.is_some() {} });
     let outcome = agent::run(
         provider,
         session,
@@ -213,6 +222,9 @@ async fn interactive_loop<P: Provider>(
         "TPI：/help 查看命令与快捷键 · Ctrl-C 取消当前 run",
     );
     let mut editor = Editor::new();
+    // 排队语义（§12 稳定化任务书）：运行中输入先存 pending_message，
+    // 当前 run 完成后由主循环作为下一条消息提交——不是 run 内的
+    // boundary steering。
     let mut pending_message: Option<String> = if initial_prompt.is_empty() {
         None
     } else {
@@ -386,7 +398,11 @@ async fn interactive_loop<P: Provider>(
                             config.workspace_root,
                             config.sessions_root.display(),
                             config.artifacts_root.display(),
-                            if config.auto_open_browser { "是" } else { "否" },
+                            if config.auto_open_browser {
+                                "是"
+                            } else {
+                                "否"
+                            },
                             config.safety_reserve_tokens,
                         ),
                     )?;
@@ -401,7 +417,11 @@ async fn interactive_loop<P: Provider>(
                             config.model.name,
                             config.model.provider,
                             config.model.base_url,
-                            config.model.reasoning.clone().unwrap_or_else(|| "默认".to_string()),
+                            config
+                                .model
+                                .reasoning
+                                .clone()
+                                .unwrap_or_else(|| "默认".to_string()),
                             config
                                 .model
                                 .max_output_tokens
@@ -446,17 +466,18 @@ async fn interactive_loop<P: Provider>(
                 }
                 "/sessions" => {
                     // 会话浏览器：列出当前 workspace 的 session，Enter 恢复。
-                    let sessions = match list_sessions(&config.sessions_root, &config.workspace_root) {
-                        Ok(sessions) => sessions,
-                        Err(error) => {
-                            push_system_line(
-                                &mut view,
-                                &mut renderer,
-                                format!("无法列出 session: {error}"),
-                            )?;
-                            continue;
-                        }
-                    };
+                    let sessions =
+                        match list_sessions(&config.sessions_root, &config.workspace_root) {
+                            Ok(sessions) => sessions,
+                            Err(error) => {
+                                push_system_line(
+                                    &mut view,
+                                    &mut renderer,
+                                    format!("无法列出 session: {error}"),
+                                )?;
+                                continue;
+                            }
+                        };
                     if sessions.is_empty() {
                         push_system_line(
                             &mut view,
@@ -495,11 +516,7 @@ async fn interactive_loop<P: Provider>(
                 "/new" => {
                     *session = None;
                     history.clear();
-                    push_system_line(
-                        &mut view,
-                        &mut renderer,
-                        "已开始新会话".to_string(),
-                    )?;
+                    push_system_line(&mut view, &mut renderer, "已开始新会话".to_string())?;
                     continue;
                 }
                 "/cancel" => {
@@ -606,7 +623,8 @@ async fn interactive_loop<P: Provider>(
                 }
             };
             view.add_usage(&outcome.usage);
-            history.extend(outcome.messages);
+            // P0-1：outcome.messages 是完整 context（含旧历史），必须 replace。
+            merge_outcome_history(history, &outcome);
             *session = Some(session_log);
             view.push_line(LineKind::System, "─".repeat(40));
         }
@@ -1133,7 +1151,9 @@ fn resume_session(
     }
     let recovery =
         session::recovery::recover(&path).map_err(|e| format!("恢复 session 失败: {e}"))?;
-    let mut history = session_to_messages(&recovery.events);
+    // P0-3：从文件重建（带真实 seq 的 replay 投影，与 runtime 语义对齐）；
+    // recovery.events 用于中断工具的恢复信息。
+    let mut history = session::replay_messages(&path).map_err(|e| format!("重建历史失败: {e}"))?;
     history.extend(agent::interrupted_as_messages(&recovery.interrupted));
     let log = SessionLog::open(sessions_root, workspace_root.as_std_path(), session_id)
         .map_err(|e| format!("打开 session 失败: {e}"))?;
@@ -1144,71 +1164,17 @@ fn resume_session(
 ///
 /// §15.4：采用最新 active compaction summary 作为前缀，排除其覆盖的 raw events；
 /// 旧 summary 不重复注入。
+///
+/// 委托 [`crate::session::project_messages`]（P0-3 统一投影语义）；
+/// 无 seq 输入时以 index+1 近似 seq（仅用于测试构造的事件数组）。
 pub fn session_to_messages(events: &[SessionEvent]) -> Vec<ChatMessage> {
-    // 最新 compaction 覆盖的结束 seq（事件顺序 == seq 顺序，append-only）。
-    let mut compacted_up_to: Option<u64> = None;
-    let mut summary_text: Option<String> = None;
-    for event in events {
-        if let SessionEvent::CompactionCommitted { covered, summary } = event {
-            let end_seq = covered.end.0.as_u128() as u64;
-            if compacted_up_to.is_none_or(|prev| end_seq > prev) {
-                compacted_up_to = Some(end_seq);
-                summary_text = Some(summary.text.clone());
-            }
-        }
-    }
-
-    let mut messages = Vec::new();
-    let mut last_assistant_idx: Option<usize> = None;
-    let mut pending_calls: Vec<crate::provider::ToolCall> = Vec::new();
-    for (index, event) in events.iter().enumerate() {
-        // 跳过被最新 compaction 覆盖的 raw events（§15.4：旧 raw 不重复注入）。
-        if let Some(up_to) = compacted_up_to
-            && (index as u64) < up_to.saturating_sub(1)
-        {
-            continue;
-        }
-        match event {
-            SessionEvent::UserSubmitted { content } | SessionEvent::UserSteered { content } => {
-                messages.push(ChatMessage::User(content.clone()));
-                last_assistant_idx = None;
-            }
-            SessionEvent::AssistantMessageCommitted { message } => {
-                messages.push(ChatMessage::Assistant {
-                    content: message.content.clone(),
-                    tool_calls: Vec::new(),
-                });
-                last_assistant_idx = Some(messages.len() - 1);
-            }
-            SessionEvent::ToolRequested { call } => {
-                if let Some(idx) = last_assistant_idx
-                    && let ChatMessage::Assistant { tool_calls, .. } = &mut messages[idx]
-                {
-                    tool_calls.push(call.clone());
-                }
-                pending_calls.push(call.clone());
-            }
-            SessionEvent::ToolCompleted { call_id, outcome } => {
-                if let Some(call) = pending_calls.iter().find(|call| call.call_id == *call_id) {
-                    messages.push(ChatMessage::Tool {
-                        tool_call_id: call.provider_id.clone(),
-                        name: call.name.clone(),
-                        content: outcome.model_payload.output.clone(),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    if let Some(summary) = summary_text {
-        let mut with_summary = Vec::with_capacity(messages.len() + 1);
-        with_summary.push(ChatMessage::User(format!(
-            "（此前会话的压缩摘要，见 CompactionCommitted）\n{summary}"
-        )));
-        with_summary.extend(messages);
-        messages = with_summary;
-    }
-    messages
+    let with_seq: Vec<(u64, SessionEvent)> = events
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, event)| (index as u64 + 1, event))
+        .collect();
+    crate::session::project_messages(&with_seq)
 }
 
 pub fn parse_session_id(value: &str) -> Result<SessionId, String> {
@@ -1242,7 +1208,11 @@ fn list_sessions(
     let mut entries: Vec<(std::time::SystemTime, SessionId, usize, String)> = Vec::new();
     for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let Ok(entry) = entry else { continue };
-        if entry.path().extension().map(|e| e == "jsonl").unwrap_or(false)
+        if entry
+            .path()
+            .extension()
+            .map(|e| e == "jsonl")
+            .unwrap_or(false)
             && let Ok(meta) = entry.metadata()
             && let Ok(modified) = meta.modified()
             && let Some(name) = entry.path().file_stem().and_then(|s| s.to_str())
@@ -1400,8 +1370,14 @@ mod tests {
         })
         .unwrap();
         let text = last_edit_diff(&log);
-        assert!(text.contains("diff-one"), "第一个成功 edit 必须出现: {text}");
-        assert!(text.contains("diff-two"), "第二个成功 edit 必须出现: {text}");
+        assert!(
+            text.contains("diff-one"),
+            "第一个成功 edit 必须出现: {text}"
+        );
+        assert!(
+            text.contains("diff-two"),
+            "第二个成功 edit 必须出现: {text}"
+        );
         assert!(
             !text.contains("diff-failed"),
             "失败的 edit 不得出现在聚合里: {text}"

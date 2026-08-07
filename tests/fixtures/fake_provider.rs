@@ -63,6 +63,12 @@ impl FakeResponse {
         };
         self
     }
+
+    /// 带文本 + 工具调用的响应（text+tool 轮，P0-3）。
+    pub fn with_text(mut self, text: &str) -> Self {
+        self.text = text.to_string();
+        self
+    }
 }
 
 /// 构造一个工具调用（TPI 内部 call id 自动分配）。

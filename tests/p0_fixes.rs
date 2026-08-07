@@ -22,8 +22,7 @@ use tpi::provider::{
     ProviderResponse,
 };
 use tpi::session::{
-    AssistantMessage, CompactSummary, CompletionReason, EventRange, SessionEvent, SessionLog,
-    Usage,
+    AssistantMessage, CompactSummary, CompletionReason, EventRange, SessionEvent, SessionLog, Usage,
 };
 
 /// 洪泛 provider：一次性发送 N 个 TextDelta（超过任何 channel 容量）。
@@ -132,9 +131,7 @@ async fn p0_2_compaction_survives_delta_flood() {
 
     // 模拟 TUI：正常消费 UI 事件（-p 的 drain 场景由 P0-1 覆盖）。
     let (ui_tx, mut ui_rx) = mpsc::channel(128);
-    let drain = tokio::spawn(async move {
-        while ui_rx.recv().await.is_some() {}
-    });
+    let drain = tokio::spawn(async move { while ui_rx.recv().await.is_some() {} });
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(10),
@@ -147,7 +144,7 @@ async fn p0_2_compaction_survives_delta_flood() {
             ui_tx,
             CancellationToken::new(),
             false,
-        false,
+            false,
         ),
     )
     .await
@@ -182,6 +179,7 @@ fn p0_8_compaction_covered_includes_last_pre_compact_event() {
         SessionEvent::AssistantMessageCommitted {
             message: AssistantMessage {
                 content: "hi".into(),
+                tool_calls: Vec::new(),
             },
         },
         SessionEvent::UserSubmitted {
@@ -199,6 +197,7 @@ fn p0_8_compaction_covered_includes_last_pre_compact_event() {
         SessionEvent::AssistantMessageCommitted {
             message: AssistantMessage {
                 content: "reply".into(),
+                tool_calls: Vec::new(),
             },
         },
     ];

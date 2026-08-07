@@ -131,6 +131,8 @@ pub async fn run<P: Provider>(
     let request_id = RequestId::new_v7();
     let span = tracing::info_span!("agent.run", %run_id, %request_id);
     let _enter = span.enter();
+    // §44：run 级耗时基线。
+    let run_started = std::time::Instant::now();
 
     // 1. 用户提交（durable boundary）。
     session
@@ -159,8 +161,7 @@ pub async fn run<P: Provider>(
     // 失败（历史不足/不显著）不中断 run，只记录日志。
     if force_compaction
         && messages.len() > 1
-        && let Err(error) =
-            compact_turn(provider, &mut messages, session, config, &cancel).await
+        && let Err(error) = compact_turn(provider, &mut messages, session, config, &cancel).await
     {
         tracing::warn!(error = %error, "manual compaction failed");
     }
@@ -219,22 +220,16 @@ pub async fn run<P: Provider>(
                 config.safety_reserve_tokens,
             );
             let system_prompt = system_prompt_text(config, current_plan.lock().unwrap().as_ref());
-            let projected =
-                crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
+            let projected = crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
             if crate::context::should_compact(projected, usable) && !compaction_failed {
                 match compact_turn(provider, &mut messages, session, config, &cancel).await {
                     Ok(()) => {
                         // P1-4：compaction 成功后若仍无法容纳（窗口过小），
                         // 不再发起普通请求（必然 length error），明确结束并提示用户。
-                        let system_prompt = system_prompt_text(
-                            config,
-                            current_plan.lock().unwrap().as_ref(),
-                        );
-                        let after = crate::context::estimate_request(
-                            &system_prompt,
-                            &messages,
-                            &tool_defs,
-                        );
+                        let system_prompt =
+                            system_prompt_text(config, current_plan.lock().unwrap().as_ref());
+                        let after =
+                            crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
                             session
                                 .append_event(&SessionEvent::RunCompleted {
@@ -253,15 +248,10 @@ pub async fn run<P: Provider>(
                         // 确定性 prune 兜底（§15.3：只影响投影）。
                         messages = crate::context::prune_messages(messages);
                         // P1-4：prune 后仍超窗口（如 user 消息本身巨大）→ 明确结束。
-                        let system_prompt = system_prompt_text(
-                            config,
-                            current_plan.lock().unwrap().as_ref(),
-                        );
-                        let after = crate::context::estimate_request(
-                            &system_prompt,
-                            &messages,
-                            &tool_defs,
-                        );
+                        let system_prompt =
+                            system_prompt_text(config, current_plan.lock().unwrap().as_ref());
+                        let after =
+                            crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
                             session
                                 .append_event(&SessionEvent::RunCompleted {
@@ -293,10 +283,8 @@ pub async fn run<P: Provider>(
                 config.model.max_output_tokens.unwrap_or(0) as u64,
                 config.safety_reserve_tokens,
             );
-            let system_prompt =
-                system_prompt_text(config, current_plan.lock().unwrap().as_ref());
-            let projected =
-                crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
+            let system_prompt = system_prompt_text(config, current_plan.lock().unwrap().as_ref());
+            let projected = crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
             let _ = ui
                 .send(RuntimeEvent::ContextUsage { projected, usable })
                 .await;
@@ -328,7 +316,10 @@ pub async fn run<P: Provider>(
                                 assistant_text = content.clone();
                                 session
                                     .append_event(&SessionEvent::AssistantMessageCommitted {
-                                        message: AssistantMessage { content: content.clone() },
+                                        message: AssistantMessage {
+                                            content: content.clone(),
+                                            tool_calls: Vec::new(),
+                                        },
                                     })
                                     .and_then(|_| session.sync_data())
                                     .map_err(|e| RunFailure::Session(e.to_string()))?;
@@ -372,24 +363,41 @@ pub async fn run<P: Provider>(
         // provider 返回的 usage 是本次请求的用量；跨轮累加（§2.2/§12.4）。
         usage_total.input_tokens += response.usage.input_tokens;
         usage_total.output_tokens += response.usage.output_tokens;
+        // §27：每个 model turn 至少记录可回答“哪一轮、什么模型、多少工具、
+        // 什么 finish reason、多少 token”的诊断行。
+        tracing::debug!(
+            turn,
+            model = %config.model.name,
+            tool_count = response.tool_calls.len(),
+            finish_reason = ?response.finish_reason,
+            input_tokens = response.usage.input_tokens,
+            output_tokens = response.usage.output_tokens,
+            "model turn completed"
+        );
 
-        // 5. 原子提交 assistant message（durable boundary，§14.2）。
-        if !content.is_empty() {
-            assistant_text = content.clone();
-            session
-                .append_event(&SessionEvent::AssistantMessageCommitted {
-                    message: AssistantMessage { content },
-                })
-                .and_then(|_| session.sync_data())
-                .map_err(|e| RunFailure::Session(e.to_string()))?;
-        }
+        // 5. 原子提交 assistant turn（durable boundary，§14.2）。
+        // P0-2：即使 content 为空（纯 tool-call 轮）也必须提交——assistant turn
+        // 是 provider 协议的最小原子单元，缺失会导致 resume 重建出非法消息序列。
+        // P0-3：runtime context 与 session 事实一致——assistant 消息同时携带
+        // content 与 tool_calls（此前纯文本轮完全没有 assistant 消息，
+        // text+tool 轮 push 的 content 为空，live projection != resume projection）。
+        assistant_text = content.clone();
+        session
+            .append_event(&SessionEvent::AssistantMessageCommitted {
+                message: AssistantMessage {
+                    content: content.clone(),
+                    tool_calls: response.tool_calls.clone(),
+                },
+            })
+            .and_then(|_| session.sync_data())
+            .map_err(|e| RunFailure::Session(e.to_string()))?;
+        messages.push(ChatMessage::Assistant {
+            content: content.clone(),
+            tool_calls: response.tool_calls.clone(),
+        });
 
         // 6. 工具调用（§12.2 batch 调度）。
         if !response.tool_calls.is_empty() {
-            messages.push(ChatMessage::Assistant {
-                content: String::new(),
-                tool_calls: response.tool_calls.clone(),
-            });
             let batch = execute_batch(
                 response.tool_calls,
                 &mut tool_calls_total,
@@ -439,6 +447,17 @@ pub async fn run<P: Provider>(
     };
 
     watchdog.abort();
+    // §27/§44：run 级汇总（turn/tool 计数、总 token、总耗时）——性能基线的最小记录。
+    tracing::info!(
+        run_id = %run_id,
+        reason = ?final_reason,
+        turns = turn,
+        tool_calls = tool_calls_total,
+        input_tokens = usage_total.input_tokens,
+        output_tokens = usage_total.output_tokens,
+        elapsed_ms = run_started.elapsed().as_millis() as u64,
+        "agent run completed"
+    );
     Ok(AgentOutcome {
         reason: final_reason,
         usage: usage_total,
@@ -520,35 +539,6 @@ async fn execute_batch(
 
     let max_parallel = config.limits.max_parallel_tools as usize;
 
-    // §12：ask_user 必须独占 batch（§8.1 P0）。
-    let has_ask_user = calls.iter().any(|call| call.name == "ask_user");
-    if has_ask_user && calls.len() > 1 {
-        for call in &calls {
-            if *tool_calls_total >= config.limits.max_tool_calls {
-                return Ok(BatchEnd::BudgetExceeded);
-            }
-            *tool_calls_total += 1;
-            let outcome = ToolOutcome::failed(
-                &call.name,
-                crate::tool::outcome::ModelPayload {
-                    status: ToolStatus::Rejected,
-                    program: None,
-                    exit_code: None,
-                    duration_ms: 0,
-                    output: format!(
-                        "status: rejected\ntool: {}\nerror: batch_rejected\n\nask_user_must_be_exclusive",
-                        call.name
-                    ),
-                    effect: None,
-                    artifact: None,
-                },
-            )
-            .into_stored();
-            messages.push(tool_result_message(call, &outcome));
-        }
-        return Ok(BatchEnd::Continue);
-    }
-
     // 1. 预检全部参数（§12.2 第 1 条）。
     let mut prepared: Vec<PreparedCall> = Vec::with_capacity(calls.len());
     let mut rejected: HashMap<usize, StoredToolOutcome> = HashMap::new();
@@ -558,7 +548,15 @@ async fn execute_batch(
         }
         *tool_calls_total += 1;
         let Some(tool) = BuiltinTool::from_name(&call.name) else {
-            rejected.insert(index, unknown_tool_outcome(&call.name));
+            // §30 第 9 条：rejected 的 observation 必须持久化——runtime messages
+            // 有 Tool 消息而 session 无 ToolRequested/ToolCompleted 时，restart 后
+            // observation 丢失（P0-3 不变量违反）。
+            let outcome = unknown_tool_outcome(&call.name);
+            session
+                .append_event(&SessionEvent::ToolRequested { call: call.clone() })
+                .and_then(|_| session.complete_tool(call.call_id, &outcome))
+                .map_err(|e| RunFailure::Session(e.to_string()))?;
+            rejected.insert(index, outcome);
             continue;
         };
         match tool.parse_args(&call.arguments) {
@@ -594,6 +592,11 @@ error: invalid_arguments
                     },
                 )
                 .into_stored();
+                // §30 第 9 条：rejected 的 observation 必须持久化（同未知工具）。
+                session
+                    .append_event(&SessionEvent::ToolRequested { call: call.clone() })
+                    .and_then(|_| session.complete_tool(call.call_id, &outcome))
+                    .map_err(|e| RunFailure::Session(e.to_string()))?;
                 rejected.insert(index, outcome);
             }
         }
@@ -771,6 +774,17 @@ error: invalid_arguments
             session
                 .complete_tool(calls[index].call_id, &outcome)
                 .map_err(|e| RunFailure::Session(e.to_string()))?;
+            // §27：每个 tool call 记录可回答“哪个 call、什么工具、什么状态、
+            // 耗时多少、exit code 与 artifact 引用”的诊断行。
+            tracing::debug!(
+                call_id = %calls[index].call_id,
+                tool = %calls[index].name,
+                status = ?outcome.status,
+                duration_ms = outcome.model_payload.duration_ms,
+                exit_code = ?outcome.model_payload.exit_code,
+                artifact = ?outcome.model_payload.artifact,
+                "tool completed"
+            );
             // §10.7 第 6 步：ToolCompleted 已持久化，崩溃恢复窗口关闭。
             // P0-11：只有成功才删除 backup；失败（如 commit_recovery_failed，
             // 无法证明恢复完成）必须保留恢复现场（§10.7 第 5 条“保留所有文件”）。
@@ -832,10 +846,7 @@ fn tool_target(call: &ToolCall) -> (String, Option<String>) {
                 .and_then(|c| c.as_str())
             {
                 let compressed = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
-                (
-                    truncate(&compressed, 200),
-                    Some(truncate(cmd, 8 * 1024)),
-                )
+                (truncate(&compressed, 200), Some(truncate(cmd, 8 * 1024)))
             } else {
                 ("bash".into(), None)
             }
@@ -889,14 +900,46 @@ async fn compact_turn<P: Provider>(
     cancel: &CancellationToken,
 ) -> Result<(), RunFailure> {
     // 1. 先 prune 大 tool output（§15.3）。
+    // P0-3：以 runtime messages 计算压缩内容（与调用方看到的上下文一致）；
+    // 用 session 投影计算 covered 边界——正常路径下两者消息数一致，
+    // covered 只覆盖真正被压缩的事件（recent 在 replay 端也保留）；
+    // 调用方注入的 history 未落 session 时（如 force 压缩测试场景）
+    // 消息数不一致，fallback 覆盖全部压缩前事件（旧语义）。
     let pruned = crate::context::prune_messages(messages.clone());
     // 2. 保留最近约 25% 的完整原始上下文，且不小于两个完整 turns（§15.4 第 3 条）。
     let keep_count = (pruned.len() as f64 * crate::context::KEEP_RECENT_RATIO)
         .ceil()
         .max(crate::context::MIN_KEEP_TURNS as f64) as usize;
-    let split = pruned.len().saturating_sub(keep_count);
+    let mut split = pruned.len().saturating_sub(keep_count);
+    // P0-3/§18.2：消息单元必须原子——recent 不能以 Tool 消息开头（其
+    // Assistant(tool_calls) 载体若被压缩，replay 重建出的 Tool 无协议载体）。
+    // 向回调整 split，直到 recent 以 User/Assistant（新单元起点）开头。
+    while split > 0 && matches!(pruned[split], ChatMessage::Tool { .. }) {
+        split -= 1;
+    }
     let history = pruned[..split].to_vec();
     let recent = pruned[split..].to_vec();
+    // 覆盖范围：只覆盖 recent 之前的事件（P0-3）。recent 第一条真实消息的
+    // 起始 seq 即覆盖边界（exclusive）；summary 前缀消息无事件关联（start=0）
+    // 需要跳过；recent 内没有真实消息或投影与 runtime 不一致时
+    // fallback 覆盖全部压缩前事件。
+    let seq = session.seq();
+    let events = crate::session::read_events_with_seq(session.path())
+        .map_err(|e| RunFailure::Session(e.to_string()))?;
+    let projected = crate::session::project_messages_with_ranges(&events);
+    let recent_start_seq = if projected.len() == pruned.len() {
+        projected[split..]
+            .iter()
+            .find(|(_, start, _)| *start > 0)
+            .map(|(_, start, _)| *start)
+            .unwrap_or(seq + 1)
+    } else {
+        seq + 1
+    };
+    let covered = crate::session::EventRange {
+        start: EventId::from_u128(1),
+        end: EventId::from_u128(recent_start_seq as u128),
+    };
 
     // 3. 用 compaction 角色（默认 primary，§7.2）生成结构化 summary。
     // P0-2：stream 与事件消费必须并发——provider 在同一 task 内 `send().await`，
@@ -951,10 +994,9 @@ async fn compact_turn<P: Provider>(
             "compaction summary invalid or not significant".into(),
         ));
     }
-    let seq = session.seq();
     session
         .append_event(&SessionEvent::CompactionCommitted {
-            covered: compaction_covered_range(seq),
+            covered,
             summary: crate::session::CompactSummary {
                 text: summary_text.clone(),
             },
@@ -970,18 +1012,6 @@ async fn compact_turn<P: Provider>(
     )));
     messages.extend(recent);
     Ok(())
-}
-
-/// compaction 覆盖范围（P0-8 修复）：
-/// `covered.end` 是 exclusive，必须等于 compaction 时**下一条**事件的 seq
-/// （= 最后一条事件 seq + 1），覆盖全部压缩前事件。
-/// 此前写 `session.seq()` 少覆盖最后一条，短会话恢复时该 raw 事件会与
-/// summary 重复注入（恢复端 `session_to_messages` 按 `index < end - 1` 跳过）。
-fn compaction_covered_range(session_seq: u64) -> crate::session::EventRange {
-    crate::session::EventRange {
-        start: EventId::from_u128(1),
-        end: EventId::from_u128(session_seq as u128 + 1),
-    }
 }
 
 /// P0-11：backup 清理策略——只有工具成功提交后才允许删除 backup。
@@ -1152,7 +1182,6 @@ impl BuiltinTool {
             "write" => Some(BuiltinTool::Write),
             "bash" => Some(BuiltinTool::Bash),
             "update_plan" => Some(BuiltinTool::UpdatePlan),
-            "ask_user" => Some(BuiltinTool::AskUser),
             "web_search" => Some(BuiltinTool::WebSearch),
             "web_fetch" => Some(BuiltinTool::WebFetch),
             _ => None,
@@ -1186,18 +1215,6 @@ pub fn session_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// P0-8：covered.end 是 exclusive，必须等于 compaction 时下一条事件的 seq。
-    /// 此前写 `session.seq()`（最后一条事件 seq），短会话恢复时最后一条
-    /// raw 事件与 summary 重复注入。
-    #[test]
-    fn compaction_covered_end_is_next_seq() {
-        let range = compaction_covered_range(3);
-        assert_eq!(range.end, EventId::from_u128(4));
-        assert_eq!(range.start, EventId::from_u128(1));
-        let range = compaction_covered_range(126);
-        assert_eq!(range.end, EventId::from_u128(127));
-    }
 
     /// P2：no-progress 拒绝输出必须带 suggestions（可恢复引导）。
     #[test]

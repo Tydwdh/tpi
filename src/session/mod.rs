@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::ids::{EventId, RunId, SessionId, ToolCallId};
-use crate::provider::ToolCall;
+use crate::provider::{ChatMessage, ToolCall};
 use crate::tool::outcome::StoredToolOutcome;
 use serde::{Deserialize, Serialize};
 
@@ -31,10 +31,16 @@ pub struct RunLimits {
     pub max_tool_calls: u32,
 }
 
-/// 已提交的 assistant 消息。
+/// 已提交的 assistant turn（P0-2：一个 provider assistant response 必须
+/// 原子表达——即使 `content` 为空（纯 tool-call 轮）也必须持久化，
+/// 否则 resume 重建会缺失 assistant 载体、ToolRequested 挂错位置）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub content: String,
+    /// 该 turn 发起的工具调用（与 ToolRequested 同一数据源）。
+    /// 旧 session 文件无此字段：`#[serde(default)]` 兼容读取。
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// 原子短计划（§13）。
@@ -99,9 +105,6 @@ pub enum SessionEvent {
     UserSubmitted {
         content: String,
     },
-    UserSteered {
-        content: String,
-    },
     RunStarted {
         model: ModelRef,
         limits: RunLimits,
@@ -139,7 +142,6 @@ impl SessionEvent {
     pub fn type_name(&self) -> &'static str {
         match self {
             SessionEvent::UserSubmitted { .. } => "user_submitted",
-            SessionEvent::UserSteered { .. } => "user_steered",
             SessionEvent::RunStarted { .. } => "run_started",
             SessionEvent::AssistantMessageCommitted { .. } => "assistant_message_committed",
             SessionEvent::ToolRequested { .. } => "tool_requested",
@@ -172,9 +174,6 @@ pub enum EventBody {
     UserSubmitted {
         payload: UserSubmittedPayload,
     },
-    UserSteered {
-        payload: UserSteeredPayload,
-    },
     RunStarted {
         payload: RunStartedPayload,
     },
@@ -203,11 +202,6 @@ pub enum EventBody {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserSubmittedPayload {
-    pub content: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UserSteeredPayload {
     pub content: String,
 }
 
@@ -261,11 +255,6 @@ impl Envelope {
         let body = match event {
             SessionEvent::UserSubmitted { content } => EventBody::UserSubmitted {
                 payload: UserSubmittedPayload {
-                    content: content.clone(),
-                },
-            },
-            SessionEvent::UserSteered { content } => EventBody::UserSteered {
-                payload: UserSteeredPayload {
                     content: content.clone(),
                 },
             },
@@ -338,9 +327,6 @@ impl Envelope {
     pub fn to_session_event(&self) -> SessionEvent {
         match &self.body {
             EventBody::UserSubmitted { payload } => SessionEvent::UserSubmitted {
-                content: payload.content.clone(),
-            },
-            EventBody::UserSteered { payload } => SessionEvent::UserSteered {
                 content: payload.content.clone(),
             },
             EventBody::RunStarted { payload } => SessionEvent::RunStarted {
@@ -536,6 +522,186 @@ pub fn read_events(path: &Path) -> std::io::Result<Vec<SessionEvent>> {
     Ok(read_events_and_max_seq(path)?.0)
 }
 
+/// 读取全部事件并保留 envelope seq（P0-3/§19B：中间存在损坏行时
+/// index != seq，compaction 覆盖范围与投影跳过必须基于真实 seq，
+/// 不能拿 vector index 假装等于事件 seq）。
+pub fn read_events_with_seq(path: &Path) -> std::io::Result<Vec<(u64, SessionEvent)>> {
+    let file = File::open(path)?;
+    let mut lines = BufReader::new(file).lines();
+    let mut events = Vec::new();
+    loop {
+        match lines.next() {
+            Some(Ok(line)) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Envelope>(&line) {
+                    Ok(envelope) => events.push((envelope.seq, envelope.to_session_event())),
+                    Err(error) => {
+                        // 非最后一行损坏：记录并跳过。
+                        tracing::warn!(%error, "skipping unparseable session line");
+                    }
+                }
+            }
+            Some(Err(error)) => {
+                // 最后一行因崩溃不完整（§14.2）：只丢弃残行。
+                if events.is_empty() || error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    tracing::warn!(%error, "dropping incomplete trailing session line");
+                }
+                break;
+            }
+            None => break,
+        }
+    }
+    Ok(events)
+}
+
+/// 从 session 文件重建对话消息（P0-3 replay 入口）：模拟进程重启后
+/// 从 JSONL 重建与 runtime 语义等价的投影（跳过被 compaction 覆盖的事件、
+/// 对保留的 recent 消息应用与 runtime 相同的 deterministic prune、注入
+/// 最新 compaction summary）。
+pub fn replay_messages(path: &Path) -> std::io::Result<Vec<ChatMessage>> {
+    let events = read_events_with_seq(path)?;
+    Ok(project_messages(&events))
+}
+
+/// 投影 + recent prune（replay 语义，P0-3）：被 compaction 保留的 recent
+/// 消息（事件 seq ∈ [covered.end, compaction 事件 seq)）应用与 runtime
+/// 相同的 deterministic prune（§15.3）——compaction 后 runtime 保留的是
+/// pruned 版本，replay 必须一致。
+pub fn project_messages(events: &[(u64, SessionEvent)]) -> Vec<ChatMessage> {
+    let ranges = project_messages_with_ranges(events);
+    let (Some(end), Some(comp_seq), _) = compacted_range(events) else {
+        return ranges.into_iter().map(|(m, _, _)| m).collect();
+    };
+    let mut result = Vec::with_capacity(ranges.len());
+    for (message, start, _) in ranges {
+        if start >= end && start < comp_seq {
+            let single = crate::context::prune_messages(vec![message]);
+            result.push(single.into_iter().next().expect("prune 不改变消息数量"));
+        } else {
+            result.push(message);
+        }
+    }
+    result
+}
+
+/// 最新 compaction 的 (covered.end, compaction 事件 seq, summary 文本)。
+/// "最新" = covered.end 最大者（compaction 覆盖范围单调扩大）。
+pub fn compacted_range(
+    events: &[(u64, SessionEvent)],
+) -> (Option<u64>, Option<u64>, Option<String>) {
+    let mut end: Option<u64> = None;
+    let mut comp_seq: Option<u64> = None;
+    let mut summary: Option<String> = None;
+    for (seq, event) in events {
+        if let SessionEvent::CompactionCommitted {
+            covered,
+            summary: s,
+        } = event
+        {
+            let end_seq = covered.end.0.as_u128() as u64;
+            if end.is_none_or(|prev| end_seq > prev) {
+                end = Some(end_seq);
+                comp_seq = Some(*seq);
+                summary = Some(s.text.clone());
+            }
+        }
+    }
+    (end, comp_seq, summary)
+}
+
+/// 事件投影（P0-3）：从带 seq 的事件重建对话消息，附每条消息的事件 seq
+/// 边界 (start_seq, end_seq_exclusive)。供 compaction 计算 covered 范围
+/// （只覆盖真正被压缩的事件，runtime 保留的 recent 在 replay 端也必须保留）。
+pub fn project_messages_with_ranges(
+    events: &[(u64, SessionEvent)],
+) -> Vec<(ChatMessage, u64, u64)> {
+    // 1. 最新 compaction 覆盖范围（P0-8：covered.end exclusive，跳过 seq < end）。
+    let (compacted_up_to, _, summary_text) = compacted_range(events);
+
+    // 2. 重建消息（跳过被覆盖的事件），记录每条消息的起始 seq。
+    // pending_calls 在所有事件上收集（P0-3/§18.2 防御）：ToolRequested 即使
+    // 被覆盖也不影响其 ToolCompleted 的关联（正常路径下消息单元原子，
+    // 不会出现 request 覆盖而 completed 保留）。
+    let mut raw: Vec<(u64, ChatMessage)> = Vec::new();
+    let mut last_assistant_idx: Option<usize> = None;
+    let mut pending_calls: Vec<ToolCall> = Vec::new();
+    for (seq, event) in events {
+        if let SessionEvent::ToolRequested { call } = event {
+            pending_calls.push(call.clone());
+        }
+        if let Some(up_to) = compacted_up_to
+            && *seq < up_to
+        {
+            continue;
+        }
+        match event {
+            SessionEvent::UserSubmitted { content } => {
+                raw.push((*seq, ChatMessage::User(content.clone())));
+                last_assistant_idx = None;
+            }
+            SessionEvent::AssistantMessageCommitted { message } => {
+                raw.push((
+                    *seq,
+                    ChatMessage::Assistant {
+                        content: message.content.clone(),
+                        tool_calls: message.tool_calls.clone(),
+                    },
+                ));
+                last_assistant_idx = Some(raw.len() - 1);
+            }
+            SessionEvent::ToolRequested { call } => {
+                if let Some(idx) = last_assistant_idx
+                    && let (_, ChatMessage::Assistant { tool_calls, .. }) = &mut raw[idx]
+                    && !tool_calls.iter().any(|c| c.call_id == call.call_id)
+                {
+                    tool_calls.push(call.clone());
+                }
+            }
+            SessionEvent::ToolCompleted { call_id, outcome } => {
+                if let Some(call) = pending_calls.iter().find(|call| call.call_id == *call_id) {
+                    raw.push((
+                        *seq,
+                        ChatMessage::Tool {
+                            tool_call_id: call.provider_id.clone(),
+                            name: call.name.clone(),
+                            content: outcome.model_payload.output.clone(),
+                        },
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 3. 每条消息的 seq 边界（end = 下一条消息的 start；最后一条 = max_seq + 1）。
+    let max_seq = events.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
+    let mut out: Vec<(ChatMessage, u64, u64)> = Vec::with_capacity(raw.len() + 1);
+    for (i, (start, message)) in raw.iter().enumerate() {
+        let end = raw
+            .get(i + 1)
+            .map(|(next_start, _)| *next_start)
+            .unwrap_or(max_seq + 1);
+        out.push((message.clone(), *start, end));
+    }
+
+    // 4. 最新 summary 以固定前缀 user 消息注入（§15.4：不伪装成新 user intent）。
+    if let Some(summary) = summary_text {
+        out.insert(
+            0,
+            (
+                ChatMessage::User(format!(
+                    "（此前会话的压缩摘要，见 CompactionCommitted）\n{summary}"
+                )),
+                0,
+                0,
+            ),
+        );
+    }
+    out
+}
+
 /// 读取全部事件并返回历史最大 envelope seq（P0-12：恢复 seq 必须基于
 /// max_seq 而不是 events.len()——中间存在损坏行时两者不一致，继续 append
 /// 会导致 seq 重复/倒退，破坏 envelope seq 单调性契约）。
@@ -618,10 +784,14 @@ mod tests {
         })
         .unwrap();
         drop(log);
-        std::fs::write(&path, std::fs::read_to_string(&path).unwrap() + "this-is-not-json\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            std::fs::read_to_string(&path).unwrap() + "this-is-not-json\n",
+        )
+        .unwrap();
         // 崩溃后恢复：open 既有 session，追加一条（应为 seq 4）。
-        let mut log = SessionLog::open(&sessions_root, workspace.as_std_path(), session_id).unwrap();
+        let mut log =
+            SessionLog::open(&sessions_root, workspace.as_std_path(), session_id).unwrap();
         let seq = log
             .append_event(&SessionEvent::UserSubmitted {
                 content: "four".into(),
