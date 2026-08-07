@@ -35,6 +35,8 @@ pub struct ToolCard {
     /// ToolCallId 的字符串形式。
     pub id: String,
     pub name: String,
+    /// 可读命令/参数摘要（如 `bash: cargo test`）；None 表示只有工具名。
+    pub detail: Option<String>,
     pub state: ToolCardState,
     /// 失败/超时等终态时携带的关键输出 tail（有界，渲染为红色尾注）。
     pub tail: Option<String>,
@@ -46,6 +48,8 @@ pub enum ToolCardState {
     Done {
         status: ToolStatus,
         duration_ms: u64,
+        /// 进程退出码（run/bash；纯读取工具为 None）。
+        exit_code: Option<i32>,
     },
 }
 
@@ -167,10 +171,16 @@ impl ViewModel {
     }
 
     /// 工具开始：追加一张运行中的卡片（§16.2：运行中单行动画）。
-    pub fn begin_tool(&mut self, id: impl Into<String>, name: impl Into<String>) {
+    pub fn begin_tool(
+        &mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        detail: Option<String>,
+    ) {
         self.transcript.push(Entry::Tool(ToolCard {
             id: id.into(),
             name: name.into(),
+            detail,
             state: ToolCardState::Running,
             tail: None,
         }));
@@ -184,6 +194,7 @@ impl ViewModel {
         name: impl Into<String>,
         status: ToolStatus,
         duration_ms: u64,
+        exit_code: Option<i32>,
         tail: impl Into<String>,
     ) {
         let id = id.into();
@@ -198,6 +209,7 @@ impl ViewModel {
                 card.state = ToolCardState::Done {
                     status,
                     duration_ms,
+                    exit_code,
                 };
                 if status != ToolStatus::Succeeded && !tail.is_empty() {
                     card.tail = Some(bound_tail(&tail));
@@ -209,9 +221,11 @@ impl ViewModel {
         self.transcript.push(Entry::Tool(ToolCard {
             id,
             name,
+            detail: None,
             state: ToolCardState::Done {
                 status,
                 duration_ms,
+                exit_code,
             },
             tail: if status == ToolStatus::Succeeded {
                 None
@@ -336,13 +350,14 @@ mod tests {
     #[test]
     fn tool_card_lifecycle_matches_by_call_id() {
         let mut view = ViewModel::default();
-        view.begin_tool("call-1", "run");
-        view.begin_tool("call-2", "read");
+        view.begin_tool("call-1", "run", Some("run: cargo test".into()));
+        view.begin_tool("call-2", "read", Some("read src/main.rs".into()));
         view.finish_tool(
             "call-1",
             "run",
             ToolStatus::Failed,
             1234,
+            Some(2),
             "exit_code: 1\n错误详情",
         );
         let Entry::Tool(card) = &view.transcript[0] else {
@@ -350,10 +365,16 @@ mod tests {
         };
         assert_eq!(card.name, "run");
         assert_eq!(
+            card.detail.as_deref(),
+            Some("run: cargo test"),
+            "detail 保留实际命令"
+        );
+        assert_eq!(
             card.state,
             ToolCardState::Done {
                 status: ToolStatus::Failed,
-                duration_ms: 1234
+                duration_ms: 1234,
+                exit_code: Some(2)
             }
         );
         assert!(card.tail.as_deref().unwrap_or("").contains("错误详情"));
@@ -367,8 +388,15 @@ mod tests {
     #[test]
     fn success_card_has_no_tail() {
         let mut view = ViewModel::default();
-        view.begin_tool("call-1", "run");
-        view.finish_tool("call-1", "run", ToolStatus::Succeeded, 42, "大量输出");
+        view.begin_tool("call-1", "run", None);
+        view.finish_tool(
+            "call-1",
+            "run",
+            ToolStatus::Succeeded,
+            42,
+            Some(0),
+            "大量输出",
+        );
         let Entry::Tool(card) = &view.transcript[0] else {
             panic!();
         };
@@ -376,7 +404,8 @@ mod tests {
             card.state,
             ToolCardState::Done {
                 status: ToolStatus::Succeeded,
-                duration_ms: 42
+                duration_ms: 42,
+                exit_code: Some(0)
             }
         );
         assert!(card.tail.is_none());
@@ -385,8 +414,8 @@ mod tests {
     #[test]
     fn tail_is_bounded() {
         let mut view = ViewModel::default();
-        view.begin_tool("c", "run");
-        view.finish_tool("c", "run", ToolStatus::Failed, 0, "x".repeat(10_000));
+        view.begin_tool("c", "run", None);
+        view.finish_tool("c", "run", ToolStatus::Failed, 0, None, "x".repeat(10_000));
         let Entry::Tool(card) = &view.transcript[0] else {
             panic!();
         };
@@ -410,8 +439,10 @@ mod tests {
 
     #[test]
     fn command_menu_filters_and_preserves_selection() {
-        let mut view = ViewModel::default();
-        view.input = "/set".into();
+        let mut view = ViewModel {
+            input: "/set".into(),
+            ..Default::default()
+        };
         view.refresh_command_menu();
         let menu = view.menu.as_ref().expect("菜单应打开");
         assert_eq!(menu.items.len(), 1);
@@ -435,8 +466,10 @@ mod tests {
 
     #[test]
     fn menu_completion_replaces_input() {
-        let mut view = ViewModel::default();
-        view.input = "/set".into();
+        let mut view = ViewModel {
+            input: "/set".into(),
+            ..Default::default()
+        };
         view.refresh_command_menu();
         view.complete_menu_command();
         assert_eq!(view.input, "/settings");

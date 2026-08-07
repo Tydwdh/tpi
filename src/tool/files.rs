@@ -5,7 +5,9 @@
 
 use crate::tool::edit::{self, EditError};
 use crate::tool::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
-use crate::tool::{ToolContext, resolve_workspace_path};
+use crate::tool::{
+    ToolContext, path_rejected_outcome, resolve_workspace_path, validate_artifact_component,
+};
 use camino::Utf8PathBuf;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -59,9 +61,28 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
                 },
             );
         };
+        if !validate_artifact_component(session_id) || !validate_artifact_component(id) {
+            return ToolOutcome::failed(
+                "read",
+                ModelPayload {
+                    status: ToolStatus::Rejected,
+                    program: None,
+                    exit_code: None,
+                    duration_ms: 0,
+                    output: format!(
+                        "status: rejected\ntool: read\nerror: invalid_artifact_reference\n\n@artifact/{session_id}/{id}"
+                    ),
+                    effect: None,
+                    artifact: None,
+                },
+            );
+        }
         return read_artifact(ctx, session_id, id, args.start_line, args.line_count);
     }
-    let path = resolve_workspace_path(&ctx.workspace_root, &args.path);
+    let path = match resolve_workspace_path(&ctx.workspace_root, &args.path) {
+        Ok(path) => path,
+        Err(error) => return path_rejected_outcome("read", error),
+    };
     let line_count = args.line_count.clamp(1, DEFAULT_READ_LINES);
     if let Ok(snapshot) = edit::snapshot_file(&path) {
         ctx.snapshot_store.lock().unwrap().record(snapshot);
@@ -165,7 +186,10 @@ pub fn edit(
     ctx: &ToolContext,
     plan: Option<&crate::tool::edit::CommitPlan>,
 ) -> ToolOutcome {
-    let path = resolve_workspace_path(&ctx.workspace_root, &args.path);
+    let path = match resolve_workspace_path(&ctx.workspace_root, &args.path) {
+        Ok(path) => path,
+        Err(error) => return path_rejected_outcome("edit", error),
+    };
     // §10.7 第 1 条：提交计划（temp/backup 路径）必须在副作用前由调用方生成。
     let Some(plan) = plan else {
         return ToolOutcome::failed(
@@ -231,7 +255,10 @@ pub fn write(
     ctx: &ToolContext,
     plan: Option<&crate::tool::edit::CommitPlan>,
 ) -> ToolOutcome {
-    let path = resolve_workspace_path(&ctx.workspace_root, &args.path);
+    let path = match resolve_workspace_path(&ctx.workspace_root, &args.path) {
+        Ok(path) => path,
+        Err(error) => return path_rejected_outcome("write", error),
+    };
     let Some(plan) = plan else {
         return ToolOutcome::failed(
             "write",

@@ -7,6 +7,10 @@
 //! - 不打开浏览器、不自动 fetch 全部结果、不调用 summary model（§17）。
 //! - 未配置 Brave key 时明确 `unavailable`，不自动切换到抓取结果页面。
 
+use std::net::IpAddr;
+
+use futures_util::StreamExt;
+use reqwest::Url;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -17,6 +21,8 @@ use crate::tool::outcome::{ArtifactRef, ModelPayload, ToolMetadata, ToolOutcome,
 pub const FETCH_BODY_BUDGET: usize = 48 * 1024;
 /// HTML 原始体积上限（转换前）。
 pub const FETCH_RAW_LIMIT: usize = 2 * 1024 * 1024;
+/// web_search 响应体上限。
+pub const SEARCH_RAW_LIMIT: usize = 2 * 1024 * 1024;
 /// 请求超时。
 pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -41,6 +47,102 @@ fn default_count() -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct WebFetchArgs {
     pub url: String,
+}
+
+/// 测试专用：允许访问私有地址（生产默认拒绝 SSRF）。
+fn allow_private_web_targets() -> bool {
+    if ALLOW_PRIVATE_WEB_TARGETS.load(std::sync::atomic::Ordering::SeqCst) {
+        return true;
+    }
+    std::env::var("TPI_WEB_FETCH_ALLOW_PRIVATE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+static ALLOW_PRIVATE_WEB_TARGETS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 集成测试专用：切换是否允许 fetch 私有地址（避免并行测试污染环境变量）。
+#[doc(hidden)]
+pub fn set_allow_private_web_targets_for_tests(allow: bool) {
+    ALLOW_PRIVATE_WEB_TARGETS.store(allow, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn web_fetch_client() -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(5));
+    if allow_private_web_targets() {
+        builder = builder.no_proxy();
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// 校验 fetch 目标 URL（§17：仅 HTTP(S)，拒绝 loopback/私网/链路本地）。
+pub fn validate_fetch_url(url_str: &str) -> Result<Url, String> {
+    let url = Url::parse(url_str.trim()).map_err(|error| format!("invalid url: {error}"))?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("unsupported scheme: {scheme}"));
+    }
+    let host = url.host_str().ok_or_else(|| "missing host".to_string())?;
+    if !allow_private_web_targets() && is_blocked_host(host) {
+        return Err(format!("blocked host: {host}"));
+    }
+    Ok(url)
+}
+
+fn is_blocked_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return is_blocked_ip(ip);
+    }
+    // 字面 IPv6 可能带 []，Url 已解析 host 时不含括号。
+    false
+}
+
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            let segments = v6.segments();
+            // link-local fe80::/10
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // unique local fc00::/7
+            if (segments[0] & 0xfe00) == 0xfc00 {
+                return true;
+            }
+            false
+        }
+    }
+}
+
+async fn read_bounded_bytes(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+    let mut stream = response.bytes_stream();
+    let mut total = 0usize;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("read_failed: {error}"))?;
+        total += chunk.len();
+        if total > limit {
+            return Err(format!("body_too_large: exceeded {limit} bytes"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// web_search（§17：只用于发现来源；结果摘要不是最终证据）。
@@ -108,8 +210,24 @@ pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
         }
     };
     let status = response.status();
-    let body = match response.text().await {
-        Ok(body) => body,
+    let body_bytes = match read_bounded_bytes(response, SEARCH_RAW_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.starts_with("body_too_large") => {
+            return ToolOutcome::failed(
+                "web_search",
+                ModelPayload {
+                    status: ToolStatus::Failed,
+                    program: None,
+                    exit_code: None,
+                    duration_ms: 0,
+                    output: format!(
+                        "status: failed\ntool: web_search\nerror: body_too_large\n\n响应体超过 {SEARCH_RAW_LIMIT} 字节限制。"
+                    ),
+                    effect: None,
+                    artifact: None,
+                },
+            );
+        }
         Err(error) => {
             return ToolOutcome::failed(
                 "web_search",
@@ -127,6 +245,7 @@ pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
             );
         }
     };
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
     if !status.is_success() {
         return ToolOutcome::failed(
             "web_search",
@@ -209,11 +328,22 @@ struct BraveResult {
 
 /// web_fetch（§17：限制 redirect、响应体大小和 timeout；HTML 转换）。
 pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .map_err(|e| e.to_string())
-        .unwrap_or_else(|_| reqwest::Client::new());
+    if let Err(error) = validate_fetch_url(&args.url) {
+        return ToolOutcome::failed(
+            "web_fetch",
+            ModelPayload {
+                status: ToolStatus::Failed,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: format!("status: failed\ntool: web_fetch\nerror: ssrf_blocked\n\n{error}"),
+                effect: None,
+                artifact: None,
+            },
+        );
+    }
+
+    let client = web_fetch_client();
 
     let response = match client.get(&args.url).timeout(FETCH_TIMEOUT).send().await {
         Ok(response) => response,
@@ -234,6 +364,24 @@ pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
             );
         }
     };
+
+    if let Err(error) = validate_fetch_url(response.url().as_str()) {
+        return ToolOutcome::failed(
+            "web_fetch",
+            ModelPayload {
+                status: ToolStatus::Failed,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: format!(
+                    "status: failed\ntool: web_fetch\nerror: ssrf_blocked\n\nredirect blocked: {error}"
+                ),
+                effect: None,
+                artifact: None,
+            },
+        );
+    }
+
     let final_url = response.url().to_string();
     let status = response.status();
     let content_type = response
@@ -243,10 +391,9 @@ pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
         .unwrap_or("")
         .to_string();
 
-    // §17：限制响应体大小（转换前原始体积）。
-    let bytes = match response.bytes().await {
-        Ok(bytes) if bytes.len() <= FETCH_RAW_LIMIT => bytes,
-        Ok(_) => {
+    let bytes = match read_bounded_bytes(response, FETCH_RAW_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.starts_with("body_too_large") => {
             return ToolOutcome::failed(
                 "web_fetch",
                 ModelPayload {
@@ -280,31 +427,7 @@ pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
         }
     };
 
-    // §17：text/plain/Markdown 直接读取；HTML 用 html2text 转换。
-    let is_html = content_type.contains("html") || looks_like_html(&bytes);
-    let text = if is_html {
-        match html2text::from_read(bytes.as_ref(), usize::MAX) {
-            Ok(text) => text,
-            Err(error) => {
-                return ToolOutcome::failed(
-                    "web_fetch",
-                    ModelPayload {
-                        status: ToolStatus::Failed,
-                        program: None,
-                        exit_code: None,
-                        duration_ms: 0,
-                        output: format!(
-                            "status: failed\ntool: web_fetch\nerror: html_convert_failed\n\n{error}"
-                        ),
-                        effect: None,
-                        artifact: None,
-                    },
-                );
-            }
-        }
-    } else {
-        String::from_utf8_lossy(&bytes).to_string()
-    };
+    let text = convert_response_body(&bytes, &content_type);
 
     // 有界正文（§8.4：48 KiB）。
     let truncated = text.len() > FETCH_BODY_BUDGET;
@@ -319,15 +442,18 @@ pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
         &ctx.artifacts_root,
         &ctx.session_id,
         "web_fetch",
-        if is_html { "text/plain" } else { &content_type },
-    ) {
-        writer.write("body", text.as_bytes());
-        if let Ok(record) = writer.finish() {
-            artifact = Some(ArtifactRef {
-                session: ctx.session_id.clone(),
-                id: record.id,
-            });
-        }
+        if content_type.contains("html") || looks_like_html(&bytes) {
+            "text/plain"
+        } else {
+            &content_type
+        },
+    ) && writer.write("body", text.as_bytes()).is_ok()
+        && let Ok(record) = writer.finish()
+    {
+        artifact = Some(ArtifactRef {
+            session: ctx.session_id.clone(),
+            id: record.id,
+        });
     }
 
     let output = format!(
@@ -354,6 +480,17 @@ pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
     outcome
 }
 
+pub fn convert_response_body(bytes: &[u8], content_type: &str) -> String {
+    let is_html = content_type.contains("html") || looks_like_html(bytes);
+    if is_html {
+        html2text::from_read(bytes, usize::MAX).unwrap_or_else(|error| {
+            format!("status: failed\ntool: web_fetch\nerror: html_convert_failed\n\n{error}")
+        })
+    } else {
+        String::from_utf8_lossy(bytes).to_string()
+    }
+}
+
 fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -374,11 +511,39 @@ fn looks_like_html(bytes: &[u8]) -> bool {
 }
 
 fn extract_title(text: &str) -> String {
-    // html2text 输出通常以 title 开头；截取第一行（有界）。
     text.lines()
         .next()
         .unwrap_or("")
         .chars()
         .take(120)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocks_loopback_urls() {
+        assert!(validate_fetch_url("http://127.0.0.1/").is_err());
+        assert!(validate_fetch_url("http://localhost/").is_err());
+    }
+
+    #[test]
+    fn blocks_private_network_urls() {
+        assert!(validate_fetch_url("http://192.168.1.1/").is_err());
+        assert!(validate_fetch_url("http://10.0.0.5/").is_err());
+    }
+
+    #[test]
+    fn allows_public_https_urls() {
+        assert!(validate_fetch_url("https://example.com/page").is_ok());
+    }
+
+    #[test]
+    fn converts_html_body() {
+        let html = b"<html><body><h1>Hello</h1></body></html>";
+        let text = convert_response_body(html, "text/html");
+        assert!(text.contains("Hello"));
+    }
 }

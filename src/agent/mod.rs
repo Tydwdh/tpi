@@ -76,13 +76,19 @@ pub enum RuntimeEvent {
         text: String,
     },
     /// 工具真正启动前发送（TUI 创建运行中的工具卡片）。
-    ToolStarted { call_id: ToolCallId, name: String },
+    ToolStarted {
+        call_id: ToolCallId,
+        name: String,
+        /// 可读展示摘要（如 `bash: cargo test`；§16.2 展示实际命令而非只有工具名）。
+        display: String,
+    },
     /// 工具终态（TUI 更新卡片状态/耗时；失败时附带关键输出 tail）。
     ToolCompleted {
         call_id: ToolCallId,
         name: String,
         status: ToolStatus,
         duration_ms: u64,
+        exit_code: Option<i32>,
         tail: String,
     },
     /// `update_plan` 提交后的独立 UI 状态；不作为聊天流水的一部分。
@@ -96,9 +102,7 @@ pub enum DeltaKind {
 }
 
 /// 执行一次完整 run（§6.2）。
-///
-/// `history` 是之前已提交的对话；`user_message` 是本轮用户输入。
-/// 所有 durable 事件经 `session` append；写工具在副作用前执行 write-ahead（§14.2）。
+#[allow(clippy::too_many_arguments)]
 pub async fn run<P: Provider>(
     provider: &mut P,
     session: &mut SessionLog,
@@ -107,6 +111,7 @@ pub async fn run<P: Provider>(
     user_message: String,
     ui: mpsc::Sender<RuntimeEvent>,
     cancel: CancellationToken,
+    interactive: bool,
 ) -> Result<AgentOutcome, RunFailure> {
     let run_id = session.run_id();
     let request_id = RequestId::new_v7();
@@ -235,13 +240,39 @@ pub async fn run<P: Provider>(
                     forward_provider_event(event, request_id, &mut content, &ui).await;
                 }
                 result = &mut stream => {
-                    let response = result.map_err(|e| {
-                        session.append_event(&SessionEvent::RunCompleted {
-                            reason: CompletionReason::Error,
-                            usage: usage_total,
-                        }).ok();
-                        RunFailure::Provider(e.to_string())
-                    })?;
+                    let response = match result {
+                        Ok(response) => response,
+                        Err(crate::provider::ProviderError::Cancelled) => {
+                            // §6.2/§11.5：取消（Esc/Ctrl-C）是正常结束——提交已到达的内容，
+                            // 记录 Cancelled 原因并保留 session，而不是让 run 以错误退出。
+                            if !content.is_empty() {
+                                assistant_text = content.clone();
+                                session
+                                    .append_event(&SessionEvent::AssistantMessageCommitted {
+                                        message: AssistantMessage { content },
+                                    })
+                                    .and_then(|_| session.sync_data())
+                                    .map_err(|e| RunFailure::Session(e.to_string()))?;
+                            }
+                            session
+                                .append_event(&SessionEvent::RunCompleted {
+                                    reason: CompletionReason::Cancelled,
+                                    usage: usage_total,
+                                })
+                                .and_then(|_| session.sync_data())
+                                .map_err(|e| RunFailure::Session(e.to_string()))?;
+                            break 'run_loop CompletionReason::Cancelled;
+                        }
+                        Err(e) => {
+                            session
+                                .append_event(&SessionEvent::RunCompleted {
+                                    reason: CompletionReason::Error,
+                                    usage: usage_total,
+                                })
+                                .ok();
+                            return Err(RunFailure::Provider(e.to_string()));
+                        }
+                    };
                     // provider 返回后仍可能有已经入队的末尾 delta；这些发送都已完成，
                     // 因而非阻塞 drain 即可，也不会依赖 future 内部 Sender 的析构时机。
                     while let Ok(event) = event_rx.try_recv() {
@@ -282,6 +313,7 @@ pub async fn run<P: Provider>(
                 &current_plan,
                 &cancel,
                 &ui,
+                interactive,
             )
             .await?;
             if batch == BatchEnd::BudgetExceeded {
@@ -387,6 +419,7 @@ async fn execute_batch(
     current_plan: &std::sync::Arc<std::sync::Mutex<Option<crate::tool::plan::Plan>>>,
     cancel: &CancellationToken,
     ui: &mpsc::Sender<RuntimeEvent>,
+    interactive: bool,
 ) -> Result<BatchEnd, RunFailure> {
     use crate::agent::scheduler::{
         PreparedCall, action_key, build_waves, stable_observation, state_stamp_from_ctx,
@@ -395,6 +428,35 @@ async fn execute_batch(
     use std::collections::HashMap;
 
     let max_parallel = config.limits.max_parallel_tools as usize;
+
+    // §12：ask_user 必须独占 batch（§8.1 P0）。
+    let has_ask_user = calls.iter().any(|call| call.name == "ask_user");
+    if has_ask_user && calls.len() > 1 {
+        for call in &calls {
+            if *tool_calls_total >= config.limits.max_tool_calls {
+                return Ok(BatchEnd::BudgetExceeded);
+            }
+            *tool_calls_total += 1;
+            let outcome = ToolOutcome::failed(
+                &call.name,
+                crate::tool::outcome::ModelPayload {
+                    status: ToolStatus::Rejected,
+                    program: None,
+                    exit_code: None,
+                    duration_ms: 0,
+                    output: format!(
+                        "status: rejected\ntool: {}\nerror: batch_rejected\n\nask_user_must_be_exclusive",
+                        call.name
+                    ),
+                    effect: None,
+                    artifact: None,
+                },
+            )
+            .into_stored();
+            messages.push(tool_result_message(call, &outcome));
+        }
+        return Ok(BatchEnd::Continue);
+    }
 
     // 1. 预检全部参数（§12.2 第 1 条）。
     let mut prepared: Vec<PreparedCall> = Vec::with_capacity(calls.len());
@@ -410,7 +472,8 @@ async fn execute_batch(
         };
         match tool.parse_args(&call.arguments) {
             Ok(args) => {
-                let access = crate::agent::scheduler::tool_access(tool, &args);
+                let access =
+                    crate::agent::scheduler::tool_access(tool, &args, &config.workspace_root);
                 prepared.push(PreparedCall {
                     source_index: index,
                     tool,
@@ -497,6 +560,7 @@ error: invalid_arguments
                 snapshot_store: snapshot_store.clone(),
                 current_plan: current_plan.clone(),
                 web_brave_key_env: config.web_brave_key_env.clone(),
+                interactive,
             };
             // §12.3：StateStamp（access footprint revisions + workspace epoch）。
             let state_stamp = format!(
@@ -512,6 +576,7 @@ error: invalid_arguments
                     .send(RuntimeEvent::ToolStarted {
                         call_id: calls[source_index].call_id,
                         name: calls[source_index].name.clone(),
+                        display: tool_display(&calls[source_index]),
                     })
                     .await;
             }
@@ -551,6 +616,7 @@ error: invalid_arguments
                     snapshot_store: snapshot_store.clone(),
                     current_plan: current_plan.clone(),
                     web_brave_key_env: config.web_brave_key_env.clone(),
+                    interactive,
                 };
                 format!(
                     "{}|{}",
@@ -566,15 +632,15 @@ error: invalid_arguments
                 .unwrap_or_else(|| calls[index].name.clone());
             progress.observe(&action_key, &observation, &state_stamp);
             // §13：update_plan 成功 → PlanReplaced durable event。
-            if outcome.status == ToolStatus::Succeeded
-                && calls[index].name == "update_plan"
-                && let Some(plan) = current_plan.lock().unwrap().clone()
-            {
-                session
-                    .append_event(&SessionEvent::PlanReplaced { plan: plan.clone() })
-                    .and_then(|_| session.sync_data())
-                    .map_err(|e| RunFailure::Session(e.to_string()))?;
-                let _ = ui.send(RuntimeEvent::PlanUpdated { plan }).await;
+            if outcome.status == ToolStatus::Succeeded && calls[index].name == "update_plan" {
+                let plan = current_plan.lock().unwrap().clone();
+                if let Some(plan) = plan {
+                    session
+                        .append_event(&SessionEvent::PlanReplaced { plan: plan.clone() })
+                        .and_then(|_| session.sync_data())
+                        .map_err(|e| RunFailure::Session(e.to_string()))?;
+                    let _ = ui.send(RuntimeEvent::PlanUpdated { plan }).await;
+                }
             }
             // §12.3：edit/write 成功 → workspace epoch 增加（允许基于新状态重试）。
             if outcome.status == ToolStatus::Succeeded
@@ -592,6 +658,7 @@ error: invalid_arguments
                         name: calls[index].name.clone(),
                         status: outcome.status,
                         duration_ms: outcome.model_payload.duration_ms,
+                        exit_code: outcome.model_payload.exit_code,
                         tail: outcome.model_payload.output.clone(),
                     })
                     .await;
@@ -607,6 +674,50 @@ error: invalid_arguments
         }
     }
     Ok(BatchEnd::Continue)
+}
+
+/// 工具调用的可读展示摘要（TUI 工具卡片，§16.2）。
+///
+/// bash → `bash: <command>`；run → `run: <program> <args>`；其余显示工具名。
+/// 有界到 200 字符，避免整段脚本刷屏。
+fn tool_display(call: &ToolCall) -> String {
+    fn summarize(text: String) -> String {
+        let mut t = text.trim().to_string();
+        if t.chars().count() > 200 {
+            let mut truncated: String = t.chars().take(200).collect();
+            truncated.push('…');
+            t = truncated;
+        }
+        t.replace('\n', " ")
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(&call.arguments).ok();
+    match call.name.as_str() {
+        "bash" => {
+            if let Some(cmd) = parsed
+                .as_ref()
+                .and_then(|v| v.get("command"))
+                .and_then(|c| c.as_str())
+            {
+                summarize(format!("bash: {cmd}"))
+            } else {
+                "bash".into()
+            }
+        }
+        "run" => {
+            if let Some(v) = parsed.as_ref() {
+                let program = v.get("program").and_then(|p| p.as_str()).unwrap_or("");
+                let extra: Vec<&str> = v
+                    .get("args")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default();
+                summarize(format!("run: {program} {}", extra.join(" ")))
+            } else {
+                "run".into()
+            }
+        }
+        name => name.into(),
+    }
 }
 
 /// §12.3：无进展重复的拒绝结果。
@@ -672,10 +783,12 @@ async fn compact_turn<P: Provider>(
     let summary_text = crate::context::parse_summary(&summary_text);
     let summary_tokens = crate::context::estimate_tokens(&summary_text);
     let original_tokens = crate::context::estimate_messages(&history);
-    eprintln!(
-        "COMPACT original={original_tokens} summary={summary_tokens} text_len={} messages={}",
-        summary_text.len(),
-        messages.len()
+    tracing::debug!(
+        original_tokens,
+        summary_tokens,
+        text_len = summary_text.len(),
+        messages = messages.len(),
+        "compaction summary generated"
     );
 
     // 4. 校验必填字段和压缩后估算；只有明显缩小才提交（§15.4 第 5 条）。
@@ -781,7 +894,7 @@ fn write_tool_plan(
                     parsed.path
                 }
             };
-            let target_path = crate::tool::resolve_workspace_path(workspace_root, &target);
+            let target_path = crate::tool::resolve_workspace_path(workspace_root, &target).ok()?;
             Some(tool::edit::prepare_commit(&target_path))
         }
         _ => None,
@@ -808,7 +921,7 @@ fn recovery_metadata(
             let parsed = serde_json::from_str::<tool::edit::EditArgs>(arguments).ok()?;
             let (temp, backup) = plan_paths(plan?);
             // §9.1：内部记录使用绝对路径（session 是内部事实源；恢复器据此定位文件）。
-            let target = crate::tool::resolve_workspace_path(workspace_root, &parsed.path);
+            let target = crate::tool::resolve_workspace_path(workspace_root, &parsed.path).ok()?;
             Some(RecoveryMetadata {
                 tool: "edit".into(),
                 target_path: target.to_string(),
@@ -820,7 +933,7 @@ fn recovery_metadata(
         (BuiltinTool::Write, arguments) => {
             let parsed = serde_json::from_str::<tool::files::WriteArgs>(arguments).ok()?;
             let (temp, backup) = plan_paths(plan?);
-            let target = crate::tool::resolve_workspace_path(workspace_root, &parsed.path);
+            let target = crate::tool::resolve_workspace_path(workspace_root, &parsed.path).ok()?;
             Some(RecoveryMetadata {
                 tool: "write".into(),
                 target_path: target.to_string(),
@@ -877,6 +990,7 @@ impl BuiltinTool {
             "run" => Some(BuiltinTool::Run),
             "bash" => Some(BuiltinTool::Bash),
             "update_plan" => Some(BuiltinTool::UpdatePlan),
+            "ask_user" => Some(BuiltinTool::AskUser),
             "web_search" => Some(BuiltinTool::WebSearch),
             "web_fetch" => Some(BuiltinTool::WebFetch),
             _ => None,

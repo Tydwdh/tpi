@@ -128,8 +128,8 @@ fn run(cli: Cli) -> Result<(), String> {
     };
     let config = config::load(&workspace_root, cli.model.as_deref())?;
 
-    if cli.no_session {
-        return Err("--no-session 在 M1 尚未实现（session 是事实源，§14）".into());
+    if cli.no_session && (cli.continue_session || cli.resume.is_some()) {
+        return Err("--no-session 不能与 --continue/--resume 同时使用".into());
     }
 
     let session_target = if cli.continue_session {
@@ -150,6 +150,7 @@ fn run(cli: Cli) -> Result<(), String> {
         session_target,
         cli.prompt.as_deref().unwrap_or(""),
         cli.prompt_mode,
+        cli.no_session,
     ))
 }
 

@@ -274,6 +274,7 @@ async fn update_plan_and_compaction_integration() {
         "请修复并制定计划".into(),
         tx,
         CancellationToken::new(),
+        true,
     )
     .await
     .expect("run succeeds");
@@ -339,6 +340,7 @@ async fn repeated_failing_action_blocked_in_agent_loop() {
         "read it".into(),
         tx,
         CancellationToken::new(),
+        true,
     )
     .await
     .expect("run succeeds");

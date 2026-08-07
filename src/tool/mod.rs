@@ -7,6 +7,7 @@
 //! M1 范围（§21 M1）：`read`、`edit`、`write`、`run`。
 //! M2：`list`、`search`、`bash`。M4：`update_plan`、`ask_user`。M6：`web_search`、`web_fetch`。
 
+pub mod ask;
 pub mod command;
 pub mod edit;
 pub mod files;
@@ -32,6 +33,7 @@ pub enum BuiltinTool {
     Run,
     Bash,
     UpdatePlan,
+    AskUser,
     WebSearch,
     WebFetch,
 }
@@ -47,6 +49,7 @@ impl BuiltinTool {
             BuiltinTool::Run => "run",
             BuiltinTool::Bash => "bash",
             BuiltinTool::UpdatePlan => "update_plan",
+            BuiltinTool::AskUser => "ask_user",
             BuiltinTool::WebSearch => "web_search",
             BuiltinTool::WebFetch => "web_fetch",
         }
@@ -77,6 +80,9 @@ impl BuiltinTool {
             }
             BuiltinTool::UpdatePlan => {
                 "Replace the whole short plan atomically (max 7 unique items). Only for complex multi-step tasks; simple tasks do not need a plan. It is a progress state, not an extra workflow."
+            }
+            BuiltinTool::AskUser => {
+                "Ask the user one blocking question when different choices would materially change the outcome. Must be the only tool in its batch. In non-interactive mode returns interactive_input_unavailable."
             }
             BuiltinTool::WebSearch => {
                 "Search the web (Brave) to discover sources. Returns title, URL, snippet and age. Results are for discovery only; never opens a browser and never calls a summary model."
@@ -113,6 +119,9 @@ impl BuiltinTool {
             }
             BuiltinTool::UpdatePlan => {
                 serde_json::to_value(schemars::schema_for!(plan::UpdatePlanArgs)).unwrap()
+            }
+            BuiltinTool::AskUser => {
+                serde_json::to_value(schemars::schema_for!(ask::AskUserArgs)).unwrap()
             }
             BuiltinTool::WebSearch => {
                 serde_json::to_value(schemars::schema_for!(web::WebSearchArgs)).unwrap()
@@ -155,6 +164,9 @@ impl BuiltinTool {
             BuiltinTool::UpdatePlan => serde_json::from_str::<plan::UpdatePlanArgs>(arguments)
                 .map(ValidatedArgs::UpdatePlan)
                 .map_err(|e| format!("invalid update_plan args: {e}")),
+            BuiltinTool::AskUser => serde_json::from_str::<ask::AskUserArgs>(arguments)
+                .map(ValidatedArgs::AskUser)
+                .map_err(|e| format!("invalid ask_user args: {e}")),
             BuiltinTool::WebSearch => serde_json::from_str::<web::WebSearchArgs>(arguments)
                 .map(ValidatedArgs::WebSearch)
                 .map_err(|e| format!("invalid web_search args: {e}")),
@@ -176,6 +188,7 @@ pub enum ValidatedArgs {
     Run(command::RunArgs),
     Bash(command::BashArgs),
     UpdatePlan(plan::UpdatePlanArgs),
+    AskUser(ask::AskUserArgs),
     WebSearch(web::WebSearchArgs),
     WebFetch(web::WebFetchArgs),
 }
@@ -199,16 +212,120 @@ pub struct ToolContext {
     pub current_plan: std::sync::Arc<std::sync::Mutex<Option<crate::tool::plan::Plan>>>,
     /// Brave API key 的环境变量名（§17；未配置时 web_search 明确 unavailable）。
     pub web_brave_key_env: String,
+    /// 交互模式（`-p` 为 false；ask_user 在非交互模式拒绝）。
+    pub interactive: bool,
 }
 
-/// 把模型给的路径解析为 workspace 内路径（§9.1：优先相对路径；绝对路径映射到 root）。
-pub fn resolve_workspace_path(workspace_root: &Utf8PathBuf, path: &str) -> Utf8PathBuf {
-    let candidate = Utf8PathBuf::from(path);
-    if candidate.is_absolute() {
+/// 路径解析失败（§9.1：禁止 workspace 外访问）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathResolveError {
+    Empty,
+    Invalid,
+    OutsideWorkspace,
+}
+
+impl std::fmt::Display for PathResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "empty path"),
+            Self::Invalid => write!(f, "invalid path"),
+            Self::OutsideWorkspace => write!(f, "path outside workspace"),
+        }
+    }
+}
+
+/// 词法规范化路径（解析 `.` / `..`，不访问文件系统）。
+fn normalize_lexical(path: &std::path::Path) -> Result<std::path::PathBuf, PathResolveError> {
+    use std::path::Component;
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                normalized.push(prefix.as_os_str());
+            }
+            Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(PathResolveError::OutsideWorkspace);
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
+}
+
+/// 把模型给的路径解析为 workspace 内路径（§9.1：相对路径优先；绝对路径必须在 root 内）。
+pub fn resolve_workspace_path(
+    workspace_root: &Utf8PathBuf,
+    path: &str,
+) -> Result<Utf8PathBuf, PathResolveError> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(PathResolveError::Empty);
+    }
+    if trimmed.contains('\0') {
+        return Err(PathResolveError::Invalid);
+    }
+
+    let candidate = Utf8PathBuf::from(trimmed);
+    let joined = if candidate.is_absolute() {
         candidate
     } else {
         workspace_root.join(candidate)
+    };
+
+    let normalized = normalize_lexical(joined.as_std_path())?;
+    let workspace_norm = normalize_lexical(workspace_root.as_std_path())?;
+    if !normalized.starts_with(&workspace_norm) {
+        return Err(PathResolveError::OutsideWorkspace);
     }
+
+    // 已存在路径：canonicalize 防止 symlink 逃逸。
+    if normalized.exists() {
+        let ws_canonical = std::fs::canonicalize(workspace_root.as_std_path())
+            .unwrap_or_else(|_| workspace_norm.clone());
+        if let Ok(canonical) = std::fs::canonicalize(&normalized)
+            && !canonical.starts_with(&ws_canonical)
+        {
+            return Err(PathResolveError::OutsideWorkspace);
+        }
+    }
+
+    Utf8PathBuf::from_path_buf(normalized).map_err(|_| PathResolveError::Invalid)
+}
+
+/// artifact 引用组件校验（禁止路径分隔符与 `..`）。
+pub fn validate_artifact_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains("..")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// 路径被拒绝时的标准 tool outcome。
+pub fn path_rejected_outcome(tool: &str, error: PathResolveError) -> ToolOutcome {
+    ToolOutcome::failed(
+        tool,
+        outcome::ModelPayload {
+            status: outcome::ToolStatus::Rejected,
+            program: None,
+            exit_code: None,
+            duration_ms: 0,
+            output: format!(
+                "status: rejected\ntool: {tool}\nerror: {error}\n\n路径必须位于 workspace 内。"
+            ),
+            effect: None,
+            artifact: None,
+        },
+    )
 }
 
 /// 执行一个已校验的工具调用（§8.2：预期失败返回 ToolOutcome，不返回 Err）。
@@ -232,6 +349,7 @@ pub async fn execute(
         (BuiltinTool::Bash, ValidatedArgs::Bash(args)) => command::bash(args, ctx).await,
         // §13：update_plan 是原生同步控制操作，不进入普通调度队列。
         (BuiltinTool::UpdatePlan, ValidatedArgs::UpdatePlan(args)) => plan::update_plan(args, ctx),
+        (BuiltinTool::AskUser, ValidatedArgs::AskUser(args)) => ask::ask_user(args, ctx),
         (BuiltinTool::WebSearch, ValidatedArgs::WebSearch(args)) => {
             web::web_search(args, ctx).await
         }
@@ -252,6 +370,7 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
         BuiltinTool::Run,
         BuiltinTool::Bash,
         BuiltinTool::UpdatePlan,
+        BuiltinTool::AskUser,
         BuiltinTool::WebSearch,
         BuiltinTool::WebFetch,
     ]

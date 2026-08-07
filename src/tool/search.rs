@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::tool::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
-use crate::tool::{ToolContext, resolve_workspace_path};
+use crate::tool::{ToolContext, path_rejected_outcome, resolve_workspace_path};
 
 /// 单次默认计算预算（§8.4）。
 pub const MAX_SCAN_FILES: u64 = 20_000;
@@ -92,7 +92,10 @@ pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
     if let Some(cursor) = &args.cursor {
         return page(cursor, ctx);
     }
-    let root = resolve_workspace_path(&ctx.workspace_root, &args.path);
+    let root = match resolve_workspace_path(&ctx.workspace_root, &args.path) {
+        Ok(path) => path,
+        Err(error) => return path_rejected_outcome("list", error),
+    };
     if !root.is_dir() {
         return ToolOutcome::failed(
             "list",
@@ -187,7 +190,10 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
             );
         }
     };
-    let root = resolve_workspace_path(&ctx.workspace_root, &args.path);
+    let root = match resolve_workspace_path(&ctx.workspace_root, &args.path) {
+        Ok(path) => path,
+        Err(error) => return path_rejected_outcome("search", error),
+    };
     if !root.is_dir() {
         return ToolOutcome::failed(
             "search",

@@ -278,10 +278,10 @@ fn read_system_md(path: &std::path::Path) -> Option<String> {
 pub fn read_api_key(config: &Config) -> Result<String, String> {
     // §18.4：环境变量是显式覆盖；否则从 Windows Credential Manager 读取
     //（`tpi auth set <provider>` 写入，配置只保存 credential label）。
-    if let Ok(key) = std::env::var(&config.model.api_key_env) {
-        if !key.is_empty() {
-            return Ok(key);
-        }
+    if let Ok(key) = std::env::var(&config.model.api_key_env)
+        && !key.is_empty()
+    {
+        return Ok(key);
     }
     if let Some(key) = crate::auth::auth_get(&config.model.provider) {
         return Ok(key);

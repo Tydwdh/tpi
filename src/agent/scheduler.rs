@@ -45,33 +45,43 @@ pub enum FileScope {
 }
 
 /// 工具访问声明（§12.1）。
-pub fn tool_access(tool: BuiltinTool, args: &ValidatedArgs) -> ToolAccess {
+pub fn tool_access(
+    tool: BuiltinTool,
+    args: &ValidatedArgs,
+    workspace_root: &camino::Utf8PathBuf,
+) -> ToolAccess {
+    fn resolved_path(workspace_root: &camino::Utf8PathBuf, path: &str) -> camino::Utf8PathBuf {
+        crate::tool::resolve_workspace_path(workspace_root, path)
+            .unwrap_or_else(|_| camino::Utf8PathBuf::from(path))
+    }
+
     match (tool, args) {
         (BuiltinTool::Read, ValidatedArgs::Read(args)) => {
-            let path = camino::Utf8PathBuf::from(&args.path);
+            let path = resolved_path(workspace_root, &args.path);
             file_lock(FileScope::Exact(path), AccessMode::Read)
         }
         (BuiltinTool::List, ValidatedArgs::List(args)) => {
-            let path = camino::Utf8PathBuf::from(&args.path);
+            let path = resolved_path(workspace_root, &args.path);
             file_lock(FileScope::Recursive(path), AccessMode::Read)
         }
         (BuiltinTool::Search, ValidatedArgs::Search(args)) => {
-            let path = camino::Utf8PathBuf::from(&args.path);
+            let path = resolved_path(workspace_root, &args.path);
             file_lock(FileScope::Recursive(path), AccessMode::Read)
         }
         (BuiltinTool::Edit, ValidatedArgs::Edit(args)) => {
-            let path = camino::Utf8PathBuf::from(&args.path);
+            let path = resolved_path(workspace_root, &args.path);
             file_lock(FileScope::Exact(path), AccessMode::Write)
         }
         (BuiltinTool::Write, ValidatedArgs::Write(args)) => {
-            let path = camino::Utf8PathBuf::from(&args.path);
+            let path = resolved_path(workspace_root, &args.path);
             file_lock(FileScope::Exact(path), AccessMode::Write)
         }
         (BuiltinTool::Run, _) | (BuiltinTool::Bash, _) => ToolAccess::WorkspaceUnknown,
-        // update_plan 是原生同步控制操作（§13）：不进入普通调度队列。
-        (BuiltinTool::UpdatePlan, _) | (BuiltinTool::WebSearch, _) | (BuiltinTool::WebFetch, _) => {
-            ToolAccess::Pure
-        }
+        // update_plan / ask_user 是原生同步控制操作（§13）：不进入普通调度队列。
+        (BuiltinTool::UpdatePlan, _)
+        | (BuiltinTool::AskUser, _)
+        | (BuiltinTool::WebSearch, _)
+        | (BuiltinTool::WebFetch, _) => ToolAccess::Pure,
         _ => ToolAccess::Pure,
     }
 }
@@ -293,7 +303,8 @@ pub fn state_stamp_from_ctx(ctx: &ToolContext, access: &ToolAccess) -> String {
                 .filter_map(|lock| match &lock.resource {
                     ResourceId::File(FileScope::Exact(path)) => {
                         let path =
-                            crate::tool::resolve_workspace_path(&ctx.workspace_root, path.as_str());
+                            crate::tool::resolve_workspace_path(&ctx.workspace_root, path.as_str())
+                                .unwrap_or_else(|_| path.clone());
                         store
                             .latest(&path)
                             .map(|snapshot| format!("{}={}", path, snapshot.revision))

@@ -38,7 +38,32 @@ pub async fn run(
     session_target: SessionTarget,
     prompt: &str,
     non_interactive: bool,
+    no_session: bool,
 ) -> Result<(), String> {
+    let mut config = config;
+    let _ephemeral_root = if no_session {
+        let root =
+            std::env::temp_dir().join(format!("tpi-ephemeral-{}", crate::ids::EventId::new_v7()));
+        std::fs::create_dir_all(&root).map_err(|e| format!("创建临时 session 目录失败: {e}"))?;
+        config.sessions_root = root.join("sessions");
+        config.artifacts_root = root.join("artifacts");
+        std::fs::create_dir_all(&config.sessions_root)
+            .map_err(|e| format!("创建临时 sessions 目录失败: {e}"))?;
+        std::fs::create_dir_all(&config.artifacts_root)
+            .map_err(|e| format!("创建临时 artifacts 目录失败: {e}"))?;
+        Some(root)
+    } else {
+        None
+    };
+
+    if no_session {
+        match session_target {
+            SessionTarget::Continue | SessionTarget::Resume(_) => {
+                return Err("--no-session 不能与 --continue/--resume 同时使用".into());
+            }
+            SessionTarget::New => {}
+        }
+    }
     let workspace_root = config.workspace_root.clone();
     let sessions_root = config.sessions_root.clone();
     let api_key = crate::config::read_api_key(&config)?;
@@ -124,6 +149,7 @@ async fn run_prompt_once<P: Provider>(
         message,
         ui_tx,
         cancel.clone(),
+        false,
     )
     .await
     .map_err(|failure| failure.to_string())?;
@@ -220,11 +246,26 @@ async fn interactive_loop<P: Provider>(
             match message.as_str() {
                 "/quit" | "/exit" => break,
                 "/settings" => {
+                    let shell = config
+                        .shell_path
+                        .as_ref()
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "未配置（自动查找 Git Bash）".to_string());
+                    let brave_key = if std::env::var(&config.web_brave_key_env).is_ok() {
+                        "已配置 key"
+                    } else {
+                        "未配置 key"
+                    };
                     view.push_line(
                         LineKind::System,
                         format!(
-                            "配置来源: {}\n模型: {} ({})",
-                            config.source, config.model.name, config.model.provider
+                            "配置来源: {}\nworkspace: {}\nsessions: {}\nartifacts: {}\nshell: {shell}\nweb_search: Brave（{brave_key}）\n自动打开浏览器: {}\n保留 token: {}",
+                            config.source,
+                            config.workspace_root,
+                            config.sessions_root.display(),
+                            config.artifacts_root.display(),
+                            if config.auto_open_browser { "是" } else { "否" },
+                            config.safety_reserve_tokens,
                         ),
                     );
                     continue;
@@ -232,7 +273,24 @@ async fn interactive_loop<P: Provider>(
                 "/model" => {
                     view.push_line(
                         LineKind::System,
-                        format!("primary: {} ({})", config.model.name, config.model.provider),
+                        format!(
+                            "primary:\n  名称: {}\n  provider: {}\n  base_url: {}\n  reasoning: {}\n  max_output_tokens: {}\n  context_window: {}\n  api_key_env: {}",
+                            config.model.name,
+                            config.model.provider,
+                            config.model.base_url,
+                            config.model.reasoning.clone().unwrap_or_else(|| "默认".to_string()),
+                            config
+                                .model
+                                .max_output_tokens
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "默认".to_string()),
+                            config
+                                .model
+                                .context_window
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "未配置".to_string()),
+                            config.model.api_key_env,
+                        ),
                     );
                     continue;
                 }
@@ -283,7 +341,12 @@ async fn interactive_loop<P: Provider>(
                         .reasoning
                         .clone()
                         .unwrap_or_else(|| "未配置（默认）".to_string());
-                    view.push_line(LineKind::System, format!("reasoning: {value}"));
+                    view.push_line(
+                        LineKind::System,
+                        format!(
+                            "reasoning: {value}\n说明: 透传给 provider 的推理设置（§18.1 [model.primary] reasoning）；\n未配置时使用 provider 默认。",
+                        ),
+                    );
                     continue;
                 }
                 "/diff" => {
@@ -461,7 +524,7 @@ async fn run_interactive<P: Provider>(
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 ) -> Result<agent::AgentOutcome, String> {
     use crate::tui::model::{LineKind, StatusLine};
-    use ratatui::crossterm::event::KeyEventKind;
+    use ratatui::crossterm::event::{KeyCode, KeyEventKind};
     let cancel = CancellationToken::new();
     *current_cancel.lock().unwrap() = Some(cancel.clone());
     view.status = StatusLine::Running {
@@ -478,6 +541,7 @@ async fn run_interactive<P: Provider>(
         message.clone(),
         ui_tx,
         cancel.clone(),
+        true,
     );
     tokio::pin!(run_future);
 
@@ -495,14 +559,14 @@ async fn run_interactive<P: Provider>(
                             DeltaKind::Reasoning => view.push_stream_delta(LineKind::Reasoning, &text),
                         }
                     }
-                    Some(RuntimeEvent::ToolStarted { call_id, name }) => {
-                        view.begin_tool(call_id.to_string(), name.clone());
+                    Some(RuntimeEvent::ToolStarted { call_id, name, display }) => {
+                        view.begin_tool(call_id.to_string(), name.clone(), Some(display));
                         if let StatusLine::Running { tool, .. } = &mut view.status {
                             *tool = name;
                         }
                     }
-                    Some(RuntimeEvent::ToolCompleted { call_id, name, status, duration_ms, tail }) => {
-                        view.finish_tool(call_id.to_string(), name, status, duration_ms, tail);
+                    Some(RuntimeEvent::ToolCompleted { call_id, name, status, duration_ms, exit_code, tail }) => {
+                        view.finish_tool(call_id.to_string(), name, status, duration_ms, exit_code, tail);
                     }
                     Some(RuntimeEvent::TurnStarted { turn }) => {
                         view.turn = turn;
@@ -529,7 +593,14 @@ async fn run_interactive<P: Provider>(
             key = key_rx.recv() => {
                 match key {
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                        handle_key(key, editor, view, pending_message);
+                        if key.code == KeyCode::Esc && view.menu.is_none() {
+                            // §6.2：Esc 打断当前 run（等价 Ctrl-C，保留 session）。
+                            // 命令补全菜单打开时 Esc 仍由 handle_key 关闭菜单。
+                            cancel.cancel();
+                            view.push_line(LineKind::System, "已发送取消（Esc）；保留 session");
+                        } else {
+                            handle_key(key, editor, view, pending_message);
+                        }
                         view.input = editor.text().to_string();
                         view.input_cursor = editor.cursor;
                         renderer.draw(view).map_err(|e| e.to_string())?;

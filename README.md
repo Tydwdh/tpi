@@ -7,14 +7,18 @@
 ## 快速开始
 
 ```powershell
-# 1. 配置模型（§18.1：不允许"看不见的默认模型"）
+# 1. 一键安装：编译 tpi + 下载随包 Git Bash（bash 工具免装 Git）
+#    等价于 cargo install --path . --locked + scripts\install-bash.ps1
+.\scripts\install.ps1
+
+# 2. 配置模型（§18.1：不允许"看不见的默认模型"）
 #    在 ~/.tpi/config.toml 写入 [model.primary]（provider/name/base_url），
 #    示例见 MIGRATION.md。
 
-# 2. 凭据（§18.4：写入 Windows Credential Manager，不写进 TOML）
+# 3. 凭据（§18.4：写入 Windows Credential Manager，不写进 TOML）
 tpi auth set opencode-go
 
-# 3. 运行
+# 4. 运行
 tpi                      # 交互会话（Ratatui inline TUI）
 tpi "修复这个测试"       # 进入交互并提交首条消息
 tpi -p "解释失败原因"    # 非交互，stdout 只输出最终答案
@@ -23,7 +27,8 @@ tpi --resume <session-id>
 tpi --model <name>
 ```
 
-安装：`cargo install --path . --locked`（release profile 已配置）。
+`scripts\install.ps1 -SkipBash` 跳过 Git Bash 下载（系统已装 Git 时可选）；
+纯编译安装 `cargo install --path . --locked`（release profile 已配置）。
 
 ## 已实现能力（按里程碑）
 

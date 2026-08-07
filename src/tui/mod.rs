@@ -88,7 +88,7 @@ impl Renderer {
         let backend = CrosstermBackend::new(stdout);
         // §16.1：活动区高度在启动时按窗口计算一次（约 2/5 屏，夹在 12..=32）。
         let (_, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
-        let height = ((rows as u16 * 2) / 5).clamp(12, 32);
+        let height = ((rows * 2) / 5).clamp(12, 32);
         let mut terminal = match Terminal::with_options(
             backend,
             ratatui::TerminalOptions {
@@ -310,10 +310,7 @@ fn plan_window(
         (Vec::new(), window_start)
     } else if scroll == 0 && window_start > committed {
         // 跟随模式：窗口之上的行已闭合，提交到 scrollback。
-        (
-            wrapped[committed..window_start].to_vec(),
-            window_start,
-        )
+        (wrapped[committed..window_start].to_vec(), window_start)
     } else {
         (Vec::new(), committed)
     };
@@ -601,8 +598,8 @@ fn flush_line(out: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>) {
     }
 }
 
-/// 工具卡片（§16.2）：单行 `icon name · duration · status`，运行中 spinner 动画；
-/// 失败时保留红色关键 tail（不自动展开几十屏）。
+/// 工具卡片（§16.2）：`icon name · duration · status`，运行中 spinner 动画；
+/// 命令摘要（detail）缩进一行展示；失败时保留红色关键 tail（不自动展开几十屏）。
 fn tool_card_lines(card: &ToolCard, anim_tick: u64, theme: theme::Theme) -> Vec<Line<'static>> {
     let (icon, status_style, status_text) = match &card.state {
         ToolCardState::Running => (
@@ -629,16 +626,36 @@ fn tool_card_lines(card: &ToolCard, anim_tick: u64, theme: theme::Theme) -> Vec<
         card.name.clone(),
         Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     ));
-    if let ToolCardState::Done { duration_ms, .. } = &card.state {
+    if let ToolCardState::Done {
+        duration_ms,
+        exit_code,
+        ..
+    } = &card.state
+    {
         spans.push(Span::styled(
             format!(" · {}", fmt_duration(*duration_ms)),
             Style::default().fg(theme.muted),
         ));
+        if let Some(code) = exit_code {
+            spans.push(Span::styled(
+                format!(" · exit {code}"),
+                Style::default().fg(theme.muted),
+            ));
+        }
     }
     if !status_text.is_empty() {
         spans.push(Span::styled(format!(" · {status_text}"), status_style));
     }
     let mut lines = vec![Line::from(spans)];
+    // §16.2：实际命令摘要独立一行，缩进展示（运行中也可见，便于观察正在做什么）。
+    if let Some(detail) = &card.detail
+        && !detail.is_empty()
+    {
+        lines.push(Line::styled(
+            format!("  {detail}"),
+            Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+        ));
+    }
     if let Some(tail) = &card.tail {
         for s in tail.split('\n') {
             lines.push(Line::styled(
@@ -1064,7 +1081,8 @@ mod tests {
         let theme = theme::Theme::omp();
         let card = ToolCard {
             id: "c1".into(),
-            name: "run cargo test".into(),
+            name: "run".into(),
+            detail: Some("run: cargo test".into()),
             state: ToolCardState::Running,
             tail: None,
         };
@@ -1073,14 +1091,23 @@ mod tests {
             lines[0].spans[0].content.starts_with('⠋'),
             "运行中显示 spinner"
         );
-        assert!(lines[0].spans.iter().any(|s| s.content == "run cargo test"));
+        assert!(lines[0].spans.iter().any(|s| s.content == "run"));
+        // 运行中已展示命令摘要（独立缩进行）。
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_string().contains("run: cargo test")),
+            "运行中显示命令摘要: {lines:?}"
+        );
 
         let card = ToolCard {
             id: "c1".into(),
-            name: "run cargo test".into(),
+            name: "run".into(),
+            detail: Some("run: cargo test".into()),
             state: ToolCardState::Done {
                 status: crate::tool::outcome::ToolStatus::Failed,
                 duration_ms: 1234,
+                exit_code: Some(2),
             },
             tail: Some("exit_code: 1".into()),
         };
@@ -1091,6 +1118,7 @@ mod tests {
             .collect();
         assert!(text.contains('✗'), "失败卡片显示 ✗: {text:?}");
         assert!(text.contains("1.2s"), "耗时格式化: {text:?}");
+        assert!(text.contains("exit 2"), "exit code 展示: {text:?}");
         assert!(text.contains("exit_code: 1"), "失败 tail 保留: {text:?}");
     }
 
@@ -1123,10 +1151,11 @@ mod tests {
         let card = ToolCard {
             id: "c".into(),
             name: "run".into(),
+            detail: None,
             state: ToolCardState::Running,
             tail: None,
         };
-        let f0 = tool_card_lines(&card, 0, theme.clone()).remove(0);
+        let f0 = tool_card_lines(&card, 0, theme).remove(0);
         let f1 = tool_card_lines(&card, 1, theme).remove(0);
         assert_ne!(
             f0.spans[0].content, f1.spans[0].content,

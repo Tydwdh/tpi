@@ -63,9 +63,10 @@ impl ArtifactWriter {
     }
 
     /// 追加一段输出。
-    pub fn write(&mut self, _stream: &str, bytes: &[u8]) {
-        let _ = self.file.write_all(bytes);
+    pub fn write(&mut self, _stream: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.file.write_all(bytes)?;
         self.written += bytes.len() as u64;
+        Ok(())
     }
 
     /// 完成并返回 record（flush + 计算 digest）。
@@ -100,6 +101,11 @@ pub fn find(
     session_id: &str,
     id: &str,
 ) -> Option<ArtifactRecord> {
+    if !crate::tool::validate_artifact_component(session_id)
+        || !crate::tool::validate_artifact_component(id)
+    {
+        return None;
+    }
     let path = artifacts_root.join(session_id).join(format!("{id}.out"));
     if !path.exists() {
         return None;

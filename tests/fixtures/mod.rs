@@ -62,5 +62,6 @@ pub fn test_tool_context(workspace_root: &Utf8PathBuf) -> tpi::tool::ToolContext
         )),
         current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
         web_brave_key_env: "TPI_BRAVE_API_KEY".into(),
+        interactive: true,
     }
 }

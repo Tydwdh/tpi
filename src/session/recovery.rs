@@ -86,7 +86,7 @@ pub fn recover(path: &Path) -> std::io::Result<RecoveryOutcome> {
 /// 纯读工具无副作用，记为 not_applied。
 fn classify_effect(tool_name: &str, recovery: Option<&RecoveryMetadata>) -> Effect {
     match tool_name {
-        "read" | "list" | "search" | "web_search" | "web_fetch" | "update_plan" => {
+        "read" | "list" | "search" | "web_search" | "web_fetch" | "update_plan" | "ask_user" => {
             Effect::NotApplied
         }
         _ => {
@@ -128,8 +128,7 @@ fn classify_effect(tool_name: &str, recovery: Option<&RecoveryMetadata>) -> Effe
                     Effect::Committed
                 }
                 (Some(_), None, None, Some(_expected)) if !metadata.temp_path.is_empty() => {
-                    // temp 与 backup 都清理了：说明 ToolCompleted 已完成或提交成功。
-                    Effect::Committed
+                    Effect::Unknown
                 }
                 _ => Effect::Unknown,
             }

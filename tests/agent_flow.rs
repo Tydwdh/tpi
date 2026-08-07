@@ -37,6 +37,7 @@ async fn finish_stop_without_tool_calls_completes_run_without_second_request() {
         "hi".into(),
         tx,
         CancellationToken::new(),
+        true,
     )
     .await
     .expect("run succeeds");
@@ -100,6 +101,7 @@ async fn tool_call_loop_terminates_and_reports_completion() {
         "read a file".into(),
         tx,
         CancellationToken::new(),
+        true,
     )
     .await
     .expect("run succeeds");

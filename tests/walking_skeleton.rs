@@ -114,6 +114,7 @@ async fn fake_provider_drives_full_read_edit_verify_loop() {
         "修复 sample.rs 中的两个 bug".into(),
         tx,
         CancellationToken::new(),
+        true,
     )
     .await
     .expect("end-to-end run succeeds");

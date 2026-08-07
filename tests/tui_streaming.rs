@@ -209,16 +209,16 @@ fn user_message_has_you_label() {
 #[test]
 fn tool_card_renders_running_and_done_states() {
     let mut view = ViewModel::default();
-    view.begin_tool("c1", "run cargo test");
+    view.begin_tool("c1", "run", Some("run: cargo test".into()));
     view.anim_tick = 0;
     let buffer = draw_to_test_backend(&view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(
-        rendered.contains('⠋') && rendered.contains("run cargo test"),
-        "运行中卡片显示 spinner 与工具名: {rendered:?}"
+        rendered.contains('⠋') && rendered.contains("run: cargo test"),
+        "运行中卡片显示 spinner、工具名与命令摘要: {rendered:?}"
     );
 
-    view.finish_tool("c1", "run cargo test", ToolStatus::Succeeded, 2345, "");
+    view.finish_tool("c1", "run", ToolStatus::Succeeded, 2345, Some(0), "");
     let buffer = draw_to_test_backend(&view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(
@@ -231,17 +231,23 @@ fn tool_card_renders_running_and_done_states() {
 #[test]
 fn failed_tool_card_shows_status_and_tail() {
     let mut view = ViewModel::default();
-    view.begin_tool("c1", "cargo test");
+    view.begin_tool("c1", "bash", Some("bash: cargo test".into()));
     view.finish_tool(
         "c1",
-        "cargo test",
+        "bash",
         ToolStatus::Failed,
         500,
+        Some(2),
         "exit_code: 1\n失败输出",
     );
     let buffer = draw_to_test_backend(&view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(rendered.contains('✗'), "失败卡片显示 ✗: {rendered:?}");
+    assert!(
+        rendered.contains("bash: cargo test"),
+        "命令摘要展示: {rendered:?}"
+    );
+    assert!(rendered.contains("exit 2"), "exit code 展示: {rendered:?}");
     assert!(
         rendered.contains("失败输出"),
         "失败 tail 保留: {rendered:?}"
@@ -285,8 +291,10 @@ fn assistant_markdown_bold_and_code_are_styled() {
 /// 命令补全菜单：输入 `/` 前缀时弹出匹配命令与中文说明。
 #[test]
 fn command_menu_pops_up_with_matches() {
-    let mut view = ViewModel::default();
-    view.input = "/set".into();
+    let mut view = ViewModel {
+        input: "/set".into(),
+        ..Default::default()
+    };
     view.refresh_command_menu();
     let buffer = draw_to_test_backend(&view, 80, 14);
     let rendered = buffer_text(&buffer);

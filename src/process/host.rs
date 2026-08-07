@@ -6,6 +6,8 @@
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Deserialize;
 
@@ -61,8 +63,10 @@ pub fn run_host() -> i32 {
     let stderr = child.stderr.take();
 
     // 转发线程：stdout → kind=MSG_OUTPUT/STREAM_STDOUT；stderr → STREAM_STDERR。
-    let stdout_handle = spawn_pump(stdout, STREAM_STDOUT);
-    let stderr_handle = spawn_pump(stderr, STREAM_STDERR);
+    // 每个 pump 退出时递增 done 计数，供 host 判断残余输出是否已转发完。
+    let done = Arc::new(AtomicUsize::new(0));
+    let stdout_handle = spawn_pump(stdout, STREAM_STDOUT, done.clone());
+    let stderr_handle = spawn_pump(stderr, STREAM_STDERR, done.clone());
 
     let status = match child.wait() {
         Ok(status) => status,
@@ -71,8 +75,19 @@ pub fn run_host() -> i32 {
             return 1;
         }
     };
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
+    // target 已退出。若 target 派生的后台进程仍持有输出管道句柄，pump 线程不会 EOF；
+    // 只等待有限时间收集残余输出，超时则放弃 join（进程退出时线程被终止）——
+    // 否则 host 永远不发送 MSG_EXIT，主进程会干等到命令超时（§11.5）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while done.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if stdout_handle.is_finished() {
+        let _ = stdout_handle.join();
+    }
+    if stderr_handle.is_finished() {
+        let _ = stderr_handle.join();
+    }
 
     let code = status.code().unwrap_or(1);
     let payload = code.to_le_bytes().to_vec();
@@ -127,9 +142,13 @@ fn write_message(kind: u8, payload: &[u8]) {
 fn spawn_pump<R: std::io::Read + Send + 'static>(
     stream: Option<R>,
     stream_kind: u8,
+    done: Arc<AtomicUsize>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let Some(mut stream) = stream else { return };
+        let Some(mut stream) = stream else {
+            done.fetch_add(1, Ordering::SeqCst);
+            return;
+        };
         let mut buffer = [0u8; 8192];
         loop {
             match stream.read(&mut buffer) {
@@ -143,5 +162,6 @@ fn spawn_pump<R: std::io::Read + Send + 'static>(
                 Err(_) => break,
             }
         }
+        done.fetch_add(1, Ordering::SeqCst);
     })
 }

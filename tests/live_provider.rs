@@ -53,6 +53,7 @@ async fn live_provider_smoke_opt_in() {
         "回复两个字：你好".into(),
         tx,
         CancellationToken::new(),
+        true,
     )
     .await
     .expect("live run succeeds");

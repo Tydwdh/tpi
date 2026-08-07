@@ -70,7 +70,12 @@ pub async fn run(args: RunArgs, ctx: &ToolContext) -> ToolOutcome {
         ),
     };
     // §11.5：host 的 cwd 是 tpi.exe 启动目录，必须把 cwd 解析为 workspace 绝对路径。
-    let exec_cwd = crate::tool::resolve_workspace_path(&ctx.workspace_root, &args.cwd).to_string();
+    let exec_cwd = match crate::tool::resolve_workspace_path(&ctx.workspace_root, &args.cwd) {
+        Ok(path) => path.to_string(),
+        Err(error) => {
+            return crate::tool::path_rejected_outcome("run", error);
+        }
+    };
     let run_args = RunArgs {
         program: exec_program,
         args: exec_args,
@@ -188,7 +193,12 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
         "text/plain",
     )
     .ok();
-    let exec_cwd = crate::tool::resolve_workspace_path(&ctx.workspace_root, &args.cwd).to_string();
+    let exec_cwd = match crate::tool::resolve_workspace_path(&ctx.workspace_root, &args.cwd) {
+        Ok(path) => path.to_string(),
+        Err(error) => {
+            return crate::tool::path_rejected_outcome("bash", error);
+        }
+    };
     let run_args = RunArgs {
         program: bash_exe,
         args: vec!["--noprofile".into(), "--norc".into(), "-c".into(), wrapped],
@@ -263,16 +273,38 @@ error: process_isolation_unavailable
 }
 
 /// Git Bash 定位（§11.2 解析顺序固定且记录实际选择）。
+///
+/// 顺序：
+/// 1. 配置 `shell.path`；
+/// 2. 随包 Git Bash：`tpi.exe` 同目录下的 `git/bin/bash.exe`、`git/usr/bin/bash.exe`、
+///    `git/bash.exe`、`bash.exe`（便携版安装位置，§11.2 安装说明）；
+/// 3. `Program Files\Git\bin\bash.exe`、`usr\bin\bash.exe`；
+/// 4. PATH 中的 bash.exe（排除 WSL launcher）。
 pub fn locate_git_bash(ctx: &ToolContext) -> Option<String> {
     if let Some(path) = &ctx.shell_path {
         return Some(path.to_string());
     }
+    // 随包位置：tpi.exe 同目录的 git 便携版。
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        for candidate in [
+            dir.join("git").join("bin").join("bash.exe"),
+            dir.join("git").join("usr").join("bin").join("bash.exe"),
+            dir.join("git").join("bash.exe"),
+            dir.join("bash.exe"),
+        ] {
+            if is_git_bash(&candidate) {
+                return Some(candidate.to_string_lossy().to_string());
+            }
+        }
+    }
     let candidates = [
-        r"C:\Program Files\\Git\\bin\\bash.exe",
-        r"C:\Program Files\\Git\\usr\\bin\\bash.exe",
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
     ];
     for candidate in candidates {
-        if std::path::Path::new(candidate).exists() {
+        if is_git_bash(std::path::Path::new(candidate)) {
             return Some(candidate.to_string());
         }
     }
@@ -280,11 +312,23 @@ pub fn locate_git_bash(ctx: &ToolContext) -> Option<String> {
     let path = std::env::var("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join("bash.exe");
-        if candidate.is_file() {
+        if is_git_bash(&candidate) {
             return Some(candidate.to_string_lossy().to_string());
         }
     }
     None
+}
+
+/// 判定候选是否为 Git Bash 的 bash.exe（排除 WSL launcher）。
+///
+/// `C:\Windows\system32\bash.exe` 与 WindowsApps 下的 bash.exe 是 Linux 子系统
+/// launcher，不是 msys 的 Git Bash；误用时冷启动会卡住或弹窗（§11.2）。
+fn is_git_bash(exe: &std::path::Path) -> bool {
+    if !exe.is_file() {
+        return false;
+    }
+    let lower = exe.to_string_lossy().to_lowercase();
+    !lower.contains("\\system32\\") && !lower.contains("\\windowsapps\\")
 }
 
 /// outcome_for 的输入打包（避免 8 参数函数）。

@@ -88,8 +88,9 @@ pub async fn run_in_host(
     // 单二进制 process-host（§11.5）：默认用自身；测试用 TPI_PROCESS_HOST 指向真实 tpi.exe。
     let exe = std::env::var_os("TPI_PROCESS_HOST")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_exe().expect("current exe"));
-    let mut host = Command::new(exe)
+        .or_else(|| std::env::current_exe().ok())
+        .ok_or_else(|| "process-host executable unavailable".to_string())?;
+    let mut host = Command::new(&exe)
         .arg("__process-host")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -100,11 +101,20 @@ pub async fn run_in_host(
 
     // §11.5 第 2-3 步：host 尚未创建 target 时归组。
     let job = Job::create().map_err(|e| IsolationError(e.to_string()).0)?;
-    job.assign_process(host.id().expect("process-host pid"))
-        .map_err(|e| IsolationError(format!("assign host to job: {e}")).0)?;
+    job.assign_process(
+        host.id()
+            .ok_or_else(|| "process-host pid unavailable".to_string())?,
+    )
+    .map_err(|e| IsolationError(format!("assign host to job: {e}")).0)?;
 
-    let mut stdin = host.stdin.take().unwrap();
-    let mut stdout = host.stdout.take().unwrap();
+    let mut stdin = host
+        .stdin
+        .take()
+        .ok_or_else(|| "process-host stdin unavailable".to_string())?;
+    let mut stdout = host
+        .stdout
+        .take()
+        .ok_or_else(|| "process-host stdout unavailable".to_string())?;
 
     // 发送 Start spec（framed：len + kind + payload）。
     let spec = serde_json::json!({
@@ -164,7 +174,14 @@ pub async fn run_in_host(
                         let stream = payload[0];
                         let bytes = &payload[1..];
                         if let Some(writer) = artifact.as_mut() {
-                            writer.write(if stream == STREAM_STDOUT { "stdout" } else { "stderr" }, bytes);
+                            let _ = writer.write(
+                                if stream == STREAM_STDOUT {
+                                    "stdout"
+                                } else {
+                                    "stderr"
+                                },
+                                bytes,
+                            );
                         }
                         if stream == STREAM_STDOUT {
                             output.stdout_total += bytes.len() as u64;
@@ -175,7 +192,11 @@ pub async fn run_in_host(
                         }
                     }
                     Ok(Some((MSG_EXIT, payload))) if payload.len() >= 4 => {
-                        let code = i32::from_le_bytes(payload[..4].try_into().unwrap());
+                        let code = i32::from_le_bytes(
+                            payload[..4]
+                                .try_into()
+                                .map_err(|_| "invalid exit payload".to_string())?,
+                        );
                         output.exit_code = Some(code);
                         exited = true;
                     }
@@ -216,7 +237,11 @@ async fn read_frame<R: AsyncReadExt + Unpin>(
         }
         read += n;
     }
-    let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(
+        header[..4]
+            .try_into()
+            .map_err(|_| "invalid frame header".to_string())?,
+    ) as usize;
     let kind = header[4];
     if len > 64 * 1024 * 1024 {
         return Err("process-host frame too large".into());

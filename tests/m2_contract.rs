@@ -22,6 +22,12 @@ async fn bash_pipefail_makes_pipeline_failure_visible() {
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let ctx = test_tool_context(&workspace);
 
+    // §11.2 环境依赖：本机无 Git Bash（含未随包放置）时跳过，不硬失败。
+    if tpi::tool::command::locate_git_bash(&ctx).is_none() {
+        eprintln!("本机未安装 Git Bash，跳过 bash 测试（§11.2 环境依赖）");
+        return;
+    }
+
     // §11.1：wrapper 统一启用 pipefail——前段失败必须可见（§20.2 场景 8）。
     let outcome = bash(
         BashArgs {
@@ -85,6 +91,7 @@ async fn cancellation_kills_entire_process_tree() {
         snapshot_store: ctx.snapshot_store.clone(),
         current_plan: ctx.current_plan.clone(),
         web_brave_key_env: ctx.web_brave_key_env.clone(),
+        interactive: true,
     };
     let handle = tokio::spawn(async move { run(args, &run_ctx).await });
 
