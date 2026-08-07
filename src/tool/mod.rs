@@ -4,7 +4,7 @@
 //! 访问声明和执行函数放在同一工具模块（§8.1）。v1 不创建动态 registry、
 //! 插件 ABI 或 `dyn Tool` 层。
 //!
-//! M1 范围（§21 M1）：`read`、`edit`、`write`、`run`。
+//! M1 范围（§21 M1）：`read`、`edit`、`write`。
 //! M2：`list`、`search`、`bash`。M4：`update_plan`、`ask_user`。M6：`web_search`、`web_fetch`。
 
 pub mod ask;
@@ -30,7 +30,6 @@ pub enum BuiltinTool {
     Search,
     Edit,
     Write,
-    Run,
     Bash,
     UpdatePlan,
     AskUser,
@@ -46,7 +45,6 @@ impl BuiltinTool {
             BuiltinTool::Search => "search",
             BuiltinTool::Edit => "edit",
             BuiltinTool::Write => "write",
-            BuiltinTool::Run => "run",
             BuiltinTool::Bash => "bash",
             BuiltinTool::UpdatePlan => "update_plan",
             BuiltinTool::AskUser => "ask_user",
@@ -72,11 +70,8 @@ impl BuiltinTool {
             BuiltinTool::Write => {
                 "Create a new file with the given content. Fails with already_exists if the target already exists; existing files must be modified through edit."
             }
-            BuiltinTool::Run => {
-                "Run a program directly with explicit arguments (no shell). Returns real status, exit_code and duration visible to the model. Prefer for builds, tests, git and ordinary programs; use bash only for pipelines/redirection."
-            }
             BuiltinTool::Bash => {
-                "Run a Bash command through Git Bash with `set -o pipefail` enabled (pipeline failures are visible). Only for pipelines, redirection, globs or compound commands; ordinary programs use run."
+                "Run a command through Git Bash with `set -o pipefail` enabled (pipeline failures are visible). This is the only execution tool: use it for programs, builds, tests, git, pipelines, redirection, globs and compound commands. Write Bash syntax; the host is Windows, never mix PowerShell syntax."
             }
             BuiltinTool::UpdatePlan => {
                 "Replace the whole short plan atomically (max 7 unique items). Only for complex multi-step tasks; simple tasks do not need a plan. It is a progress state, not an extra workflow."
@@ -110,9 +105,6 @@ impl BuiltinTool {
             }
             BuiltinTool::Write => {
                 serde_json::to_value(schemars::schema_for!(files::WriteArgs)).unwrap()
-            }
-            BuiltinTool::Run => {
-                serde_json::to_value(schemars::schema_for!(command::RunArgs)).unwrap()
             }
             BuiltinTool::Bash => {
                 serde_json::to_value(schemars::schema_for!(command::BashArgs)).unwrap()
@@ -155,9 +147,6 @@ impl BuiltinTool {
             BuiltinTool::Write => serde_json::from_str::<files::WriteArgs>(arguments)
                 .map(ValidatedArgs::Write)
                 .map_err(|e| format!("invalid write args: {e}")),
-            BuiltinTool::Run => serde_json::from_str::<command::RunArgs>(arguments)
-                .map(ValidatedArgs::Run)
-                .map_err(|e| format!("invalid run args: {e}")),
             BuiltinTool::Bash => serde_json::from_str::<command::BashArgs>(arguments)
                 .map(ValidatedArgs::Bash)
                 .map_err(|e| format!("invalid bash args: {e}")),
@@ -185,7 +174,6 @@ pub enum ValidatedArgs {
     Search(search::SearchArgs),
     Edit(edit::EditArgs),
     Write(files::WriteArgs),
-    Run(command::RunArgs),
     Bash(command::BashArgs),
     UpdatePlan(plan::UpdatePlanArgs),
     AskUser(ask::AskUserArgs),
@@ -345,7 +333,6 @@ pub async fn execute(
         (BuiltinTool::Search, ValidatedArgs::Search(args)) => search::search(args, ctx),
         (BuiltinTool::Edit, ValidatedArgs::Edit(args)) => files::edit(args, ctx, plan),
         (BuiltinTool::Write, ValidatedArgs::Write(args)) => files::write(args, ctx, plan),
-        (BuiltinTool::Run, ValidatedArgs::Run(args)) => command::run(args, ctx).await,
         (BuiltinTool::Bash, ValidatedArgs::Bash(args)) => command::bash(args, ctx).await,
         // §13：update_plan 是原生同步控制操作，不进入普通调度队列。
         (BuiltinTool::UpdatePlan, ValidatedArgs::UpdatePlan(args)) => plan::update_plan(args, ctx),
@@ -367,7 +354,6 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
         BuiltinTool::Search,
         BuiltinTool::Edit,
         BuiltinTool::Write,
-        BuiltinTool::Run,
         BuiltinTool::Bash,
         BuiltinTool::UpdatePlan,
         BuiltinTool::AskUser,
@@ -380,7 +366,7 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
 pub fn requires_write_ahead(tool: BuiltinTool) -> bool {
     matches!(
         tool,
-        BuiltinTool::Edit | BuiltinTool::Write | BuiltinTool::Run | BuiltinTool::Bash
+        BuiltinTool::Edit | BuiltinTool::Write | BuiltinTool::Bash
     )
 }
 

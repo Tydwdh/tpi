@@ -129,7 +129,7 @@ impl ToolOutcome {
     /// M1：`exit_code` 必须进入 `model_payload`（§2.2：结构化退出状态不能只在 UI details）。
     pub fn command_failed(program: &str, exit_code: i32) -> Self {
         Self::failed(
-            "run",
+            "bash",
             ModelPayload {
                 status: ToolStatus::Failed,
                 program: Some(program.to_string()),

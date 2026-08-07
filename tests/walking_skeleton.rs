@@ -23,17 +23,12 @@ fn current_revision(workspace: &Utf8PathBuf, relative: &str) -> String {
     revision_of(&raw)
 }
 
-/// PowerShell 检查：文件中不含 "BUG" 时 exit 0，含时 exit 1。
+/// bash 检查：文件中不含 "BUG" 时 exit 0，含时 exit 1。
 fn bug_check_tool_call() -> tpi::provider::ToolCall {
     tool_call(
-        "run",
+        "bash",
         serde_json::json!({
-            "program": "powershell.exe",
-            "args": [
-                "-NoProfile",
-                "-Command",
-                "$c = Get-Content -Raw 'sample.rs'; if ($c -match 'BUG') { exit 1 } else { exit 0 }"
-            ],
+            "command": "powershell.exe -NoProfile -Command \"\\$c = Get-Content -Raw 'sample.rs'; if (\\$c -match 'BUG') { exit 1 } else { exit 0 }\"",
             "timeout_ms": 60000,
         }),
     )
@@ -132,24 +127,24 @@ async fn fake_provider_drives_full_read_edit_verify_loop() {
 
     // session 中记录的 run 工具 outcomes：第一次 failed(exit 1)，第二次 succeeded(exit 0)。
     let events = read_events(session.path()).expect("read session");
-    let run_outcomes: Vec<_> = events
+    let bash_outcomes: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
             SessionEvent::ToolCompleted {
                 outcome,
                 call_id: _,
-            } if outcome.session_metadata.tool == "run" => Some(outcome.clone()),
+            } if outcome.session_metadata.tool == "bash" => Some(outcome.clone()),
             _ => None,
         })
         .collect();
-    assert_eq!(run_outcomes.len(), 2);
-    assert_eq!(run_outcomes[0].status, ToolStatus::Failed);
-    assert_eq!(run_outcomes[0].model_payload.exit_code, Some(1));
-    assert_eq!(run_outcomes[1].status, ToolStatus::Succeeded);
-    assert_eq!(run_outcomes[1].model_payload.exit_code, Some(0));
+    assert_eq!(bash_outcomes.len(), 2);
+    assert_eq!(bash_outcomes[0].status, ToolStatus::Failed);
+    assert_eq!(bash_outcomes[0].model_payload.exit_code, Some(1));
+    assert_eq!(bash_outcomes[1].status, ToolStatus::Succeeded);
+    assert_eq!(bash_outcomes[1].model_payload.exit_code, Some(0));
 
     // write-ahead 顺序（§14.2）：每次 edit 前都有 ToolStarted + recovery metadata。
-    // （run 也属于 WorkspaceUnknown，同样有 recovery metadata，因此按 tool == "edit" 过滤。）
+    // （bash 也属于 WorkspaceUnknown，同样有 recovery metadata，因此按 tool == "edit" 过滤。）
     let edit_started: Vec<_> = events
         .iter()
         .filter_map(|event| match event {

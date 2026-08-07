@@ -33,11 +33,11 @@ tpi --model <name>
 ## 已实现能力（按里程碑）
 
 - **M0**：核心类型、fake provider、4 个驱动失败测试、CI。
-- **M1**：CLI/配置、OpenAI-compatible SSE、read/edit/write/run、串行
+- **M1**：CLI/配置、OpenAI-compatible SSE、read/edit/write、串行
   tool-call loop、append-only session（JSONL）、write-ahead 与恢复、Ctrl-C 取消。
-- **M2**：list/search（ignore/预算/cursor）、bash（Git Bash + pipefail）、
+- **M2**：list/search（ignore/预算/cursor）、bash（Git Bash + pipefail，唯一执行通道）、
   artifact store（`@artifact/...` 有界读取）、process-host + Job Object
-  进程树取消、PATH/PATHEXT 受控 launcher。
+  进程树取消。
 - **M3**：SnapshotStore、ReplaceFileW + backup 恢复协议、CRLF/BOM/mixed
   行尾 property tests、unified diff、竞态检测（backup digest）。
 - **M4**：资源感知 scheduler（waves 并行 read/串行 write）、确定性

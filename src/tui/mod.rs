@@ -1081,8 +1081,8 @@ mod tests {
         let theme = theme::Theme::omp();
         let card = ToolCard {
             id: "c1".into(),
-            name: "run".into(),
-            detail: Some("run: cargo test".into()),
+            name: "bash".into(),
+            detail: Some("bash: cargo test".into()),
             state: ToolCardState::Running,
             tail: None,
         };
@@ -1091,19 +1091,19 @@ mod tests {
             lines[0].spans[0].content.starts_with('⠋'),
             "运行中显示 spinner"
         );
-        assert!(lines[0].spans.iter().any(|s| s.content == "run"));
+        assert!(lines[0].spans.iter().any(|s| s.content == "bash"));
         // 运行中已展示命令摘要（独立缩进行）。
         assert!(
             lines
                 .iter()
-                .any(|l| l.to_string().contains("run: cargo test")),
+                .any(|l| l.to_string().contains("bash: cargo test")),
             "运行中显示命令摘要: {lines:?}"
         );
 
         let card = ToolCard {
             id: "c1".into(),
-            name: "run".into(),
-            detail: Some("run: cargo test".into()),
+            name: "bash".into(),
+            detail: Some("bash: cargo test".into()),
             state: ToolCardState::Done {
                 status: crate::tool::outcome::ToolStatus::Failed,
                 duration_ms: 1234,
@@ -1150,7 +1150,7 @@ mod tests {
         let theme = theme::Theme::omp();
         let card = ToolCard {
             id: "c".into(),
-            name: "run".into(),
+            name: "bash".into(),
             detail: None,
             state: ToolCardState::Running,
             tail: None,

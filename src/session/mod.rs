@@ -562,5 +562,5 @@ pub fn read_events(path: &Path) -> std::io::Result<Vec<SessionEvent>> {
 
 /// 该工具是否属于需要 write-ahead 的类型（§12.1：Write / WorkspaceUnknown）。
 pub fn requires_write_ahead(tool_name: &str) -> bool {
-    matches!(tool_name, "edit" | "write" | "run" | "bash")
+    matches!(tool_name, "edit" | "write" | "bash")
 }

@@ -678,8 +678,7 @@ error: invalid_arguments
 
 /// 工具调用的可读展示摘要（TUI 工具卡片，§16.2）。
 ///
-/// bash → `bash: <command>`；run → `run: <program> <args>`；其余显示工具名。
-/// 有界到 200 字符，避免整段脚本刷屏。
+/// bash → `bash: <command>`；其余显示工具名。有界到 200 字符，避免整段脚本刷屏。
 fn tool_display(call: &ToolCall) -> String {
     fn summarize(text: String) -> String {
         let mut t = text.trim().to_string();
@@ -701,19 +700,6 @@ fn tool_display(call: &ToolCall) -> String {
                 summarize(format!("bash: {cmd}"))
             } else {
                 "bash".into()
-            }
-        }
-        "run" => {
-            if let Some(v) = parsed.as_ref() {
-                let program = v.get("program").and_then(|p| p.as_str()).unwrap_or("");
-                let extra: Vec<&str> = v
-                    .get("args")
-                    .and_then(|a| a.as_array())
-                    .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect())
-                    .unwrap_or_default();
-                summarize(format!("run: {program} {}", extra.join(" ")))
-            } else {
-                "run".into()
             }
         }
         name => name.into(),
@@ -942,16 +928,6 @@ fn recovery_metadata(
                 backup_path: backup,
             })
         }
-        (BuiltinTool::Run, arguments) => {
-            let parsed = serde_json::from_str::<tool::command::RunArgs>(arguments).ok()?;
-            Some(RecoveryMetadata {
-                tool: "run".into(),
-                target_path: parsed.program,
-                expected_revision: String::new(),
-                temp_path: String::new(),
-                backup_path: None,
-            })
-        }
         (BuiltinTool::Bash, arguments) => {
             let parsed = serde_json::from_str::<tool::command::BashArgs>(arguments).ok()?;
             Some(RecoveryMetadata {
@@ -987,7 +963,6 @@ impl BuiltinTool {
             "search" => Some(BuiltinTool::Search),
             "edit" => Some(BuiltinTool::Edit),
             "write" => Some(BuiltinTool::Write),
-            "run" => Some(BuiltinTool::Run),
             "bash" => Some(BuiltinTool::Bash),
             "update_plan" => Some(BuiltinTool::UpdatePlan),
             "ask_user" => Some(BuiltinTool::AskUser),

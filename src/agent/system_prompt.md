@@ -4,7 +4,7 @@
 
 以文件、工具结果、测试和可靠来源为依据。修改前先读取相关实现；用户只要求分析时不要修改。优先最小修改，不创建无明确用途的抽象、依赖或文档。
 
-主机是 Windows，但 bash 工具固定使用 Bash 语法。普通程序、构建、测试和 Git 优先使用 run(program, args)；只有管道、重定向或复合命令才使用 bash。不要混用 PowerShell 与 Bash。stderr 不等于失败，以工具返回的 status 和 exit_code 为准。
+主机是 Windows，但 bash 工具固定使用 Bash 语法。bash 是唯一的命令执行工具：程序、构建、测试、Git、管道、重定向和复合命令都通过它执行；shell 内建命令（pwd、cd 等）同样用 bash。不要混用 PowerShell 与 Bash；需要 PowerShell 时在 bash 命令里调用 pwsh.exe。stderr 不等于失败，以工具返回的 status 和 exit_code 为准。
 
 优先使用 read、list、search 理解项目。所有输出均有界；需要更多内容时使用返回的 cursor、path 或 artifact。工具给出的 path、revision 和 artifact 是权威值，不要扫描 / 或猜测位置。
 

@@ -350,11 +350,11 @@ mod tests {
     #[test]
     fn tool_card_lifecycle_matches_by_call_id() {
         let mut view = ViewModel::default();
-        view.begin_tool("call-1", "run", Some("run: cargo test".into()));
+        view.begin_tool("call-1", "bash", Some("bash: cargo test".into()));
         view.begin_tool("call-2", "read", Some("read src/main.rs".into()));
         view.finish_tool(
             "call-1",
-            "run",
+            "bash",
             ToolStatus::Failed,
             1234,
             Some(2),
@@ -363,10 +363,10 @@ mod tests {
         let Entry::Tool(card) = &view.transcript[0] else {
             panic!("call-1 必须是卡片");
         };
-        assert_eq!(card.name, "run");
+        assert_eq!(card.name, "bash");
         assert_eq!(
             card.detail.as_deref(),
-            Some("run: cargo test"),
+            Some("bash: cargo test"),
             "detail 保留实际命令"
         );
         assert_eq!(
@@ -388,10 +388,10 @@ mod tests {
     #[test]
     fn success_card_has_no_tail() {
         let mut view = ViewModel::default();
-        view.begin_tool("call-1", "run", None);
+        view.begin_tool("call-1", "bash", None);
         view.finish_tool(
             "call-1",
-            "run",
+            "bash",
             ToolStatus::Succeeded,
             42,
             Some(0),
@@ -414,8 +414,8 @@ mod tests {
     #[test]
     fn tail_is_bounded() {
         let mut view = ViewModel::default();
-        view.begin_tool("c", "run", None);
-        view.finish_tool("c", "run", ToolStatus::Failed, 0, None, "x".repeat(10_000));
+        view.begin_tool("c", "bash", None);
+        view.finish_tool("c", "bash", ToolStatus::Failed, 0, None, "x".repeat(10_000));
         let Entry::Tool(card) = &view.transcript[0] else {
             panic!();
         };

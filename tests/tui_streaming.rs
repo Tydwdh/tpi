@@ -209,16 +209,16 @@ fn user_message_has_you_label() {
 #[test]
 fn tool_card_renders_running_and_done_states() {
     let mut view = ViewModel::default();
-    view.begin_tool("c1", "run", Some("run: cargo test".into()));
+    view.begin_tool("c1", "bash", Some("bash: cargo test".into()));
     view.anim_tick = 0;
     let buffer = draw_to_test_backend(&view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(
-        rendered.contains('⠋') && rendered.contains("run: cargo test"),
+        rendered.contains('⠋') && rendered.contains("bash: cargo test"),
         "运行中卡片显示 spinner、工具名与命令摘要: {rendered:?}"
     );
 
-    view.finish_tool("c1", "run", ToolStatus::Succeeded, 2345, Some(0), "");
+    view.finish_tool("c1", "bash", ToolStatus::Succeeded, 2345, Some(0), "");
     let buffer = draw_to_test_backend(&view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(

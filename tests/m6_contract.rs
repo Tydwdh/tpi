@@ -12,6 +12,9 @@ use fixtures::test_tool_context;
 use tpi::tool::outcome::ToolStatus;
 use tpi::tool::web::{WebFetchArgs, WebSearchArgs, web_fetch, web_search};
 
+/// 串行化依赖全局 allow_private 测试开关的两个 web_fetch 测试（并行互相覆盖会死锁）。
+static WEB_FETCH_TESTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// §17：未配置 Brave key → 明确 unavailable（不自动切换到其他服务）。
 #[tokio::test]
 async fn web_search_without_key_is_explicitly_unavailable() {
@@ -40,8 +43,12 @@ async fn web_search_without_key_is_explicitly_unavailable() {
 }
 
 /// §17：web_fetch 对私有地址默认 SSRF 拦截。
+///
+/// 与 web_fetch_converts_html_and_bounds_body 串行（二者共享全局
+/// allow_private 测试开关，并行时互相覆盖会导致 accept 死锁）。
 #[tokio::test]
 async fn web_fetch_failure_is_explicit() {
+    let _guard = WEB_FETCH_TESTS_LOCK.lock().unwrap();
     tpi::tool::web::set_allow_private_web_targets_for_tests(false);
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
@@ -60,6 +67,7 @@ async fn web_fetch_failure_is_explicit() {
 /// §17：web_fetch 对 HTML 做转换，正文有界。
 #[tokio::test]
 async fn web_fetch_converts_html_and_bounds_body() {
+    let _guard = WEB_FETCH_TESTS_LOCK.lock().unwrap();
     tpi::tool::web::set_allow_private_web_targets_for_tests(true);
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
@@ -72,17 +80,31 @@ async fn web_fetch_converts_html_and_bounds_body() {
         "content ".repeat(50)
     );
     let handle = std::thread::spawn(move || {
-        for _ in 0..1 {
-            let (mut stream, _) = listener.accept().unwrap();
-            use std::io::{Read, Write};
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
+        // 非阻塞轮询 + 超时：即使请求被 SSRF 拦截/失败也返回，避免 accept 永久阻塞。
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    use std::io::{Read, Write};
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
         }
     });
     let outcome = web_fetch(

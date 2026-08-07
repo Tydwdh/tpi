@@ -22,7 +22,7 @@
 
 - **保留**：软件设计偏好、Git 行为、表达习惯等稳定个人规则 → 写入 `~/.tpi/SYSTEM.md`。
 - **删除**：与 TPI 工具协议重复的临时规则——TPI 已用代码保证 revision 回传、
-  run 真实退出码、stderr 不误判、stdout 单 renderer 等（§2.4：能由工具协议
+  bash 真实退出码、stderr 不误判、stdout 单 renderer 等（§2.4：能由工具协议
   消除的问题应由代码消除，而不是继续增加提示词）。
 - 内建 system prompt 跟随版本测试，不需要手工维护（`src/agent/system_prompt.md`）。
 
@@ -76,9 +76,9 @@ tpi auth set opencode-go        # 写入 Windows Credential Manager（§18.4）
 
 ## 5. 行为差异速查
 
-- `bash` 工具固定使用 Bash 语法（Git Bash）；需要 PowerShell 时用
-  `run(program="pwsh.exe", args=[...])`（§11.2）。
-- 普通程序、构建、测试、Git 用 `run`（direct process，不经过 shell）。
+- `bash` 工具固定使用 Bash 语法（Git Bash），是唯一命令执行工具；
+  需要 PowerShell 时在 bash 命令里调用 `pwsh.exe`。
+- 普通程序、构建、测试、Git 都用 `bash` 执行。
 - `edit` 只替换明确给出的 `old_text`（revision-bound exact edit）；stale 必须
   重新 `read`（§10.3）。
 - `write` 只创建新文件；已有文件整体重写也必须通过 `edit`（§10.6）。

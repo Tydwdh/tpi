@@ -1,6 +1,6 @@
-//! 命令执行工具（文档 §11）：`run`（M1）；`bash` 属 M2。
+//! 命令执行工具（文档 §11）：`bash`（M2）是唯一执行通道。
 //!
-//! `run` 不做 shell interpolation（§11.1），直接执行 program + args；
+//! `bash` 通过随包/系统 Git Bash 执行（§11.1），wrapper 统一 `set -o pipefail`；
 //! 状态判定：exit_code==0 → succeeded，非零 → failed；stderr 只是一条输出流，
 //! 不能单独决定失败（§11.3）；timeout/cancellation 是独立状态，不伪装成 exit code 1。
 
@@ -12,12 +12,12 @@ use crate::tool::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-/// `run` 的模型输出预算（§8.4：24 KiB，保留错误相关 tail）。
+/// 命令输出的模型预算（§8.4：24 KiB，保留错误相关 tail）。
 pub const DEFAULT_RUN_MAX_BYTES: usize = 24 * 1024;
 /// 默认超时（120 秒，§11.1 示例）。
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
-/// `bash` 参数（§11.1：只有需要管道、重定向、glob 或复合条件时才使用）。
+/// `bash` 参数（§11.1：唯一执行工具，覆盖程序执行与 shell 复合命令）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct BashArgs {
     /// Bash 命令（Bash 语法；wrapper 统一启用 `set -o pipefail`）。
@@ -28,18 +28,15 @@ pub struct BashArgs {
     pub timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+/// bash 工具内部使用的启动规格（由 `command::bash` 构造，不暴露为工具 schema）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunArgs {
     pub program: String,
-    #[serde(default)]
     pub args: Vec<String>,
     /// 工作目录；默认为 workspace root。
-    #[serde(default = "default_cwd")]
     pub cwd: String,
-    #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
     /// 附加环境变量（值按字面传递）。
-    #[serde(default)]
     pub env: HashMap<String, String>,
 }
 
@@ -49,115 +46,6 @@ fn default_cwd() -> String {
 
 fn default_timeout() -> u64 {
     DEFAULT_TIMEOUT_MS
-}
-
-pub async fn run(args: RunArgs, ctx: &ToolContext) -> ToolOutcome {
-    let program = args.program.clone();
-    let timeout = Duration::from_millis(args.timeout_ms.max(1));
-    let start = std::time::Instant::now();
-
-    // §11.1：PATH/PATHEXT 解析；`.cmd/.bat` 使用受控 cmd launcher（标记 launcher=cmd-script）。
-    let resolved = crate::process::resolver::resolve(&program);
-    let (exec_program, exec_args) = match resolved.launcher {
-        Some("cmd-script") => {
-            let (cmd, args) =
-                crate::process::resolver::build_cmd_launcher(&resolved.path, &args.args);
-            (cmd, args)
-        }
-        _ => (
-            resolved.path.to_string_lossy().to_string(),
-            args.args.clone(),
-        ),
-    };
-    // §11.5：host 的 cwd 是 tpi.exe 启动目录，必须把 cwd 解析为 workspace 绝对路径。
-    let exec_cwd = match crate::tool::resolve_workspace_path(&ctx.workspace_root, &args.cwd) {
-        Ok(path) => path.to_string(),
-        Err(error) => {
-            return crate::tool::path_rejected_outcome("run", error);
-        }
-    };
-    let run_args = RunArgs {
-        program: exec_program,
-        args: exec_args,
-        cwd: exec_cwd,
-        timeout_ms: args.timeout_ms,
-        env: args.env.clone(),
-    };
-
-    // §8.4：完整输出写入 artifact；模型只见有界摘要。
-    let mut artifact = crate::session::artifact::ArtifactWriter::create(
-        &ctx.artifacts_root,
-        &ctx.session_id,
-        "run",
-        "text/plain",
-    )
-    .ok();
-
-    // §11.5：process-host + Job Object 执行（取消/超时终止整棵进程树）。
-    let result = crate::process::run_in_host(
-        &run_args,
-        &std::path::PathBuf::from(&run_args.program),
-        resolved.launcher,
-        ctx.cancel.clone(),
-        timeout,
-        &ctx.session_id,
-        artifact.as_mut(),
-    )
-    .await;
-
-    let record = artifact.and_then(|writer| writer.finish().ok());
-    let artifact_ref = record.map(|record| crate::tool::outcome::ArtifactRef {
-        session: ctx.session_id.clone(),
-        id: record.id,
-    });
-
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            return ToolOutcome::failed(
-                "run",
-                ModelPayload {
-                    status: ToolStatus::Failed,
-                    program: Some(program.clone()),
-                    exit_code: None,
-                    duration_ms: 0,
-                    output: format!(
-                        "status: failed\ntool: run\nerror: process_isolation_unavailable\n\n{error}"
-                    ),
-                    effect: None,
-                    artifact: artifact_ref,
-                },
-            )
-            .with_metadata(ToolMetadata {
-                tool: "run".into(),
-                program: Some(program),
-                target: Some(args.cwd),
-                timeout_ms: Some(args.timeout_ms),
-            });
-        }
-    };
-
-    // §11.3：timeout/cancellation 是独立状态，不伪装成 exit code。
-    let tool_status = match result.ended_by {
-        crate::process::EndReason::Cancelled => ToolStatus::Cancelled,
-        crate::process::EndReason::TimedOut => ToolStatus::TimedOut,
-        crate::process::EndReason::Exited => match result.exit_code {
-            Some(0) => ToolStatus::Succeeded,
-            _ => ToolStatus::Failed,
-        },
-    };
-    let elapsed = start.elapsed();
-    let mut outcome = outcome_for(OutcomeInput {
-        program: program.clone(),
-        args,
-        exit_code: result.exit_code,
-        elapsed,
-        status: tool_status,
-        stdout_bytes: &result.stdout,
-        stderr_bytes: &result.stderr,
-    });
-    outcome.artifacts = artifact_ref.into_iter().collect();
-    outcome
 }
 
 /// `bash` 工具（§11.2：Git Bash 解析固定顺序；wrapper 统一 `set -o pipefail`）。
@@ -418,7 +306,7 @@ fn outcome_for(input: OutcomeInput<'_>) -> ToolOutcome {
         },
         display_payload: Default::default(),
         session_metadata: ToolMetadata {
-            tool: "run".into(),
+            tool: "bash".into(),
             program: Some(program),
             target: Some(args.cwd),
             timeout_ms: Some(args.timeout_ms),

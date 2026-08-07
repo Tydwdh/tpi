@@ -7,7 +7,7 @@ mod fixtures;
 
 use camino::Utf8PathBuf;
 use tokio_util::sync::CancellationToken;
-use tpi::tool::command::{RunArgs, run};
+use tpi::tool::command::{BashArgs, bash};
 use tpi::tool::outcome::ToolStatus;
 
 /// 取消 token 触发后，长时间运行的命令以 Cancelled 结束（§11.5：取消是独立状态）。
@@ -19,23 +19,17 @@ async fn cancellation_terminates_running_command_with_cancelled_status() {
     let cancel = CancellationToken::new();
     let mut ctx = fixtures::test_tool_context(&workspace);
     ctx.cancel = cancel.clone();
-    let args = RunArgs {
-        program: "powershell.exe".into(),
-        args: vec![
-            "-NoProfile".into(),
-            "-Command".into(),
-            "Start-Sleep -Seconds 30".into(),
-        ],
+    let args = BashArgs {
+        command: "powershell.exe -NoProfile -Command 'Start-Sleep -Seconds 30'".into(),
         cwd: ".".into(),
         timeout_ms: 60_000,
-        env: Default::default(),
     };
 
-    let handle = tokio::spawn(async move { run(args, &ctx).await });
+    let handle = tokio::spawn(async move { bash(args, &ctx).await });
     // 等命令真正启动后再取消（模拟第一次 Ctrl-C）。
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     cancel.cancel();
-    let outcome = handle.await.expect("run task completes");
+    let outcome = handle.await.expect("bash task completes");
 
     assert_eq!(
         outcome.status,
@@ -52,19 +46,13 @@ async fn timeout_terminates_command_with_timed_out_status() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let ctx = fixtures::test_tool_context(&workspace);
-    let args = RunArgs {
-        program: "powershell.exe".into(),
-        args: vec![
-            "-NoProfile".into(),
-            "-Command".into(),
-            "Start-Sleep -Seconds 30".into(),
-        ],
+    let args = BashArgs {
+        command: "powershell.exe -NoProfile -Command 'Start-Sleep -Seconds 30'".into(),
         cwd: ".".into(),
         timeout_ms: 500,
-        env: Default::default(),
     };
 
-    let outcome = run(args, &ctx).await;
+    let outcome = bash(args, &ctx).await;
     assert_eq!(outcome.status, ToolStatus::TimedOut);
     assert!(outcome.model_payload.output.contains("status: timed_out"));
 }

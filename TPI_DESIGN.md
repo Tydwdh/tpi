@@ -21,7 +21,7 @@ TPI 的一句话定义：
 
 ## 1. 结论先行
 
-TPI 应从一个单进程、单二进制、单活动任务的应用开始。核心由一个显式 Agent 状态机驱动；模型、工具、会话和 TUI 通过强类型事件通信；会话采用 append-only JSONL；上下文是从会话事实派生出的有预算视图；文件修改使用 revision-bound exact edit；命令执行明确区分 direct `run` 与 Git Bash `bash`；TUI 只有一个 stdout 所有者，以帧为单位合并模型增量和动画。
+TPI 应从一个单进程、单二进制、单活动任务的应用开始。核心由一个显式 Agent 状态机驱动；模型、工具、会话和 TUI 通过强类型事件通信；会话采用 append-only JSONL；上下文是从会话事实派生出的有预算视图；文件修改使用 revision-bound exact edit；命令执行统一走 Git Bash `bash`（单一执行工具）；TUI 只有一个 stdout 所有者，以帧为单位合并模型增量和动画。
 
 第一版不实现：
 
@@ -50,8 +50,8 @@ TPI 应从一个单进程、单二进制、单活动任务的应用开始。核�
 
 | 当前经验或问题 | TPI 的决定 |
 | --- | --- |
-| Windows 上模型混用 PowerShell、Bash 和路径语法 | Windows 一等支持；Shell 工具固定 Git Bash；另设不经过 Shell 的 `run` |
-| 构建命令经管道或 `echo success` 掩盖退出码 | `run` 返回模型可见的真实 `status`、`exit_code`、`signal`、`duration`；不以 stderr 判断成败 |
+| Windows 上模型混用 PowerShell、Bash 和路径语法 | Windows 一等支持；Shell 工具固定 Git Bash 作为唯一执行工具 |
+| 构建命令经管道或 `echo success` 掩盖退出码 | `bash` 返回模型可见的真实 `status`、`exit_code`、`signal`、`duration`；不以 stderr 判断成败 |
 | `read` 展示的 revision 与 `edit` 接受格式不一致 | revision 是单独的稳定字段；展示值必须可原样回传，并有 round-trip 测试 |
 | 模糊/范围编辑误删相邻代码，修括号时继续破坏结构 | exact edit 只允许删除明确给出的 `old_text`；整批预检；全成或全不成 |
 | 多次 edit 导致 stale，或同文件并行写互相覆盖 | 同一次 `edit` 接受多个 replacements；同资源写入串行；stale 返回精确诊断 |
@@ -202,7 +202,7 @@ tpi/
 │  │  ├─ mod.rs            # registry、ToolOutcome、schema
 │  │  ├─ files.rs          # read/list/search
 │  │  ├─ edit.rs           # snapshot、revision、exact edit、write
-│  │  ├─ command.rs        # run/bash 对外工具
+│  │  ├─ command.rs        # bash 对外工具
 │  │  ├─ plan.rs           # 原子短计划
 │  │  └─ web.rs            # v1 后段加入
 │  ├─ process/
@@ -444,14 +444,13 @@ v1 没有 `reviewer`、`architect` 或自动 fallback model。任何模型切换
 | `search` | 有界内容搜索，返回可继续游标 | P0 |
 | `edit` | revision-bound 批量 exact replacements | P0 |
 | `write` | 仅安全创建不存在的新文件 | P0 |
-| `run` | 直接执行 program + args，不经过 Shell | P0 |
-| `bash` | 需要管道、重定向、组合命令时使用 Git Bash | P0 |
+| `bash` | 唯一命令执行工具（Git Bash，统一 pipefail） | P0 |
 | `update_plan` | 原子替换短计划；不进入聊天流水 | P0 |
 | `ask_user` | 只有真正阻塞时请求一个明确输入 | P0 |
 | `web_search` | 发现来源，不调用模型、不打开浏览器 | P1 |
 | `web_fetch` | 获取并转换原始页面 | P1 |
 
-SWE-agent 的实验说明 Agent-Computer Interface 会显著影响解决能力：有界输出、明确编辑和带反馈的工具优于只给一个无限制 Shell。[SWE-agent paper](https://papers.nips.cc/paper_files/paper/2024/hash/5a7c947568c1b1328ccc5230172e1e7c-Abstract-Conference.html) 同时，CodeAct 表明少量可组合动作空间比大量微工具更通用。[CodeAct paper](https://proceedings.mlr.press/v235/wang24h.html) 因而 TPI 保留 direct tools 与一个 Bash escape hatch，但不堆叠几十种工具。
+SWE-agent 的实验说明 Agent-Computer Interface 会显著影响解决能力：有界输出、明确编辑和带反馈的工具优于只给一个无限制 Shell。[SWE-agent paper](https://papers.nips.cc/paper_files/paper/2024/hash/5a7c947568c1b1328ccc5230172e1e7c-Abstract-Conference.html) 同时，CodeAct 表明少量可组合动作空间比大量微工具更通用。[CodeAct paper](https://proceedings.mlr.press/v235/wang24h.html) 因而 TPI 保留 direct tools 与一个 Bash 执行工具，但不堆叠几十种工具。
 
 内建工具使用 `BuiltinTool` enum + `match` 静态分发；schema、参数类型、访问声明和执行函数放在同一工具模块。v1 不创建动态 registry、插件 ABI 或 `dyn Tool` 层。
 
@@ -522,7 +521,7 @@ error[E0308]: ...
 | `read` | 200 行，最多 32 KiB | `start_line` + `line_count` |
 | `list` | 200 项，默认 depth 2 | cursor / 更窄 path |
 | `search` | 100 matches，单行 300 chars，最多 32 KiB | cursor / path / glob |
-| `run/bash` | 24 KiB，保留错误相关 tail | `@artifact/...` 交给 `read` |
+| `bash` | 24 KiB，保留错误相关 tail | `@artifact/...` 交给 `read` |
 | `web_fetch` | 正文 48 KiB | start offset / section |
 
 完整输出写入 session artifact store。模型使用 opaque `@artifact/<session>/<id>` 读取，不接触本机临时目录绝对路径。
@@ -677,26 +676,20 @@ revision-bound edit 是乐观并发保护，不是操作系统级原子 CAS。TP
 
 ## 11. 命令执行
 
-### 11.1 `run` 与 `bash` 的边界
+### 11.1 `bash`：唯一命令执行工具
 
-`run` 是构建、测试、Git 和普通程序的默认工具：
+`bash` 是唯一命令执行工具，构建、测试、Git、普通程序和复合命令统一走它：
 
 ```json
 {
-  "program": "cargo",
-  "args": ["test", "--package", "tpi", "edit_contract"],
+  "command": "cargo test --package tpi edit_contract",
   "cwd": ".",
   "timeout_ms": 120000
 }
 ```
 
-它不做 shell interpolation，因此不存在引号、管道或 PowerShell/Bash 混用。
-
-`run` 可以携带小型 `env` map 和 `remove_env` 列表，值按字面传递且日志脱敏；默认继承 TPI 环境。v1 不提供交互 stdin/PTY，命令需要交互时返回明确限制，不能挂住等待不可见输入。
-
-Windows executable resolver 必须按 PATH/PATHEXT 找到实际目标，并把 resolved program 记录在 metadata。`.cmd/.bat`（例如某些 npm shim）本质上需要 `cmd.exe`；TPI 可用 Rust 的受控 batch handling 执行独立参数，但必须标记 `launcher=cmd-script`，不得把它伪装成原生 executable，也不得接受一整段 CMD 命令字符串。Rust 官方文档特别指出 batch 参数遵循不同的转义规则。[std::process on Windows](https://doc.rust-lang.org/stable/std/process/)
-
-只有需要管道、重定向、glob 或复合条件时才使用 `bash`：
+命令是 Bash 语法字符串；shell 内建命令（`pwd`、`cd` 等）与程序执行同样通过它。
+wrapper 统一启用 `set -o pipefail`，pipeline 前段失败必须可见，不要求模型每次重复书写：
 
 ```json
 {
@@ -706,18 +699,25 @@ Windows executable resolver 必须按 PATH/PATHEXT 找到实际目标，并把 r
 }
 ```
 
-TPI 在 wrapper 中统一启用 `set -o pipefail`，不要求模型每次重复书写。
+需要 PowerShell 时在命令中显式调用 `pwsh.exe`。v1 不提供交互 stdin/PTY，命令需要交互时返回明确限制，不能挂住等待不可见输入。
+
+> 设计史：v1 曾拆分 direct `run`（不经 shell 的 program+args 数组）与 `bash` 两个工具。
+> 实测在 Windows + MSYS 环境下，模型对“该用哪个”的选择负担（如把 `pwd` 这类 shell
+> 内建误当程序执行导致 spawn 失败）大于收益，且能力上 `bash` 全覆盖；主流 harness
+> （Claude Code、Codex、Gemini CLI 等）也均收敛为单一 Bash 执行工具。故合并为单一
+> `bash`，每次执行都走统一受控的 Git Bash 通道。
 
 ### 11.2 Git Bash 解析
 
-Windows 解析顺序固定且记录实际选择：
+Windows 解析顺序固定且记录实际选择（随包安装见 `scripts/install-bash.ps1`）：
 
 1. `shell.path` 显式配置；
-2. `C:\\Program Files\\Git\\bin\\bash.exe`；
-3. `C:\\Program Files\\Git\\usr\\bin\\bash.exe`；
-4. PATH 中的 `bash.exe`。
+2. 随包 Git Bash：`tpi.exe` 同目录下的 `git/bin/bash.exe`、`git/usr/bin/bash.exe`、
+   `git/bash.exe`、`bash.exe`；
+3. `C:\\Program Files\\Git\\bin\\bash.exe`、`C:\\Program Files\\Git\\usr\\bin\\bash.exe`；
+4. PATH 中的 `bash.exe`（排除 WSL launcher）。
 
-启动参数固定为非交互 Bash；cwd 通过 process API 设置。TPI 的 system prompt 明确：主机是 Windows，但 `bash` 参数必须使用 Bash 语法；需要 PowerShell 时通过 `run(program="pwsh.exe", args=[...])` 显式调用。
+启动参数固定为非交互 Bash（`--noprofile --norc -c`）；cwd 通过 process API 设置。TPI 的 system prompt 明确：主机是 Windows，但 `bash` 参数必须使用 Bash 语法；需要 PowerShell 时在 bash 命令中显式调用 `pwsh.exe`。
 
 ### 11.3 状态判定
 
@@ -772,7 +772,7 @@ struct ResourceLock {
 - `read/list/search` 由 TPI 根据规范化 path 生成 read lock。
 - `edit/write` 对目标文件生成 write lock。
 - `web_search/web_fetch` 是 Pure，但受网络并发上限控制。
-- `run/bash` v1 记为 `WorkspaceUnknown`：按源顺序串行，不与任何 workspace 文件操作重叠，但可与纯网络调用并行。不要用正则假装理解任意命令副作用。
+- `bash` v1 记为 `WorkspaceUnknown`：按源顺序串行，不与任何 workspace 文件操作重叠，但可与纯网络调用并行。不要用正则假装理解任意命令副作用。
 
 文件资源必须表达作用域而非普通字符串：`read(file)` 是 exact scope，`list/search(dir)` 是 recursive scope，`edit(file)` 是 exact write。两个 scope 在同一 root 下存在祖先/后代包含关系且至少一方为 write 时冲突；这样 `search("src")` 不会与同时修改 `src/main.rs` 的 edit 错误并行。Windows 比较使用规范化后的文件系统语义。
 
@@ -1301,7 +1301,7 @@ TPI v1 不实现命令确认流和 permission DSL。工具以启动 TPI 的用�
 
 - CLI/最小配置、OpenAI-compatible SSE 和 fake provider；
 - 极简但已遵守“单 renderer”的 inline TUI，以及 `-p` 模式；
-- `read`、严格 revision exact `edit`、create-only `write`、direct `run`；
+- `read`、严格 revision exact `edit`、create-only `write`、`bash`（唯一执行通道）；
 - 串行 tool-call loop、模型可见 ToolOutcome；
 - append-only session、写工具最小 write-ahead 和恢复；
 - Windows process-host 的最小安全路径；
@@ -1416,7 +1416,7 @@ TPI v1 不实现命令确认流和 permission DSL。工具以启动 TPI 的用�
 
 以文件、工具结果、测试和可靠来源为依据。修改前先读取相关实现；用户只要求分析时不要修改。优先最小修改，不创建无明确用途的抽象、依赖或文档。
 
-主机是 Windows，但 bash 工具固定使用 Bash 语法。普通程序、构建、测试和 Git 优先使用 run(program, args)；只有管道、重定向或复合命令才使用 bash。不要混用 PowerShell 与 Bash。stderr 不等于失败，以工具返回的 status 和 exit_code 为准。
+主机是 Windows，但 bash 工具固定使用 Bash 语法。bash 是唯一的命令执行工具：程序、构建、测试、Git、管道、重定向和复合命令都通过它执行；shell 内建命令（pwd、cd 等）同样用 bash。不要混用 PowerShell 与 Bash；需要 PowerShell 时在 bash 命令里调用 pwsh.exe。stderr 不等于失败，以工具返回的 status 和 exit_code 为准。
 
 优先使用 read、list、search 理解项目。所有输出均有界；需要更多内容时使用返回的 cursor、path 或 artifact。工具给出的 path、revision 和 artifact 是权威值，不要扫描 / 或猜测位置。
 

@@ -9,6 +9,9 @@ use tpi::tool::outcome::ToolStatus;
 use tpi::tool::web::{WebFetchArgs, validate_fetch_url, web_fetch};
 use tpi::tool::{resolve_workspace_path, validate_artifact_component};
 
+/// 串行化依赖全局 allow_private 测试开关的两个 web_fetch 测试（并行互相覆盖会失败/死锁）。
+static WEB_FETCH_TESTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn resolve_workspace_path_rejects_parent_escape() {
     let dir = tempfile::tempdir().unwrap();
@@ -92,12 +95,14 @@ fn write_rejects_outside_workspace() {
 
 #[test]
 fn web_fetch_blocks_private_targets_by_default() {
+    let _guard = WEB_FETCH_TESTS_LOCK.lock().unwrap();
     assert!(validate_fetch_url("http://127.0.0.1:8080/").is_err());
     assert!(validate_fetch_url("http://192.168.0.1/").is_err());
 }
 
 #[tokio::test]
 async fn web_fetch_localhost_is_blocked_without_test_override() {
+    let _guard = WEB_FETCH_TESTS_LOCK.lock().unwrap();
     tpi::tool::web::set_allow_private_web_targets_for_tests(false);
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
@@ -115,6 +120,7 @@ async fn web_fetch_localhost_is_blocked_without_test_override() {
 
 #[tokio::test]
 async fn web_fetch_allows_localhost_when_test_override_enabled() {
+    let _guard = WEB_FETCH_TESTS_LOCK.lock().unwrap();
     tpi::tool::web::set_allow_private_web_targets_for_tests(true);
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
@@ -123,16 +129,32 @@ async fn web_fetch_allows_localhost_when_test_override_enabled() {
     let addr = listener.local_addr().unwrap();
     let body = "<html><head><title>Test Page</title></head><body><h1>Hello TPI</h1></body></html>";
     let handle = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        use std::io::{Read, Write};
-        let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = stream.write_all(response.as_bytes());
+        // 非阻塞轮询 + 超时：即使请求被 SSRF 拦截/失败也返回，避免 accept 永久阻塞。
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    use std::io::{Read, Write};
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
     });
     let outcome = web_fetch(
         WebFetchArgs {

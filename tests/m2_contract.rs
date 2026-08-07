@@ -10,7 +10,7 @@ mod fixtures;
 use camino::Utf8PathBuf;
 use fixtures::{point_host_at_real_tpi, test_config, test_tool_context};
 use tokio_util::sync::CancellationToken;
-use tpi::tool::command::{BashArgs, RunArgs, bash, run};
+use tpi::tool::command::{BashArgs, bash};
 use tpi::tool::outcome::ToolStatus;
 use tpi::tool::search::{ListArgs, SearchArgs, list, search};
 use tpi::tool::{ToolContext, files};
@@ -70,16 +70,15 @@ async fn cancellation_kills_entire_process_tree() {
     let pid_file = dir.path().join("child.pid");
 
     // target 启动后立即派生 child（Start-Process），并把自己的 PID 写文件。
+    // bash 包装：双引号内 \$ 转义，避免 bash 展开 PowerShell 变量。
     let script = format!(
-        "$p = Start-Process powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60' -PassThru; Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 60",
+        "powershell.exe -NoProfile -Command \"\\$p = Start-Process powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60' -PassThru; Set-Content -Path '{}' -Value \\$p.Id; Start-Sleep -Seconds 60\"",
         pid_file.display()
     );
-    let args = RunArgs {
-        program: "powershell.exe".into(),
-        args: vec!["-NoProfile".into(), "-Command".into(), script],
+    let args = BashArgs {
+        command: script,
         cwd: ".".into(),
         timeout_ms: 60_000,
-        env: Default::default(),
     };
     let run_ctx = ToolContext {
         workspace_root: ctx.workspace_root.clone(),
@@ -93,7 +92,7 @@ async fn cancellation_kills_entire_process_tree() {
         web_brave_key_env: ctx.web_brave_key_env.clone(),
         interactive: true,
     };
-    let handle = tokio::spawn(async move { run(args, &run_ctx).await });
+    let handle = tokio::spawn(async move { bash(args, &run_ctx).await });
 
     // 等子进程 PID 落盘。
     let mut child_pid: Option<u32> = None;
@@ -123,20 +122,14 @@ async fn is_process_alive(pid: u32, _ctx: &ToolContext) -> bool {
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let check_ctx = test_tool_context(&workspace);
     for _ in 0..50 {
-        let args = RunArgs {
-            program: "powershell.exe".into(),
-            args: vec![
-                "-NoProfile".into(),
-                "-Command".into(),
-                format!(
-                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
-                ),
-            ],
+        let args = BashArgs {
+            command: format!(
+                "powershell.exe -NoProfile -Command \"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}\""
+            ),
             cwd: ".".into(),
             timeout_ms: 10_000,
-            env: Default::default(),
         };
-        let outcome = run(args, &check_ctx).await;
+        let outcome = bash(args, &check_ctx).await;
         match outcome.model_payload.exit_code {
             Some(0) => {}
             Some(1) => return false, // 进程已不存在
@@ -233,7 +226,7 @@ async fn list_and_search_respect_budget_and_cursor() {
 }
 
 #[tokio::test]
-async fn run_output_lands_in_artifact_and_readable_via_opaque_ref() {
+async fn bash_output_lands_in_artifact_and_readable_via_opaque_ref() {
     point_host_at_real_tpi();
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
@@ -242,22 +235,17 @@ async fn run_output_lands_in_artifact_and_readable_via_opaque_ref() {
     ctx.artifacts_root = config.artifacts_root.clone();
 
     // 输出 50 行（超过模型预算的 tail 之外也有完整内容在 artifact）。
-    let args = RunArgs {
-        program: "powershell.exe".into(),
-        args: vec![
-            "-NoProfile".into(),
-            "-Command".into(),
-            "1..50 | ForEach-Object { 'line-' + $_ }".into(),
-        ],
+    // bash 包装：双引号内 \$_ 转义，避免 bash 展开 PowerShell 变量。
+    let args = BashArgs {
+        command: "powershell.exe -NoProfile -Command \"1..50 | ForEach-Object { 'line-' + \\$_ }\"".into(),
         cwd: ".".into(),
         timeout_ms: 30_000,
-        env: Default::default(),
     };
-    let outcome = run(args, &ctx).await;
+    let outcome = bash(args, &ctx).await;
     assert_eq!(outcome.status, ToolStatus::Succeeded);
     assert!(
         !outcome.artifacts.is_empty(),
-        "run 必须产出 artifact（§8.4）"
+        "bash 必须产出 artifact（§8.4）"
     );
     let artifact = &outcome.artifacts[0];
     assert_eq!(artifact.session, ctx.session_id);

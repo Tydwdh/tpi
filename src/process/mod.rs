@@ -4,7 +4,6 @@
 //! M2：单二进制 process-host handshake + Job Object 进程树取消（§11.5）+ 受控 launcher。
 
 pub mod host;
-pub mod resolver;
 
 use std::path::PathBuf;
 

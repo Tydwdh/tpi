@@ -76,7 +76,7 @@ pub fn tool_access(
             let path = resolved_path(workspace_root, &args.path);
             file_lock(FileScope::Exact(path), AccessMode::Write)
         }
-        (BuiltinTool::Run, _) | (BuiltinTool::Bash, _) => ToolAccess::WorkspaceUnknown,
+        (BuiltinTool::Bash, _) => ToolAccess::WorkspaceUnknown,
         // update_plan / ask_user 是原生同步控制操作（§13）：不进入普通调度队列。
         (BuiltinTool::UpdatePlan, _)
         | (BuiltinTool::AskUser, _)
