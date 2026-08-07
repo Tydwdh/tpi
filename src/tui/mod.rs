@@ -53,6 +53,15 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("compact", "手动压缩上下文"),
 ];
 
+/// 鼠标 hit 目标（点击转录行打开详情 Overlay）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HitTarget {
+    /// 工具卡片（按 call_id 打开详情）。
+    Tool(String),
+    /// 折叠的 reasoning 行（按 transcript entry index 打开原文）。
+    Reasoning(usize),
+}
+
 /// stdout 的唯一所有者（§3.2 不变量 11、§16.1）。
 ///
 /// M6+：内部持有 Ratatui `Terminal`（inline viewport，保留 scrollback）；
@@ -74,7 +83,7 @@ pub struct Renderer {
     /// 最近一帧的转录区矩形（鼠标 hit-test 用）。
     last_transcript_rect: Option<Rect>,
     /// 最近一帧窗口内每行对应的工具卡片 id（鼠标点击展开用）。
-    last_row_hits: Vec<Option<String>>,
+    last_row_hits: Vec<Option<HitTarget>>,
     /// 已提交到 scrollback 的行数（折叠/展开状态变化时 hit 失效，置空）。
     hits_valid: bool,
 }
@@ -84,7 +93,7 @@ struct FramePlan {
     /// 活动区窗口内容（已按宽度折行的逻辑行，直接渲染）。
     window: Vec<Line<'static>>,
     /// 窗口内每行对应的工具卡片 id（鼠标点击展开；消息行为 None）。
-    row_hits: Vec<Option<String>>,
+    row_hits: Vec<Option<HitTarget>>,
     /// 转录区屏幕矩形（鼠标 hit-test）。
     transcript_rect: Rect,
     overflow: Vec<Line<'static>>,
@@ -137,8 +146,8 @@ impl Renderer {
         })
     }
 
-    /// 鼠标点击 hit-test：命中工具卡片返回其 id（Alt+E 的鼠标等价）。
-    pub fn hit_tool_card(&self, column: u16, row: u16) -> Option<String> {
+    /// 鼠标点击 hit-test：命中工具卡片/reasoning 行返回目标（Overlay 用）。
+    pub fn hit_target(&self, column: u16, row: u16) -> Option<HitTarget> {
         if !self.hits_valid {
             return None;
         }
@@ -337,6 +346,15 @@ fn render_frame(
         draw_menu(frame, Rect::new(area.x, y, w, h), view, theme);
     }
 
+    // 详情 Overlay（整改 B：覆盖显示，不重写 scrollback；Esc 关闭）。
+    if view.overlay.is_some() {
+        let w = area.width.min(88).saturating_sub(4).max(40);
+        let h = trans_area.height.min(28).saturating_sub(2).max(10);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = trans_area.y + trans_area.height.saturating_sub(h) / 2;
+        draw_overlay(frame, Rect::new(x, y, w, h), view, theme);
+    }
+
     draw_input(frame, input_area, view, theme);
     FramePlan {
         window: Vec::new(),
@@ -360,7 +378,7 @@ fn plan_window(
     reset_committed: bool,
     cache: &mut HashMap<u64, Vec<Line<'static>>>,
 ) -> FramePlan {
-    let (logical, hits) = build_transcript_text(view, theme, cache);
+    let (logical, hits) = build_transcript_text(view, theme, cache, width as usize);
     let (wrapped, wrapped_hits) = wrap_lines_with_hits(logical, hits, width as usize);
     let total = wrapped.len();
     let area_h = area_h as usize;
@@ -390,20 +408,20 @@ fn plan_window(
 /// [`wrap_lines`] 的 hit 伴随版本：折行时卡片 id 跟随所属逻辑行。
 fn wrap_lines_with_hits(
     lines: Vec<Line<'static>>,
-    hits: Vec<Option<String>>,
+    hits: Vec<Option<HitTarget>>,
     width: usize,
-) -> (Vec<Line<'static>>, Vec<Option<String>>) {
+) -> (Vec<Line<'static>>, Vec<Option<HitTarget>>) {
     let width = width.max(1);
     let mut out: Vec<Line<'static>> = Vec::new();
-    let mut out_hits: Vec<Option<String>> = Vec::new();
+    let mut out_hits: Vec<Option<HitTarget>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
     let mut cur_w = 0usize;
-    let mut cur_hit: Option<String> = None;
+    let mut cur_hit: Option<HitTarget> = None;
     let flush = |out: &mut Vec<Line<'static>>,
-                     out_hits: &mut Vec<Option<String>>,
+                     out_hits: &mut Vec<Option<HitTarget>>,
                      cur: &mut Vec<Span<'static>>,
                      cur_w: &mut usize,
-                     cur_hit: &mut Option<String>| {
+                     cur_hit: &mut Option<HitTarget>| {
         if !cur.is_empty() {
             out.push(Line::from(std::mem::take(cur)));
             out_hits.push(cur_hit.clone());
@@ -493,17 +511,18 @@ fn build_transcript_text(
     view: &ViewModel,
     theme: theme::Theme,
     cache: &mut HashMap<u64, Vec<Line<'static>>>,
-) -> (Vec<Line<'static>>, Vec<Option<String>>) {
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<Option<HitTarget>>) {
     let mut out: Vec<Line<'static>> = Vec::new();
-    let mut hits: Vec<Option<String>> = Vec::new();
+    let mut hits: Vec<Option<HitTarget>> = Vec::new();
     let push_hit = |lines: &mut Vec<Line<'static>>,
-                        hits: &mut Vec<Option<String>>,
+                        hits: &mut Vec<Option<HitTarget>>,
                         line: Line<'static>,
-                        hit: Option<String>| {
+                        hit: Option<HitTarget>| {
         lines.push(line);
         hits.push(hit);
     };
-    for entry in &view.transcript {
+    for (entry_index, entry) in view.transcript.iter().enumerate() {
         match entry {
             Entry::Message(line) => match line.kind {
                 // §16.2：用户消息细紫红左 rail + 小型 `you` 标签。
@@ -529,8 +548,9 @@ fn build_transcript_text(
                 LineKind::Assistant => {
                     let rendered = cached_markdown(cache, line, theme);
                     out.extend(rendered.iter().cloned());
+                    hits.extend(rendered.iter().map(|_| None));
                 }
-                // §16.2：thinking dim italic，可折叠（Alt+T）。
+                // §16.2：thinking dim italic，可折叠（Alt+T）；点击打开原文 Overlay。
                 LineKind::Reasoning => {
                     if view.reasoning_visible {
                         for (i, s) in line.text.split('\n').enumerate() {
@@ -540,15 +560,15 @@ fn build_transcript_text(
                                 Style::default()
                                     .fg(theme.muted)
                                     .add_modifier(Modifier::ITALIC),
-                            ), None);
+                            ), Some(HitTarget::Reasoning(entry_index)));
                         }
                     } else {
                         push_hit(&mut out, &mut hits, Line::styled(
-                            "思考 · 已折叠（Alt+T 展开）",
+                            "◇ 思考 · 已折叠（Alt+T 展开 · 点击查看）",
                             Style::default()
                                 .fg(theme.muted)
                                 .add_modifier(Modifier::ITALIC),
-                        ), None);
+                        ), Some(HitTarget::Reasoning(entry_index)));
                     }
                 }
                 LineKind::Tool => {
@@ -572,8 +592,13 @@ fn build_transcript_text(
             },
             Entry::Tool(card) => {
                 let card_id = card.id.clone();
-                for line in tool_card_lines(card, view.anim_tick, theme) {
-                    push_hit(&mut out, &mut hits, line, Some(card_id.clone()));
+                for line in tool_card_lines(card, view.anim_tick, theme, width) {
+                    push_hit(
+                        &mut out,
+                        &mut hits,
+                        line,
+                        Some(HitTarget::Tool(card_id.clone())),
+                    );
                 }
             }
         }
@@ -736,25 +761,56 @@ fn flush_line(out: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>) {
     }
 }
 
-/// 工具卡片（§16.2）：`icon name · duration · status`，运行中 spinner 动画；
-/// 命令摘要（detail）缩进一行展示；实时输出（运行中）/完整输出（展开时）
-/// 作为缩进正文；失败时折叠态保留红色关键 tail。
-fn tool_card_lines(card: &ToolCard, anim_tick: u64, theme: theme::Theme) -> Vec<Line<'static>> {
-    let (icon, status_style, status_text) = match &card.state {
+/// 工具卡片主行（整改 A2/A3）：`icon name target…  metadata` 恒为单个 visual line。
+///
+/// - icon/status 语义色；name 正常亮度 BOLD；target muted（display-width ellipsis）；
+/// - metadata（duration · exit）最右，muted；
+/// - 折叠态：失败 tail ≤4 行、运行中实时输出 ≤3 行；成功无正文；
+/// - 展开态（active 卡片）：完整输出内联（scrollback 卡片走 overlay，Phase B）。
+fn tool_card_lines(
+    card: &ToolCard,
+    anim_tick: u64,
+    theme: theme::Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let (icon, status_style) = match &card.state {
         ToolCardState::Running => (
             SPINNER_FRAMES[anim_tick as usize % SPINNER_FRAMES.len()],
             theme.info,
-            "运行中",
         ),
         ToolCardState::Done { status, .. } => match status {
-            crate::tool::outcome::ToolStatus::Succeeded => ("✓", theme.success, ""),
-            crate::tool::outcome::ToolStatus::Failed => ("✗", theme.error, "失败"),
-            crate::tool::outcome::ToolStatus::TimedOut => ("⏱", theme.warning, "超时"),
-            crate::tool::outcome::ToolStatus::Cancelled => ("−", theme.muted, "已取消"),
-            crate::tool::outcome::ToolStatus::Interrupted => ("⏹", theme.warning, "中断"),
-            crate::tool::outcome::ToolStatus::Rejected => ("⊘", theme.warning, "拒绝"),
+            crate::tool::outcome::ToolStatus::Succeeded => ("✓", theme.success),
+            crate::tool::outcome::ToolStatus::Failed => ("✗", theme.error),
+            crate::tool::outcome::ToolStatus::TimedOut => ("⏱", theme.warning),
+            crate::tool::outcome::ToolStatus::Cancelled => ("−", theme.muted),
+            crate::tool::outcome::ToolStatus::Interrupted => ("⏹", theme.warning),
+            crate::tool::outcome::ToolStatus::Rejected => ("⊘", theme.warning),
         },
     };
+
+    // metadata（固定右侧区域）：duration [· exit code] [· 状态词]。
+    let mut meta = String::new();
+    if let ToolCardState::Done {
+        duration_ms,
+        exit_code,
+        ..
+    } = &card.state
+    {
+        meta.push_str(&fmt_duration(*duration_ms));
+        if let Some(code) = exit_code {
+            meta.push_str(&format!(" · exit {code}"));
+        }
+    }
+    let meta_w = unicode_width::UnicodeWidthStr::width(meta.as_str());
+    let name_w = unicode_width::UnicodeWidthStr::width(card.name.as_str());
+    let icon_w = 2; // "✓ " 等 icon + 空格
+    // 预算分配：icon + name + target + meta（各 1 空格分隔）。
+    let target_budget = width
+        .saturating_sub(icon_w + 1 + name_w + 1 + meta_w + 1)
+        .max(4);
+    let target = card.target.as_deref().unwrap_or("");
+    let target = truncate_display(target, target_budget);
+
     let mut spans = vec![Span::styled(
         format!("{icon} "),
         Style::default()
@@ -765,65 +821,47 @@ fn tool_card_lines(card: &ToolCard, anim_tick: u64, theme: theme::Theme) -> Vec<
         card.name.clone(),
         Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     ));
-    if let ToolCardState::Done {
-        duration_ms,
-        exit_code,
-        ..
-    } = &card.state
-    {
+    if !target.is_empty() {
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            format!(" · {}", fmt_duration(*duration_ms)),
-            Style::default().fg(theme.muted),
-        ));
-        if let Some(code) = exit_code {
-            spans.push(Span::styled(
-                format!(" · exit {code}"),
-                Style::default().fg(theme.muted),
-            ));
-        }
-    }
-    if !status_text.is_empty() {
-        spans.push(Span::styled(format!(" · {status_text}"), status_style));
-    }
-    // 展开/实时输出提示（折叠且有输出时可见）。
-    if card.output.is_some() {
-        let hint = if card.expanded { " [−]" } else { " [+展开]" };
-        spans.push(Span::styled(hint, Style::default().fg(theme.muted)));
-    }
-    let mut lines = vec![Line::from(spans)];
-    // §16.2：实际命令摘要独立一行，缩进展示（运行中也可见，便于观察正在做什么）。
-    if let Some(detail) = &card.detail
-        && !detail.is_empty()
-    {
-        lines.push(Line::styled(
-            format!("  {detail}"),
+            target,
             Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
         ));
     }
-    // 展开时显示完整输出正文（有界），否则失败显示 tail、运行中显示实时尾注。
+    if !meta.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(meta, Style::default().fg(theme.muted)));
+    }
+    let mut lines = vec![Line::from(spans)];
+
+    // 正文（有严格行数预算）：展开态完整输出 / 运行中实时尾注 / 失败 tail。
     let show_body = if card.expanded {
         card.output.as_deref()
     } else if let ToolCardState::Running = card.state {
-        card.output.as_deref() // 运行中的实时输出（折叠态也显示，截断为尾注）
+        card.output.as_deref() // 运行中的实时输出（折叠态显示，最多 3 行）
     } else {
         None
     };
     if let Some(body) = show_body {
-        // 折叠态实时输出只保留最后几行；展开态显示全部（渲染层不再截断）。
         let body_lines: Vec<&str> = body.split('\n').collect();
         let shown: Vec<&str> = if card.expanded {
             body_lines
         } else {
-            body_lines.iter().rev().take(6).copied().collect::<Vec<_>>()
+            // 整改 A3：折叠态实时输出只保留最后 3 行。
+            body_lines
+                .iter()
+                .rev()
+                .take(3)
+                .copied()
+                .collect::<Vec<_>>()
         };
         for s in shown {
-            let prefix = "│ ";
             let style = if card.expanded {
                 Style::default().fg(theme.text)
             } else {
                 Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
             };
-            lines.push(Line::styled(format!("{prefix}{s}"), style));
+            lines.push(Line::styled(format!("│ {s}"), style));
         }
         if card.output_truncated && card.expanded {
             lines.push(Line::styled(
@@ -835,7 +873,10 @@ fn tool_card_lines(card: &ToolCard, anim_tick: u64, theme: theme::Theme) -> Vec<
     if !card.expanded
         && let Some(tail) = &card.tail
     {
-        for s in tail.split('\n') {
+        // 整改 A3：失败 tail 最多 4 行（取尾部——错误诊断在输出末尾）。
+        let tail_lines: Vec<&str> = tail.split('\n').collect();
+        let last: Vec<&str> = tail_lines.iter().rev().take(4).copied().collect();
+        for s in last.into_iter().rev() {
             lines.push(Line::styled(
                 format!("│ {s}"),
                 Style::default().fg(theme.error).add_modifier(Modifier::DIM),
@@ -843,6 +884,26 @@ fn tool_card_lines(card: &ToolCard, anim_tick: u64, theme: theme::Theme) -> Vec<
         }
     }
     lines
+}
+
+/// 按 display width 截断（超宽加 …），保证主行不溢出。
+fn truncate_display(text: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if unicode_width::UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in text.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+        if w + cw + 1 > max_width {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
 }
 
 /// 计划条（§16.2：编辑器上方独立紧凑区域，不出现在 transcript）。
@@ -924,16 +985,7 @@ fn draw_footer(
             ));
         }
     }
-    if view.input_tokens > 0 || view.output_tokens > 0 {
-        spans.push(Span::styled(
-            format!(
-                " · ↑{} ↓{}",
-                fmt_tokens(view.input_tokens),
-                fmt_tokens(view.output_tokens)
-            ),
-            muted,
-        ));
-    }
+    // 整改 D：footer 固定顺序 workspace · model · state · ctx · tokens · 提示。
     // 上下文用量条（§对比：gemini-cli ContextUsageDisplay；projected/usable）。
     if let Some((projected, usable)) = view.context_usage
         && usable > 0
@@ -953,9 +1005,26 @@ fn draw_footer(
             style,
         ));
     }
+    if view.input_tokens > 0 || view.output_tokens > 0 {
+        spans.push(Span::styled(
+            format!(
+                " · ↑{} ↓{}",
+                fmt_tokens(view.input_tokens),
+                fmt_tokens(view.output_tokens)
+            ),
+            muted,
+        ));
+    }
     if !scrollback {
         spans.push(Span::styled(
             " · 兼容模式（无滚动回退）",
+            Style::default().fg(theme.warning),
+        ));
+    }
+    // 整改 C：scroll lock 期间的新消息提示。
+    if view.pending_below > 0 {
+        spans.push(Span::styled(
+            format!(" · ↓{} 条新消息 · Ctrl+End 返回最新", view.pending_below),
             Style::default().fg(theme.warning),
         ));
     }
@@ -1028,6 +1097,85 @@ fn input_cursor_cell(input: &str, cursor: usize, width: u16) -> (u16, u16) {
     (row, col)
 }
 
+/// 详情 Overlay（整改 B）：带边框对话框，展示 command/output/status；
+/// Esc 关闭、PgUp/PgDn 内部滚动；不修改 scrollback。
+fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: theme::Theme) {
+    let Some(overlay) = &view.overlay else {
+        return;
+    };
+    let inner_w = rect.width.saturating_sub(2).max(1) as usize;
+    let inner_h = rect.height.saturating_sub(2).max(1) as usize;
+
+    let mut content: Vec<Line<'static>> = Vec::new();
+    content.push(Line::styled(
+        overlay.title.clone(),
+        Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD),
+    ));
+    content.push(Line::default());
+    if let Some(command) = &overlay.command {
+        content.push(Line::styled(
+            "Command",
+            Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
+        ));
+        for line in command.split('\n') {
+            content.push(Line::styled(
+                line.to_string(),
+                Style::default().fg(theme.text),
+            ));
+        }
+        content.push(Line::default());
+    }
+    if !overlay.body.is_empty() {
+        content.push(Line::styled(
+            "Output",
+            Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
+        ));
+        for line in overlay.body.split('\n') {
+            content.push(Line::styled(
+                line.to_string(),
+                Style::default().fg(theme.text),
+            ));
+        }
+    } else {
+        content.push(Line::styled(
+            "（无输出）",
+            Style::default().fg(theme.muted),
+        ));
+    }
+    if overlay.body_truncated {
+        content.push(Line::styled(
+            "…（输出超预算被截断；完整内容可通过 read @artifact 读取）",
+            Style::default().fg(theme.warning),
+        ));
+    }
+    content.push(Line::default());
+    content.push(Line::styled(
+        "[Esc] 关闭 · [PgUp/PgDn] 滚动",
+        Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+    ));
+
+    // 内部滚动（逻辑行按 inner_w 折行后窗口化）。
+    let (wrapped, _) = wrap_lines_with_hits(content, Vec::new(), inner_w);
+    let total = wrapped.len() as u16;
+    let scroll = overlay.scroll.min(total.saturating_sub(inner_h as u16));
+    let start = scroll as usize;
+    let end = (start + inner_h).min(wrapped.len());
+    let window = wrapped[start..end].to_vec();
+
+    let block = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_style(Style::default().fg(theme.primary))
+        .title(" Tool details ");
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(window)
+            .block(block)
+            .scroll((0, 0)),
+        rect,
+    );
+}
+
 /// 命令补全菜单（输入以 `/` 开头时弹出；↑/↓ 选择、Tab 补全、Enter 选中）。
 fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: theme::Theme) {
     let Some(menu) = &view.menu else {
@@ -1060,13 +1208,7 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
 }
 
 fn fmt_duration(ms: u64) -> String {
-    if ms < 1_000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
-    } else {
-        format!("{}m{:02}s", ms / 60_000, (ms / 1_000) % 60)
-    }
+    crate::tui::model::fmt_duration(ms)
 }
 
 fn fmt_tokens(n: u64) -> String {
@@ -1283,14 +1425,15 @@ mod tests {
         let card = ToolCard {
             id: "c1".into(),
             name: "bash".into(),
-            detail: Some("bash: cargo test".into()),
+            target: Some("bash: cargo test".into()),
+            command: None,
             state: ToolCardState::Running,
             output: None,
             output_truncated: false,
             expanded: false,
             tail: None,
         };
-        let lines = tool_card_lines(&card, 0, theme);
+        let lines = tool_card_lines(&card, 0, theme, 100);
         assert!(
             lines[0].spans[0].content.starts_with('⠋'),
             "运行中显示 spinner"
@@ -1307,7 +1450,8 @@ mod tests {
         let card = ToolCard {
             id: "c1".into(),
             name: "bash".into(),
-            detail: Some("bash: cargo test".into()),
+            target: Some("bash: cargo test".into()),
+            command: None,
             state: ToolCardState::Done {
                 status: crate::tool::outcome::ToolStatus::Failed,
                 duration_ms: 1234,
@@ -1318,7 +1462,7 @@ mod tests {
             expanded: false,
             tail: Some("exit_code: 1".into()),
         };
-        let lines = tool_card_lines(&card, 0, theme);
+        let lines = tool_card_lines(&card, 0, theme, 100);
         let text: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
@@ -1358,15 +1502,16 @@ mod tests {
         let card = ToolCard {
             id: "c".into(),
             name: "bash".into(),
-            detail: None,
+            target: None,
+            command: None,
             state: ToolCardState::Running,
             output: None,
             output_truncated: false,
             expanded: false,
             tail: None,
         };
-        let f0 = tool_card_lines(&card, 0, theme).remove(0);
-        let f1 = tool_card_lines(&card, 1, theme).remove(0);
+        let f0 = tool_card_lines(&card, 0, theme, 100).remove(0);
+        let f1 = tool_card_lines(&card, 1, theme, 100).remove(0);
         assert_ne!(
             f0.spans[0].content, f1.spans[0].content,
             "动画帧应随 tick 变化"
@@ -1379,7 +1524,8 @@ mod tests {
         let card = ToolCard {
             id: "c".into(),
             name: "bash".into(),
-            detail: Some("bash: cargo test".into()),
+            target: Some("bash: cargo test".into()),
+            command: None,
             state: ToolCardState::Running,
             output: Some(
                 "progress 1\nprogress 2\nprogress 3\nprogress 4\nprogress 5\nprogress 6\nprogress 7\n"
@@ -1389,17 +1535,16 @@ mod tests {
             expanded: false,
             tail: None,
         };
-        let lines = tool_card_lines(&card, 0, theme);
+        let lines = tool_card_lines(&card, 0, theme, 100);
         let text: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains("[+展开]"), "有输出时显示展开提示");
-        // 折叠态只显示最后 6 行实时输出。
+        assert!(!text.contains("progress 1"), "折叠态只显示最近输出: {text}");
         assert!(text.contains("progress 7"), "最新输出可见: {text}");
         assert!(
-            !text.contains("progress 1"),
-            "折叠态不显示早期输出: {text}"
+            !text.contains("progress 5") || !text.contains("progress 4"),
+            "折叠态实时输出最多 3 行（progress 1-4 不应全部可见）: {text}"
         );
     }
 
@@ -1409,7 +1554,8 @@ mod tests {
         let card = ToolCard {
             id: "c".into(),
             name: "bash".into(),
-            detail: None,
+            target: None,
+            command: None,
             state: ToolCardState::Done {
                 status: crate::tool::outcome::ToolStatus::Succeeded,
                 duration_ms: 10,
@@ -1420,12 +1566,11 @@ mod tests {
             expanded: true,
             tail: None,
         };
-        let lines = tool_card_lines(&card, 0, theme);
+        let lines = tool_card_lines(&card, 0, theme, 100);
         let text: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains("[−]"), "展开态提示收起");
         assert!(
             text.contains("第一行") && text.contains("第三行"),
             "展开显示全部输出: {text}"

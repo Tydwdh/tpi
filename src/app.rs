@@ -251,18 +251,39 @@ async fn interactive_loop<P: Provider>(
                         use ratatui::crossterm::event::MouseEventKind;
                         match mouse.kind {
                             MouseEventKind::ScrollUp => {
-                                view.scroll_up(3);
+                                if view.overlay.is_some() {
+                                    if let Some(overlay) = &mut view.overlay {
+                                        overlay.scroll = overlay.scroll.saturating_sub(3);
+                                    }
+                                } else {
+                                    view.scroll_up(3);
+                                }
                                 need_draw = true;
                             }
                             MouseEventKind::ScrollDown => {
-                                view.scroll_down(3);
+                                if view.overlay.is_some() {
+                                    if let Some(overlay) = &mut view.overlay {
+                                        overlay.scroll = overlay.scroll.saturating_add(3);
+                                    }
+                                } else {
+                                    view.scroll_down(3);
+                                }
                                 need_draw = true;
                             }
                             MouseEventKind::Down(_) => {
-                                if let Some(card_id) =
-                                    renderer.hit_tool_card(mouse.column, mouse.row)
+                                if view.overlay.is_some() {
+                                    // Overlay 打开时点击外部不动作。
+                                } else if let Some(target) =
+                                    renderer.hit_target(mouse.column, mouse.row)
                                 {
-                                    view.toggle_expand(card_id);
+                                    match target {
+                                        crate::tui::HitTarget::Tool(id) => {
+                                            view.open_tool_overlay(id);
+                                        }
+                                        crate::tui::HitTarget::Reasoning(index) => {
+                                            view.open_reasoning_overlay(index);
+                                        }
+                                    }
                                     need_draw = true;
                                 }
                             }
@@ -565,7 +586,13 @@ fn handle_key(
                 view.complete_menu_command();
             }
         }
-        KeyCode::Esc => view.menu = None,
+        KeyCode::Esc => {
+            if view.overlay.is_some() {
+                view.close_overlay();
+            } else {
+                view.menu = None;
+            }
+        }
         KeyCode::Backspace => {
             editor.backspace();
             view.refresh_command_menu();
@@ -577,7 +604,14 @@ fn handle_key(
         KeyCode::Left => editor.move_left(),
         KeyCode::Right => editor.move_right(),
         KeyCode::Home => editor.home(),
-        KeyCode::End => editor.end(),
+        KeyCode::End => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                // 整改 C：Ctrl+End 恢复 follow-tail（scroll lock 中）。
+                view.follow_tail();
+            } else {
+                editor.end();
+            }
+        }
         KeyCode::Up => {
             if view.menu.is_some() {
                 if let Some(menu) = view.menu.as_mut()
@@ -602,8 +636,20 @@ fn handle_key(
                 view.refresh_command_menu();
             }
         }
-        KeyCode::PageUp => view.scroll_up(8),
-        KeyCode::PageDown => view.scroll_down(8),
+        KeyCode::PageUp => {
+            if let Some(overlay) = &mut view.overlay {
+                overlay.scroll = overlay.scroll.saturating_sub(10);
+            } else {
+                view.scroll_up(8);
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(overlay) = &mut view.overlay {
+                overlay.scroll = overlay.scroll.saturating_add(10);
+            } else {
+                view.scroll_down(8);
+            }
+        }
         KeyCode::Char(c) => {
             if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
                 return; // Ctrl-C 由 ctrl_c handler 处理。
@@ -626,8 +672,8 @@ fn handle_key(
                 return;
             }
             if key.modifiers.contains(KeyModifiers::ALT) && c == 'e' {
-                // 展开/折叠最后一张工具卡片（鼠标点击的键盘等价）。
-                view.toggle_last_tool_expanded();
+                // 打开最近一张工具卡片的详情 Overlay（鼠标点击的键盘等价）。
+                view.open_last_tool_overlay();
                 return;
             }
             editor.insert_char(c);
@@ -692,8 +738,8 @@ async fn run_interactive<P: Provider>(
                             DeltaKind::Reasoning => view.push_stream_delta(LineKind::Reasoning, &text),
                         }
                     }
-                    Some(RuntimeEvent::ToolStarted { call_id, name, display }) => {
-                        view.begin_tool(call_id.to_string(), name.clone(), Some(display));
+                    Some(RuntimeEvent::ToolStarted { call_id, name, target, command }) => {
+                        view.begin_tool(call_id.to_string(), name.clone(), Some(target), command);
                         if let StatusLine::Running { tool, .. } = &mut view.status {
                             *tool = name;
                         }
@@ -732,7 +778,10 @@ async fn run_interactive<P: Provider>(
             key = key_rx.recv() => {
                 match key {
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                        if key.code == KeyCode::Esc && view.menu.is_none() {
+                        if key.code == KeyCode::Esc && view.overlay.is_some() {
+                            // 详情 Overlay 优先：Esc 关闭 Overlay，不打断 run。
+                            view.close_overlay();
+                        } else if key.code == KeyCode::Esc && view.menu.is_none() {
                             // §6.2：Esc 打断当前 run（等价 Ctrl-C，保留 session）。
                             // 命令补全菜单打开时 Esc 仍由 handle_key 关闭菜单。
                             cancel.cancel();
@@ -758,17 +807,39 @@ async fn run_interactive<P: Provider>(
                         use ratatui::crossterm::event::MouseEventKind;
                         match mouse.kind {
                             MouseEventKind::ScrollUp => {
-                                view.scroll_up(3);
+                                if view.overlay.is_some() {
+                                    if let Some(overlay) = &mut view.overlay {
+                                        overlay.scroll = overlay.scroll.saturating_sub(3);
+                                    }
+                                } else {
+                                    view.scroll_up(3);
+                                }
                                 renderer.draw(view).map_err(|e| e.to_string())?;
                             }
                             MouseEventKind::ScrollDown => {
-                                view.scroll_down(3);
+                                if view.overlay.is_some() {
+                                    if let Some(overlay) = &mut view.overlay {
+                                        overlay.scroll = overlay.scroll.saturating_add(3);
+                                    }
+                                } else {
+                                    view.scroll_down(3);
+                                }
                                 renderer.draw(view).map_err(|e| e.to_string())?;
                             }
                             MouseEventKind::Down(_) => {
-                                if let Some(card_id) = renderer.hit_tool_card(mouse.column, mouse.row)
+                                if view.overlay.is_some() {
+                                    // Overlay 打开时点击外部不动作。
+                                } else if let Some(target) =
+                                    renderer.hit_target(mouse.column, mouse.row)
                                 {
-                                    view.toggle_expand(card_id);
+                                    match target {
+                                        crate::tui::HitTarget::Tool(id) => {
+                                            view.open_tool_overlay(id);
+                                        }
+                                        crate::tui::HitTarget::Reasoning(index) => {
+                                            view.open_reasoning_overlay(index);
+                                        }
+                                    }
                                     renderer.draw(view).map_err(|e| e.to_string())?;
                                 }
                             }

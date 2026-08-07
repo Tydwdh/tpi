@@ -79,8 +79,10 @@ pub enum RuntimeEvent {
     ToolStarted {
         call_id: ToolCallId,
         name: String,
-        /// 可读展示摘要（如 `bash: cargo test`；§16.2 展示实际命令而非只有工具名）。
-        display: String,
+        /// 主行 target 摘要（整改 A3：压缩后的命令或 `name path`）。
+        target: String,
+        /// 完整命令（详情 overlay 用；非 bash 为 None）。
+        command: Option<String>,
     },
     /// 工具终态（TUI 更新卡片状态/耗时；失败时附带关键输出 tail）。
     ToolCompleted {
@@ -614,11 +616,13 @@ error: invalid_arguments
 
             // 工具真正启动前通知 TUI；长命令不再等执行结束才出现反馈。
             if tool != BuiltinTool::UpdatePlan {
+                let (target, command) = tool_target(&calls[source_index]);
                 let _ = ui
                     .send(RuntimeEvent::ToolStarted {
                         call_id: calls[source_index].call_id,
                         name: calls[source_index].name.clone(),
-                        display: tool_display(&calls[source_index]),
+                        target,
+                        command,
                     })
                     .await;
             }
@@ -733,15 +737,20 @@ error: invalid_arguments
 /// 工具调用的可读展示摘要（TUI 工具卡片，§16.2）。
 ///
 /// bash → `bash: <command>`；其余显示工具名。有界到 200 字符，避免整段脚本刷屏。
-fn tool_display(call: &ToolCall) -> String {
-    fn summarize(text: String) -> String {
-        let mut t = text.trim().to_string();
-        if t.chars().count() > 200 {
-            let mut truncated: String = t.chars().take(200).collect();
-            truncated.push('…');
-            t = truncated;
+/// 工具调用的主行 target 与完整命令（整改 A2/A3：主行单行、命令进 overlay）。
+///
+/// - bash：target = 压缩后的命令（换行折空格、连续空白压缩、200 字符截断）；
+///   command = 原文（≤8KiB，overlay 展示）。
+/// - 其他文件工具：target = `name path`；其余只显示工具名。
+fn tool_target(call: &ToolCall) -> (String, Option<String>) {
+    fn truncate(text: &str, max_chars: usize) -> String {
+        if text.chars().count() <= max_chars {
+            text.to_string()
+        } else {
+            let mut t: String = text.chars().take(max_chars).collect();
+            t.push('…');
+            t
         }
-        t.replace('\n', " ")
     }
     let parsed = serde_json::from_str::<serde_json::Value>(&call.arguments).ok();
     match call.name.as_str() {
@@ -751,12 +760,25 @@ fn tool_display(call: &ToolCall) -> String {
                 .and_then(|v| v.get("command"))
                 .and_then(|c| c.as_str())
             {
-                summarize(format!("bash: {cmd}"))
+                let compressed = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+                (
+                    truncate(&compressed, 200),
+                    Some(truncate(cmd, 8 * 1024)),
+                )
             } else {
-                "bash".into()
+                ("bash".into(), None)
             }
         }
-        name => name.into(),
+        name if matches!(name, "read" | "write" | "edit" | "list" | "search") => {
+            let target = parsed
+                .as_ref()
+                .and_then(|v| v.get("path"))
+                .and_then(|p| p.as_str())
+                .map(|path| format!("{name} {path}"))
+                .unwrap_or_else(|| name.to_string());
+            (truncate(&target, 120), None)
+        }
+        name => (name.to_string(), None),
     }
 }
 

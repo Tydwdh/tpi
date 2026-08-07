@@ -29,32 +29,46 @@ pub enum LineKind {
     System,
 }
 
-/// 工具卡片（§16.2：单行 `icon name duration status`，运行中动画）。
+/// 工具卡片（§16.2 + TUI 整改 A2：一个 call 一张卡、主行恒单行）。
 ///
-/// 输出展示（对照 crush 的可展开工具消息）：
-/// - 运行中：`output` 累积实时增量（有界），渲染为卡片下方尾注；
-/// - 终态：`output` 保存完整输出（成功也保留，不再丢弃），
-///   折叠时显示摘要 + 失败 tail，`expanded` 时显示正文（Alt+E/鼠标切换）。
+/// - 主行 = `icon name target metadata` 单 visual line（target 按宽度 ellipsis）；
+/// - 运行中实时输出/失败 tail 只在折叠态下方显示有限行数；
+/// - 完整 command 与输出进详情 overlay（不重写 scrollback）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCard {
     /// ToolCallId 的字符串形式。
     pub id: String,
     pub name: String,
-    /// 可读命令/参数摘要（如 `bash: cargo test`）；None 表示只有工具名。
-    pub detail: Option<String>,
+    /// 主行 target 摘要（bash = 压缩后的命令；其他 = 路径/参数摘要）。
+    pub target: Option<String>,
+    /// 完整命令（overlay 展示；bash 命令原文，有界）。
+    pub command: Option<String>,
     pub state: ToolCardState,
     /// 完整输出（有界累积，≤ MAX_CARD_OUTPUT；成功与失败都保留）。
     pub output: Option<String>,
     /// 输出被截断（超过 MAX_CARD_OUTPUT 丢弃中段）。
     pub output_truncated: bool,
-    /// 展开状态（显示完整输出正文；默认折叠）。
+    /// 展开状态（active 卡片内联显示完整输出；scrollback 卡片走 overlay）。
     pub expanded: bool,
-    /// 失败/超时等终态时携带的关键输出 tail（有界，折叠时渲染为红色尾注）。
+    /// 失败/超时等终态的关键 tail（有界，折叠态显示最多 4 行）。
     pub tail: Option<String>,
 }
 
 /// 卡片输出上限（UI 内存与渲染预算；完整输出仍可通过 read @artifact 读取）。
 pub const MAX_CARD_OUTPUT: usize = 32 * 1024;
+/// 命令上限（overlay 展示用；正常命令远小于此）。
+pub const MAX_CARD_COMMAND: usize = 8 * 1024;
+
+/// 耗时格式化（Overlay 标题与 ToolCard metadata 共用）。
+pub fn fmt_duration(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{}m{:02}s", ms / 60_000, (ms / 1_000) % 60)
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCardState {
     Running,
@@ -64,6 +78,69 @@ pub enum ToolCardState {
         /// 进程退出码（run/bash；纯读取工具为 None）。
         exit_code: Option<i32>,
     },
+}
+
+/// 详情 Overlay 状态（整改 B：历史/工具详情不重写 scrollback，覆盖显示）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayState {
+    /// 标题行（如 `bash · succeeded · 3.6s · exit 0`）。
+    pub title: String,
+    /// 完整命令（bash；其他工具为 None）。
+    pub command: Option<String>,
+    /// 正文（输出或 reasoning 原文；有界）。
+    pub body: String,
+    /// 正文被截断。
+    pub body_truncated: bool,
+    /// Overlay 内滚动偏移（行）。
+    pub scroll: u16,
+}
+
+impl OverlayState {
+    /// 工具详情 overlay。
+    pub fn for_tool(card: &ToolCard) -> Self {
+        let status_word = match &card.state {
+            ToolCardState::Running => "running".to_string(),
+            ToolCardState::Done { status, .. } => match status {
+                ToolStatus::Succeeded => "succeeded".into(),
+                ToolStatus::Failed => "failed".into(),
+                ToolStatus::TimedOut => "timed_out".into(),
+                ToolStatus::Cancelled => "cancelled".into(),
+                ToolStatus::Interrupted => "interrupted".into(),
+                ToolStatus::Rejected => "rejected".into(),
+            },
+        };
+        let mut title = format!("{} · {status_word}", card.name);
+        if let ToolCardState::Done {
+            duration_ms,
+            exit_code,
+            ..
+        } = &card.state
+        {
+            title.push_str(&format!(" · {}", fmt_duration(*duration_ms)));
+            if let Some(code) = exit_code {
+                title.push_str(&format!(" · exit {code}"));
+            }
+        }
+        let body = card.output.clone().unwrap_or_default();
+        Self {
+            title,
+            command: card.command.clone(),
+            body_truncated: card.output_truncated,
+            body,
+            scroll: 0,
+        }
+    }
+
+    /// reasoning 原文 overlay。
+    pub fn for_reasoning(text: &str) -> Self {
+        Self {
+            title: "思考（reasoning）".into(),
+            command: None,
+            body: text.to_string(),
+            body_truncated: false,
+            scroll: 0,
+        }
+    }
 }
 
 /// 转录条目：消息或工具卡片（保持原始出现顺序）。
@@ -116,6 +193,8 @@ pub struct ViewModel {
     pub turn: u32,
     /// 距离转录末尾的逻辑行数。0 表示跟随最新输出；翻页时增大。
     pub transcript_scroll: u16,
+    /// scroll lock 期间到达的新条目数（footer 提示；End/Ctrl+End 清空）。
+    pub pending_below: u64,
     /// 思考内容是否展开（Alt+T 切换，§16.2：thinking 可折叠）。
     pub reasoning_visible: bool,
     /// 本会话累计 token 用量（AgentOutcome.usage 累积，§16.2：无 pricing 时显示 usage）。
@@ -129,6 +208,8 @@ pub struct ViewModel {
     pub context_usage: Option<(u64, u64)>,
     /// workspace 文件索引（`@` 引用补全用；会话开始时扫描一次，有界）。
     pub file_index: Vec<String>,
+    /// 详情 Overlay（None = 关闭；打开时 Esc 关闭、PgUp/PgDn 滚动）。
+    pub overlay: Option<OverlayState>,
     pub next_version: u64,
 }
 
@@ -144,13 +225,15 @@ impl Default for ViewModel {
             workspace: String::new(),
             turn: 0,
             transcript_scroll: 0,
-            reasoning_visible: true,
+            pending_below: 0,
+            reasoning_visible: false,
             input_tokens: 0,
             output_tokens: 0,
             anim_tick: 0,
             menu: None,
             context_usage: None,
             file_index: Vec::new(),
+            overlay: None,
             next_version: 1,
         }
     }
@@ -176,6 +259,7 @@ impl ViewModel {
             text: text.into(),
             version,
         }));
+        self.note_new_content();
         self.trim_transcript();
     }
 
@@ -194,30 +278,47 @@ impl ViewModel {
                     text: text.to_string(),
                     version,
                 }));
+                self.note_new_content();
                 self.trim_transcript();
             }
         }
-        // 新输出到达时恢复跟随模式；用户显式翻页后可再次上翻。
-        self.transcript_scroll = 0;
+        // 整改 C：不再强制拉回底部——用户滚动查看历史时新输出只计数。
+        // 跟随模式（scroll==0）保持跟随；scroll lock 时累计 pending。
     }
 
-    /// 工具开始：追加一张运行中的卡片（§16.2：运行中单行动画）。
+    /// 整改 C：scroll lock 期间的新条目计数（footer 提示“↓ N 条新消息”）。
+    fn note_new_content(&mut self) {
+        if self.transcript_scroll > 0 {
+            self.pending_below += 1;
+        }
+    }
+
+    /// 恢复 follow-tail（End/Ctrl+End）：回到底部并清空新消息计数。
+    pub fn follow_tail(&mut self) {
+        self.transcript_scroll = 0;
+        self.pending_below = 0;
+    }
+
+    /// 工具开始：追加一张运行中的卡片（整改 A2：一个 call 一张卡，原地更新）。
     pub fn begin_tool(
         &mut self,
         id: impl Into<String>,
         name: impl Into<String>,
-        detail: Option<String>,
+        target: Option<String>,
+        command: Option<String>,
     ) {
         self.transcript.push(Entry::Tool(ToolCard {
             id: id.into(),
             name: name.into(),
-            detail,
+            target,
+            command,
             state: ToolCardState::Running,
             output: None,
             output_truncated: false,
             expanded: false,
             tail: None,
         }));
+        self.note_new_content();
         self.trim_transcript();
     }
 
@@ -268,6 +369,45 @@ impl ViewModel {
         }
     }
 
+    /// 打开最近一张工具卡片的详情 Overlay（Alt+E）。
+    pub fn open_last_tool_overlay(&mut self) {
+        for entry in self.transcript.iter().rev() {
+            if let Entry::Tool(card) = entry {
+                self.overlay = Some(OverlayState::for_tool(card));
+                return;
+            }
+        }
+    }
+
+    /// 按 id 打开工具卡片详情 Overlay（鼠标点击）。
+    pub fn open_tool_overlay(&mut self, id: impl Into<String>) {
+        let id = id.into();
+        for entry in self.transcript.iter().rev() {
+            if let Entry::Tool(card) = entry
+                && card.id == id
+            {
+                self.overlay = Some(OverlayState::for_tool(card));
+                return;
+            }
+        }
+    }
+
+    /// 打开 reasoning 原文 Overlay（点击折叠的 reasoning 行）。
+    pub fn open_reasoning_overlay(&mut self, index: usize) {
+        let Some(Entry::Message(line)) = self.transcript.get(index) else {
+            return;
+        };
+        if line.kind != LineKind::Reasoning {
+            return;
+        }
+        self.overlay = Some(OverlayState::for_reasoning(&line.text));
+    }
+
+    /// 关闭 Overlay（Esc）。
+    pub fn close_overlay(&mut self) {
+        self.overlay = None;
+    }
+
     /// 工具终态：按 call_id 定位卡片，更新状态与耗时；失败时保留关键 tail（有界）。
     pub fn finish_tool(
         &mut self,
@@ -309,7 +449,8 @@ impl ViewModel {
         self.transcript.push(Entry::Tool(ToolCard {
             id,
             name,
-            detail: None,
+            target: None,
+            command: None,
             state: ToolCardState::Done {
                 status,
                 duration_ms,
@@ -346,6 +487,9 @@ impl ViewModel {
 
     pub fn scroll_down(&mut self, lines: u16) {
         self.transcript_scroll = self.transcript_scroll.saturating_sub(lines);
+        if self.transcript_scroll == 0 {
+            self.pending_below = 0;
+        }
     }
 
     /// 累积一次 run 的 token 用量（§16.2：footer 展示）。
@@ -465,10 +609,10 @@ fn bound_tail(tail: &str) -> String {
     if tail.chars().count() <= MAX_CHARS {
         return tail.to_string();
     }
+    // 取末尾 MAX_CHARS 字符并保持原顺序（“…” 前缀标记截断）。
     let mut out = String::from("…");
-    for ch in tail.chars().rev().take(MAX_CHARS) {
-        out.push(ch);
-    }
+    let suffix: String = tail.chars().rev().take(MAX_CHARS).collect();
+    out.extend(suffix.chars().rev());
     out
 }
 
@@ -477,7 +621,11 @@ fn bound_output(output: &str) -> String {
     if output.len() <= MAX_CARD_OUTPUT {
         return output.to_string();
     }
-    format!("…{}", &output[output.len() - MAX_CARD_OUTPUT..])
+    // “…” 是 3 字节 UTF-8，截断窗口相应减 3，保证总长不超过 MAX_CARD_OUTPUT。
+    format!(
+        "…{}",
+        &output[output.len() - (MAX_CARD_OUTPUT - 3)..]
+    )
 }
 
 #[cfg(test)]
@@ -514,17 +662,23 @@ mod tests {
 
     #[test]
     fn new_output_returns_to_follow_mode() {
+        // 整改 C：scroll lock 期间新输出不再强制拉回底部，只计数。
         let mut view = ViewModel::default();
         view.scroll_up(20);
         view.push_stream_delta(LineKind::Assistant, "new");
+        assert_eq!(view.transcript_scroll, 20, "scroll lock 保持");
+        assert_eq!(view.pending_below, 1, "新条目计数");
+        // Ctrl+End 恢复跟随并清空计数。
+        view.follow_tail();
         assert_eq!(view.transcript_scroll, 0);
+        assert_eq!(view.pending_below, 0);
     }
 
     #[test]
     fn tool_card_lifecycle_matches_by_call_id() {
         let mut view = ViewModel::default();
-        view.begin_tool("call-1", "bash", Some("bash: cargo test".into()));
-        view.begin_tool("call-2", "read", Some("read src/main.rs".into()));
+        view.begin_tool("call-1", "bash", Some("bash: cargo test".into()), None);
+        view.begin_tool("call-2", "read", Some("read src/main.rs".into()), None);
         view.finish_tool(
             "call-1",
             "bash",
@@ -538,7 +692,7 @@ mod tests {
         };
         assert_eq!(card.name, "bash");
         assert_eq!(
-            card.detail.as_deref(),
+            card.target.as_deref(),
             Some("bash: cargo test"),
             "detail 保留实际命令"
         );
@@ -561,7 +715,7 @@ mod tests {
     #[test]
     fn success_card_has_no_tail() {
         let mut view = ViewModel::default();
-        view.begin_tool("call-1", "bash", None);
+        view.begin_tool("call-1", "bash", None, None);
         view.finish_tool(
             "call-1",
             "bash",
@@ -587,7 +741,7 @@ mod tests {
     #[test]
     fn tail_is_bounded() {
         let mut view = ViewModel::default();
-        view.begin_tool("c", "bash", None);
+        view.begin_tool("c", "bash", None, None);
         view.finish_tool("c", "bash", ToolStatus::Failed, 0, None, "x".repeat(10_000));
         let Entry::Tool(card) = &view.transcript[0] else {
             panic!();
@@ -651,14 +805,15 @@ mod tests {
 
     #[test]
     fn reasoning_fold_defaults_visible() {
+        // 整改 A1：reasoning 默认折叠（不形成正文墙）。
         let view = ViewModel::default();
-        assert!(view.reasoning_visible);
+        assert!(!view.reasoning_visible);
     }
 
     #[test]
     fn finish_tool_keeps_success_output_expandable() {
         let mut view = ViewModel::default();
-        view.begin_tool("call-1", "bash", None);
+        view.begin_tool("call-1", "bash", None, None);
         // 运行中实时输出累积。
         view.append_tool_output("call-1", "line-1\n");
         view.append_tool_output("call-1", "line-2\n");
@@ -686,7 +841,7 @@ mod tests {
     #[test]
     fn append_tool_output_is_bounded() {
         let mut view = ViewModel::default();
-        view.begin_tool("c", "bash", None);
+        view.begin_tool("c", "bash", None, None);
         let big = "x".repeat(40 * 1024);
         view.append_tool_output("c", &big);
         let Entry::Tool(card) = &view.transcript[0] else {

@@ -209,7 +209,7 @@ fn user_message_has_you_label() {
 #[test]
 fn tool_card_renders_running_and_done_states() {
     let mut view = ViewModel::default();
-    view.begin_tool("c1", "bash", Some("bash: cargo test".into()));
+    view.begin_tool("c1", "bash", Some("bash: cargo test".into()), None);
     view.anim_tick = 0;
     let buffer = draw_to_test_backend(&view, 80, 12);
     let rendered = buffer_text(&buffer);
@@ -231,7 +231,7 @@ fn tool_card_renders_running_and_done_states() {
 #[test]
 fn failed_tool_card_shows_status_and_tail() {
     let mut view = ViewModel::default();
-    view.begin_tool("c1", "bash", Some("bash: cargo test".into()));
+    view.begin_tool("c1", "bash", Some("bash: cargo test".into()), None);
     view.finish_tool(
         "c1",
         "bash",
@@ -258,18 +258,20 @@ fn failed_tool_card_shows_status_and_tail() {
 #[test]
 fn reasoning_can_be_folded() {
     let mut view = ViewModel::default();
+    // 整改 A1：默认折叠（不显示正文）。
     view.push_line(LineKind::Reasoning, "内部推理过程");
-    let buffer = draw_to_test_backend(&view, 80, 12);
-    assert!(buffer_text(&buffer).contains("内部推理过程"));
-
-    view.reasoning_visible = false;
     let buffer = draw_to_test_backend(&view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(
         rendered.contains("已折叠"),
-        "折叠后显示提示行: {rendered:?}"
+        "默认折叠显示提示行: {rendered:?}"
     );
     assert!(!rendered.contains("内部推理过程"));
+
+    // Alt+T 展开后显示原文。
+    view.reasoning_visible = true;
+    let buffer = draw_to_test_backend(&view, 80, 12);
+    assert!(buffer_text(&buffer).contains("内部推理过程"));
 }
 
 /// Markdown 渲染：assistant 消息中加粗/行内代码进入 buffer 且带样式。
