@@ -16,4 +16,4 @@ contains = 'Demo Project'
 type = "bash"
 command = 'git status --porcelain'
 expect_exit = 0
-base_commit = "bc711c9647cb1e3f5217e3f15569cf6b43a5a396"
+base_commit = "a4949a5004cad8c8e5ad592c4c50d93c4905269a"

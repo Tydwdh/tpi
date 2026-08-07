@@ -80,7 +80,7 @@ fn main() {
         "Cargo.toml": '[package]\nname = "rust_fix_001"\nversion = "0.1.0"\nedition = "2021"\n',
     },
     "src/main.rs 无法编译（借用检查错误）。修复它，使 `cargo build` 通过。\n不要改变程序输出语义（first=1 len=4）。",
-    [bash_ok("cargo build", out="Finished", exit_code=0),
+    [bash_ok("cargo build", err="Finished", exit_code=0),
      bash_ok("./target/debug/rust_fix_001.exe", out="first=1 len=4")],
 )
 
@@ -122,7 +122,7 @@ mod tests {
         "Cargo.toml": '[package]\nname = "rust_fix_002"\nversion = "0.1.0"\nedition = "2021"\n',
     },
     "src/lib.rs 的 binary_search 有 bug：某些测试失败。修复算法使全部测试通过。\n不要修改测试代码。",
-    [bash_ok("cargo test", out="test result: ok")],
+    [bash_ok("cargo test", err="test result: ok")],
 )
 
 make_task(
@@ -160,7 +160,7 @@ mod tests {
         "Cargo.toml": '[package]\nname = "rust_fix_003"\nversion = "0.1.0"\nedition = "2021"\n',
     },
     "src/lib.rs 的 fizzbuzz 序列少了一项（区间边界错误）。修复使全部测试通过。\n不要修改测试代码。",
-    [bash_ok("cargo test", out="test result: ok")],
+    [bash_ok("cargo test", err="test result: ok")],
 )
 
 make_task(
@@ -193,7 +193,7 @@ mod tests {
         "Cargo.toml": '[package]\nname = "rust_fix_004"\nversion = "0.1.0"\nedition = "2021"\n',
     },
     "src/lib.rs 有两个问题：末尾多余空格导致测试失败；另外该函数在\n某个调用点有类型错误（把 &str 当 String 用）。修复使全部测试通过。\n不要修改测试代码。",
-    [bash_ok("cargo test", out="test result: ok")],
+    [bash_ok("cargo test", err="test result: ok")],
 )
 
 make_task(
@@ -480,7 +480,7 @@ mod tests {
         "Cargo.toml": '[package]\nname = "feature_001"\nversion = "0.1.0"\nedition = "2021"\n',
     },
     "src/lib.rs 的 `dedup` 未实现（todo!）。实现它：保留首次出现的元素、\n保持顺序。不要修改测试。使 `cargo test` 全绿。",
-    [bash_ok("cargo test", out="test result: ok")],
+    [bash_ok("cargo test", err="test result: ok")],
 )
 
 make_task(
@@ -509,7 +509,7 @@ mod tests {
         "Cargo.toml": '[package]\nname = "feature_002"\nversion = "0.1.0"\nedition = "2021"\n',
     },
     "src/lib.rs 的 `is_palindrome` 未实现（todo!）。实现：忽略大小写与非\n字母数字字符。不要修改测试。使 `cargo test` 全绿。",
-    [bash_ok("cargo test", out="test result: ok")],
+    [bash_ok("cargo test", err="test result: ok")],
 )
 
 make_task(
@@ -634,7 +634,7 @@ mod tests {
         "Cargo.toml": '[package]\nname = "refactor_001"\nversion = "0.1.0"\nedition = "2021"\n',
     },
     "refactor：average_a 与 average_b 完全重复。提取一个 `stats(scores) -> (f64, i32)`\n返回 (均值, 最大值)，让两个函数都调用它。`cargo test` 保持全绿。",
-    [bash_ok("cargo test", out="test result: ok"),
+    [bash_ok("cargo test", err="test result: ok"),
      file_contains("src/lib.rs", "fn stats")],
 )
 
@@ -886,7 +886,7 @@ make_task(
         "Cargo.toml": '[package]\nname = "long_context_001"\nversion = "0.1.0"\nedition = "2021"\n',
     },
     "src/lib.rs 有 600+ 行自动生成的函数。其中 `calculate` 的求和\n范围有 off-by-one（1..n 应为 1..=n）。定位并修复。不要修改测试。\n`cargo test` 全绿。",
-    [bash_ok("cargo test", out="test result: ok")],
+    [bash_ok("cargo test", err="test result: ok")],
 )
 
 # ============ git 操作 ============

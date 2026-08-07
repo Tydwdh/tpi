@@ -142,29 +142,34 @@ pub fn build_snapshot(path: Utf8PathBuf, raw: Vec<u8>) -> Result<FileSnapshot, E
 /// BOM 已剥离；`\r\n` 的 `\r` 不进入逻辑文本（§10.1：`logical_lf_text` 去 BOM 并统一 `\n`）。
 fn normalize_lf(text: &str, has_bom: bool) -> (String, Vec<usize>, LineEnding) {
     let raw_offset_base = if has_bom { 3 } else { 0 };
-    let bytes = text.as_bytes();
-    let mut logical = String::with_capacity(bytes.len());
-    let mut map = Vec::with_capacity(bytes.len() + 1);
+    let mut logical = String::with_capacity(text.len());
+    // 字节级映射：logical 字符串的每个**字节**位置 → 该字符起始的原始字节偏移。
+    // 多字节字符的所有字节映射到同一 raw 偏移；find()/len() 的字节索引可直接用。
+    let mut map = Vec::with_capacity(text.len() + 1);
     let mut crlf_count = 0usize;
     let mut lf_count = 0usize;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+    // 按字符迭代（UTF-8 安全）：此前按字节 `push(b as char)` 会把多字节
+    // 字符拆成 Latin-1 乱码（中文/emoji 文件 read/edit 全部损坏）。
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        if ch == '\r'
+            && let Some(&(_, '\n')) = chars.peek()
+        {
+            chars.next(); // 消费 \n
             crlf_count += 1;
             map.push(raw_offset_base + i);
             logical.push('\n');
-            i += 2;
-        } else {
-            if b == b'\n' {
-                lf_count += 1;
-            }
-            map.push(raw_offset_base + i);
-            logical.push(b as char);
-            i += 1;
+            continue;
         }
+        if ch == '\n' {
+            lf_count += 1;
+        }
+        for _ in 0..ch.len_utf8() {
+            map.push(raw_offset_base + i);
+        }
+        logical.push(ch);
     }
-    map.push(raw_offset_base + bytes.len());
+    map.push(raw_offset_base + text.len());
     let line_ending = if crlf_count > lf_count {
         LineEnding::Crlf
     } else {
@@ -961,6 +966,79 @@ mod tests {
         assert_eq!(snapshot.line_ending, LineEnding::Crlf);
         // 逻辑偏移 0 → 原始 3（BOM 后）。
         assert_eq!(snapshot.logical_to_raw[0], 3);
+    }
+
+    /// 回归：normalize_lf 此前按字节 push(b as char)，中文/emoji 被拆成
+    /// Latin-1 乱码（read 输出乱码、edit 匹配用乱码文本）。
+    #[test]
+    fn snapshot_keeps_multibyte_chars_intact() {
+        let path = Utf8PathBuf::from("test");
+        let raw = "// 目标：让 `cargo build` 通过。\nfn 主() {}\n".as_bytes();
+        let snapshot = build_snapshot(path, raw.to_vec()).unwrap();
+        assert_eq!(
+            &*snapshot.logical_lf_text,
+            "// 目标：让 `cargo build` 通过。\nfn 主() {}\n"
+        );
+        // 字符边界映射：'目' 的原始字节偏移 = 3（"// " 之后）。
+        assert_eq!(snapshot.logical_to_raw[3], 3);
+        // 行数正确（logical 按字符换行）。
+        assert_eq!(snapshot.logical_lf_text.lines().count(), 2);
+    }
+
+    /// 回归：中文内容 + CRLF + BOM 的组合快照与写回。
+    #[test]
+    fn snapshot_keeps_multibyte_crlf_and_bom() {
+        let path = Utf8PathBuf::from("test");
+        let raw_bytes = b"\xEF\xBB\xBF// \xe6\xa0\x87\xe9\xa2\x98\r\n\xe6\xad\xa3\xe6\x96\x87\xe5\x86\x85\xe5\xae\xb9\r\n";
+        let raw = String::from_utf8(raw_bytes.to_vec()).unwrap();
+        let snapshot = build_snapshot(path, raw.as_bytes().to_vec()).unwrap();
+        assert_eq!(&*snapshot.logical_lf_text, "// 标题\n正文内容\n");
+        assert_eq!(snapshot.line_ending, LineEnding::Crlf);
+        // '正' 的 logical 字节偏移 = 3("// ") + 6("标题") + 1(\n) = 10；
+        // raw 偏移 = 3(BOM) + 3 + 6 + 2(\r\n) = 14。
+        assert_eq!(snapshot.logical_to_raw[10], 14);
+        // 多字节字符的每个字节映射到同一 raw 偏移。
+        assert_eq!(snapshot.logical_to_raw[11], 14);
+        assert_eq!(snapshot.logical_to_raw[12], 14);
+    }
+
+    /// 回归：中文文件 read_window 返回正确文本（此前乱码）。
+    #[test]
+    fn read_window_returns_utf8_chinese() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("zh.rs")).unwrap();
+        std::fs::write(
+            path.as_std_path(),
+            "// 第一行\n// 第二行\nfn main() {}\n",
+        )
+        .unwrap();
+        let window = read_window(&path, 1, 3).unwrap();
+        assert_eq!(window.text, "// 第一行\n// 第二行\nfn main() {}");
+        assert_eq!(window.total_lines, 3);
+    }
+
+    /// 回归：中文替换 round-trip（old_text/new_text 均为中文，写回字节正确）。
+    #[test]
+    fn edit_chinese_round_trip_preserves_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("zh.rs")).unwrap();
+        let original = "// 标题：旧内容\nfn main() {}\n";
+        std::fs::write(path.as_std_path(), original).unwrap();
+        let snapshot = snapshot_file(&path).unwrap();
+        let result = apply_edit(
+            &path,
+            &snapshot.revision,
+            &[Replacement {
+                old_text: "旧内容".into(),
+                new_text: "新内容".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(result.new_raw, b"// \xe6\xa0\x87\xe9\xa2\x98\xef\xbc\x9a\xe6\x96\xb0\xe5\x86\x85\xe5\xae\xb9\nfn main() {}\n");
+        // 写回后可重新快照且 round-trip 稳定。
+        std::fs::write(path.as_std_path(), &result.new_raw).unwrap();
+        let again = snapshot_file(&path).unwrap();
+        assert_eq!(&*again.logical_lf_text, "// 标题：新内容\nfn main() {}\n");
     }
 
     #[test]

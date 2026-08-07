@@ -7,4 +7,4 @@ timeout_sec = 900
 type = "bash"
 command = 'cargo test'
 expect_exit = 0
-expect_stdout_contains = ['test result: ok']
+expect_stderr_contains = ['test result: ok']
