@@ -32,6 +32,8 @@ const DDG_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 /// DDG HTML 端点（免费、无需 API key）。
 const DDG_HTML_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+/// Bing HTML 端点（免费回退引擎；可能对异常流量返回人机验证页）。
+const BING_ENDPOINT: &str = "https://www.bing.com/search";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct WebSearchArgs {
@@ -189,130 +191,54 @@ async fn read_bounded_bytes(response: reqwest::Response, limit: usize) -> Result
 ///
 /// 免费方案：DuckDuckGo HTML 端点（无需 API key，零配置）。
 /// DDG 可能对异常流量返回人机验证页——此时返回明确错误，不静默降级。
+/// web_search（§17：只用于发现来源；结果摘要不是最终证据）。
+///
+/// 免费方案：主引擎 DuckDuckGo HTML 端点；失败（人机验证/无结果/HTTP
+/// 错误）时自动回退 Bing HTML 端点——不同网络环境下至少一个可用。
+/// 两个引擎都返回人机验证页时给出汇总错误，不产生乱码输出。
 pub async fn web_search(args: WebSearchArgs, _ctx: &ToolContext) -> ToolOutcome {
+    let count = args.count.clamp(1, 20);
+    let query = build_search_query(&args);
+    let freshness = args.freshness.as_deref();
+
+    match search_ddg(&query, freshness).await {
+        Ok(hits) => search_succeeded(&args, hits, count),
+        Err(ddg_error) => {
+            tracing::warn!(error = %ddg_error, "web_search: DDG 失败，回退 Bing");
+            match search_bing(&query, freshness).await {
+                Ok(hits) => search_succeeded(&args, hits, count),
+                Err(bing_error) => ToolOutcome::failed(
+                    "web_search",
+                    ModelPayload {
+                        status: ToolStatus::Failed,
+                        program: None,
+                        exit_code: None,
+                        duration_ms: 0,
+                        output: format!(
+                            "status: failed\ntool: web_search\nerror: both_engines_failed\n\nDuckDuckGo: {ddg_error}\nBing: {bing_error}"
+                        ),
+                        effect: None,
+                        artifact: None,
+                    },
+                ),
+            }
+        }
+    }
+}
+
+/// 拼接查询（原始 query + site: 域过滤）。
+fn build_search_query(args: &WebSearchArgs) -> String {
     let mut query = args.query.clone();
     if let Some(domains) = &args.domains {
         for domain in domains {
             query.push_str(&format!(" site:{domain}"));
         }
     }
-    let count = args.count.clamp(1, 20);
-    let mut url = format!("{DDG_HTML_ENDPOINT}?q={}", urlencode(&query));
-    if let Some(df) = args.freshness.as_deref().and_then(ddg_freshness) {
-        url.push_str(&format!("&df={df}"));
-    }
+    query
+}
 
-    let client = reqwest::Client::new();
-    let response = match client
-        .get(&url)
-        .header(reqwest::header::USER_AGENT, DDG_USER_AGENT)
-        .header(reqwest::header::ACCEPT, "text/html")
-        .timeout(FETCH_TIMEOUT)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            return ToolOutcome::failed(
-                "web_search",
-                ModelPayload {
-                    status: ToolStatus::Failed,
-                    program: None,
-                    exit_code: None,
-                    duration_ms: 0,
-                    output: format!(
-                        "status: failed\ntool: web_search\nerror: request_failed\n\n{error}"
-                    ),
-                    effect: None,
-                    artifact: None,
-                },
-            );
-        }
-    };
-    let status = response.status();
-    let body_bytes = match read_bounded_bytes(response, SEARCH_RAW_LIMIT).await {
-        Ok(bytes) => bytes,
-        Err(error) if error.starts_with("body_too_large") => {
-            return ToolOutcome::failed(
-                "web_search",
-                ModelPayload {
-                    status: ToolStatus::Failed,
-                    program: None,
-                    exit_code: None,
-                    duration_ms: 0,
-                    output: format!(
-                        "status: failed\ntool: web_search\nerror: body_too_large\n\n响应体超过 {SEARCH_RAW_LIMIT} 字节限制。"
-                    ),
-                    effect: None,
-                    artifact: None,
-                },
-            );
-        }
-        Err(error) => {
-            return ToolOutcome::failed(
-                "web_search",
-                ModelPayload {
-                    status: ToolStatus::Failed,
-                    program: None,
-                    exit_code: None,
-                    duration_ms: 0,
-                    output: format!(
-                        "status: failed\ntool: web_search\nerror: read_failed\n\n{error}"
-                    ),
-                    effect: None,
-                    artifact: None,
-                },
-            );
-        }
-    };
-    let body = String::from_utf8_lossy(&body_bytes).into_owned();
-    if !status.is_success() {
-        return ToolOutcome::failed(
-            "web_search",
-            ModelPayload {
-                status: ToolStatus::Failed,
-                program: None,
-                exit_code: None,
-                duration_ms: 0,
-                output: format!("status: failed\ntool: web_search\nerror: http_{status}\n\n{body}"),
-                effect: None,
-                artifact: None,
-            },
-        );
-    }
-
-    if is_ddg_bot_challenge(&body) {
-        return ToolOutcome::failed(
-            "web_search",
-            ModelPayload {
-                status: ToolStatus::Failed,
-                program: None,
-                exit_code: None,
-                duration_ms: 0,
-                output: "status: failed\ntool: web_search\nerror: bot_challenge\n\nDuckDuckGo 返回了人机验证页（疑似流量异常）。稍后重试，或换用其他查询。"
-                    .into(),
-                effect: None,
-                artifact: None,
-            },
-        );
-    }
-
-    let hits = parse_ddg_results(&body);
-    if hits.is_empty() {
-        return ToolOutcome::failed(
-            "web_search",
-            ModelPayload {
-                status: ToolStatus::Failed,
-                program: None,
-                exit_code: None,
-                duration_ms: 0,
-                output: "status: failed\ntool: web_search\nerror: no_results\n\n没有找到结果（或结果页结构与预期不符）。".into(),
-                effect: None,
-                artifact: None,
-            },
-        );
-    }
-
+/// 成功输出（DDG/Bing 结果格式一致）。
+fn search_succeeded(args: &WebSearchArgs, hits: Vec<DdgHit>, count: u32) -> ToolOutcome {
     let mut output = String::from("status: succeeded\ntool: web_search\n");
     output.push_str(&format!(
         "query: {}\nresults: {}\n\n",
@@ -330,9 +256,74 @@ pub async fn web_search(args: WebSearchArgs, _ctx: &ToolContext) -> ToolOutcome 
     }
     ToolOutcome::succeeded("web_search", output).with_metadata(ToolMetadata {
         tool: "web_search".into(),
-        target: Some(args.query),
+        target: Some(args.query.clone()),
         ..Default::default()
     })
+}
+
+/// 通用 HTML GET：浏览器 UA + timeout + 有界读取 + HTTP 状态检查。
+async fn fetch_search_html(url: &str) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let response = match client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, DDG_USER_AGENT)
+        .header(reqwest::header::ACCEPT, "text/html")
+        .timeout(FETCH_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return Err(format!("request_failed: {error}")),
+    };
+    let status = response.status();
+    let body_bytes = match read_bounded_bytes(response, SEARCH_RAW_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.starts_with("body_too_large") => {
+            return Err(format!(
+                "body_too_large: 响应体超过 {SEARCH_RAW_LIMIT} 字节限制"
+            ));
+        }
+        Err(error) => return Err(format!("read_failed: {error}")),
+    };
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
+    if !status.is_success() {
+        return Err(format!("http_{status}"));
+    }
+    Ok(body)
+}
+
+/// DDG 引擎：无结果/人机验证/错误时返回 Err（触发 Bing 回退）。
+async fn search_ddg(query: &str, freshness: Option<&str>) -> Result<Vec<DdgHit>, String> {
+    let mut url = format!("{DDG_HTML_ENDPOINT}?q={}", urlencode(query));
+    if let Some(df) = freshness.and_then(ddg_freshness) {
+        url.push_str(&format!("&df={df}"));
+    }
+    let body = fetch_search_html(&url).await?;
+    if is_ddg_bot_challenge(&body) {
+        return Err("bot_challenge: DuckDuckGo 返回人机验证页（疑似流量异常）".into());
+    }
+    let hits = parse_ddg_results(&body);
+    if hits.is_empty() {
+        return Err("no_results: DuckDuckGo 无结果（或页面结构变化）".into());
+    }
+    Ok(hits)
+}
+
+/// Bing 引擎：无结果/人机验证/错误时返回 Err。
+async fn search_bing(query: &str, freshness: Option<&str>) -> Result<Vec<DdgHit>, String> {
+    let mut url = format!("{BING_ENDPOINT}?q={}&count=10&setlang=en", urlencode(query));
+    if let Some(qft) = freshness.and_then(bing_freshness) {
+        url.push_str(&format!("&qft={}", urlencode(qft)));
+    }
+    let body = fetch_search_html(&url).await?;
+    if is_bing_captcha(&body) {
+        return Err("bot_challenge: Bing 返回人机验证页（疑似流量异常）".into());
+    }
+    let hits = parse_bing_results(&body);
+    if hits.is_empty() {
+        return Err("no_results: Bing 无结果（或页面结构变化）".into());
+    }
+    Ok(hits)
 }
 
 /// DDG 的 df 参数（Brave freshness 语法 → DDG）。
@@ -342,6 +333,17 @@ fn ddg_freshness(value: &str) -> Option<&'static str> {
         "pd_1w" => Some("w"),
         "pd_1m" => Some("m"),
         "pd_1y" => Some("y"),
+        _ => None,
+    }
+}
+
+/// Bing 的 qft 参数（过去 N 天；`interval="N"` 由调用方 urlencode）。
+fn bing_freshness(value: &str) -> Option<&'static str> {
+    match value {
+        "pd_1d" => Some(r#"interval="1""#),
+        "pd_1w" => Some(r#"interval="7""#),
+        "pd_1m" => Some(r#"interval="30""#),
+        "pd_1y" => Some(r#"interval="365""#),
         _ => None,
     }
 }
@@ -519,6 +521,112 @@ fn percent_decode(value: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+// ---- Bing HTML 端点（回退引擎）----
+
+/// Bing HTML 端点的人机验证页特征（Cloudflare Turnstile challenge）。
+pub fn is_bing_captcha(html: &str) -> bool {
+    html.contains("verifyEndpoint")
+        || html.contains("captchaSuccessPostMessage")
+        || html.contains("b_captcha")
+        || html.contains("CAPTCHA")
+}
+
+/// 解析 Bing HTML 结果页（`<li class="b_algo">` 块，多年稳定）。
+///
+/// - 广告块（`b_ad`）过滤；
+/// - 标题 `<h2><a href="...">Title</a></h2>`；
+/// - 摘要 `<p>snippet</p>`；
+/// - Bing 重定向链接 `bing.com/ck/a?...&u=<base64url>` 还原真实 URL。
+pub fn parse_bing_results(html: &str) -> Vec<DdgHit> {
+    let mut hits = Vec::new();
+    for block in html.split("b_algo").skip(1) {
+        if block.contains("b_ad") || block.contains("b_ad2") {
+            continue; // 广告（§17：不展示广告结果）。
+        }
+        let Some((title, raw_href)) = extract_first_anchor(block) else {
+            continue;
+        };
+        let url = decode_bing_href(&raw_href);
+        if url.is_empty() || title.is_empty() {
+            continue;
+        }
+        let snippet = extract_first_paragraph(block).unwrap_or_default();
+        hits.push(DdgHit {
+            title,
+            url,
+            snippet,
+        });
+    }
+    hits
+}
+
+/// 提取块内第一个 `<a href="...">text</a>`（Bing 的 `<h2><a>` 标题）。
+fn extract_first_anchor(block: &str) -> Option<(String, String)> {
+    let anchor_start = block.find("<a ")?;
+    let after = &block[anchor_start..];
+    let tag_end = after.find('>')?;
+    let href = extract_href_attr(&after[..tag_end]);
+    let inner = &after[tag_end + 1..];
+    let close = inner.find("</a>")?;
+    let text = strip_tags(&inner[..close]);
+    Some((text, href))
+}
+
+/// 提取块内第一个 `<p ...>text</p>` 的文本（Bing 摘要）。
+fn extract_first_paragraph(block: &str) -> Option<String> {
+    let start = block.find("<p")?;
+    let after = &block[start..];
+    let tag_end = after.find('>')?;
+    let inner = &after[tag_end + 1..];
+    let close = inner.find("</p>")?;
+    let text = strip_tags(&inner[..close]);
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// 还原 Bing 跳转链接：`https://www.bing.com/ck/a?...&u=<base64url>&ntb=1`。
+/// 普通直链原样返回。
+fn decode_bing_href(href: &str) -> String {
+    if let Some(start) = href.find("u=") {
+        let value = &href[start + 2..];
+        let value = value.split('&').next().unwrap_or("");
+        // u= 值先做 URL 百分号解码（Bing 会对 padding 的 `=` 编码为 %3d），
+        // 再 base64url 解码得到真实 URL。
+        let value = percent_decode(value);
+        if let Some(decoded) = base64url_decode(&value) {
+            let decoded = decode_html_entities(&decoded);
+            if decoded.starts_with("http://") || decoded.starts_with("https://") {
+                return decoded;
+            }
+        }
+    }
+    let decoded = decode_html_entities(href);
+    if let Some(rest) = decoded.strip_prefix("//") {
+        return format!("https://{rest}");
+    }
+    decoded
+}
+
+/// base64url 解码（无 padding 或带 `=` padding、URL-safe 字母表；失败返回 None）。
+fn base64url_decode(value: &str) -> Option<String> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut bits: u32 = 0;
+    let mut nbits = 0u32;
+    let mut out = Vec::with_capacity(value.len() * 3 / 4);
+    for byte in value.bytes() {
+        if byte == b'=' {
+            break; // padding（仅允许在末尾）
+        }
+        let index = ALPHABET.iter().position(|&c| c == byte)?;
+        bits = (bits << 6) | index as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((bits >> nbits) as u8);
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// web_fetch（§17：限制 redirect、响应体大小和 timeout；HTML 转换）。
@@ -909,5 +1017,67 @@ mod tests {
         assert_eq!(ddg_freshness("pd_1y"), Some("y"));
         assert_eq!(ddg_freshness("2025-01-01..2025-02-01"), None);
         assert_eq!(ddg_freshness(""), None);
+    }
+
+    // ---- Bing 回退引擎 ----
+
+    /// 标准 b_algo 结构：普通结果（含 ck/a 重定向）+ 广告 + 协议相对链接。
+    fn bing_fixture() -> String {
+        r##"<html><body>
+<li class="b_algo"><h2><a href="https://www.bing.com/ck/a?x=1&u=aHR0cHM6Ly9ydXN0LWxhbmcub3JnLw%3d%3d&ntb=1">Rust Programming Language</a></h2><div class="b_caption"><p>Systems programming language focused on <b>safety</b>.</p></div></li>
+<li class="b_algo b_ad"><h2><a href="https://ad.example/">Sponsored</a></h2><p>ad text</p></li>
+<li class="b_algo"><h2><a href="https://doc.rust-lang.org/book/">The Rust Book</a></h2><div class="b_caption"><p>Learn Rust with the official book.</p></div></li>
+<li class="b_algo"><h2><a href="//example.com/protocol-relative">Rel</a></h2><p>proto</p></li>
+</body></html>
+"##
+        .to_string()
+    }
+
+    #[test]
+    fn parses_bing_fixture_skips_ads_and_decodes_redirects() {
+        let hits = parse_bing_results(&bing_fixture());
+        // 广告过滤后剩 3 个真实结果。
+        assert_eq!(hits.len(), 3, "广告块必须被过滤: {hits:?}");
+        let rust = hits
+            .iter()
+            .find(|h| h.title.contains("Rust Programming"))
+            .unwrap();
+        // ck/a 的 u= base64url 还原为真实 URL（含 %3d padding 与实体解码）。
+        assert_eq!(rust.url, "https://rust-lang.org/");
+        assert_eq!(
+            rust.snippet,
+            "Systems programming language focused on safety."
+        );
+        // 协议相对链接补全。
+        assert_eq!(hits[2].url, "https://example.com/protocol-relative");
+        assert!(!hits.iter().any(|h| h.url.contains("bing.com/ck")));
+    }
+
+    #[test]
+    fn bing_challenge_page_is_detected() {
+        // 真实 captcha 页特征（Cloudflare Turnstile challenge）。
+        let real = r#"var CfConfig ={"lang":"en","verifyEndpoint":"https://www.bing.com/challenge/verify?partner=7","captchaSuccessPostMessage":"verificationComplete"};"#;
+        assert!(is_bing_captcha(real));
+        assert!(!is_bing_captcha(&bing_fixture()));
+    }
+
+    #[test]
+    fn base64url_decode_round_trips() {
+        // "https://rust-lang.org/" 的 base64url（无 padding）。
+        assert_eq!(
+            base64url_decode("aHR0cHM6Ly9ydXN0LWxhbmcub3JnLw").as_deref(),
+            Some("https://rust-lang.org/")
+        );
+        // 非法字符 → None（不 panic）。
+        assert_eq!(base64url_decode("!!!not-base64!!"), None);
+    }
+
+    #[test]
+    fn bing_freshness_maps_brave_syntax() {
+        assert_eq!(bing_freshness("pd_1d"), Some(r#"interval="1""#));
+        assert_eq!(bing_freshness("pd_1w"), Some(r#"interval="7""#));
+        assert_eq!(bing_freshness("pd_1m"), Some(r#"interval="30""#));
+        assert_eq!(bing_freshness("pd_1y"), Some(r#"interval="365""#));
+        assert_eq!(bing_freshness("nonsense"), None);
     }
 }
