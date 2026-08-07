@@ -206,8 +206,13 @@ async fn interactive_loop<P: Provider>(
     use crate::tui::model::LineKind;
     use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
-    let mut renderer = Renderer::new(crate::tui::theme::Theme::named(&config.ui_theme))
-        .map_err(|e| format!("初始化终端失败: {e}"))?;
+    let mut renderer = Renderer::new(
+        crate::tui::theme::Theme::named(&config.ui_theme),
+        config.ui_mode,
+    )
+    .map_err(|e| format!("初始化终端失败: {e}"))?;
+    // §31：panic 时尽力恢复终端（不把 Windows Terminal/PowerShell 留在 raw mode）。
+    install_terminal_panic_hook();
     let mut view = ViewModel {
         model_name: config.model.name.clone(),
         workspace: config
@@ -1129,6 +1134,20 @@ fn restore_terminal_on_exit() {
         ratatui::crossterm::style::ResetColor,
     );
     let _ = std::io::stdout().flush();
+}
+
+/// §31：panic hook——先尽力恢复终端，再走默认 panic 输出。
+/// 只安装一次（进程级）；恢复逻辑不依赖具体实例（TerminalDriver::restore_global）。
+fn install_terminal_panic_hook() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            crate::tui::terminal::TerminalDriver::restore_global();
+            default(info);
+        }));
+    });
 }
 
 fn create_session(

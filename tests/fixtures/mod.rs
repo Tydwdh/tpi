@@ -28,6 +28,7 @@ pub fn test_config(workspace_root: &Utf8PathBuf) -> Config {
         artifacts_root: workspace_root.join(".tpi-test-artifacts").into(),
         shell_path: None,
         safety_reserve_tokens: 8192,
+        ui_mode: Default::default(),
         web_brave_key_env: "TPI_BRAVE_API_KEY".into(),
         auto_open_browser: false,
         web_summary_model: "none".into(),

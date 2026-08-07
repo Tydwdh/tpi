@@ -28,12 +28,14 @@ pub struct ConfigFile {
     pub ui: UiFile,
 }
 
-/// §16.3 [ui] 配置（P2：主题可选，默认 omp）。
+/// §16.3 [ui] 配置（P2：主题可选，默认 omp；TUI v2：模式可选，默认 fullscreen）。
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct UiFile {
     /// 主题名：omp / dark / light（未知值回退 omp）。
     pub theme: Option<String>,
+    /// 视口模式：fullscreen（默认）/ inline（兼容模式；§1.2）。
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -109,6 +111,8 @@ pub struct Config {
     pub source: String,
     /// §16.3 [ui] theme：omp / dark / light（P2：主题可选，默认 omp）。
     pub ui_theme: String,
+    /// §1 [ui] mode：fullscreen（默认）/ inline（兼容模式）。
+    pub ui_mode: crate::tui::terminal::ViewMode,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +255,12 @@ pub fn load(workspace_root: &Utf8PathBuf, cli_model: Option<&str>) -> Result<Con
         system_prompt_extra,
         source,
         ui_theme: merged.ui.theme.clone().unwrap_or_else(|| "omp".to_string()),
+        ui_mode: merged
+            .ui
+            .mode
+            .as_deref()
+            .map(crate::tui::terminal::ViewMode::parse)
+            .unwrap_or_default(),
     })
 }
 
@@ -283,6 +293,7 @@ fn merge(home: ConfigFile, workspace: ConfigFile) -> ConfigFile {
         },
         ui: UiFile {
             theme: workspace.ui.theme.or(home.ui.theme),
+            mode: workspace.ui.mode.or(home.ui.mode),
         },
     }
 }

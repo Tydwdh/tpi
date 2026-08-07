@@ -49,6 +49,9 @@ struct Cli {
     /// 工作目录（默认当前目录）
     #[arg(long)]
     cwd: Option<PathBuf>,
+    /// 兼容模式：inline 视口（默认 fullscreen，§1.2）
+    #[arg(long)]
+    inline: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -321,7 +324,11 @@ fn run(cli: Cli) -> Result<(), String> {
     init_logging()?;
 
     let workspace_root: Utf8PathBuf = current_workspace_root(cli.cwd.as_deref())?;
-    let config = config::load(&workspace_root, cli.model.as_deref())?;
+    let mut config = config::load(&workspace_root, cli.model.as_deref())?;
+    // §1.2：`--inline` 覆盖 `[ui] mode`（兼容模式，仅特殊终端环境使用）。
+    if cli.inline {
+        config.ui_mode = tpi::tui::terminal::ViewMode::Inline;
+    }
 
     if cli.no_session && (cli.continue_session || cli.resume.is_some()) {
         return Err("--no-session 不能与 --continue/--resume 同时使用".into());

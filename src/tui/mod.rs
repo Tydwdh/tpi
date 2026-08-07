@@ -17,12 +17,9 @@
 
 pub mod editor;
 pub mod model;
+pub mod terminal;
 pub mod text;
 pub mod theme;
-
-use std::collections::HashMap;
-use std::io::{BufWriter, Stdout};
-use std::time::Instant;
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -30,6 +27,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
+use std::collections::HashMap;
+use std::time::Instant;
 
 use model::{Entry, LineKind, StatusLine, ToolCard, ToolCardState, TranscriptLine, ViewModel};
 
@@ -76,18 +75,19 @@ pub enum HitTarget {
 /// stdout 的唯一所有者（§3.2 不变量 11、§16.1）。
 ///
 /// M6+：内部持有 Ratatui `Terminal`（inline viewport，保留 scrollback）；
+/// TUI v2（§29）：终端生命周期已抽到 [`terminal::TerminalDriver`]，
+/// Renderer 不再直接触碰 crossterm。
 /// `draw` 是唯一写 stdout 的路径。帧合并由 [`should_draw`](Self::should_draw) 控制。
 pub struct Renderer {
-    terminal: Terminal<CrosstermBackend<BufWriter<Stdout>>>,
-    /// 当前活动区高度（resize 时随终端行数重新计算并重建 viewport）。
-    activity_rows: u16,
+    driver: terminal::TerminalDriver,
     last_draw: Option<Instant>,
     /// 距上次 draw 的合并计数（诊断与测试用）。
     pub coalesced_events: u64,
     theme: theme::Theme,
-    /// inline scrollback 是否可用（首次 `insert_before` 失败后降级为内部滚动）。
+    /// inline scrollback 是否可用（首次 `insert_before` 失败后降级为内部滚动；
+    /// fullscreen 模式下恒为 false——全屏直接绘制，无 scrollback 概念）。
     scrollback: bool,
-    /// 已提交到 scrollback 的（折行后）行数。
+    /// 已提交到 scrollback 的（折行后）行数（inline 专用）。
     committed_lines: usize,
     /// Markdown 渲染缓存：条目 version → 渲染后的逻辑行。
     md_cache: HashMap<u64, Vec<Line<'static>>>,
@@ -114,44 +114,18 @@ struct FramePlan {
 }
 
 impl Renderer {
-    /// 初始化终端（raw mode + 隐藏光标 + inline viewport + 同步更新支持）。
-    /// P2：主题由配置注入（`[ui] theme`）。
-    pub fn new(theme: theme::Theme) -> std::io::Result<Self> {
-        ratatui::crossterm::terminal::enable_raw_mode()?;
-        // 鼠标：点击工具卡片展开、滚轮翻页（键盘线程的 event::read 会收到）。
-        let _ = ratatui::crossterm::execute!(
-            std::io::stdout(),
-            ratatui::crossterm::event::EnableMouseCapture
-        );
-        let stdout = BufWriter::new(std::io::stdout());
-        let backend = CrosstermBackend::new(stdout);
-        // §16.1：活动区高度随终端大小自适应（约 2/5 屏，resize 时重新计算）。
-        let (_, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
-        let height = activity_height(rows);
-        let mut terminal = match Terminal::with_options(
-            backend,
-            ratatui::TerminalOptions {
-                viewport: ratatui::Viewport::Inline(height),
-            },
-        ) {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                let _ = ratatui::crossterm::terminal::disable_raw_mode();
-                return Err(error);
-            }
-        };
-        if let Err(error) = terminal.hide_cursor() {
-            let _ = ratatui::crossterm::terminal::disable_raw_mode();
-            return Err(error);
-        }
-        // inline TUI 不清除 scrollback 或整个屏幕；首帧只绘制自己的区域。
+    /// 初始化终端（§29-30：raw mode + alternate screen（fullscreen）+ bracketed
+    /// paste + mouse capture + hide cursor）。P2：主题由配置注入（`[ui] theme`）。
+    /// 默认全屏（§1）；inline 仅兼容模式。
+    pub fn new(theme: theme::Theme, mode: terminal::ViewMode) -> std::io::Result<Self> {
+        let driver = terminal::TerminalDriver::new(mode)?;
         Ok(Self {
-            terminal,
-            activity_rows: height,
+            driver,
             last_draw: None,
             coalesced_events: 0,
             theme,
-            scrollback: true,
+            // inline 模式 scrollback 可用；fullscreen 直接绘制整个终端。
+            scrollback: mode == terminal::ViewMode::Inline,
             committed_lines: 0,
             md_cache: HashMap::new(),
             cache_width: 0,
@@ -185,6 +159,7 @@ impl Renderer {
     /// 渲染一帧（唯一的 stdout 写入路径；§16.1 以帧为单位合并模型增量）。
     pub fn draw(&mut self, view: &ViewModel) -> std::io::Result<()> {
         let theme = self.theme;
+        let mode = self.driver.mode();
         let mut cache = std::mem::take(&mut self.md_cache);
         let mut cache_width = self.cache_width;
         let mut committed = self.committed_lines;
@@ -192,7 +167,7 @@ impl Renderer {
         let mut new_committed = committed;
         let scrollback = self.scrollback;
         let mut plan_out: Option<FramePlan> = None;
-        self.terminal.draw(|frame| {
+        self.driver.draw(|frame| {
             let FramePlan {
                 window,
                 row_hits,
@@ -207,6 +182,7 @@ impl Renderer {
                 &mut cache_width,
                 &mut committed,
                 scrollback,
+                mode,
             );
             overflow = frame_overflow;
             new_committed = committed_after;
@@ -224,12 +200,13 @@ impl Renderer {
             self.last_row_hits = plan.row_hits;
             self.hits_valid = true;
         }
-        // §16.1：闭合且不再变化的行提交到 scrollback（活动区上方）。
+        // §16.1：闭合且不再变化的行提交到 scrollback（活动区上方；仅 inline）。
+        // fullscreen：alternate screen 内直接绘制整个终端，无 scrollback。
         if scrollback && !overflow.is_empty() {
             let lines = std::mem::take(&mut overflow);
             let height = lines.len() as u16;
             if self
-                .terminal
+                .driver
                 .insert_before(height, |buf| {
                     let area = Rect::new(0, 0, buf.area().width, height);
                     ratatui::widgets::Paragraph::new(Text::from(lines.clone())).render(area, buf);
@@ -249,65 +226,30 @@ impl Renderer {
     }
 
     /// 终端 resize 时重算布局（§16.1：不丢 transcript、不闪白）。
-    /// 终端 resize 时重算布局（§16.1：不丢 transcript、不闪白）。
     ///
-    /// ratatui 的 `Viewport::Inline(height)` 高度在 resize 时保持不变（只重算原点）；
-    /// 这里在终端行数变化时重新计算活动区高度并重建 viewport，实现随终端自适应。
+    /// fullscreen：Viewport::Fullscreen 自动跟随终端大小；inline：Viewport::Inline
+    /// 高度在 resize 时保持不变（只重算原点），行数变化时重建 viewport。
     pub fn autoresize(&mut self) -> std::io::Result<()> {
-        self.terminal.autoresize()?;
-        let (_, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
-        let height = activity_height(rows);
-        if height != self.activity_rows {
-            self.rebuild_viewport(height)?;
-        }
-        Ok(())
+        self.driver.autoresize()
     }
 
-    /// 以新高度重建 inline viewport（scrollback 在终端缓冲区中，重建不清屏）。
-    fn rebuild_viewport(&mut self, height: u16) -> std::io::Result<()> {
-        let stdout = BufWriter::new(std::io::stdout());
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::with_options(
-            backend,
-            ratatui::TerminalOptions {
-                viewport: ratatui::Viewport::Inline(height),
-            },
-        )?;
-        self.terminal = terminal;
-        self.terminal.hide_cursor()?;
-        self.activity_rows = height;
-        Ok(())
-    }
-
-    /// 恢复终端（异常退出也能恢复，§21 M5 验收）。
+    /// 恢复终端（异常退出也能恢复，§21 M5 验收；委托 TerminalDriver 逆序恢复）。
     pub fn restore(&mut self) -> std::io::Result<()> {
-        self.terminal.show_cursor()?;
-        let _ = ratatui::crossterm::execute!(
-            std::io::stdout(),
-            ratatui::crossterm::event::DisableMouseCapture
-        );
-        self.terminal.flush()?;
-        ratatui::crossterm::terminal::disable_raw_mode()
+        self.driver.restore()
     }
 }
 
 impl Drop for Renderer {
     fn drop(&mut self) {
         // app 因错误提前返回时仍尽力还原终端。显式 restore 是正常路径；
-        // 这里的重复调用安全且避免用户遗留在 raw mode。
-        let _ = self.terminal.show_cursor();
-        let _ = ratatui::crossterm::execute!(
-            std::io::stdout(),
-            ratatui::crossterm::event::DisableMouseCapture
-        );
-        let _ = self.terminal.flush();
-        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        // TerminalDriver 的 Drop 同样尽力恢复（§31），重复调用安全。
+        let _ = self.driver.restore();
     }
 }
 
 impl Default for Renderer {
     fn default() -> Self {
-        Self::new(theme::Theme::omp()).expect("renderer init")
+        Self::new(theme::Theme::omp(), terminal::ViewMode::Inline).expect("renderer init")
     }
 }
 
@@ -323,6 +265,7 @@ fn render_frame(
     cache_width: &mut u16,
     committed: &mut usize,
     scrollback: bool,
+    mode: terminal::ViewMode,
 ) -> FramePlan {
     let area = frame.area();
     // 宽度变化 → Markdown 渲染缓存失效，提交位置重置为当前窗口起点
@@ -336,12 +279,13 @@ fn render_frame(
     let input_rows = input_area_rows(view, area.width);
     let plan_rows = plan_area_rows(view);
 
+    // §8.1：自下而上 = footer(1) → input(1..8) → plan(0..N) → transcript(Min)。
     let mut constraints: Vec<Constraint> = vec![Constraint::Min(1)];
     if plan_rows > 0 {
         constraints.push(Constraint::Length(plan_rows));
     }
-    constraints.push(Constraint::Length(1)); // footer
     constraints.push(Constraint::Length(input_rows));
+    constraints.push(Constraint::Length(1)); // footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -356,14 +300,14 @@ fn render_frame(
     } else {
         None
     };
-    let footer_area = chunks[idx];
-    idx += 1;
     let input_area = chunks[idx];
+    idx += 1;
+    let footer_area = chunks[idx];
 
     if let Some(pa) = plan_area {
         draw_plan(frame, pa, view, theme);
     }
-    draw_footer(frame, footer_area, view, theme, scrollback);
+    draw_footer(frame, footer_area, view, theme, scrollback, mode);
 
     let plan = plan_window(
         view,
@@ -1003,6 +947,7 @@ fn draw_footer(
     view: &ViewModel,
     theme: theme::Theme,
     scrollback: bool,
+    mode: terminal::ViewMode,
 ) {
     let muted = Style::default().fg(theme.muted);
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -1068,7 +1013,8 @@ fn draw_footer(
             muted,
         ));
     }
-    if !scrollback {
+    // 兼容模式提示：仅 inline 且 scrollback 不可用时显示（fullscreen 正常模式）。
+    if !scrollback && mode == terminal::ViewMode::Inline {
         spans.push(Span::styled(
             " · 兼容模式（无滚动回退）",
             Style::default().fg(theme.warning),
@@ -1277,18 +1223,28 @@ fn fmt_tokens(n: u64) -> String {
 
 /// 用 TestBackend 渲染一帧（测试与录制用，§20.3）。
 pub fn draw_to_test_backend(view: &ViewModel, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    draw_to_test_backend_mode(view, width, height, terminal::ViewMode::Inline)
+}
+
+/// 用 TestBackend 按指定视口模式渲染一帧（§20.3；fullscreen 验收测试用）。
+pub fn draw_to_test_backend_mode(
+    view: &ViewModel,
+    width: u16,
+    height: u16,
+    mode: terminal::ViewMode,
+) -> ratatui::buffer::Buffer {
     let backend = ratatui::backend::TestBackend::new(width, height);
-    let mut terminal = Terminal::with_options(
-        backend,
-        ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Inline(height),
-        },
-    )
-    .expect("test terminal");
+    let viewport = match mode {
+        terminal::ViewMode::Fullscreen => ratatui::Viewport::Fullscreen,
+        terminal::ViewMode::Inline => ratatui::Viewport::Inline(height),
+    };
+    let mut terminal = Terminal::with_options(backend, ratatui::TerminalOptions { viewport })
+        .expect("test terminal");
     let theme = theme::Theme::omp();
     let mut cache: HashMap<u64, Vec<Line<'static>>> = HashMap::new();
     let mut cache_width = 0u16;
     let mut committed = 0usize;
+    let scrollback = mode == terminal::ViewMode::Inline;
     terminal
         .draw(|frame| {
             render_frame(
@@ -1298,7 +1254,8 @@ pub fn draw_to_test_backend(view: &ViewModel, width: u16, height: u16) -> ratatu
                 &mut cache,
                 &mut cache_width,
                 &mut committed,
-                true,
+                scrollback,
+                mode,
             );
         })
         .expect("draw");
@@ -1332,6 +1289,7 @@ pub fn draw_captured_bytes(view: &ViewModel) -> Vec<u8> {
                     &mut cache_width,
                     &mut committed,
                     true,
+                    terminal::ViewMode::Inline,
                 );
                 overflow = plan.overflow;
             })
