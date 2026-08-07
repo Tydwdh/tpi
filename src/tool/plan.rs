@@ -186,7 +186,7 @@ pub fn update_plan(
     ctx: &crate::tool::ToolContext,
 ) -> crate::tool::outcome::ToolOutcome {
     use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
-    let previous = ctx.current_plan.lock().unwrap().clone();
+    let previous = crate::util::lock_mutex(&ctx.current_plan, "current_plan").clone();
     match build_plan(&args, previous.as_ref()) {
         Ok(plan) => {
             if let Err(error) = validate_invariants(&plan) {
@@ -214,7 +214,7 @@ pub fn update_plan(
                     plan_snapshot(Some(&plan))
                 )
             };
-            *ctx.current_plan.lock().unwrap() = Some(plan);
+            *crate::util::lock_mutex(&ctx.current_plan, "current_plan") = Some(plan);
             ToolOutcome::succeeded("update_plan", output)
         }
         Err(error) => ToolOutcome::failed(

@@ -166,7 +166,7 @@ pub async fn run_prompt_once<P: Provider>(
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 ) -> Result<agent::AgentOutcome, String> {
     let cancel = CancellationToken::new();
-    *current_cancel.lock().unwrap() = Some(cancel.clone());
+    *crate::util::lock_mutex(&current_cancel, "current_cancel") = Some(cancel.clone());
     let (ui_tx, mut ui_rx) = mpsc::channel(128);
     // P0-1：`-p` 模式没有 TUI 消费 UI 事件；直接丢弃 rx 会在 channel 满后
     // 让 agent 的 `ui.send().await` 永久等待（挂死）。drain task 持续消费。
@@ -184,7 +184,7 @@ pub async fn run_prompt_once<P: Provider>(
     )
     .await
     .map_err(|failure| failure.to_string())?;
-    *current_cancel.lock().unwrap() = None;
+    *crate::util::lock_mutex(&current_cancel, "current_cancel") = None;
     if outcome.reason == crate::session::CompletionReason::Error {
         return Err("run 以 Error 结束（长度限制/内容过滤/协议错误，见 session 记录）".into());
     }
@@ -257,7 +257,7 @@ async fn interactive_loop<P: Provider>(
             })
             .await
             .unwrap_or_default();
-            *index_slot.lock().unwrap() = Some(files);
+            *crate::util::lock_mutex(&index_slot, "file_index") = Some(files);
         });
     }
 
@@ -332,7 +332,7 @@ async fn interactive_loop<P: Provider>(
         }
 
         // `@` 文件索引就绪（P0-3：共享状态顺带检查，不占 select 分支）。
-        if let Some(files) = file_index.lock().unwrap().take() {
+        if let Some(files) = crate::util::lock_mutex(&file_index, "file_index").take() {
             ui_state.view.file_index = files;
             need_draw = true;
         }
@@ -545,7 +545,9 @@ workspace: {}
                     continue;
                 }
                 "/cancel" => {
-                    if let Some(cancel) = current_cancel.lock().unwrap().clone() {
+                    if let Some(cancel) =
+                        crate::util::lock_mutex(&current_cancel, "current_cancel").clone()
+                    {
                         cancel.cancel();
                         push_system_line(
                             &mut ui_state.view,
@@ -620,7 +622,11 @@ workspace: {}
                     &config.workspace_root,
                 )?);
             }
-            let mut session_log = session.take().unwrap();
+            // 上面已确保 Some；take 为空说明内部状态被破坏——按错误上报。
+            let Some(mut session_log) = session.take() else {
+                tracing::error!("run 循环：session 槽位为空（内部不变量破坏）");
+                return Err("内部错误：session 未初始化".into());
+            };
             let outcome = match run_interactive(
                 provider,
                 &mut session_log,
@@ -671,7 +677,8 @@ fn execute_ui_effect(
 ) {
     match effect {
         UiEffect::CancelRun => {
-            if let Some(cancel) = current_cancel.lock().unwrap().clone() {
+            if let Some(cancel) = crate::util::lock_mutex(&current_cancel, "current_cancel").clone()
+            {
                 cancel.cancel();
             }
             ui_state
@@ -700,7 +707,7 @@ async fn run_interactive<P: Provider>(
     use crate::tui::model::LineKind;
     use ratatui::crossterm::event::KeyEventKind;
     let cancel = CancellationToken::new();
-    *current_cancel.lock().unwrap() = Some(cancel.clone());
+    *crate::util::lock_mutex(&current_cancel, "current_cancel") = Some(cancel.clone());
     ui_state.view.status = StatusLine::Running {
         turn: 0,
         tool: "正在连接模型".into(),
@@ -812,7 +819,7 @@ async fn run_interactive<P: Provider>(
             result = &mut run_future => break result,
         }
     };
-    *current_cancel.lock().unwrap() = None;
+    *crate::util::lock_mutex(&current_cancel, "current_cancel") = None;
     ui_state.running = false;
     // TUI v2 §7.2：run 结束（成功或失败）→ 提交全部剩余 live 内容。
     ui_state.view.finalize_live();
@@ -881,9 +888,11 @@ fn spawn_ctrl_c_handler(current_cancel: Arc<Mutex<Option<CancellationToken>>>) {
             if tokio::signal::ctrl_c().await.is_err() {
                 break;
             }
-            let has_run = current_cancel.lock().unwrap().is_some();
+            let has_run = crate::util::lock_mutex(&current_cancel, "current_cancel").is_some();
             if has_run {
-                if let Some(cancel) = current_cancel.lock().unwrap().clone() {
+                if let Some(cancel) =
+                    crate::util::lock_mutex(&current_cancel, "current_cancel").clone()
+                {
                     cancel.cancel();
                 }
             } else {

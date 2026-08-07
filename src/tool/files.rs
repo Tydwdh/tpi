@@ -90,7 +90,7 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
     };
     let line_count = args.line_count.clamp(1, DEFAULT_READ_LINES);
     if let Ok(snapshot) = edit::snapshot_file(&path) {
-        ctx.snapshot_store.lock().unwrap().record(snapshot);
+        crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
     }
     match edit::read_window(&path, args.start_line, line_count) {
         Ok(window) => {
@@ -225,7 +225,7 @@ pub fn edit(
             if let Ok(snapshot) =
                 crate::tool::edit::build_snapshot(path.clone(), result.new_raw.clone())
             {
-                ctx.snapshot_store.lock().unwrap().record(snapshot);
+                crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
             }
             Ok(result)
         },

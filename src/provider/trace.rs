@@ -14,7 +14,7 @@ use std::sync::{Mutex, OnceLock};
 
 /// 当前 trace 模式：None = 关闭，Some(false) = 元数据，Some(true) = 含 body。
 static TRACE_MODE: OnceLock<Option<bool>> = OnceLock::new();
-static TRACE_FILE: OnceLock<Mutex<File>> = OnceLock::new();
+static TRACE_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
 fn log_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("TPI_HOME")
@@ -50,24 +50,21 @@ fn writer() -> Option<&'static Mutex<File>> {
     if !enabled() {
         return None;
     }
-    Some(TRACE_FILE.get_or_init(|| {
-        let dir = log_dir();
-        std::fs::create_dir_all(&dir).ok();
-        let path = dir.join(format!("provider-{}.jsonl", std::process::id()));
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap_or_else(|_| {
-                // 无法打开日志文件时丢弃 trace（不阻塞主流程）。
-                let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
-                OpenOptions::new()
-                    .append(true)
-                    .open(null)
-                    .expect("null device")
-            });
-        Mutex::new(file)
-    }))
+    TRACE_FILE
+        .get_or_init(|| {
+            let dir = log_dir();
+            std::fs::create_dir_all(&dir).ok();
+            let path = dir.join(format!("provider-{}.jsonl", std::process::id()));
+            match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(file) => Some(Mutex::new(file)),
+                Err(error) => {
+                    // 无法打开日志文件时丢弃 trace（不阻塞主流程），并上报日志。
+                    tracing::error!(error = %error, path = %path.display(), "provider trace 无法打开日志文件；trace 已禁用");
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 /// 写入一条 trace 记录（JSON 单行）。
@@ -84,7 +81,7 @@ pub fn log(kind: &str, mut fields: serde_json::Map<String, serde_json::Value>) {
     );
     fields.insert("kind".into(), serde_json::json!(kind));
     let line = serde_json::Value::Object(fields).to_string() + "\n";
-    let mut guard = writer.lock().unwrap();
+    let mut guard = crate::util::lock_mutex(writer, "provider_trace");
     let _ = guard.write_all(line.as_bytes());
     let _ = guard.flush();
 }

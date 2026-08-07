@@ -253,12 +253,6 @@ impl Drop for Renderer {
     }
 }
 
-impl Default for Renderer {
-    fn default() -> Self {
-        Self::new(theme::Theme::omp(), terminal::ViewMode::Inline).expect("renderer init")
-    }
-}
-
 /// 布局并渲染一帧（Renderer 与测试后端共用；纯布局逻辑集中在 plan_window）。
 ///
 /// 自下而上：输入区（多行，≤4 行）→ footer（1 行）→ 计划条（0..4 行）→ 转录区。
@@ -1467,8 +1461,16 @@ pub fn draw_to_test_backend_mode(
         terminal::ViewMode::Fullscreen => ratatui::Viewport::Fullscreen,
         terminal::ViewMode::Inline => ratatui::Viewport::Inline(height),
     };
-    let mut terminal = Terminal::with_options(backend, ratatui::TerminalOptions { viewport })
-        .expect("test terminal");
+    let mut terminal = match Terminal::with_options(backend, ratatui::TerminalOptions { viewport })
+    {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            // 测试基建失败：显式报错退出（不 panic、不 unwrap）。
+            tracing::error!(error = %error, "draw_into_buffer: TestBackend 终端初始化失败");
+            eprintln!("tpi test helper: terminal init failed: {error}");
+            std::process::exit(2);
+        }
+    };
     let theme = theme::Theme::omp();
     let mut cache: HashMap<u64, Vec<Line<'static>>> = HashMap::new();
     let mut cache_width = 0u16;
@@ -1487,7 +1489,12 @@ pub fn draw_to_test_backend_mode(
                 mode,
             );
         })
-        .expect("draw");
+        .map_err(|error| {
+            tracing::error!(error = %error, "draw_into_buffer: 渲染失败（测试基建）");
+            eprintln!("tpi test helper: draw failed: {error}");
+            std::process::exit(2);
+        })
+        .ok();
     terminal.backend().buffer().clone()
 }
 
@@ -1496,13 +1503,19 @@ pub fn draw_captured_bytes(view: &mut ViewModel) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     {
         let backend = CrosstermBackend::new(&mut out);
-        let mut terminal = Terminal::with_options(
+        let mut terminal = match Terminal::with_options(
             backend,
             ratatui::TerminalOptions {
                 viewport: ratatui::Viewport::Inline(10),
             },
-        )
-        .expect("capture terminal");
+        ) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                tracing::error!(error = %error, "draw_captured_bytes: 终端初始化失败（测试基建）");
+                eprintln!("tpi test helper: terminal init failed: {error}");
+                std::process::exit(2);
+            }
+        };
         let theme = theme::Theme::omp();
         let mut cache: HashMap<u64, Vec<Line<'static>>> = HashMap::new();
         let mut cache_width = 0u16;
@@ -1522,7 +1535,12 @@ pub fn draw_captured_bytes(view: &mut ViewModel) -> Vec<u8> {
                 );
                 overflow = plan.overflow;
             })
-            .expect("draw");
+            .map_err(|error| {
+                tracing::error!(error = %error, "draw_captured_bytes: 渲染失败（测试基建）");
+                eprintln!("tpi test helper: draw failed: {error}");
+                std::process::exit(2);
+            })
+            .ok();
         if !overflow.is_empty() {
             let height = overflow.len() as u16;
             let lines = std::mem::take(&mut overflow);

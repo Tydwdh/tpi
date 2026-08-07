@@ -380,10 +380,22 @@ fn apply_edit_to_snapshot(
                 index,
             });
         }
-        let logical_start = snapshot
-            .logical_lf_text
-            .find(&replacement.old_text)
-            .unwrap();
+        // occurrences == 1 已保证唯一；find 失败意味着计数与查找不一致
+        // （内部不变量被破坏）——按 NoMatch 处理并记录日志，不 panic。
+        let logical_start = match snapshot.logical_lf_text.find(&replacement.old_text) {
+            Some(start) => start,
+            None => {
+                tracing::error!(
+                    path = %snapshot.path,
+                    index,
+                    "edit: count_occurrences 与 find 不一致（内部不变量破坏）",
+                );
+                return Err(EditError::NoMatch {
+                    path: snapshot.path.clone(),
+                    index,
+                });
+            }
+        };
         prepared.push(PreparedReplacement {
             index,
             logical_start,

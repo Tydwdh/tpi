@@ -296,7 +296,7 @@ pub fn stable_observation(tool: &str, status: &str, payload: &str) -> String {
 pub fn state_stamp_from_ctx(ctx: &ToolContext, access: &ToolAccess) -> String {
     match access {
         ToolAccess::Resources(locks) => {
-            let store = ctx.snapshot_store.lock().unwrap();
+            let store = crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
             let mut parts: Vec<String> = locks
                 .iter()
                 .filter_map(|lock| match &lock.resource {

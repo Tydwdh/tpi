@@ -473,7 +473,11 @@ fn decode_html_entities(text: &str) -> String {
                 continue;
             }
         }
-        let ch = text[i..].chars().next().unwrap();
+        // i < bytes.len() 保证此处必有一个字符；防御性处理（不 panic）。
+        let Some(ch) = text[i..].chars().next() else {
+            tracing::error!("decode_html_entities: 字节索引越界（内部不变量破坏）");
+            break;
+        };
         out.push(ch);
         i += ch.len_utf8();
     }

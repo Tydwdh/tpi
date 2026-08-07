@@ -578,7 +578,17 @@ pub fn project_messages(events: &[(u64, SessionEvent)]) -> Vec<ChatMessage> {
     for (message, start, _) in ranges {
         if start >= end && start < comp_seq {
             let single = crate::context::prune_messages(vec![message]);
-            result.push(single.into_iter().next().expect("prune 不改变消息数量"));
+            match single.into_iter().next() {
+                Some(item) => result.push(item),
+                None => {
+                    // prune 不改变消息数量是不变量；异常时丢日志并跳过该消息
+                    // （保留其余消息，避免整个投影失败）。
+                    tracing::error!(
+                        seq = start,
+                        "project: prune_messages 返回空（内部不变量破坏），跳过该消息",
+                    );
+                }
+            }
         } else {
             result.push(message);
         }

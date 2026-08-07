@@ -17,10 +17,22 @@ pub mod search;
 pub mod web;
 
 use camino::Utf8PathBuf;
-use outcome::ToolOutcome;
+use outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::ToolDef;
+
+/// 工具 schema 的 JSON 序列化（schemars 生成，理论上不会失败）。
+/// 失败时记录日志并返回 null（模型将看到无参数 schema，但进程不崩溃）。
+fn schema_value<T: schemars::JsonSchema>(tool: &'static str) -> serde_json::Value {
+    match serde_json::to_value(schemars::schema_for!(T)) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(tool, error = %error, "tool schema 序列化失败；暴露空 schema");
+            serde_json::Value::Null
+        }
+    }
+}
 
 /// 内置工具集合（§8.1 静态分发）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,33 +98,15 @@ impl BuiltinTool {
     /// 工具 schema（§5.2 schemars：从参数类型生成，减少描述与实现漂移）。
     pub fn schema(&self) -> ToolDef {
         let parameters = match self {
-            BuiltinTool::Read => {
-                serde_json::to_value(schemars::schema_for!(files::ReadArgs)).unwrap()
-            }
-            BuiltinTool::List => {
-                serde_json::to_value(schemars::schema_for!(search::ListArgs)).unwrap()
-            }
-            BuiltinTool::Search => {
-                serde_json::to_value(schemars::schema_for!(search::SearchArgs)).unwrap()
-            }
-            BuiltinTool::Edit => {
-                serde_json::to_value(schemars::schema_for!(edit::EditArgs)).unwrap()
-            }
-            BuiltinTool::Write => {
-                serde_json::to_value(schemars::schema_for!(files::WriteArgs)).unwrap()
-            }
-            BuiltinTool::Bash => {
-                serde_json::to_value(schemars::schema_for!(command::BashArgs)).unwrap()
-            }
-            BuiltinTool::UpdatePlan => {
-                serde_json::to_value(schemars::schema_for!(plan::UpdatePlanArgs)).unwrap()
-            }
-            BuiltinTool::WebSearch => {
-                serde_json::to_value(schemars::schema_for!(web::WebSearchArgs)).unwrap()
-            }
-            BuiltinTool::WebFetch => {
-                serde_json::to_value(schemars::schema_for!(web::WebFetchArgs)).unwrap()
-            }
+            BuiltinTool::Read => schema_value::<files::ReadArgs>("read"),
+            BuiltinTool::List => schema_value::<search::ListArgs>("list"),
+            BuiltinTool::Search => schema_value::<search::SearchArgs>("search"),
+            BuiltinTool::Edit => schema_value::<edit::EditArgs>("edit"),
+            BuiltinTool::Write => schema_value::<files::WriteArgs>("write"),
+            BuiltinTool::Bash => schema_value::<command::BashArgs>("bash"),
+            BuiltinTool::UpdatePlan => schema_value::<plan::UpdatePlanArgs>("update_plan"),
+            BuiltinTool::WebSearch => schema_value::<web::WebSearchArgs>("web_search"),
+            BuiltinTool::WebFetch => schema_value::<web::WebFetchArgs>("web_fetch"),
         };
         ToolDef {
             name: self.name().to_string(),
@@ -361,7 +355,26 @@ pub async fn execute(
             web::web_search(args, ctx).await
         }
         (BuiltinTool::WebFetch, ValidatedArgs::WebFetch(args)) => web::web_fetch(args, ctx).await,
-        _ => unreachable!("validated args must match the tool"),
+        (tool, args) => {
+            // 内部不变量：ValidatedArgs 由同工具解析产生；异常组合按失败上报。
+            tracing::error!(
+                tool = ?tool,
+                args = ?args,
+                "execute: tool 与已解析参数不匹配（内部不变量破坏）",
+            );
+            ToolOutcome::failed(
+                "internal",
+                ModelPayload {
+                    status: ToolStatus::Failed,
+                    program: None,
+                    exit_code: None,
+                    duration_ms: 0,
+                    output: "status: failed\ntool: internal\nerror: args_mismatch\n\n内部错误：工具与参数不匹配。".into(),
+                    effect: None,
+                    artifact: None,
+                },
+            )
+        }
     };
     outcome.with_timing(start.elapsed().as_millis() as u64)
 }

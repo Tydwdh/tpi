@@ -463,10 +463,14 @@ impl ViewModel {
     /// 工具开始（上一段文本结束）与 run 结束时调用。
     pub fn finalize_streaming(&mut self) {
         for kind in [LineKind::Reasoning, LineKind::Assistant] {
+            // 循环只产生上述两种；其余类型不可能出现——日志上报并跳过。
             let slot = match kind {
                 LineKind::Reasoning => &mut self.live.reasoning,
                 LineKind::Assistant => &mut self.live.assistant,
-                _ => unreachable!(),
+                other => {
+                    tracing::error!(kind = ?other, "finalize_streaming: 意外消息类型（内部不变量破坏）");
+                    continue;
+                }
             };
             if let Some(msg) = slot.take() {
                 if msg.text.is_empty() {

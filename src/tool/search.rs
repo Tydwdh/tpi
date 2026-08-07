@@ -319,7 +319,7 @@ fn finish_scan(
     };
     let cursor = crate::ids::EventId::new_v7().to_string();
     {
-        let mut store = ctx.scan_snapshots.lock().unwrap();
+        let mut store = crate::util::lock_mutex(&ctx.scan_snapshots, "scan_snapshots");
         // 有界：最多保留 16 个 snapshot（P1-6：按 cursor 有序淘汰最旧，
         // 此前 HashMap keys().next() 顺序不可预测，cursor 可能意外失效）。
         evict_oldest_snapshot(&mut store);
@@ -345,7 +345,7 @@ fn page(cursor: &str, ctx: &ToolContext) -> ToolOutcome {
         Some((id, offset)) => (id.to_string(), offset.parse::<usize>().unwrap_or(0)),
         None => (cursor.to_string(), 0),
     };
-    let store = ctx.scan_snapshots.lock().unwrap();
+    let store = crate::util::lock_mutex(&ctx.scan_snapshots, "scan_snapshots");
     let Some(snapshot) = store.get(&snapshot_id) else {
         return ToolOutcome::failed(
             "page",

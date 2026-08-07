@@ -219,15 +219,20 @@ pub async fn run<P: Provider>(
                 config.model.max_output_tokens.unwrap_or(0) as u64,
                 config.safety_reserve_tokens,
             );
-            let system_prompt = system_prompt_text(config, current_plan.lock().unwrap().as_ref());
+            let system_prompt = system_prompt_text(
+                config,
+                crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+            );
             let projected = crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
             if crate::context::should_compact(projected, usable) && !compaction_failed {
                 match compact_turn(provider, &mut messages, session, config, &cancel).await {
                     Ok(()) => {
                         // P1-4：compaction 成功后若仍无法容纳（窗口过小），
                         // 不再发起普通请求（必然 length error），明确结束并提示用户。
-                        let system_prompt =
-                            system_prompt_text(config, current_plan.lock().unwrap().as_ref());
+                        let system_prompt = system_prompt_text(
+                            config,
+                            crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+                        );
                         let after =
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
@@ -248,8 +253,10 @@ pub async fn run<P: Provider>(
                         // 确定性 prune 兜底（§15.3：只影响投影）。
                         messages = crate::context::prune_messages(messages);
                         // P1-4：prune 后仍超窗口（如 user 消息本身巨大）→ 明确结束。
-                        let system_prompt =
-                            system_prompt_text(config, current_plan.lock().unwrap().as_ref());
+                        let system_prompt = system_prompt_text(
+                            config,
+                            crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+                        );
                         let after =
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
@@ -270,7 +277,11 @@ pub async fn run<P: Provider>(
         // 3. 构建 context projection 并发起一次请求（§6.2 第 3-4 步）。
         let request = ModelRequest {
             model: config.model.name.clone(),
-            messages: build_context(config, &messages, current_plan.lock().unwrap().as_ref()),
+            messages: build_context(
+                config,
+                &messages,
+                crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+            ),
             tools: tool_defs.clone(),
             max_output_tokens: config.model.max_output_tokens,
             reasoning: config.model.reasoning.clone(),
@@ -283,7 +294,10 @@ pub async fn run<P: Provider>(
                 config.model.max_output_tokens.unwrap_or(0) as u64,
                 config.safety_reserve_tokens,
             );
-            let system_prompt = system_prompt_text(config, current_plan.lock().unwrap().as_ref());
+            let system_prompt = system_prompt_text(
+                config,
+                crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+            );
             let projected = crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
             let _ = ui
                 .send(RuntimeEvent::ContextUsage { projected, usable })
@@ -754,7 +768,7 @@ error: invalid_arguments
             progress.observe(&action_key, &observation, &state_stamp);
             // §13：update_plan 成功 → PlanReplaced durable event。
             if outcome.status == ToolStatus::Succeeded && calls[index].name == "update_plan" {
-                let plan = current_plan.lock().unwrap().clone();
+                let plan = crate::util::lock_mutex(current_plan, "current_plan").clone();
                 if let Some(plan) = plan {
                     session
                         .append_event(&SessionEvent::PlanReplaced { plan: plan.clone() })
