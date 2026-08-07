@@ -69,13 +69,30 @@ renderer.draw(&view)
 
 ## 阶段进度
 
-- [x] T0 baseline：fmt/clippy/test 全绿（提交 f347550..32082de 后确认）；Task 1 inventory 完成
-- [ ] T1 UTF-8 P0
-- [ ] T2 TerminalDriver + Fullscreen
-- [ ] T3 UiState + Reducer
-- [ ] T4 Scroll Engine
-- [ ] T5 Transcript/Live 分离
-- [ ] T6 Composer v2
-- [ ] T7 Modal/Palette
-- [ ] T8 Search + Turn Jump
-- [ ] T9 Polish
+- [x] T0 baseline：fmt/clippy/test 全绿；Task 1 inventory 完成
+- [x] T1 UTF-8 P0：text.rs helper + 3 处 panic 修复（b7dd44f）
+- [x] T2 TerminalDriver + 默认 Fullscreen（1a38d12）
+- [x] T3 UiState/Reducer 单向流（66f55a3）
+- [x] T4 Scroll Engine：Follow/Locked(EntryId+row) + §58 四场景（52663dd）
+- [x] T5 Transcript/Live 分离（f9bfcf3）
+- [x] T6 Composer v2：logical line/preferred column/Shift+Enter/Ctrl+J（62ef287）
+- [x] T7 Modal：/help /settings /doctor /session /sessions /diff 出 transcript（69bdabe）
+- [x] T8 Search（Ctrl+F）+ Alt+Up/Down user turn 跳转（61bbeff）
+- [x] T9 Polish：§16 提示文案 + §64 回归补充（5c38674）
+
+## §64 回归清单核对（自动化覆盖）
+
+- [x] resize 不 panic / 80x24 布局 / 极小终端降级（tui_fullscreen）
+- [x] CJK/emoji 不 panic、safe truncation（tui_utf8 + text.rs）
+- [x] Locked 不被新输出拉回 / resize 保持 anchor / End 恢复（tui_scroll A-D）
+- [x] PageUp/PageDown 按 viewport 移动 / wheel 更新 anchor（tui_scroll）
+- [x] tool overlay 不改变 anchor（tui_scroll）
+- [x] modal close 后保持原位置（tui_rework）
+- [x] 500 deltas/s 不按 delta draw（tui_streaming frame_coalescing）
+- [x] composer multiline cursor / paste 多行（editor + tui_streaming）
+- [x] run 中输入响应 / cancel 回 idle（reducer + 架构性）
+
+## 人工验收剩余（§55/§75）
+
+- [ ] 真实终端启动占满/resize/退出恢复（TerminalDriver 已实现 + 自动化布局验证）
+- [ ] §75 最终 18 场景（30-60 分钟连续使用）
