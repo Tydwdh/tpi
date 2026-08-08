@@ -185,15 +185,53 @@ impl Renderer {
         self.last_transcript_rect
     }
 
-    /// 提取选中行的文本（§用户诉求：Ctrl+C 复制；selection 基于视口行号，
-    /// 从最近窗口文本取对应行）。
+    /// 提取选中文本（§用户诉求：Ctrl+C 复制；基于 start/end 坐标精确到字符，
+    /// 从最近窗口文本取对应子串，跨行用 \n 连接）。
     pub fn selection_text(&self, sel: &crate::tui::model::SelectionState) -> String {
-        let lo = sel.start_row.min(sel.end_row) as usize;
-        let hi = sel.start_row.max(sel.end_row) as usize;
-        self.last_window_text
-            .get(lo..=hi.min(self.last_window_text.len().saturating_sub(1)))
-            .unwrap_or(&[])
-            .join("\n")
+        let s = &sel.start;
+        let e = &sel.end;
+        let (lo_r, lo_c, hi_r, hi_c) = if (s.row, s.col) <= (e.row, e.col) {
+            (
+                s.row as usize,
+                s.col as usize,
+                e.row as usize,
+                e.col as usize,
+            )
+        } else {
+            (
+                e.row as usize,
+                e.col as usize,
+                s.row as usize,
+                s.col as usize,
+            )
+        };
+        let mut parts: Vec<String> = Vec::new();
+        for (row, text) in self.last_window_text.iter().enumerate() {
+            if row < lo_r || row > hi_r {
+                continue;
+            }
+            // 字符列 → 字节偏移（display 列近似为字符索引）。
+            let col_chars = |t: &str, c: usize| t.chars().take(c).collect::<String>().len();
+            if lo_r == hi_r {
+                // 单行：切 [lo_c, hi_c]。
+                let start = col_chars(text, lo_c);
+                let end = col_chars(text, hi_c + 1).min(text.len());
+                if start < text.len() {
+                    parts.push(text[start..end.min(text.len())].to_string());
+                }
+            } else if row == lo_r {
+                let start = col_chars(text, lo_c);
+                if start < text.len() {
+                    parts.push(text[start..].to_string());
+                }
+            } else if row == hi_r {
+                let end = col_chars(text, hi_c + 1).min(text.len());
+                parts.push(text[..end].to_string());
+            } else {
+                parts.push(text.to_string());
+            }
+        }
+        parts.join("\n")
     }
 
     /// 距上次 draw 是否已过帧间隔（§16.1：16 ms 合并）。
@@ -542,13 +580,14 @@ fn plan_window(
             }
         }
     }
-    // §用户诉求：应用内选择高亮——选中视口行用强调背景（覆盖 active/hover）。
+    // §用户诉求：应用内选择高亮——选中视口行用强调背景。
+    // 视觉上整行高亮；复制时按 start/end 坐标精确提取文本。
     if let Some(sel) = &view.selection {
         let selected = Style::default()
             .bg(theme.surface)
             .add_modifier(Modifier::REVERSED);
         for (i, line) in window.iter_mut().enumerate() {
-            if sel.contains(i as u16) {
+            if sel.contains(i as u16, 0) {
                 *line = Line::from(
                     line.spans
                         .iter()
@@ -3362,8 +3401,8 @@ fn selection_highlights_selected_window_rows() {
         view.push_line(LineKind::Assistant, format!("line {i}"));
     }
     // 选择视口第 1-2 行（反转背景）。
-    view.selection_start(1);
-    view.selection_update(2);
+    view.selection_start(1, 0);
+    view.selection_update(2, 0);
     view.selection_end();
     let mut cache = HashMap::new();
     let plan = plan_window(&mut view, theme::Theme::omp(), 80, 6, 0, false, &mut cache);

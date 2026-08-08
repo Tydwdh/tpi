@@ -358,7 +358,8 @@ async fn interactive_loop<P: Provider>(
                                                 && mouse.row < rect.y + rect.height
                                             {
                                                 let view_row = mouse.row - rect.y;
-                                                ui_state.view.selection_start(view_row);
+                                                let view_col = mouse.column.saturating_sub(rect.x);
+                                                ui_state.view.selection_start(view_row, view_col);
                                                 drag_selecting = true;
                                                 need_draw = true;
                                             }
@@ -368,7 +369,8 @@ async fn interactive_loop<P: Provider>(
                                                 let view_row = mouse.row
                                                     .saturating_sub(rect.y)
                                                     .min(rect.height.saturating_sub(1));
-                                                ui_state.view.selection_update(view_row);
+                                                let view_col = mouse.column.saturating_sub(rect.x);
+                                                ui_state.view.selection_update(view_row, view_col);
                                                 need_draw = true;
                                             }
                                         }

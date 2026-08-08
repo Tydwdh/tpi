@@ -997,8 +997,8 @@ fn esc_closes_sessions_browser_in_one_press() {
 fn ctrl_c_with_selection_triggers_copy_effect() {
     let mut s = state();
     // 模拟拖动选择视口第 1-2 行。
-    s.view.selection_start(1);
-    s.view.selection_update(2);
+    s.view.selection_start(1, 0);
+    s.view.selection_update(2, 0);
     s.view.selection_end();
     assert!(s.view.selection.is_some(), "选区必须存在");
 
