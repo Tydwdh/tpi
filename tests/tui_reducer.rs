@@ -89,7 +89,7 @@ fn esc_priority_overlay_over_menu_over_cancel() {
     s.running = true;
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
-        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err");
+        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
     reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
     assert!(s.view.overlay.is_some());
     let effects = reducer::update(&mut s, key(KeyCode::Esc));
@@ -212,6 +212,7 @@ fn agent_events_drive_view_state() {
             duration_ms: 5,
             exit_code: None,
             tail: "输出内容".into(),
+            diff: None,
         }),
     );
     // 工具卡片存在且含输出。
@@ -429,7 +430,7 @@ fn ctrl_c_does_not_close_overlay() {
     s.running = true;
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
-        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err");
+        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
     reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
     assert!(s.view.overlay.is_some());
     let effects = reducer::update(
@@ -676,7 +677,7 @@ fn overlay_blocks_composer_typing() {
     let mut s = state();
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
-        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err");
+        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
     reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
     assert!(s.view.overlay.is_some());
     reducer::update(
@@ -705,7 +706,7 @@ fn paste_blocked_while_modal_or_overlay_open() {
     let mut s2 = state();
     s2.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s2.view
-        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err");
+        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
     reducer::update(&mut s2, UiEvent::ClickTool("c1".into()));
     assert!(s2.view.overlay.is_some());
     reducer::update(&mut s2, UiEvent::Paste("junk".into()));
@@ -770,7 +771,7 @@ fn clicks_blocked_while_modal_open() {
     // ClickTool must not open an overlay behind the modal.
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
-        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err");
+        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
     reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
     assert!(
         s.view.overlay.is_none(),
@@ -786,7 +787,7 @@ fn clicks_blocked_while_overlay_open() {
     }
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
-        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err");
+        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
     reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
     assert!(s.view.overlay.is_some());
     let scroll_before = s.view.transcript_scroll;

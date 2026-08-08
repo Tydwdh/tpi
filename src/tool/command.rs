@@ -339,6 +339,7 @@ fn outcome_for(input: OutcomeInput<'_>) -> ToolOutcome {
             program: Some(program),
             target: Some(args.cwd),
             timeout_ms: Some(args.timeout_ms),
+            ..Default::default()
         },
         evidence: Vec::new(),
         observed_resources: Vec::new(),

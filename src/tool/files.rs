@@ -255,6 +255,8 @@ pub fn edit(
             outcome.session_metadata = ToolMetadata {
                 tool: "edit".into(),
                 target: Some(display_path(&ctx.workspace_root, &path)),
+                // §用户诉求：diff 独立字段，TUI 默认展开显示红绿 diff。
+                diff: if diff.is_empty() { None } else { Some(diff) },
                 ..Default::default()
             };
             outcome
@@ -398,7 +400,15 @@ fn rewrite_with_revision(
                 "status: succeeded\ntool: write\npath: {display_path}\nrewritten: true\nprevious_revision: {}\ncurrent_revision: {}{diff_summary}",
                 result.previous_revision, result.current_revision,
             );
-            ToolOutcome::succeeded("write", output)
+            let mut outcome = ToolOutcome::succeeded("write", output);
+            // §用户诉求：重写已有文件时 diff 独立字段（TUI 默认展开红绿 diff）。
+            outcome.session_metadata = ToolMetadata {
+                tool: "write".into(),
+                target: Some(display_path.to_string()),
+                diff: if diff.is_empty() { None } else { Some(diff) },
+                ..Default::default()
+            };
+            outcome
         }
         Err(error) => failed_outcome("write", error),
     }

@@ -242,6 +242,7 @@ fn tool_overlay_does_not_change_transcript_anchor() {
         1,
         Some(1),
         "err",
+        None,
     );
     view.open_tool_overlay("c1");
     assert_eq!(

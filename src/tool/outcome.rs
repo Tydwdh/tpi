@@ -87,6 +87,10 @@ pub struct ToolMetadata {
     /// 实际解析/执行的程序（§11.2：记录实际选择）。
     pub program: Option<String>,
     pub timeout_ms: Option<u64>,
+    /// edit/write 的 unified diff（§用户诉求：每次写入后默认展开显示红绿 diff；
+    /// 从 model_payload 分离，避免重复且 TUI 可结构化渲染）。
+    #[serde(default)]
+    pub diff: Option<String>,
 }
 
 /// 工具执行耗时（毫秒）。

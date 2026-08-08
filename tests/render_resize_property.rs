@@ -25,6 +25,7 @@ fn busy_view() -> ViewModel {
         1234,
         Some(101),
         "error[E0308]",
+        None,
     );
     view
 }

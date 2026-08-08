@@ -79,6 +79,8 @@ pub struct ToolCard {
     pub state: ToolCardState,
     /// 完整输出（有界累积，≤ MAX_CARD_OUTPUT；成功与失败都保留）。
     pub output: Option<String>,
+    /// edit/write 的 unified diff（§用户诉求：默认展开显示红绿 diff）。
+    pub diff: Option<String>,
     /// 输出被截断（超过 MAX_CARD_OUTPUT 丢弃中段）。
     pub output_truncated: bool,
     /// 展开状态（active 卡片内联显示完整输出；scrollback 卡片走 overlay）。
@@ -860,6 +862,7 @@ impl ViewModel {
                 command,
                 state: ToolCardState::Running,
                 output: None,
+                diff: None,
                 output_truncated: false,
                 expanded: false,
                 tail: None,
@@ -1052,6 +1055,7 @@ impl ViewModel {
         duration_ms: u64,
         exit_code: Option<i32>,
         tail: impl Into<String>,
+        diff: Option<String>,
     ) {
         let id = id.into();
         let name = name.into();
@@ -1063,6 +1067,8 @@ impl ViewModel {
                 duration_ms,
                 exit_code,
             };
+            // §用户诉求：edit/write 的 diff 独立保存（默认展开渲染）。
+            card.diff = diff;
             // 完整输出始终保留（成功也可见，Alt+E/鼠标展开）；失败时折叠态显示 tail。
             if !tail.is_empty() {
                 card.output = Some(bound_output(&tail));
@@ -1090,6 +1096,7 @@ impl ViewModel {
                     duration_ms,
                     exit_code,
                 };
+                card.diff = diff;
                 if !tail.is_empty() {
                     card.output = Some(bound_output(&tail));
                     if tail.len() > MAX_CARD_OUTPUT {
@@ -1121,6 +1128,7 @@ impl ViewModel {
                 } else {
                     Some(bound_output(&tail))
                 },
+                diff,
                 output_truncated: tail.len() > MAX_CARD_OUTPUT,
                 expanded: false,
                 tail: if status == ToolStatus::Succeeded {
@@ -1390,6 +1398,7 @@ mod tests {
             1234,
             Some(2),
             "exit_code: 1\n错误详情",
+            None,
         );
         let Entry::Tool { card, .. } = &view.transcript[0] else {
             panic!("call-1 必须是卡片");
@@ -1430,6 +1439,7 @@ mod tests {
             42,
             Some(0),
             "大量输出",
+            None,
         );
         let Entry::Tool { card, .. } = &view.transcript[0] else {
             panic!();
@@ -1449,7 +1459,15 @@ mod tests {
     fn tail_is_bounded() {
         let mut view = ViewModel::default();
         view.begin_tool("c", "bash", None, None);
-        view.finish_tool("c", "bash", ToolStatus::Failed, 0, None, "x".repeat(10_000));
+        view.finish_tool(
+            "c",
+            "bash",
+            ToolStatus::Failed,
+            0,
+            None,
+            "x".repeat(10_000),
+            None,
+        );
         let Entry::Tool { card, .. } = &view.transcript[0] else {
             panic!();
         };
@@ -1566,6 +1584,7 @@ mod tests {
             42,
             Some(0),
             "line-1\nline-2\n",
+            None,
         );
         let Entry::Tool { card, .. } = &view.transcript[0] else {
             panic!();
@@ -1696,6 +1715,7 @@ mod p2_card_nav_tests {
             10,
             None,
             String::from("ok"),
+            None,
         );
         // 卡 2：失败。
         view.begin_tool(
@@ -1711,6 +1731,7 @@ mod p2_card_nav_tests {
             20,
             Some(1),
             String::from("boom"),
+            None,
         );
         view
     }
@@ -1822,7 +1843,15 @@ mod p2_card_nav_tests {
     fn tool_overlay_sets_and_clears_active_hit() {
         let mut view = ViewModel::default();
         view.begin_tool("call-1", "bash", Some("run".into()), None);
-        view.finish_tool("call-1", "bash", ToolStatus::Succeeded, 10, Some(0), "");
+        view.finish_tool(
+            "call-1",
+            "bash",
+            ToolStatus::Succeeded,
+            10,
+            Some(0),
+            "",
+            None,
+        );
         assert!(view.active_hit.is_none(), "初始无高亮");
 
         view.open_tool_overlay("call-1");

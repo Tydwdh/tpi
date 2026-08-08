@@ -29,7 +29,7 @@ pub mod theme;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use std::collections::HashMap;
@@ -1517,43 +1517,52 @@ fn tool_card_lines(
         None
     };
     if let Some(body) = show_body {
-        // §16.2 增强：edit/write 输出含 `diff:` 段——diff 段红绿着色
-        // （opencode 式），其余行按默认样式。
-        let diff_idx = find_diff_start(body);
-        if card.expanded && diff_idx.is_some() {
-            // 展开态：diff 段用 render_diff_lines 着色。
-            let (prefix, diff_part) = match diff_idx {
-                Some(idx) => (&body[..idx], &body[idx..]),
-                None => (body, ""),
-            };
-            for s in prefix.lines() {
-                lines.push(Line::styled(
-                    format!("│ {s}"),
-                    Style::default().fg(theme.text),
-                ));
-            }
-            let diff_lines = render_diff_lines(diff_part, theme);
+        // §用户诉求：edit/write 的独立 diff 字段 → 默认展开显示红绿 diff
+        // （opencode 式：每次写入后直接可见，无需点开）。
+        if let Some(diff_text) = &card.diff {
+            let diff_lines = render_diff_lines(diff_text, theme);
             for l in diff_lines {
-                // 保留工具卡片的 │ 前缀 + 原 diff 行着色（Line.style 应用到整行）。
+                // 保留工具卡片的 │ 前缀 + diff 行红绿背景（Line.style 应用整行）。
                 let mut spans = vec![Span::styled("│ ", Style::default().fg(theme.muted))];
                 spans.extend(l.spans.iter().cloned());
                 lines.push(Line::from(spans).style(l.style));
             }
         } else {
-            let body_lines: Vec<&str> = body.split('\n').collect();
-            let shown: Vec<&str> = if card.expanded {
-                body_lines
-            } else {
-                // 整改 A3：折叠态实时输出只保留最后 3 行。
-                body_lines.iter().rev().take(3).copied().collect::<Vec<_>>()
-            };
-            for s in shown {
-                let style = if card.expanded {
-                    Style::default().fg(theme.text)
-                } else {
-                    Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
+            // 无独立 diff：展开态显示完整输出文本（含 `diff:` 段时着色）。
+            let diff_idx = find_diff_start(body);
+            if card.expanded && diff_idx.is_some() {
+                let (prefix, diff_part) = match diff_idx {
+                    Some(idx) => (&body[..idx], &body[idx..]),
+                    None => (body, ""),
                 };
-                lines.push(Line::styled(format!("│ {s}"), style));
+                for s in prefix.lines() {
+                    lines.push(Line::styled(
+                        format!("│ {s}"),
+                        Style::default().fg(theme.text),
+                    ));
+                }
+                let diff_lines = render_diff_lines(diff_part, theme);
+                for l in diff_lines {
+                    let mut spans = vec![Span::styled("│ ", Style::default().fg(theme.muted))];
+                    spans.extend(l.spans.iter().cloned());
+                    lines.push(Line::from(spans).style(l.style));
+                }
+            } else {
+                let body_lines: Vec<&str> = body.split('\n').collect();
+                let shown: Vec<&str> = if card.expanded {
+                    body_lines
+                } else {
+                    // 整改 A3：折叠态实时输出只保留最后 3 行。
+                    body_lines.iter().rev().take(3).copied().collect::<Vec<_>>()
+                };
+                for s in shown {
+                    let style = if card.expanded {
+                        Style::default().fg(theme.text)
+                    } else {
+                        Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
+                    };
+                    lines.push(Line::styled(format!("│ {s}"), style));
+                }
             }
         }
         if card.output_truncated && card.expanded {
@@ -1581,9 +1590,16 @@ fn tool_card_lines(
 
 /// 渲染 unified diff 文本为红绿着色行（§16.2 增强：opencode 式 diff 展示）。
 ///
-/// 按行首判定：`+` → success（绿）、`-` → error（红）、`@@` 统计 → primary、
-/// 其余上下文 → text（muted）。输入是 edit/write 工具输出的 `diff:` 段。
+/// 按行首判定（opencode 式红绿背景）：`+` → 绿底、`-` → 红底、`@@` → 主色、
+/// 文件头 → muted BOLD、上下文 → 默认。输入是 edit/write 的 unified diff。
 fn render_diff_lines(diff_text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
+    // 深色前景（绿/红底上的可读文字）。
+    let on_green = Style::default()
+        .bg(theme.success)
+        .fg(Color::Rgb(0x0d, 0x0f, 0x14));
+    let on_red = Style::default()
+        .bg(theme.error)
+        .fg(Color::Rgb(0x0d, 0x0f, 0x14));
     diff_text
         .lines()
         .map(|line| {
@@ -1592,14 +1608,16 @@ fn render_diff_lines(diff_text: &str, theme: theme::Theme) -> Vec<Line<'static>>
                 Style::default()
                     .fg(theme.muted)
                     .add_modifier(Modifier::BOLD)
-            } else if let Some(_) = line.strip_prefix('+') {
-                Style::default().fg(theme.success)
-            } else if let Some(_) = line.strip_prefix('-') {
-                Style::default().fg(theme.error)
+            } else if line.strip_prefix('+').is_some() {
+                on_green
+            } else if line.strip_prefix('-').is_some() {
+                on_red
             } else if line.starts_with("@@") {
-                Style::default().fg(theme.primary)
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme.muted)
+                Style::default()
             };
             Line::styled(line.to_string(), style)
         })
@@ -2410,6 +2428,7 @@ mod tests {
             10,
             Some(1),
             "第一行\n第二行\n第三行\n第四行",
+            None,
         );
         let mut cache = HashMap::new();
         let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
@@ -2656,7 +2675,7 @@ mod tests {
         );
     }
 
-    /// §16.2 增强：unified diff 行红绿着色（+ 绿 / - 红 / @@ 主色）。
+    /// §用户诉求：unified diff 红绿背景（+ 绿底 / - 红底 / @@ 主色）。
     #[test]
     fn diff_lines_render_with_add_remove_colors() {
         let theme = theme::Theme::omp();
@@ -2664,18 +2683,18 @@ mod tests {
         let lines = render_diff_lines(diff, theme);
         // 行数 = diff 行数（7 行：--- +++ @@ 上下文 - + 上下文）。
         assert_eq!(lines.len(), 7, "每行一个 Line: {lines:?}");
-        // - 行 → error 色。
+        // - 行 → error 背景（红底）。
         let minus = lines
             .iter()
             .find(|l| l.spans[0].content.starts_with("-    let x = 1;"))
             .expect("找到 - 行");
-        assert_eq!(minus.style.fg, Some(theme.error));
-        // + 行 → success 色。
+        assert_eq!(minus.style.bg, Some(theme.error));
+        // + 行 → success 背景（绿底）。
         let plus = lines
             .iter()
             .find(|l| l.spans[0].content.starts_with("+    let x = 2;"))
             .expect("找到 + 行");
-        assert_eq!(plus.style.fg, Some(theme.success));
+        assert_eq!(plus.style.bg, Some(theme.success));
         // @@ 行 → primary 色。
         let hunk = lines
             .iter()
@@ -2694,6 +2713,7 @@ mod tests {
             command: None,
             state: ToolCardState::Running,
             output: None,
+            diff: None,
             output_truncated: false,
             expanded: false,
             tail: None,
@@ -2723,6 +2743,7 @@ mod tests {
                 exit_code: Some(2),
             },
             output: None,
+            diff: None,
             output_truncated: false,
             expanded: false,
             tail: Some("exit_code: 1".into()),
@@ -2819,6 +2840,7 @@ mod tests {
             command: None,
             state: ToolCardState::Running,
             output: None,
+            diff: None,
             output_truncated: false,
             expanded: false,
             tail: None,
@@ -2844,6 +2866,7 @@ mod tests {
                 "progress 1\nprogress 2\nprogress 3\nprogress 4\nprogress 5\nprogress 6\nprogress 7\n"
                     .into(),
             ),
+            diff: None,
             output_truncated: false,
             expanded: false,
             tail: None,
@@ -2875,6 +2898,7 @@ mod tests {
                 exit_code: Some(0),
             },
             output: Some("第一行\n第二行\n第三行\n".into()),
+            diff: None,
             output_truncated: false,
             expanded: true,
             tail: None,
@@ -2956,6 +2980,7 @@ fn overlay_clears_background_before_rendering() {
         1,
         Some(1),
         "err",
+        None,
     );
     view.open_tool_overlay(String::from("c"));
     let buf = draw_to_test_backend(&mut view, 80, 24);

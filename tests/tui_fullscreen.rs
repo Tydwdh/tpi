@@ -267,6 +267,7 @@ fn tool_card_stays_single_line_on_narrow_terminal() {
         123_456,
         Some(101),
         "error[E0308]",
+        None,
     );
     let buf = draw_to_test_backend_mode(&mut view, 40, 12, ViewMode::Fullscreen);
     let rows: Vec<&[ratatui::buffer::Cell]> = buf.content().chunks(40).collect();
@@ -297,6 +298,7 @@ fn success_card_hides_exit_zero_failure_keeps_it() {
         100,
         Some(0),
         "",
+        None,
     );
     let buf = draw_to_test_backend_mode(&mut view, 80, 12, ViewMode::Fullscreen);
     let all: String = row_texts(&buf).join("\n");
@@ -311,6 +313,7 @@ fn success_card_hides_exit_zero_failure_keeps_it() {
         100,
         Some(101),
         "boom",
+        None,
     );
     let buf2 = draw_to_test_backend_mode(&mut view2, 80, 12, ViewMode::Fullscreen);
     let all2: String = row_texts(&buf2).join("\n");

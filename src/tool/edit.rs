@@ -1144,21 +1144,17 @@ mod tests {
         .expect("相邻 replacement 应成功");
         // apply_edit 只计算新内容（写盘在 commit_edit）；从 result 验证。
         let content = String::from_utf8_lossy(&result.new_raw).into_owned();
-        assert!(
-            content.contains("a + b"),
-            "add 必须替换: {content:?}"
-        );
+        assert!(content.contains("a + b"), "add 必须替换: {content:?}");
         assert!(
             content.contains("pub fn abs(x: i64)"),
             "abs 必须替换: {content:?}"
         );
-        assert!(
-            !content.contains("a - b"),
-            "不应残留 a - b: {content:?}"
-        );
+        assert!(!content.contains("a - b"), "不应残留 a - b: {content:?}");
         // 不损坏：add 函数头只能出现一次完整定义。
         assert_eq!(
-            content.matches("pub fn add(a: i32, b: i32) -> i32 {").count(),
+            content
+                .matches("pub fn add(a: i32, b: i32) -> i32 {")
+                .count(),
             1,
             "add 函数头不得重复: {content:?}"
         );
@@ -1272,5 +1268,3 @@ mod p1_lru_tests {
         assert!(store.get(&Utf8PathBuf::from("c.txt"), &rev_c1).is_some());
     }
 }
-
-

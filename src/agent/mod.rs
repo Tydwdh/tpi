@@ -114,6 +114,8 @@ pub enum RuntimeEvent {
         duration_ms: u64,
         exit_code: Option<i32>,
         tail: String,
+        /// edit/write 的 unified diff（§用户诉求：默认展开红绿 diff）。
+        diff: Option<String>,
     },
     /// 工具执行中的实时输出增量（bash stdout/stderr；TUI 卡片运行中可见）。
     ToolOutputDelta {
@@ -1066,6 +1068,7 @@ error: invalid_arguments
                         duration_ms: outcome.model_payload.duration_ms,
                         exit_code: outcome.model_payload.exit_code,
                         tail: outcome.model_payload.output.clone(),
+                        diff: outcome.session_metadata.diff.clone(),
                     })
                     .await;
             }

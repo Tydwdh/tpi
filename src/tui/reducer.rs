@@ -416,6 +416,7 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
             duration_ms,
             exit_code,
             tail,
+            diff,
         } => {
             view.finish_tool(
                 call_id.to_string(),
@@ -424,6 +425,7 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
                 duration_ms,
                 exit_code,
                 tail,
+                diff,
             );
         }
         RuntimeEvent::ToolOutputDelta { call_id, text, .. } => {
