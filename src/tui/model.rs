@@ -1096,6 +1096,12 @@ impl ViewModel {
                 canonical_semantic_text(LineKind::Reasoning, &msg.text),
             ));
         }
+        // §PointerHit ⑤：运行中工具卡片也在候选（独立稳定 id）。
+        for call_id in &self.live.tool_order {
+            if let Some(tool) = self.live.tools.get(call_id) {
+                candidates.push((tool.entry_id, card_semantic_text(&tool.card)));
+            }
+        }
         let mut parts: Vec<String> = Vec::new();
         for (entry_id, text) in candidates {
             if entry_id < lo.entry_id || entry_id > hi.entry_id {
@@ -2116,6 +2122,49 @@ mod p2_card_nav_tests {
             view.selected_text(),
             "streaming",
             "finalize 后选区仍指向同一内容"
+        );
+    }
+
+    /// §PointerHit ⑤：运行中工具卡片有独立稳定 id，finalize 后选区不悬空，
+    /// selected_text 能覆盖 tool 输出（情况 A：仅 tool 运行时）。
+    #[test]
+    fn live_tool_selection_survives_finalize() {
+        use crate::tui::interaction::TextPosition;
+        use crate::tui::scroll::EntryId;
+        let mut view = ViewModel::default();
+        view.begin_tool("c1", "bash", Some("cargo test".into()), None);
+        view.append_tool_output("c1", "running tests...");
+        // 运行中 tool 有独立 id（不是 assistant/reasoning 的，也不是哨兵）。
+        let live_id = view.live.tools.get("c1").expect("c1 必须在 live").entry_id;
+        assert_ne!(live_id, EntryId(u64::MAX), "live tool 不得用哨兵 id");
+        view.selection_start(TextPosition {
+            entry_id: live_id,
+            offset: 0,
+        });
+        view.selection_update(TextPosition {
+            entry_id: live_id,
+            offset: 7,
+        });
+        // tool 语义文本 = "bash cargo test\nrunning tests..."；offset 0..7 = "bash ca"。
+        assert_eq!(view.selected_text(), "bash ca");
+        // 选 body 部分：offset 跳过 "bash cargo test\n"（16 chars）后到 "running"。
+        view.selection_start(TextPosition {
+            entry_id: live_id,
+            offset: 16,
+        });
+        view.selection_update(TextPosition {
+            entry_id: live_id,
+            offset: 23,
+        });
+        assert_eq!(view.selected_text(), "running");
+        // finish_tool：沿用同一 id，选区不悬空。
+        view.finish_tool("c1", "bash", ToolStatus::Succeeded, 10, None, "", None);
+        let finalized = view.transcript.last().expect("finish 后必须提交").id();
+        assert_eq!(finalized, live_id, "finish_tool 必须沿用 begin 的稳定 id");
+        assert_eq!(
+            view.selected_text(),
+            "running",
+            "finalize 后 tool 选区仍指向同一内容"
         );
     }
 }
