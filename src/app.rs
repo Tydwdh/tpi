@@ -24,7 +24,6 @@ use crate::provider::openai_compat::OpenAiCompatClient;
 use crate::provider::{ChatMessage, Provider};
 use crate::session::{self, SessionEvent, SessionLog};
 use crate::tui::effect::UiEffect;
-use crate::tui::event::UiEvent;
 use crate::tui::state::UiState;
 use crate::tui::{Renderer, model::LineKind, model::StatusLine, model::ViewModel};
 use ratatui::crossterm::event::Event;
@@ -303,10 +302,9 @@ async fn interactive_loop<P: Provider>(
     // `/retry` 目标：上一次因 provider 失败而中断的 turn 的用户消息。
     // 成功完成后清空；失败/中断后保留，供用户一键重试（§4.3）。
     let mut last_failed_message: Option<String> = None;
-    // 鼠标按下位置（§用户诉求：区分点击展开 vs 拖动选择）。
-    let mut mouse_down: Option<(u16, u16)> = None;
-    // 正在拖动选择中（按下后位移超过阈值）。
-    let mut drag_selecting = false;
+    // §InteractionRefactor：统一指针状态机（idle 与 run 共用），
+    // 取代旧的 mouse_down/drag_selecting 两套路径。
+    let mut pointer_gesture = crate::tui::interaction::PointerGesture::default();
 
     loop {
         // BUG-003：存在排队输入（初始 prompt / run 期间提交的消息 / /sessions 选择）
@@ -336,70 +334,50 @@ async fn interactive_loop<P: Provider>(
                             need_draw = true;
                             crate::tui::reducer::update(&mut ui_state, UiEvent::Paste(text));
                         }
-                        // 鼠标：滚轮翻页、点击工具卡片展开、拖动选择（空闲态）。
+                        // 鼠标：统一走 Pointer State Machine（§InteractionRefactor），
+                        // 覆盖滚轮/点击/拖动选择/scrollbar，与 run 中同一状态机。
                         Some(Event::Mouse(mouse)) => {
+                            use crate::tui::interaction::{PointerInput, PointerTarget};
                             use ratatui::crossterm::event::MouseButton;
                             use ratatui::crossterm::event::MouseEventKind;
-                            match mouse.kind {
-                                MouseEventKind::Down(MouseButton::Left) => {
-                                    // 记录按下位置（区分点击 vs 拖动选择）。
-                                    mouse_down = Some((mouse.column, mouse.row));
-                                }
-                                MouseEventKind::Drag(MouseButton::Left) => {
-                                    if let Some((start_col, start_row)) = mouse_down {
-                                        let col_delta =
-                                            (mouse.column as i32 - start_col as i32).abs();
-                                        let row_delta =
-                                            (mouse.row as i32 - start_row as i32).abs();
-                                        // 位移超过阈值 → 进入拖动选择（转录区内）。
-                                        if !drag_selecting && (col_delta + row_delta) > 2 {
-                                            if let Some(rect) = renderer.transcript_rect()
-                                                && mouse.row >= rect.y
-                                                && mouse.row < rect.y + rect.height
-                                            {
-                                                let view_row = mouse.row - rect.y;
-                                                let view_col = mouse.column.saturating_sub(rect.x);
-                                                ui_state.view.selection_start(view_row, view_col);
-                                                drag_selecting = true;
-                                                need_draw = true;
-                                            }
-                                        }
-                                        if drag_selecting {
-                                            if let Some(rect) = renderer.transcript_rect() {
-                                                let view_row = mouse.row
-                                                    .saturating_sub(rect.y)
-                                                    .min(rect.height.saturating_sub(1));
-                                                let view_col = mouse.column.saturating_sub(rect.x);
-                                                ui_state.view.selection_update(view_row, view_col);
-                                                need_draw = true;
-                                            }
-                                        }
-                                    }
-                                }
-                                MouseEventKind::Up(MouseButton::Left) => {
-                                    if drag_selecting {
-                                        // 结束选择（选区保留，Ctrl+C 复制）。
-                                        ui_state.view.selection_end();
-                                        drag_selecting = false;
-                                        mouse_down = None;
-                                        need_draw = true;
-                                    } else {
-                                        mouse_down = None;
-                                        if let Some(event) =
-                                            mouse_ui_event(&ui_state, &renderer, mouse)
-                                        {
-                                            need_draw = true;
-                                            crate::tui::reducer::update(&mut ui_state, event);
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    if let Some(event) =
-                                        mouse_ui_event(&ui_state, &renderer, mouse)
-                                    {
-                                        need_draw = true;
-                                        crate::tui::reducer::update(&mut ui_state, event);
-                                    }
+                            // 弹层（Overlay/Modal）打开时点击不动作。
+                            let target = if ui_state.view.overlay.is_some()
+                                || ui_state.view.modal.is_some()
+                            {
+                                PointerTarget::None
+                            } else {
+                                pointer_target(&renderer, mouse.column, mouse.row)
+                            };
+                            let input = match mouse.kind {
+                                MouseEventKind::Down(MouseButton::Left) => PointerInput::Down {
+                                    column: mouse.column,
+                                    row: mouse.row,
+                                    target,
+                                },
+                                MouseEventKind::Drag(MouseButton::Left) => PointerInput::Drag {
+                                    column: mouse.column,
+                                    row: mouse.row,
+                                    target,
+                                },
+                                MouseEventKind::Up(MouseButton::Left) => PointerInput::Up {
+                                    column: mouse.column,
+                                    row: mouse.row,
+                                    target,
+                                },
+                                MouseEventKind::Moved => PointerInput::Move {
+                                    column: mouse.column,
+                                    row: mouse.row,
+                                    target,
+                                },
+                                MouseEventKind::ScrollUp => PointerInput::ScrollUp,
+                                MouseEventKind::ScrollDown => PointerInput::ScrollDown,
+                                _ => continue,
+                            };
+                            let events = pointer_gesture.feed(input);
+                            if !events.is_empty() {
+                                need_draw = true;
+                                for event in events {
+                                    crate::tui::reducer::update(&mut ui_state, event);
                                 }
                             }
                         }
@@ -863,54 +841,33 @@ workspace: {}
     Ok(())
 }
 
-/// 把 crossterm 鼠标事件解析为语义化 UiEvent（§24 scrollbar 点击/拖拽 +
-/// 工具/reasoning hit-test；reducer 不依赖终端坐标）。
-fn mouse_ui_event(
-    ui_state: &UiState,
+/// §InteractionRefactor：屏幕坐标 → 指针命中目标。
+/// 优先级：scrollbar（1 列优先）→ 工具/reasoning hit → 转录区文本（语义位置）→ None。
+fn pointer_target(
     renderer: &Renderer,
-    mouse: ratatui::crossterm::event::MouseEvent,
-) -> Option<UiEvent> {
-    use ratatui::crossterm::event::MouseEventKind;
-    let scrollbar_click = |mouse: &ratatui::crossterm::event::MouseEvent| -> Option<UiEvent> {
-        let rect = renderer.scrollbar_rect()?;
-        if mouse.column < rect.x
-            || mouse.column >= rect.x + rect.width
-            || mouse.row < rect.y
-            || mouse.row >= rect.y + rect.height
-        {
-            return None;
-        }
-        Some(UiEvent::ScrollbarClick(mouse.row - rect.y))
-    };
-    match mouse.kind {
-        MouseEventKind::ScrollUp => Some(UiEvent::MouseScrollUp),
-        MouseEventKind::ScrollDown => Some(UiEvent::MouseScrollDown),
-        MouseEventKind::Down(_) => {
-            if ui_state.view.overlay.is_some() || ui_state.view.modal.is_some() {
-                // 弹层（Overlay/Modal）打开时点击不动作：
-                // 不得打开后台 overlay，也不得滚动背后 transcript。
-                None
-            } else if let Some(event) = scrollbar_click(&mouse) {
-                Some(event)
-            } else if let Some(target) = renderer.hit_target(mouse.column, mouse.row) {
-                match target {
-                    crate::tui::HitTarget::Tool(id) => Some(UiEvent::ClickTool(id)),
-                    crate::tui::HitTarget::Reasoning(id) => Some(UiEvent::ClickReasoning(id)),
-                }
-            } else {
-                None
-            }
-        }
-        MouseEventKind::Drag(_) => {
-            // §24：拖拽 scrollbar thumb 持续跳转；其他位置不动作。
-            if ui_state.view.overlay.is_none() && ui_state.view.modal.is_none() {
-                scrollbar_click(&mouse)
-            } else {
-                None
-            }
-        }
-        _ => None,
+    column: u16,
+    row: u16,
+) -> crate::tui::interaction::PointerTarget {
+    use crate::tui::interaction::PointerTarget;
+    // scrollbar 优先（1 列窄条，避免误判为文本）。
+    if let Some(rect) = renderer.scrollbar_rect()
+        && column >= rect.x
+        && column < rect.x + rect.width
+        && row >= rect.y
+        && row < rect.y + rect.height
+    {
+        return PointerTarget::Scrollbar;
     }
+    if let Some(target) = renderer.hit_target(column, row) {
+        return match target {
+            crate::tui::HitTarget::Tool(id) => PointerTarget::Tool(id),
+            crate::tui::HitTarget::Reasoning(id) => PointerTarget::Reasoning(id),
+        };
+    }
+    if let Some(position) = renderer.hit_text(column, row) {
+        return PointerTarget::Transcript(position);
+    }
+    PointerTarget::None
 }
 /// 执行 reducer 返回的跨边界效果（§27：app 层执行 effect）。
 /// 返回 true 表示请求退出主循环（BUG-004：空闲 Ctrl-C）。
@@ -980,6 +937,9 @@ async fn run_interactive<P: Provider>(
         tool: "正在连接模型".into(),
     };
     ui_state.running = true;
+    // §InteractionRefactor：run 期间与空闲用同一指针状态机（拖选复制在
+    // Agent 运行时可用的关键能力）。
+    let mut pointer_gesture = crate::tui::interaction::PointerGesture::default();
     let (ui_tx, mut ui_rx) = mpsc::channel(128);
 
     let force = ui_state.force_compaction;
@@ -1065,10 +1025,50 @@ async fn run_interactive<P: Provider>(
                         renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }
                     Some(Event::Mouse(mouse)) => {
-                        if let Some(event) = mouse_ui_event(ui_state, renderer, mouse) {
+                        use crate::tui::interaction::{PointerInput, PointerTarget};
+                        use ratatui::crossterm::event::MouseButton;
+                        use ratatui::crossterm::event::MouseEventKind;
+                        // 与空闲态同一状态机（拖选复制在运行中可用）。
+                        let target = if ui_state.view.overlay.is_some()
+                            || ui_state.view.modal.is_some()
+                        {
+                            PointerTarget::None
+                        } else {
+                            pointer_target(renderer, mouse.column, mouse.row)
+                        };
+                        let input = match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) => PointerInput::Down {
+                                column: mouse.column,
+                                row: mouse.row,
+                                target,
+                            },
+                            MouseEventKind::Drag(MouseButton::Left) => PointerInput::Drag {
+                                column: mouse.column,
+                                row: mouse.row,
+                                target,
+                            },
+                            MouseEventKind::Up(MouseButton::Left) => PointerInput::Up {
+                                column: mouse.column,
+                                row: mouse.row,
+                                target,
+                            },
+                            MouseEventKind::Moved => PointerInput::Move {
+                                column: mouse.column,
+                                row: mouse.row,
+                                target,
+                            },
+                            MouseEventKind::ScrollUp => PointerInput::ScrollUp,
+                            MouseEventKind::ScrollDown => PointerInput::ScrollDown,
+                            _ => {
+                                renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
+                                continue;
+                            }
+                        };
+                        let events = pointer_gesture.feed(input);
+                        for event in events {
                             crate::tui::reducer::update(ui_state, event);
-                            renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                         }
+                        renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }
                     Some(Event::Resize(_, _)) => {
                         renderer.autoresize().map_err(|e| e.to_string())?;

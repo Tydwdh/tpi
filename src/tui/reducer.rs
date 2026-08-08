@@ -526,11 +526,20 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
         }
         // MouseMoved 保留为穷尽占位（hover 高亮已移除；移动事件不再影响状态）。
         UiEvent::MouseMoved { .. } => Vec::new(),
-        // §用户诉求：应用内选择复制。选择状态由 app 层直接更新
-        //（需要 Renderer 的转录区坐标做 hit-test），reducer 只做穷尽占位。
-        UiEvent::SelectionStart { .. }
-        | UiEvent::SelectionUpdate { .. }
-        | UiEvent::SelectionEnd => Vec::new(),
+        // §InteractionRefactor：语义选择事件由 reducer 直接写入 view（不再
+        // 依赖 Renderer 坐标——TextPosition 指向内容）。SelectionEnd 保留选区。
+        UiEvent::SelectionStart(position) => {
+            state.view.selection_start(position);
+            Vec::new()
+        }
+        UiEvent::SelectionUpdate(position) => {
+            state.view.selection_update(position);
+            Vec::new()
+        }
+        UiEvent::SelectionEnd => {
+            state.view.selection_end();
+            Vec::new()
+        }
         UiEvent::ClickTool(id) => {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new(); // 弹层打开时鼠标点击不得打开后台 overlay

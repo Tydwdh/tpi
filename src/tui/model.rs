@@ -12,62 +12,8 @@ use std::collections::HashMap;
 use crate::session::Usage;
 use crate::tool::outcome::ToolStatus;
 use crate::tool::plan::Plan;
+use crate::tui::interaction::TextPosition;
 use crate::tui::scroll::{EntryId, ScrollAnchor, ScrollMode};
-
-/// 选择坐标（视口内行 + 列）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SelPos {
-    pub row: u16,
-    pub col: u16,
-}
-
-/// 应用内选择状态（§用户诉求：拖动选择 + Ctrl+C 复制）。
-/// 基于视口内坐标（row, col），精确到字符（opencode 式，非行级）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectionState {
-    /// 选择起始（含）。
-    pub start: SelPos,
-    /// 选择结束（含）。
-    pub end: SelPos,
-    /// 是否正在拖动（未释放；拖动中实时更新 end）。
-    pub dragging: bool,
-}
-
-impl SelectionState {
-    pub fn new(row: u16, col: u16) -> Self {
-        Self {
-            start: SelPos { row, col },
-            end: SelPos { row, col },
-            dragging: true,
-        }
-    }
-
-    /// 是否选中给定坐标（行内范围：起止行之间全选，起止行内按列）。
-    pub fn contains(&self, row: u16, col: u16) -> bool {
-        let (sr, sc) = (self.start.row, self.start.col);
-        let (er, ec) = (self.end.row, self.end.col);
-        // 规范化起止（支持反向拖动）。
-        let (lo_r, lo_c, hi_r, hi_c) = if (sr, sc) <= (er, ec) {
-            (sr, sc, er, ec)
-        } else {
-            (er, ec, sr, sc)
-        };
-        if row < lo_r || row > hi_r {
-            return false;
-        }
-        if lo_r == hi_r {
-            // 同行：只选 col 在 [lo_c, hi_c]。
-            return col >= lo_c && col <= hi_c;
-        }
-        if row == lo_r {
-            return col >= lo_c;
-        }
-        if row == hi_r {
-            return col <= hi_c;
-        }
-        true // 中间行全选
-    }
-}
 
 /// 转录行类型（§16.2：普通工具可见、plan call 隐藏由 UI 策略决定）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -395,10 +341,9 @@ pub struct ViewModel {
     /// 鼠标点击命中的目标（工具卡片/reasoning 行；§24 高亮反馈）。
     /// Overlay 打开期间该行高亮；关闭 Overlay 后清除。
     pub active_hit: Option<crate::tui::HitTarget>,
-    /// 应用内选择复制（§用户诉求：拖动选择 + Ctrl+C 复制，不依赖终端原生
-    /// 选择——mouse capture 保留，点击展开与拖选用位移阈值区分）。
-    /// `Some` = 正在选择或已有选区（选区高亮直到清除/复制）。
-    pub selection: Option<SelectionState>,
+    /// 应用内选择复制（语义位置：entry + 逻辑文本偏移，不依赖屏幕坐标；
+    /// resize/rewrap/滚动不改变选中内容）。`Some` = 正在选择或已有选区。
+    pub selection: Option<crate::tui::interaction::TextSelection>,
     /// 本会话累计 token 用量（AgentOutcome.usage 累积，§16.2：无 pricing 时显示 usage）。
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -1051,25 +996,23 @@ impl ViewModel {
         self.active_hit = None;
     }
 
-    /// 开始应用内选择（§用户诉求：鼠标按下开始拖动选择，坐标级）。
-    pub fn selection_start(&mut self, row: u16, col: u16) {
-        self.selection = Some(SelectionState::new(row, col));
+    /// 开始应用内选择（语义位置：entry + 逻辑文本偏移）。
+    pub fn selection_start(&mut self, position: TextPosition) {
+        self.selection = Some(crate::tui::interaction::TextSelection {
+            anchor: position,
+            focus: position,
+        });
     }
 
-    /// 拖动更新选择范围（坐标级，支持反向拖动）。
-    pub fn selection_update(&mut self, row: u16, col: u16) {
+    /// 拖动更新选择范围（更新 focus；anchor 保持按下点，支持反向拖动）。
+    pub fn selection_update(&mut self, position: TextPosition) {
         if let Some(sel) = &mut self.selection {
-            sel.end = SelPos { row, col };
-            sel.dragging = true;
+            sel.focus = position;
         }
     }
 
     /// 释放鼠标：结束拖动（选区保留，等待复制/清除）。
-    pub fn selection_end(&mut self) {
-        if let Some(sel) = &mut self.selection {
-            sel.dragging = false;
-        }
-    }
+    pub fn selection_end(&mut self) {}
 
     /// 清除选区（点击空白处 / 开始新选择时先清旧选区）。
     pub fn selection_clear(&mut self) {
@@ -1903,51 +1846,48 @@ mod p2_card_nav_tests {
         assert!(view.overlay.is_none());
     }
 
-    /// §用户诉求：应用内选择状态——开始/更新/结束/清除/包含判断（坐标级）。
+    /// §用户诉求：应用内选择——语义位置（entry + 偏移），开始/更新/清除。
+    /// 语义选区指向内容而非屏幕坐标；反向拖动由 normalized() 处理。
     #[test]
     fn selection_state_lifecycle() {
+        use crate::tui::interaction::TextPosition;
+        use crate::tui::scroll::EntryId;
         let mut view = ViewModel::default();
         assert!(view.selection.is_none());
 
-        view.selection_start(2, 3);
+        let p2 = TextPosition {
+            entry_id: EntryId(1),
+            offset: 2,
+        };
+        let p3 = TextPosition {
+            entry_id: EntryId(1),
+            offset: 3,
+        };
+        let p7 = TextPosition {
+            entry_id: EntryId(1),
+            offset: 7,
+        };
+        view.selection_start(p2);
         let sel = view.selection.as_ref().expect("开始选择");
-        assert!(sel.dragging);
-        assert_eq!(sel.start.row, 2);
-        assert_eq!(sel.start.col, 3);
-        assert_eq!(sel.end.row, 2);
-        assert_eq!(sel.end.col, 3);
+        assert_eq!(sel.anchor, p2);
+        assert_eq!(sel.focus, p2);
 
-        view.selection_update(5, 7);
+        view.selection_update(p7);
         let sel = view.selection.as_ref().unwrap();
-        assert_eq!(sel.end.row, 5);
-        assert_eq!(sel.end.col, 7);
-        // 行 2..5 选中：start 行从 col 3 起、end 行到 col 7、中间全选。
-        assert!(sel.contains(2, 3) && sel.contains(5, 7));
-        assert!(sel.contains(2, 4) && sel.contains(5, 0));
-        assert!(sel.contains(3, 0) && sel.contains(4, 0));
-        assert!(!sel.contains(2, 2) && !sel.contains(5, 8));
-        assert!(!sel.contains(1, 0) && !sel.contains(6, 0));
+        assert_eq!(sel.anchor, p2, "anchor 保持按下点");
+        assert_eq!(sel.focus, p7);
+        assert_eq!(sel.normalized(), (p2, p7));
 
-        // 单行同行：按列精确。
-        view.selection_start(1, 2);
-        view.selection_update(1, 5);
+        // 反向拖动：anchor 不变，focus 更新。
+        view.selection_update(p3);
         let sel = view.selection.as_ref().unwrap();
-        assert!(sel.contains(1, 2) && sel.contains(1, 5));
-        assert!(sel.contains(1, 3) && sel.contains(1, 4));
-        assert!(!sel.contains(1, 1) && !sel.contains(1, 6));
-        assert!(!sel.contains(0, 3) && !sel.contains(2, 3));
-
-        // 反向拖动（start(1,2), end(0,8)）→ 行 0 从 col 8 起。
-        view.selection_update(0, 8);
-        let sel = view.selection.as_ref().unwrap();
-        assert!(sel.contains(0, 8));
-        assert!(sel.contains(0, 9));
-        assert!(!sel.contains(0, 7));
-        assert!(sel.contains(1, 2), "末行从 start 列起");
+        assert_eq!(sel.anchor, p2);
+        assert_eq!(sel.focus, p3);
+        // 值排序：offset 2 < offset 3 → normalized 为 (p2, p3)。
+        assert_eq!(sel.normalized(), (p2, p3));
 
         view.selection_end();
-        let sel = view.selection.as_ref().unwrap();
-        assert!(!sel.dragging, "释放后结束拖动");
+        assert!(view.selection.is_some(), "释放后选区保留");
 
         view.selection_clear();
         assert!(view.selection.is_none());

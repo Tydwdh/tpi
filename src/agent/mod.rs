@@ -88,7 +88,7 @@ impl std::fmt::Display for BudgetKind {
 }
 
 /// ephemeral 运行时事件（§4.3：不逐 token 写盘）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
     /// 每次实际 provider 请求前发送，供 TUI 更新运行状态。
     TurnStarted { turn: u32 },

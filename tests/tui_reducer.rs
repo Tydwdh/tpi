@@ -995,10 +995,18 @@ fn esc_closes_sessions_browser_in_one_press() {
 /// §用户诉求：鼠标拖动选择后 Ctrl+C 触发 CopySelection effect（复制到剪贴板）。
 #[test]
 fn ctrl_c_with_selection_triggers_copy_effect() {
+    use tpi::tui::interaction::TextPosition;
+    use tpi::tui::scroll::EntryId;
     let mut s = state();
-    // 模拟拖动选择视口第 1-2 行。
-    s.view.selection_start(1, 0);
-    s.view.selection_update(2, 0);
+    // 模拟语义选区：entry 1 的 offset 0..5。
+    s.view.selection_start(TextPosition {
+        entry_id: EntryId(1),
+        offset: 0,
+    });
+    s.view.selection_update(TextPosition {
+        entry_id: EntryId(1),
+        offset: 5,
+    });
     s.view.selection_end();
     assert!(s.view.selection.is_some(), "选区必须存在");
 
@@ -1023,15 +1031,37 @@ fn ctrl_c_with_selection_triggers_copy_effect() {
     );
 }
 
-/// §用户诉求：SelectionStart/Update/End 事件更新选择状态（reducer 占位，
-/// app 层直接操作；此处验证不影响其它状态）。
+/// §InteractionRefactor：SelectionStart/Update/End 事件把语义选区写入 view
+///（reducer 直接处理，不再依赖 Renderer 坐标）。
 #[test]
-fn selection_events_are_noop_in_reducer() {
+fn selection_events_update_view_selection() {
+    use tpi::tui::interaction::TextPosition;
+    use tpi::tui::scroll::EntryId;
     let mut s = state();
-    let effects = reducer::update(&mut s, UiEvent::SelectionStart { row: 2 });
+    assert!(s.view.selection.is_none());
+    let p2 = TextPosition {
+        entry_id: EntryId(1),
+        offset: 2,
+    };
+    let p5 = TextPosition {
+        entry_id: EntryId(1),
+        offset: 5,
+    };
+    let effects = reducer::update(&mut s, UiEvent::SelectionStart(p2));
     assert!(effects.is_empty());
-    let effects = reducer::update(&mut s, UiEvent::SelectionUpdate { row: 5 });
+    assert_eq!(
+        s.view.selection.map(|sel| sel.anchor),
+        Some(p2),
+        "SelectionStart 必须写入 anchor"
+    );
+    let effects = reducer::update(&mut s, UiEvent::SelectionUpdate(p5));
     assert!(effects.is_empty());
+    assert_eq!(
+        s.view.selection.map(|sel| sel.focus),
+        Some(p5),
+        "SelectionUpdate 必须更新 focus"
+    );
     let effects = reducer::update(&mut s, UiEvent::SelectionEnd);
     assert!(effects.is_empty());
+    assert!(s.view.selection.is_some(), "SelectionEnd 保留选区");
 }

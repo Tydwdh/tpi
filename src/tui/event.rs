@@ -1,14 +1,15 @@
 //! UI 事件（TPI_TUI_V2_TASK §26）：Terminal / Agent / Tick 统一进单向流。
 //!
 //! 鼠标事件在 app 层解析（hit-test 需要 Renderer），只把**语义化**结果
-//! 送入 reducer（ScrollUp/Down、ClickTool/ClickReasoning），reducer 不依赖
-//! 终端或渲染器。
+//! 送入 reducer（ScrollUp/Down、ClickTool/ClickReasoning、Selection 的语义
+//! 位置），reducer 不依赖终端或渲染器。
 
 use crate::agent::RuntimeEvent;
+use crate::tui::interaction::TextPosition;
 use ratatui::crossterm::event::KeyEvent;
 
 /// 进入 reducer 的 UI 事件。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiEvent {
     /// 键盘按键（仅 `KeyEventKind::Press`）。
     Key(KeyEvent),
@@ -19,9 +20,10 @@ pub enum UiEvent {
     /// 鼠标移动（§24 hover 高亮；命中可点击行时高亮显示）。
     MouseMoved { column: u16, row: u16 },
     /// 应用内选择复制（§用户诉求）：鼠标按下开始拖动选择。
-    SelectionStart { row: u16 },
+    /// 携带**语义位置**（entry + 逻辑偏移），不依赖屏幕坐标。
+    SelectionStart(TextPosition),
     /// 拖动更新选择范围。
-    SelectionUpdate { row: u16 },
+    SelectionUpdate(TextPosition),
     /// 释放鼠标结束选择（选区保留）。
     SelectionEnd,
     /// 鼠标点击命中工具卡片（Renderer hit-test 后）。
