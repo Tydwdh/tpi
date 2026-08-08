@@ -562,6 +562,24 @@ impl ViewModel {
         self.trim_transcript();
     }
 
+    /// 丢弃当前 attempt 的流式内容（§4.3 第三阶段：partial tool-call restart）。
+    /// 整个 model turn 重新生成，已显示的 partial 不进 transcript；
+    /// partial 文本由 session 的 `AssistantAttemptInterrupted` 记录（durable 事实）。
+    /// 若有运行中的工具卡片则一并提交（防止中间状态丢失）。
+    pub fn discard_live_turn(&mut self) {
+        self.live.assistant = None;
+        self.live.reasoning = None;
+        let order = std::mem::take(&mut self.live.tool_order);
+        for call_id in order {
+            if let Some(card) = self.live.tools.remove(&call_id) {
+                let entry_id = self.alloc_entry_id();
+                self.transcript.push(Entry::Tool { id: entry_id, card });
+                self.note_new_content();
+            }
+        }
+        self.trim_transcript();
+    }
+
     /// 整改 C + TUI v2 §16：Locked 期间的新条目计数（footer 提示）。
     fn note_new_content(&mut self) {
         if self.scroll_mode != ScrollMode::Follow {
@@ -1197,6 +1215,29 @@ mod tests {
         view.push_stream_delta(LineKind::Assistant, "b");
         let v2 = view.live.assistant.as_ref().unwrap().version;
         assert_ne!(v1, v2);
+    }
+
+    /// §4.3 第三阶段：partial tool-call restart 时丢弃 live 区 partial
+    /// （不进 transcript）——已显示的流式内容被清空，等待整个 turn 重新生成。
+    #[test]
+    fn discard_live_turn_drops_partial() {
+        let mut view = ViewModel::default();
+        view.push_stream_delta(LineKind::Reasoning, "思考中…");
+        view.push_stream_delta(LineKind::Assistant, "部分回答");
+        assert!(view.live.assistant.is_some() && view.live.reasoning.is_some());
+        assert_eq!(view.transcript.len(), 0, "finalize 前不进 transcript");
+
+        view.discard_live_turn();
+
+        assert!(
+            view.live.assistant.is_none() && view.live.reasoning.is_none(),
+            "restart 必须丢弃 partial 流式内容（整个 turn 重新生成）"
+        );
+        assert_eq!(
+            view.transcript.len(),
+            0,
+            "丢弃的 partial 不得进入 transcript（durable 事实在 session）"
+        );
     }
 
     #[test]

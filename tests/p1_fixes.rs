@@ -651,15 +651,15 @@ async fn recovery_capped_after_one_attempt() {
     assert_eq!(interrupted, 2, "首次 + 续写各记录一次中断: {events:?}");
 }
 
-/// §4.3 第二阶段：已收到 tool delta 后断联——**不自动续写**（partial JSON 恢复
-/// 风险大）。若 agent 错误地触发第二次调用（续写），stream 内 panic。
-struct ToolDeltaThenDisconnectProvider {
+/// §4.3 第三阶段：已收到 tool delta 后断联 → **整个 model turn 重新生成**。
+/// 不尝试续接 partial JSON（风险大）。第二次调用（restart）成功返回完整响应。
+struct ToolDeltaThenRestartProvider {
     calls: u32,
 }
 
-impl Provider for ToolDeltaThenDisconnectProvider {
+impl Provider for ToolDeltaThenRestartProvider {
     fn model_name(&self) -> &str {
-        "tool-delta-then-disconnect"
+        "tool-delta-then-restart"
     }
 
     async fn stream(
@@ -669,10 +669,19 @@ impl Provider for ToolDeltaThenDisconnectProvider {
         _cancel: CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
         self.calls += 1;
-        if self.calls > 1 {
-            panic!("tool delta 后断联不得触发续写（第二次调用）");
+        if self.calls >= 2 {
+            // 第二次调用（restart）：重新生成整个 turn——正常返回完整响应。
+            events
+                .send(ProviderEvent::TextDelta("重新生成的回答".into()))
+                .await
+                .map_err(|_| ProviderError::Protocol("closed".into()))?;
+            return Ok(ProviderResponse {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+                tool_calls: Vec::new(),
+            });
         }
-        // 收到 tool delta（不完整 JSON），随后断联。
+        // 第一次调用：收到 tool delta（不完整 JSON），随后断联。
         events
             .send(ProviderEvent::ToolCallStarted {
                 index: 0,
@@ -692,13 +701,108 @@ impl Provider for ToolDeltaThenDisconnectProvider {
     }
 }
 
-/// §4.3 第二阶段：tool delta 后断联必须以 ProviderInterrupted 结束且不触发续写。
+/// §4.3 第三阶段：tool delta 后断联 → 自动 restart 整个 turn。
+/// 验证：run 以 Stop 正常结束；partial tool delta 不进入提交内容；
+/// session 记录 saw_tool_calls=true 的中断事件。
 #[tokio::test]
-async fn tool_delta_interrupt_does_not_auto_continue() {
+async fn tool_delta_interrupt_restarts_whole_turn() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let config = test_config(&workspace);
-    let mut provider = ToolDeltaThenDisconnectProvider { calls: 0 };
+    let mut provider = ToolDeltaThenRestartProvider { calls: 0 };
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, mut rx) = mpsc::channel(16);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        &[],
+        "hello".into(),
+        tx,
+        CancellationToken::new(),
+        false,
+        false,
+    )
+    .await
+    .expect("restart 后 run 必须正常结束");
+
+    drain.abort();
+    assert_eq!(outcome.reason, CompletionReason::Stop);
+    assert_eq!(provider.calls, 2, "首次 tool delta + restart 共 2 次调用");
+    assert_eq!(
+        outcome.assistant_text, "重新生成的回答",
+        "提交内容必须是 restart 后的完整回答，不含 partial tool delta"
+    );
+
+    // session：记录一次 saw_tool_calls=true 的中断 + 提交的完整 assistant turn。
+    let events = tpi::session::read_events(session.path()).unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SessionEvent::AssistantAttemptInterrupted {
+                saw_tool_calls: true,
+                ..
+            }
+        )),
+        "必须记录 saw_tool_calls=true 的中断（partial tool JSON 是 durable 事实）: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SessionEvent::AssistantMessageCommitted { message }
+                if message.content == "重新生成的回答"
+        )),
+        "必须提交 restart 后的完整 assistant turn"
+    );
+}
+
+/// §4.3 第三阶段：tool delta 断联后 restart 再次失败（每次调用都断）——
+/// restart 额度用尽后以 ProviderInterrupted 结束（防无限 restart）。
+struct ToolDeltaAlwaysInterruptProvider {
+    calls: u32,
+}
+
+impl Provider for ToolDeltaAlwaysInterruptProvider {
+    fn model_name(&self) -> &str {
+        "tool-delta-always-interrupt"
+    }
+
+    async fn stream(
+        &mut self,
+        _request: ModelRequest,
+        events: mpsc::Sender<ProviderEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderResponse, ProviderError> {
+        self.calls += 1;
+        // 首次 + restart = 2 次；第 3 次说明 restart 未封顶（防无限循环）。
+        if self.calls > 2 {
+            panic!("restart 必须封顶（防无限循环）");
+        }
+        events
+            .send(ProviderEvent::ToolCallStarted {
+                index: 0,
+                id: "call_x".into(),
+                name: "edit".into(),
+            })
+            .await
+            .map_err(|_| ProviderError::Protocol("closed".into()))?;
+        Err(ProviderError::Connection("flaky".into()))
+    }
+}
+
+#[tokio::test]
+async fn tool_delta_restart_is_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = ToolDeltaAlwaysInterruptProvider { calls: 0 };
     let mut session = SessionLog::create(
         &config.sessions_root,
         workspace.as_std_path(),
@@ -724,18 +828,13 @@ async fn tool_delta_interrupt_does_not_auto_continue() {
 
     drain.abort();
     assert_eq!(outcome.reason, CompletionReason::ProviderInterrupted);
-    assert_eq!(provider.calls, 1, "tool delta 后断联不得触发续写");
+    assert_eq!(provider.calls, 2, "restart 必须封顶为 1 次（共 2 次调用）");
 
-    // 记录中断且 saw_tool_calls=true。
+    // 两次中断都记录（首次 + restart）。
     let events = tpi::session::read_events(session.path()).unwrap();
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            SessionEvent::AssistantAttemptInterrupted {
-                saw_tool_calls: true,
-                ..
-            }
-        )),
-        "中断事件必须标记 saw_tool_calls=true: {events:?}"
-    );
+    let interrupted = events
+        .iter()
+        .filter(|e| matches!(e, SessionEvent::AssistantAttemptInterrupted { .. }))
+        .count();
+    assert_eq!(interrupted, 2, "首次 + restart 各记录一次中断: {events:?}");
 }

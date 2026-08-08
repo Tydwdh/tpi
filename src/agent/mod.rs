@@ -31,6 +31,11 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
 /// 只允许一次（防无限续写循环）；已出现 tool delta 的 attempt 不自动续。
 pub const MAX_STREAM_RECOVERIES: u32 = 1;
 
+/// §4.3 第三阶段：partial tool-call 后整个 model turn 重新生成的最大次数。
+/// 只允许一次（防无限 restart）；tool-call 场景风险更大，恢复一次后仍失败
+/// 就如实上报 ProviderInterrupted。
+pub const MAX_TURN_RESTARTS: u32 = 1;
+
 /// 续写请求注入的 recovery instruction（§4.3：harness control metadata，
 /// 不进 durable conversation，不进 session）。
 const STREAM_RECOVERY_INSTRUCTION: &str = "\
@@ -124,6 +129,9 @@ pub enum RuntimeEvent {
     PlanUpdated { plan: crate::tool::plan::Plan },
     /// 流中断后正在自动续写（第二阶段 §4.3：text-only attempt 恢复）。
     StreamRecovering { attempt: u32 },
+    /// partial tool-call 后整个 model turn 重新生成（第三阶段 §4.3）。
+    /// UI 应丢弃当前 attempt 的 partial 展示（不进 transcript）。
+    TurnRestarting { attempt: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,10 +318,12 @@ pub async fn run<P: Provider>(
         }
 
         // 3. 构建 context projection 并发起请求（§6.2 第 3-4 步）。
-        // §4.3 第二阶段：text-only attempt 断联后自动续写（最多 1 次）。
+        // §4.3 attempt 模型：text-only 断联 → 续写（stream_recoveries）；
+        // partial tool-call 断联 → 整个 turn 重新生成（turn_restarts）。
         // `content`/`saw_any_semantic`/`saw_tool_calls` 跨 attempt 累积
-        // （整个 model turn 的事实）；`stream_recoveries` 是已续写次数。
+        // （整个 model turn 的事实）；restart 会清空 content 重新发起原始请求。
         let mut stream_recoveries: u32 = 0;
+        let mut turn_restarts: u32 = 0;
         let mut content = String::new();
         let mut saw_any_semantic = false;
         let mut saw_tool_calls = false;
@@ -366,7 +376,7 @@ pub async fn run<P: Provider>(
             tokio::pin!(stream);
             // §4.3：流中断分类需要知道是否已产生语义内容（文本/工具调用）。
             // 统一消费入口：主 select 分支与所有 drain 分支共用，保证标志与 UI 同步。
-            let response = loop {
+            loop {
                 tokio::select! {
                     Some(event) = event_rx.recv() => {
                         consume_stream_event(
@@ -444,31 +454,58 @@ pub async fn run<P: Provider>(
                                     )
                                     .await;
                                 }
-                                // §4.3 第二阶段：text-only attempt 断联 → 自动续写一次。
-                                // 条件：已产生文本（非连接不可用）、未出现 tool delta（partial
-                                // JSON 恢复风险大）、还有续写额度。
-                                if saw_any_semantic && !saw_tool_calls && stream_recoveries < MAX_STREAM_RECOVERIES
-                                {
-                                    let cause = interrupt_cause(&e);
-                                    session
-                                        .append_event(&SessionEvent::AssistantAttemptInterrupted {
-                                            request_id,
-                                            content: content.clone(),
-                                            cause,
-                                            saw_tool_calls: false,
-                                        })
-                                        .and_then(|_| session.sync_data())
-                                        .map_err(|e2| RunFailure::Session(e2.to_string()))?;
-                                    let _ = ui
-                                        .send(RuntimeEvent::StreamRecovering {
-                                            attempt: stream_recoveries + 1,
-                                        })
-                                        .await;
-                                    stream_recoveries += 1;
-                                    // 续写请求（content 已累积 partial，recovery instruction
-                                    // 在下一个 attempt 循环开头注入 request）。
-                                    continue 'attempt;
-                                }
+                            // §4.3 第二阶段：text-only attempt 断联 → 自动续写一次。
+                            // 条件：已产生文本（非连接不可用）、未出现 tool delta（partial
+                            // JSON 恢复风险大）、还有续写额度。
+                            if saw_any_semantic && !saw_tool_calls && stream_recoveries < MAX_STREAM_RECOVERIES
+                            {
+                                let cause = interrupt_cause(&e);
+                                session
+                                    .append_event(&SessionEvent::AssistantAttemptInterrupted {
+                                        request_id,
+                                        content: content.clone(),
+                                        cause,
+                                        saw_tool_calls: false,
+                                    })
+                                    .and_then(|_| session.sync_data())
+                                    .map_err(|e2| RunFailure::Session(e2.to_string()))?;
+                                let _ = ui
+                                    .send(RuntimeEvent::StreamRecovering {
+                                        attempt: stream_recoveries + 1,
+                                    })
+                                    .await;
+                                stream_recoveries += 1;
+                                // 续写请求（content 已累积 partial，recovery instruction
+                                // 在下一个 attempt 循环开头注入 request）。
+                                continue 'attempt;
+                            }
+                            // §4.3 第三阶段：partial tool-call 后断联 → 整个 turn 重新生成。
+                            // 条件：已出现 tool delta（saw_tool_calls=true）、还有 restart 额度。
+                            // 不尝试续接 partial JSON（风险大）；重新发起原始请求。
+                            if saw_tool_calls && turn_restarts < MAX_TURN_RESTARTS {
+                                let cause = interrupt_cause(&e);
+                                session
+                                    .append_event(&SessionEvent::AssistantAttemptInterrupted {
+                                        request_id,
+                                        content: content.clone(),
+                                        cause,
+                                        saw_tool_calls: true,
+                                    })
+                                    .and_then(|_| session.sync_data())
+                                    .map_err(|e2| RunFailure::Session(e2.to_string()))?;
+                                let _ = ui
+                                    .send(RuntimeEvent::TurnRestarting {
+                                        attempt: turn_restarts + 1,
+                                    })
+                                    .await;
+                                turn_restarts += 1;
+                                // 清空本 attempt 的 partial（UI 已 discard；content 重置），
+                                // 下一个 attempt 以原始 request 重新生成整个 turn。
+                                content.clear();
+                                saw_any_semantic = false;
+                                saw_tool_calls = false;
+                                continue 'attempt;
+                            }
                                 // §4.3：区分"未收到任何语义事件"（连接不可用）与
                                 // "已收到部分内容后断联"（记录 interrupted attempt）。
                                 // partial content 已发给 UI 但不是一个完整 turn：
@@ -520,7 +557,7 @@ pub async fn run<P: Provider>(
                         break 'attempt response;
                     }
                 }
-            };
+            }
         };
         // provider 返回的 usage 是本次请求的用量；跨轮累加（§2.2/§12.4）。
         usage_total.input_tokens += response.usage.input_tokens;

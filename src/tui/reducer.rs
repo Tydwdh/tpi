@@ -469,6 +469,15 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
                 format!("⟳ 模型连接中断，正在自动续写…（第 {attempt} 次）"),
             );
         }
+        RuntimeEvent::TurnRestarting { attempt } => {
+            // §4.3 第三阶段：partial tool-call 后整个 turn 重新生成——
+            // 丢弃已显示的 partial（不进 transcript），提示用户。
+            view.discard_live_turn();
+            view.push_line(
+                LineKind::System,
+                format!("⟳ 工具调用中断，正在重新生成该轮回答…（第 {attempt} 次）"),
+            );
+        }
     }
 }
 
