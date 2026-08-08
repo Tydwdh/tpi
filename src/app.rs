@@ -838,6 +838,11 @@ workspace: {}
                         .map_err(|e| e.to_string())?;
                     // 记录失败 turn 供 /retry（§4.3）。
                     last_failed_message = Some(message.clone());
+                    // §修复：失败时把 User 消息写入 history——否则 /retry 复用
+                    // history 时模型丢失本次任务（context 不包含这条 User）。
+                    if !message.is_empty() {
+                        history.push(ChatMessage::User(message.clone()));
+                    }
                     *session = Some(session_log);
                     continue;
                 }
