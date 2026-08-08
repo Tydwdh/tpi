@@ -60,11 +60,11 @@ impl TerminalDriver {
                 )?;
             }
             execute!(std::io::stdout(), EnableBracketedPaste)?;
-            // §opencode 对齐：鼠标捕获用自定义 ANSI 序列——只启用点击/拖动
-            // （?1000h ?1002h ?1006h），**禁用 any-event（?1003h）**。这样：
-            // 应用可接收点击/拖动（展开工具、滚动），终端拖选文本仍可用
-            // （?1003h 一旦启用，终端会吞掉所有鼠标移动，文本选择失效）。
-            // 先显式 ?1003l 复位（部分终端三序列一族，last-wins）。
+            // §PointerHit：App-managed mouse 模式（单一选择）——启用点击/拖动
+            // 捕获（?1000h ?1002h ?1006h），禁用 any-event（?1003h，不报告
+            // 未按键的 hover）。注意：启用 1002 后**拖动由应用接收**，终端
+            // 不会同时做原生文本选择——这是有意为之的单一选择归属，不依赖
+            // "终端同时拖选"的假设。应用内拖选 + Ctrl+C 复制负责文本选择。
             let _ = std::io::Write::write_all(
                 &mut std::io::stdout(),
                 b"\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h",

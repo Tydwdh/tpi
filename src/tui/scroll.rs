@@ -5,7 +5,7 @@
 //! （§65：entries + width + height + anchor → 窗口），可单测。
 
 /// 转录条目的稳定 ID（§4.1）：不用 Vec index——trim/filter 都可能改 index。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct EntryId(pub u64);
 
 /// 滚动锚点（§4）：entry + entry 内 visual row。

@@ -276,6 +276,9 @@ pub enum MenuKind {
 /// 流式消息（TUI v2 §7.2：live 区，finalize 前不进 transcript）。
 #[derive(Debug, Clone, Default)]
 pub struct StreamingMessage {
+    /// 稳定 EntryId（§PointerHit：streaming 期间可选中，finalize 后沿用同一 id，
+    /// 选区不因 finalize 悬空）。
+    pub entry_id: EntryId,
     pub text: String,
     /// 文本变化时递增（渲染缓存失效；与 TranscriptLine.version 同义）。
     pub version: u64,
@@ -509,6 +512,25 @@ impl ViewModel {
     /// 否则会把“你好”渲染成多条带前缀的碎片行。
     pub fn push_stream_delta(&mut self, kind: LineKind, text: &str) {
         let version = self.alloc_version();
+        let needs_new = match kind {
+            LineKind::Assistant => self.live.assistant.is_none(),
+            LineKind::Reasoning => self.live.reasoning.is_none(),
+            _ => false,
+        };
+        if needs_new {
+            let entry_id = self.alloc_entry_id();
+            let msg = StreamingMessage {
+                entry_id,
+                text: String::new(),
+                version: 0,
+                truncated: false,
+            };
+            match kind {
+                LineKind::Assistant => self.live.assistant = Some(msg),
+                LineKind::Reasoning => self.live.reasoning = Some(msg),
+                _ => {}
+            }
+        }
         let slot = match kind {
             LineKind::Assistant => &mut self.live.assistant,
             LineKind::Reasoning => &mut self.live.reasoning,
@@ -518,11 +540,7 @@ impl ViewModel {
                 return;
             }
         };
-        let msg = slot.get_or_insert_with(|| StreamingMessage {
-            text: String::new(),
-            version: 0,
-            truncated: false,
-        });
+        let msg = slot.as_mut().expect("上方已初始化");
         // P1-9：单条消息有界（超出丢弃中段并标记，防膨胀）。
         if msg.text.len() < MAX_MESSAGE_CHARS {
             let room = MAX_MESSAGE_CHARS - msg.text.len();
@@ -563,7 +581,8 @@ impl ViewModel {
                     continue;
                 }
                 let version = self.alloc_version();
-                let id = self.alloc_entry_id();
+                // §PointerHit：沿用 streaming 期间分配的稳定 id，选区不悬空。
+                let id = msg.entry_id;
                 self.transcript.push(Entry::Message {
                     id,
                     line: TranscriptLine {
@@ -1319,8 +1338,8 @@ fn card_semantic_text(card: &ToolCard) -> String {
     let body = card
         .diff
         .as_deref()
-        .or_else(|| card.output.as_deref())
-        .or_else(|| card.tail.as_deref())
+        .or(card.output.as_deref())
+        .or(card.tail.as_deref())
         .unwrap_or_default();
     if !body.is_empty() {
         out.push('\n');

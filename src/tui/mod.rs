@@ -587,27 +587,24 @@ fn plan_window(
     } else {
         (Vec::new(), committed)
     };
-    // §InteractionRefactor：应用内选择高亮——语义选区（entry + 逻辑偏移）
-    // 投影回视觉行：窗口行所属 entry 与偏移落在选区内的整行加强调背景。
-    // 修复旧实现 `contains(row, 0)` 只查首列导致「选中但不高亮」的缺陷。
+    // §PointerHit：应用内选择高亮——语义选区（entry + 逻辑偏移）投影回视觉
+    // 行的精确 cell 范围（不再整行 REVERSED，修复「选中区域视觉比复制内容宽」）。
     if let Some(sel) = &view.selection {
         let selected = Style::default()
             .bg(theme.surface)
             .add_modifier(Modifier::REVERSED);
         let (lo, hi) = sel.normalized();
         for (i, row) in semantic_rows.iter().enumerate() {
-            let Some((entry_id, char_start, text, _decor)) = row else {
+            let Some((entry_id, char_start, text, decor)) = row else {
                 continue;
             };
             let row_lo = *char_start;
             let row_hi = *char_start + text.chars().count();
             let row_entry = *entry_id;
-            // 行 entry 必须在选区 entry 区间内。
-            let entry_in_range = row_entry >= lo.entry_id && row_entry <= hi.entry_id;
-            if !entry_in_range {
+            if row_entry < lo.entry_id || row_entry > hi.entry_id {
                 continue;
             }
-            // 行语义范围与选区偏移交集非空 → 高亮。
+            // 行语义范围与选区偏移的交集（char 范围）。
             let (sel_lo, sel_hi) = if row_entry == lo.entry_id && row_entry == hi.entry_id {
                 (lo.offset, hi.offset)
             } else if row_entry == lo.entry_id {
@@ -617,17 +614,50 @@ fn plan_window(
             } else {
                 (usize::MIN, usize::MAX)
             };
-            let overlap = row_lo.max(sel_lo) < row_hi.min(sel_hi);
-            if !overlap {
+            let from_char = row_lo.max(sel_lo).min(row_hi);
+            let to_char = row_hi.min(sel_hi).min(row_hi);
+            if from_char >= to_char {
                 continue;
             }
+            // char 交集 → 语义 cell 范围 → 加装饰前缀得到视觉 cell 范围。
+            let from_sel = from_char - row_lo;
+            let to_sel = to_char - row_lo;
+            let cell_from = crate::tui::interaction::chars_to_cells(text, from_sel) + *decor;
+            let cell_to = crate::tui::interaction::chars_to_cells(text, to_sel) + *decor;
             if let Some(line) = window.get_mut(i) {
-                *line = Line::from(
-                    line.spans
-                        .iter()
-                        .map(|span| Span::styled(span.content.clone(), selected))
-                        .collect::<Vec<_>>(),
-                );
+                // 逐 span：span 的视觉 cell 范围与 [cell_from, cell_to) 有交集则
+                // 高亮该 span 中交集的部分（保留 span 原有内容）。
+                let mut out_spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+                let mut cell_cursor = 0usize;
+                for span in &line.spans {
+                    let span_w = unicode_width::UnicodeWidthStr::width(span.content.as_ref());
+                    let span_from = cell_cursor;
+                    let span_to = cell_cursor + span_w;
+                    cell_cursor = span_to;
+                    if span_to <= cell_from || span_from >= cell_to {
+                        out_spans.push(span.clone());
+                        continue;
+                    }
+                    // 部分交集：截取该 span 中属于选区的字符。
+                    let hit_from = cell_from.saturating_sub(span_from);
+                    let hit_to = cell_to.saturating_sub(span_from).min(span_w);
+                    let content: String = span
+                        .content
+                        .chars()
+                        .scan(0usize, |w, ch| {
+                            let cw = crate::tui::text::char_cell_width(ch);
+                            let start = *w;
+                            *w += cw;
+                            Some((start, ch))
+                        })
+                        .filter(|(start, _)| *start >= hit_from && *start < hit_to)
+                        .map(|(_, ch)| ch)
+                        .collect();
+                    if !content.is_empty() {
+                        out_spans.push(Span::styled(content, selected));
+                    }
+                }
+                *line = Line::from(out_spans);
             }
         }
     }
@@ -1336,9 +1366,18 @@ fn build_live_group(
             }
         }
     }
+    // §PointerHit：live 区用稳定 EntryId（streaming 期间可选中，finalize 沿用
+    // 同一 id，选区不悬空）。取 assistant 优先，其次 reasoning；无流式文本时
+    // 退回落 point（不可选，仅工具卡片区域）。
+    let live_id = view
+        .live
+        .assistant
+        .as_ref()
+        .map(|m| m.entry_id)
+        .or_else(|| view.live.reasoning.as_ref().map(|m| m.entry_id))
+        .unwrap_or(EntryId(u64::MAX));
     groups.push((
-        // 哨兵 id：Locked 锚定不到 live 区（§16：live 只在 Follow 尾部可见）。
-        EntryId(u64::MAX),
+        live_id,
         std::mem::take(out),
         std::mem::take(hits),
         std::mem::take(semantic),
