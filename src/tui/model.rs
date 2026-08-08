@@ -362,14 +362,14 @@ pub struct ViewModel {
     pub transcript_rows: u16,
     /// 排队中的待提交消息数（footer 提示；由 UiState 同步）。
     pub pending_queue_len: usize,
-    /// 思考内容是否展开（Alt+T 切换，§16.2：thinking 可折叠）。
+    /// 思考内容是否展开（Alt+T 全局切换；§用户诉求：点击单个 thinking 行按条目展开）。
     pub reasoning_visible: bool,
+    /// 按条目展开的 thinking（§用户诉求：像 diff 一样点击行展开/收缩）。
+    /// 该 entry 的 thinking 折叠态显示一行，展开态显示全文。
+    pub reasoning_expanded: std::collections::HashSet<EntryId>,
     /// 鼠标点击命中的目标（工具卡片/reasoning 行；§24 高亮反馈）。
     /// Overlay 打开期间该行高亮；关闭 Overlay 后清除。
     pub active_hit: Option<crate::tui::HitTarget>,
-    /// 鼠标悬浮命中的目标（§24 hover 高亮）：光标停在可点击行上时
-    /// 该行显示 hover 反馈（反转/下划线），移开即清除。
-    pub hover_hit: Option<crate::tui::HitTarget>,
     /// 应用内选择复制（§用户诉求：拖动选择 + Ctrl+C 复制，不依赖终端原生
     /// 选择——mouse capture 保留，点击展开与拖选用位移阈值区分）。
     /// `Some` = 正在选择或已有选区（选区高亮直到清除/复制）。
@@ -423,8 +423,8 @@ impl Default for ViewModel {
             transcript_rows: 0,
             pending_queue_len: 0,
             reasoning_visible: false,
+            reasoning_expanded: std::collections::HashSet::new(),
             active_hit: None,
-            hover_hit: None,
             selection: None,
             input_tokens: 0,
             output_tokens: 0,
@@ -473,6 +473,7 @@ impl ViewModel {
         self.plan = None;
         self.status = StatusLine::Idle;
         self.turn = 0;
+        self.reasoning_expanded.clear();
         self.scroll_mode = ScrollMode::Follow;
         self.transcript_scroll = 0;
         self.pending_below = 0;
@@ -489,7 +490,6 @@ impl ViewModel {
         self.modal = None;
         self.search = None;
         self.active_hit = None;
-        self.hover_hit = None;
         self.selection = None;
     }
 
@@ -982,6 +982,23 @@ impl ViewModel {
         }
     }
 
+    /// §用户诉求：thinking 按条目展开/收缩（点击该行，像 diff 一样）。
+    pub fn toggle_reasoning_expanded(&mut self, id: EntryId) {
+        if self.reasoning_expanded.contains(&id) {
+            self.reasoning_expanded.remove(&id);
+        } else {
+            self.reasoning_expanded.insert(id);
+        }
+    }
+
+    /// 该 entry 的 thinking 是否展开（按条目展开优先；否则跟随全局 Alt+T）。
+    pub fn is_reasoning_expanded(&self, id: EntryId) -> bool {
+        if self.reasoning_expanded.contains(&id) {
+            return true;
+        }
+        self.reasoning_visible
+    }
+
     /// 打开 reasoning 原文 Overlay（点击折叠的 reasoning 行）。
     pub fn open_reasoning_overlay(&mut self, id: EntryId) {
         let Some(line) = self.transcript.iter().find_map(|entry| match entry {
@@ -1010,11 +1027,6 @@ impl ViewModel {
     }
 
     /// 更新鼠标悬浮目标（§24 hover 高亮）：命中可点击行 → 记录；
-    /// 移开/不可点 → 清除。
-    pub fn set_hover_hit(&mut self, hit: Option<crate::tui::HitTarget>) {
-        self.hover_hit = hit;
-    }
-
     /// 开始应用内选择（§用户诉求：鼠标按下开始拖动选择）。
     pub fn selection_start(&mut self, row: u16) {
         self.selection = Some(SelectionState::new(row));
@@ -1865,25 +1877,6 @@ mod p2_card_nav_tests {
         view.close_overlay();
         assert!(view.active_hit.is_none(), "关闭 Overlay 清除高亮");
         assert!(view.overlay.is_none());
-    }
-
-    /// §24：鼠标悬浮设置/清除 hover_hit（hover 高亮）。
-    #[test]
-    fn hover_hit_sets_and_clears() {
-        let mut view = ViewModel::default();
-        assert!(view.hover_hit.is_none(), "初始无 hover");
-        view.set_hover_hit(Some(crate::tui::HitTarget::Tool("c1".into())));
-        assert!(
-            matches!(&view.hover_hit, Some(crate::tui::HitTarget::Tool(id)) if id == "c1"),
-            "悬浮到工具卡片行必须记录: {:?}",
-            view.hover_hit
-        );
-        view.set_hover_hit(None);
-        assert!(view.hover_hit.is_none(), "移开鼠标清除 hover");
-        // 新会话也清除。
-        view.set_hover_hit(Some(crate::tui::HitTarget::Reasoning(EntryId(1))));
-        view.reset_for_new_session();
-        assert!(view.hover_hit.is_none());
     }
 
     /// §用户诉求：应用内选择状态——开始/更新/结束/清除/包含判断。

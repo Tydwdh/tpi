@@ -523,6 +523,25 @@ fn plan_window(
         window.extend(wrapped[from..to].iter().cloned());
         row_hits.extend(wrapped_hits[from..to].iter().cloned());
     }
+    // §用户诉求：卡片整行背景填满——有背景色（卡片/surface 或 diff 红绿）的
+    // 行补空格到满宽，避免「只有文字处有背景」的碎片感。
+    for line in window.iter_mut() {
+        let bg = line.spans.iter().find_map(|s| s.style.bg);
+        if let Some(color) = bg {
+            let cur = unicode_width::UnicodeWidthStr::width(
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .as_str(),
+            );
+            if cur < width as usize {
+                let pad = width as usize - cur;
+                line.spans
+                    .push(Span::styled(" ".repeat(pad), Style::default().bg(color)));
+            }
+        }
+    }
     // §用户诉求：应用内选择高亮——选中视口行用强调背景（覆盖 active/hover）。
     if let Some(sel) = &view.selection {
         let selected = Style::default()
@@ -801,7 +820,7 @@ fn build_transcript_text(
                 }
                 // §16.2：thinking dim italic，可折叠（Alt+T）；点击打开原文 Overlay。
                 LineKind::Reasoning => {
-                    if view.reasoning_visible {
+                    if view.is_reasoning_expanded(entry_id) {
                         for (i, s) in line.text.split('\n').enumerate() {
                             let prefix = if i == 0 { "思考 " } else { "    " };
                             push_hit(
@@ -821,7 +840,7 @@ fn build_transcript_text(
                             &mut out,
                             &mut hits,
                             Line::styled(
-                                "◇ 思考 · 已折叠（Alt+T 展开 · 点击查看）",
+                                "◇ 思考 · 点击展开",
                                 Style::default()
                                     .fg(theme.muted)
                                     .add_modifier(Modifier::ITALIC),
@@ -870,13 +889,8 @@ fn build_transcript_text(
                 let card_id = card.id.clone();
                 let card_lines = tool_card_lines(card, view.anim_tick, theme, width);
                 for (i, line) in card_lines.into_iter().enumerate() {
-                    // §24：主行可点击范围 = 图标+工具名+target 宽度（先算，避免 move 后借用）。
-                    let hit = if i == 0 {
-                        let w = line.width() as u16;
-                        Some((HitTarget::Tool(card_id.clone()), w))
-                    } else {
-                        None
-                    };
+                    // §用户诉求：整行可点击（点击任意位置展开/收缩 diff）。
+                    let hit = Some((HitTarget::Tool(card_id.clone()), width as u16));
                     // §用户诉求：卡片背景色（surface），形成 opencode 式卡片感
                     // （与 transcript 区分）。diff 行保留红绿背景（本身高亮）。
                     let is_diff_line = i > 0 && card.diff.is_some();
@@ -937,25 +951,6 @@ fn build_transcript_text(
                 })
                 .collect();
             out = highlighted;
-        } else if entry_matches_active_hit(&entry_id, &hits, &view.hover_hit) {
-            // §24 hover：鼠标停在可点击行上 → 反转色提示"可点击"。
-            let hovered = std::mem::take(&mut out)
-                .into_iter()
-                .map(|line| {
-                    Line::from(
-                        line.spans
-                            .into_iter()
-                            .map(|span| {
-                                Span::styled(
-                                    span.content,
-                                    span.style.add_modifier(Modifier::REVERSED),
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect();
-            out = hovered;
         }
         groups.push((
             entry_id,
@@ -2466,9 +2461,9 @@ mod tests {
         assert!(view.pending_below >= 1, "Locked 时新内容必须计数");
     }
 
-    /// §24：工具卡片只有主行可点击（end_col>0），正文行不可点（None）。
+    /// §用户诉求：工具卡片整行可点击（点击任意位置展开/收缩 diff）。
     #[test]
-    fn tool_card_only_main_row_is_clickable() {
+    fn tool_card_all_rows_clickable() {
         let mut view = ViewModel::default();
         view.begin_tool("c1", "bash", Some("cmd".into()), None);
         view.finish_tool(
@@ -2482,19 +2477,12 @@ mod tests {
         );
         let mut cache = HashMap::new();
         let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
-        // row_hits 与 window 等长；主行(index 0)应有 Tool hit 且 end_col>0，
-        // 正文/tail 行(index>0)应为 None（不可点，避免整行误触）。
+        // row_hits 与 window 等长；所有行都应可点击（end_col = 整行宽度）。
         assert!(plan.window.len() >= 2, "卡片含主行+正文: {:?}", plan.window);
-        let main = plan.row_hits[0].as_ref();
-        assert!(
-            matches!(main, Some((HitTarget::Tool(id), end)) if id == "c1" && *end > 0),
-            "主行必须可点击且限定列宽: {:?}",
-            plan.row_hits[0]
-        );
-        for hit in plan.row_hits.iter().skip(1) {
+        for hit in plan.row_hits.iter() {
             assert!(
-                hit.is_none(),
-                "卡片正文/tail 行不得可点击（避免误触）: {:?}",
+                matches!(hit, Some((HitTarget::Tool(id), end)) if id == "c1" && *end > 0),
+                "卡片每行都可点击（整行）: {:?}",
                 hit
             );
         }

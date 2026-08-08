@@ -336,19 +336,11 @@ async fn interactive_loop<P: Provider>(
                             need_draw = true;
                             crate::tui::reducer::update(&mut ui_state, UiEvent::Paste(text));
                         }
-                        // 鼠标：滚轮翻页、点击工具卡片展开、悬浮高亮、拖动选择（空闲态）。
+                        // 鼠标：滚轮翻页、点击工具卡片展开、拖动选择（空闲态）。
                         Some(Event::Mouse(mouse)) => {
                             use ratatui::crossterm::event::MouseButton;
                             use ratatui::crossterm::event::MouseEventKind;
                             match mouse.kind {
-                                MouseEventKind::Moved => {
-                                    // §24 hover：直接 hit-test 更新 view.hover_hit。
-                                    let hit = renderer.hit_target(mouse.column, mouse.row);
-                                    if ui_state.view.hover_hit != hit {
-                                        ui_state.view.set_hover_hit(hit);
-                                        need_draw = true;
-                                    }
-                                }
                                 MouseEventKind::Down(MouseButton::Left) => {
                                     // 记录按下位置（区分点击 vs 拖动选择）。
                                     mouse_down = Some((mouse.column, mouse.row));
@@ -1071,15 +1063,7 @@ async fn run_interactive<P: Provider>(
                         renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }
                     Some(Event::Mouse(mouse)) => {
-                        use ratatui::crossterm::event::MouseEventKind;
-                        if matches!(mouse.kind, MouseEventKind::Moved) {
-                            // §24 hover：直接 hit-test 更新 view.hover_hit。
-                            let hit = renderer.hit_target(mouse.column, mouse.row);
-                            if ui_state.view.hover_hit != hit {
-                                ui_state.view.set_hover_hit(hit);
-                                renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
-                            }
-                        } else if let Some(event) = mouse_ui_event(ui_state, renderer, mouse) {
+                        if let Some(event) = mouse_ui_event(ui_state, renderer, mouse) {
                             crate::tui::reducer::update(ui_state, event);
                             renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                         }

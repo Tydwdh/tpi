@@ -524,13 +524,8 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             }
             Vec::new()
         }
-        // §24 hover：reducer 不依赖终端坐标，MouseMoved 由 app 层解析为
-        // hit 目标后传入（未命中为 None）。
-        UiEvent::MouseMoved { .. } => {
-            // app 层已通过 Renderer.hit_target 更新 view.hover_hit；
-            // 此处仅标记重绘由 app 处理。
-            Vec::new()
-        }
+        // MouseMoved 保留为穷尽占位（hover 高亮已移除；移动事件不再影响状态）。
+        UiEvent::MouseMoved { .. } => Vec::new(),
         // §用户诉求：应用内选择复制。选择状态由 app 层直接更新
         //（需要 Renderer 的转录区坐标做 hit-test），reducer 只做穷尽占位。
         UiEvent::SelectionStart { .. }
@@ -548,7 +543,8 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new();
             }
-            state.view.open_reasoning_overlay(id);
+            // §用户诉求：点击 thinking 行展开/收缩（像 diff 一样）。
+            state.view.toggle_reasoning_expanded(id);
             Vec::new()
         }
         UiEvent::ScrollbarClick(row) => {
