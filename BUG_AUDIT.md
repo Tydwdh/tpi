@@ -214,3 +214,7 @@
 ## 迭代记录（2026-08-08 续 2）
 - MODAL-INPUT-001（新）：弹层打开时普通按键写入后台 composer；已修（弹层输入屏蔽 + 回归测试）。
 - SEARCH-001（新）：搜索命中无视觉高亮；已实现下划线高亮 + 回归测试。
+
+## 迭代记录（2026-08-08 续 3）
+- PROVIDER-RETRY-001（新，P1）：SSE 中途断开且已收到事件时，consume_stream 仍标记 retryable=true → 重发请求会重复已到达的文本/工具调用（与 §7.3 注释自相矛盾）。已修：`retryable = sse_transport_error_retryable(received_any)`（收到事件即不可重试）。
+  回归：单测 `sse_transport_error_retryable_only_before_any_event` + 集成测试 `sse_midstream_error_after_events_does_not_retry`（部分 SSE 后 RST，断言连接数=1 不重试）。

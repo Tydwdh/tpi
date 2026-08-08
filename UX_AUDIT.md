@@ -205,3 +205,6 @@
 1. 弹层输入屏蔽（真 bug）：Modal/Overlay 打开时普通按键会写入后台 composer，关弹层后输入框出现乱码——现在只放行 Esc/导航键/（菜单打开时的 Enter），其余按键 no-op。回归：modal_blocks_composer_typing / overlay_blocks_composer_typing / sessions_menu_enter_still_works_with_modal_open。
 2. 搜索命中高亮（人体工学）：命中条目整段下划线（保留原 fg），未命中不变；回归 search_highlight_underlines_matched_entries。
 3. ConPTY 交互验收回归：9/9 通过（scripts/interactive_acceptance.js，NODE_PATH=临时 node_modules）。
+
+## 20. 迭代第6轮（2026-08-08）
+- PROVIDER-RETRY-001（P1 正确性）：SSE 中途断开且已收到事件时不可重试（否则重复文本/工具调用）；修复 + 单测/集成回归（RST mock，连接数=1）。

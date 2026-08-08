@@ -745,3 +745,77 @@ async fn provider_failure_keeps_session_recoverable() {
         .unwrap();
     assert_eq!(reason, tpi::session::CompletionReason::Error);
 }
+
+#[allow(deprecated)]
+// SO_LINGER 是触发 RST 的标准手段；tokio 标记 deprecated（drop 可能阻塞线程）。`r`n/// 模拟 SSE 中途断开：返回头部 + 一个事件后以 RST（SO_LINGER=0）断开。
+/// 最多接受 4 个连接（若客户端错误地重试，计数会 >1；修复后应恒为 1）。
+async fn mock_sse_server_rst_after_partial(
+    partial: &'static str,
+) -> (String, tokio::task::JoinHandle<usize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let mut conns = 0usize;
+        for _ in 0..4 {
+            let accept = tokio::time::timeout(Duration::from_secs(3), listener.accept()).await;
+            let Ok(Ok((mut socket, _))) = accept else {
+                break;
+            };
+            conns += 1;
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let n = socket.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            })
+            .await;
+            let response =
+                format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{partial}");
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = socket.set_linger(Some(Duration::from_secs(0)));
+            drop(socket);
+        }
+        conns
+    });
+    (format!("http://{addr}/v1"), handle)
+}
+
+/// §7.3/§15：SSE 中途断开且已收到事件 → 必须返回错误且不得重试
+/// （否则重发请求会重复已到达的文本/工具调用）。
+#[tokio::test]
+async fn sse_midstream_error_after_events_does_not_retry() {
+    let partial = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"部分文本\"},\"finish_reason\":null}]}\n\n";
+    let (base_url, conns) = mock_sse_server_rst_after_partial(partial).await;
+    let mut client = OpenAiCompatClient::new(base_url, "m".into(), "k".into(), None, None, None);
+    let request = ModelRequest {
+        model: "m".into(),
+        messages: vec![ChatMessage::User("hi".into())],
+        tools: Vec::new(),
+        max_output_tokens: None,
+        reasoning: None,
+        context_window: None,
+    };
+    let (tx, mut rx) = mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = client
+        .stream(request, tx.clone(), CancellationToken::new())
+        .await;
+    drop(tx);
+    drain.abort();
+    assert!(result.is_err(), "SSE 中途断开（已收到事件）必须是错误");
+    assert_eq!(
+        conns.await.unwrap(),
+        1,
+        "收到事件后不得重试（否则重复文本/工具调用）"
+    );
+}

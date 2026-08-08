@@ -358,6 +358,11 @@ fn classify_error(message: String, attempt: u32) -> ProviderError {
     ProviderError::Connection(format!("attempt {attempt}: {message}"))
 }
 
+/// §7.3/§15：SSE 传输错误是否可安全重试。
+/// 收到任何事件后重试会重复内容（重复 assistant 文本/工具调用），必须不可重试。
+fn sse_transport_error_retryable(received_any: bool) -> bool {
+    !received_any
+}
 async fn consume_stream(
     response: reqwest::Response,
     events: tokio::sync::mpsc::Sender<ProviderEvent>,
@@ -389,7 +394,9 @@ async fn consume_stream(
             Err(e) => {
                 return ConsumeResult::Failed {
                     error: ProviderError::Protocol(e.to_string()),
-                    retryable: true,
+                    // §7.3/§15：只有未收到任何事件时才能重试——否则重发请求会重复
+                    // 已到达的文本/工具调用（此前恒为 true，SSE 中途断开会重复内容）。
+                    retryable: sse_transport_error_retryable(received_any),
                 };
             }
         };
@@ -693,4 +700,14 @@ mod tests {
         assert!(body.get("max_tokens").is_none(), "{body}");
         assert!(body.get("reasoning").is_none(), "{body}");
     }
+}
+
+/// §7.3/§15：SSE 传输错误只有未收到事件时才可重试（收到后重试会重复内容）。
+#[test]
+fn sse_transport_error_retryable_only_before_any_event() {
+    assert!(sse_transport_error_retryable(false), "未收到事件：可重试");
+    assert!(
+        !sse_transport_error_retryable(true),
+        "已收到事件：不可重试（避免重复文本/工具调用）"
+    );
 }
