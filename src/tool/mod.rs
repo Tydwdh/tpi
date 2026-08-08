@@ -314,6 +314,33 @@ pub fn resolve_tool_path(ctx: &ToolContext, path: &str) -> Result<Utf8PathBuf, P
     let normalized = normalize_lexical(joined.as_std_path())?;
     Utf8PathBuf::from_path_buf(normalized).map_err(|_| PathResolveError::Invalid)
 }
+
+/// 调度锁的路径标识（与工具实际解析一致，保证等价写法映射到同一锁）。
+///
+/// 严格模式：`resolve_workspace_path`（外部路径本就不会真正执行）；
+/// 自由模式：对路径做词法规范化，外部绝对路径的等价写法（`.\`、`..`、大小写之外的
+/// 词法差异）收敛为同一标识——否则同一外部文件可能被两个等价路径并行写入（竞态）。
+pub fn resolve_lock_path(
+    workspace_root: &Utf8PathBuf,
+    path: &str,
+    allow_outside_workspace: bool,
+) -> Utf8PathBuf {
+    if !allow_outside_workspace {
+        return resolve_workspace_path(workspace_root, path)
+            .unwrap_or_else(|_| Utf8PathBuf::from(path.trim()));
+    }
+    let trimmed = path.trim();
+    let candidate = Utf8PathBuf::from(trimmed);
+    let joined = if candidate.is_absolute() {
+        candidate
+    } else {
+        workspace_root.join(candidate)
+    };
+    normalize_lexical(joined.as_std_path())
+        .ok()
+        .and_then(|p| Utf8PathBuf::from_path_buf(p).ok())
+        .unwrap_or(joined)
+}
 /// 对路径本身做 canonicalize；失败时逐级向上解析最近存在的祖先。
 ///
 /// 目标尚不存在时（create 场景）`canonicalize` 返回 Err；此时必须解析其父链上

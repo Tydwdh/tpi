@@ -1212,10 +1212,17 @@ fn draw_footer(
             ));
         }
     }
-    // BUG-005：运行中排队的消息在 footer 可见（避免用户以为提交丢失/未生效）。
+
+    // 优先级：状态 → 排队/新内容提示 → ctx → tokens → 兼容模式（窄屏先保提示，不被 ctx/tokens 挤掉）。
     if view.pending_queue_len > 0 {
         spans.push(Span::styled(
             format!(" · 已排队 {} 条消息", view.pending_queue_len),
+            Style::default().fg(theme.warning),
+        ));
+    }
+    if view.pending_below > 0 {
+        spans.push(Span::styled(
+            format!(" · ↓{} 条新内容 · Ctrl+End 返回最新", view.pending_below),
             Style::default().fg(theme.warning),
         ));
     }
@@ -1253,13 +1260,6 @@ fn draw_footer(
     if !scrollback && mode == terminal::ViewMode::Inline {
         spans.push(Span::styled(
             " · 兼容模式（无滚动回退）",
-            Style::default().fg(theme.warning),
-        ));
-    }
-    // §16：Locked 期间的新内容提示（End 一键返回最新）。
-    if view.pending_below > 0 {
-        spans.push(Span::styled(
-            format!(" · ↓{} 条新内容 · Ctrl+End 返回最新", view.pending_below),
             Style::default().fg(theme.warning),
         ));
     }
@@ -1320,15 +1320,23 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: t
     let x = area.x + cursor_col;
     // 光标可见性：ratatui 每帧 set_cursor_position 都会 show_cursor，导致模型输出期间光标一直闪烁。
     // 运行中且输入为空时隐藏（用户主要在看输出；一旦开始输入（排队）就恢复显示）。
-    if should_show_input_cursor(&view.status, view.input.is_empty()) {
+    if should_show_input_cursor(
+        &view.status,
+        view.input.is_empty(),
+        view.modal.is_some() || view.overlay.is_some(),
+    ) {
         frame.set_cursor_position((x, y));
     }
 }
 
 /// 输入光标可见性策略（产品规则，可单测）：空闲恒显示；运行中仅在已有输入时显示
 /// （正在排队输入需要光标；否则隐藏，避免模型输出期间光标一直闪烁）。
-fn should_show_input_cursor(status: &StatusLine, input_empty: bool) -> bool {
-    matches!(status, StatusLine::Idle) || !input_empty
+fn should_show_input_cursor(
+    status: &StatusLine,
+    input_empty: bool,
+    overlay_or_modal_open: bool,
+) -> bool {
+    (matches!(status, StatusLine::Idle) || !input_empty) && !overlay_or_modal_open
 }
 
 /// BUG-008：输入区内部滚动的可见基准——保证光标行落在 `area` 内。
@@ -2076,22 +2084,36 @@ fn overlay_clears_background_before_rendering() {
 /// 修复：模型输出（Running + 空输入）期间隐藏光标，避免一直闪烁；空闲时显示。
 #[test]
 fn cursor_hidden_during_run_when_input_empty() {
-    // 产品规则：空闲恒显示；运行中仅输入非空时显示。
-    assert!(should_show_input_cursor(&StatusLine::Idle, true));
-    assert!(should_show_input_cursor(&StatusLine::Idle, false));
+    // 产品规则：空闲恒显示；运行中仅输入非空时显示；Modal/Overlay 打开时隐藏。
+    assert!(should_show_input_cursor(&StatusLine::Idle, true, false));
+    assert!(should_show_input_cursor(&StatusLine::Idle, false, false));
     assert!(!should_show_input_cursor(
         &StatusLine::Running {
             turn: 1,
             tool: "x".into()
         },
-        true
+        true,
+        false
     ));
     assert!(should_show_input_cursor(
         &StatusLine::Running {
             turn: 1,
             tool: "x".into()
         },
+        false,
         false
+    ));
+    assert!(
+        !should_show_input_cursor(&StatusLine::Idle, true, true),
+        "Modal/Overlay 打开时隐藏输入光标"
+    );
+    assert!(!should_show_input_cursor(
+        &StatusLine::Running {
+            turn: 1,
+            tool: "x".into()
+        },
+        false,
+        true
     ));
 
     // 字节级：运行中 + 空输入的帧必须发出隐藏序列（绘制期间不得 set_cursor_position）。

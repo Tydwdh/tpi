@@ -1,4 +1,4 @@
-﻿//! Agent 状态机与执行循环（文档 §6）。
+//! Agent 状态机与执行循环（文档 §6）。
 //!
 //! §6.2 一轮的精确算法：接收用户消息 → append UserSubmitted → 构建 context →
 //! 发起一次 provider request → 消费规范化 stream → 原子提交 assistant message →
@@ -595,8 +595,12 @@ async fn execute_batch(
         };
         match tool.parse_args(&call.arguments) {
             Ok(args) => {
-                let access =
-                    crate::agent::scheduler::tool_access(tool, &args, &config.workspace_root);
+                let access = crate::agent::scheduler::tool_access(
+                    tool,
+                    &args,
+                    &config.workspace_root,
+                    config.allow_outside_workspace,
+                );
                 prepared.push(PreparedCall {
                     source_index: index,
                     tool,

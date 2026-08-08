@@ -1,4 +1,4 @@
-//! M6 验收契约（§21 M6、§17）。
+﻿//! M6 验收契约（§21 M6、§17）。
 //!
 //! - `web_search` 使用免费 DuckDuckGo 端点（无需 API key，零配置；§17）；
 //!   解析器契约在此 + src/tool/web.rs 单测覆盖（广告过滤、uddg 链接还原）；
@@ -174,6 +174,7 @@ fn web_tools_are_pure_access() {
             domains: None,
         }),
         &workspace,
+        true,
     );
     assert_eq!(access, tpi::agent::scheduler::ToolAccess::Pure);
 }

@@ -194,3 +194,9 @@
 3. 首次打开光标在 ❯ 左边 —— 空输入时 wrap 结果为空、行列未赋值（0,0），已改为停在 prompt 右侧（0,2）。
 4. 模型输出期间光标一直闪烁 —— ratatui 每帧 set_cursor_position 都会 show_cursor；新增 should_show_input_cursor：空闲恒显示、运行中仅输入非空时显示（正在排队输入仍可见），其余时间隐藏。
 全部有回归测试（submit_clears_input_projection / overlay_clears_background_before_rendering / input_cursor_empty_input_sits_right_of_prompt / cursor_hidden_during_run_when_input_empty）。
+
+## 18. 下一轮迭代（2026-08-08）
+1. 自由模式调度锁路径不一致（真 bug）：`tool_access` 用严格 resolver，外部绝对路径的等价写法（`..`/`.\`）映射到不同锁 → 同一外部文件可能并行写。新增 `resolve_lock_path`（自由模式词法规范化），`tool_access` 增加 allow_outside 参数；回归测试 freedom_mode_normalizes_outside_path_locks。
+2. Ctrl-C 在搜索打开时直接退出/取消（人体工学陷阱）：改为优先关闭搜索，再按一次才退出；回归测试。
+3. Modal/Overlay 打开时输入光标仍显示/闪烁：`should_show_input_cursor` 增加 modal/overlay 条件，打开弹层即隐藏输入光标。
+4. footer 信息优先级：排队/新内容提示移到 ctx/tokens 之前，窄屏不再被挤掉。

@@ -601,3 +601,29 @@ fn submit_clears_input_projection() {
         "view.input 必须同步清空（发送后输入框不得残留文本）"
     );
 }
+
+/// Ctrl-C 在搜索打开时先关闭搜索，不误退出/误取消；再按一次才退出。
+#[test]
+fn ctrl_c_closes_search_instead_of_quitting_or_cancelling() {
+    let mut s = state();
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+    );
+    assert!(s.view.search.is_some());
+    let effects = reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+    );
+    assert!(s.view.search.is_none(), "Ctrl-C 必须先关闭搜索");
+    assert!(
+        effects.is_empty(),
+        "关闭搜索不得产生 Quit/CancelRun: {effects:?}"
+    );
+    // 搜索已关、空闲：再按 Ctrl-C → 退出。
+    let effects2 = reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+    );
+    assert!(effects2.contains(&UiEffect::Quit));
+}

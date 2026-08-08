@@ -87,6 +87,9 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             state.view.close_modal();
         } else if state.view.menu.is_some() {
             state.view.menu = None;
+        } else if state.view.search.is_some() {
+            // Ctrl-C 在搜索打开时先关闭搜索（避免误退出/误取消，与 Esc 语义一致）。
+            state.view.search = None;
         } else if state.running {
             // §6.2：Ctrl-C 打断当前 run（等价 Esc，保留 session）。
             effects.push(UiEffect::CancelRun);

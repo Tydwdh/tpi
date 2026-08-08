@@ -49,31 +49,34 @@ pub fn tool_access(
     tool: BuiltinTool,
     args: &ValidatedArgs,
     workspace_root: &camino::Utf8PathBuf,
+    allow_outside_workspace: bool,
 ) -> ToolAccess {
-    fn resolved_path(workspace_root: &camino::Utf8PathBuf, path: &str) -> camino::Utf8PathBuf {
-        crate::tool::resolve_workspace_path(workspace_root, path)
-            .unwrap_or_else(|_| camino::Utf8PathBuf::from(path))
+    fn resolved_path(
+        workspace_root: &camino::Utf8PathBuf,
+        path: &str,
+        allow_outside: bool,
+    ) -> camino::Utf8PathBuf {
+        crate::tool::resolve_lock_path(workspace_root, path, allow_outside)
     }
-
     match (tool, args) {
         (BuiltinTool::Read, ValidatedArgs::Read(args)) => {
-            let path = resolved_path(workspace_root, &args.path);
+            let path = resolved_path(workspace_root, &args.path, allow_outside_workspace);
             file_lock(FileScope::Exact(path), AccessMode::Read)
         }
         (BuiltinTool::List, ValidatedArgs::List(args)) => {
-            let path = resolved_path(workspace_root, &args.path);
+            let path = resolved_path(workspace_root, &args.path, allow_outside_workspace);
             file_lock(FileScope::Recursive(path), AccessMode::Read)
         }
         (BuiltinTool::Search, ValidatedArgs::Search(args)) => {
-            let path = resolved_path(workspace_root, &args.path);
+            let path = resolved_path(workspace_root, &args.path, allow_outside_workspace);
             file_lock(FileScope::Recursive(path), AccessMode::Read)
         }
         (BuiltinTool::Edit, ValidatedArgs::Edit(args)) => {
-            let path = resolved_path(workspace_root, &args.path);
+            let path = resolved_path(workspace_root, &args.path, allow_outside_workspace);
             file_lock(FileScope::Exact(path), AccessMode::Write)
         }
         (BuiltinTool::Write, ValidatedArgs::Write(args)) => {
-            let path = resolved_path(workspace_root, &args.path);
+            let path = resolved_path(workspace_root, &args.path, allow_outside_workspace);
             file_lock(FileScope::Exact(path), AccessMode::Write)
         }
         (BuiltinTool::Bash, _) => ToolAccess::WorkspaceUnknown,

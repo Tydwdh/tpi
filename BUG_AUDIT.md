@@ -207,3 +207,6 @@
   - 严格模式：维持原 `resolve_workspace_path`（含 junction/symlink 写穿检查）。
 - 接线：`Config → ToolContext.allow_outside_workspace → 各工具`；`/settings` 展示当前模式。
 - 测试：`read_allows_outside_absolute_path_when_freedom_enabled`、`resolve_tool_path_accepts_outside_when_freedom_enabled`；原严格模式测试显式 `allow_outside_workspace=false` 保留。
+
+## 迭代记录（2026-08-08 续）
+- LOCK-001（新）：自由模式调度锁对等价外部路径不收敛 → 并行写竞态；已修（resolve_lock_path + tool_access 参数 + 回归测试）。

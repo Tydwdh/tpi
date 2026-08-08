@@ -240,6 +240,7 @@ fn scheduler_locks_use_resolved_paths() {
             replacements: Vec::new(),
         }),
         &workspace,
+        true,
     );
     let access_b = tool_access(
         BuiltinTool::Edit,
@@ -249,6 +250,7 @@ fn scheduler_locks_use_resolved_paths() {
             replacements: Vec::new(),
         }),
         &workspace,
+        true,
     );
 
     let lock_a = match access_a {
@@ -309,4 +311,47 @@ fn resolve_tool_path_accepts_outside_when_freedom_enabled() {
     // 严格模式仍拒绝。
     ctx.allow_outside_workspace = false;
     assert!(tpi::tool::resolve_tool_path(&ctx, &outside.to_string_lossy()).is_err());
+}
+
+/// 自由模式：外部绝对路径的等价写法必须映射到同一调度锁，
+/// 否则同一外部文件可能被两个等价路径并行写入（竞态）。
+#[test]
+fn freedom_mode_normalizes_outside_path_locks() {
+    use tpi::agent::scheduler::{AccessMode, ToolAccess, tool_access};
+    use tpi::tool::{BuiltinTool, ValidatedArgs, edit::EditArgs};
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().join("project")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let outside_dir = dir.path().join("outside");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::fs::write(outside_dir.join("a.txt"), "x").unwrap();
+
+    let edit = |path: String| {
+        tool_access(
+            BuiltinTool::Edit,
+            &ValidatedArgs::Edit(EditArgs {
+                path,
+                revision: String::new(),
+                replacements: Vec::new(),
+            }),
+            &workspace,
+            true,
+        )
+    };
+    let base = outside_dir.join("a.txt").to_string_lossy().into_owned();
+    let with_dotdot = format!("{}\\..\\outside\\a.txt", outside_dir.to_string_lossy());
+
+    let lock_a = match edit(base) {
+        ToolAccess::Resources(locks) => locks,
+        _ => panic!("expected resource lock"),
+    };
+    let lock_b = match edit(with_dotdot) {
+        ToolAccess::Resources(locks) => locks,
+        _ => panic!("expected resource lock"),
+    };
+    assert_eq!(
+        lock_a, lock_b,
+        "等价外部路径必须映射到同一锁（自由模式词法规范化）"
+    );
+    assert_eq!(lock_a[0].mode, AccessMode::Write);
 }
