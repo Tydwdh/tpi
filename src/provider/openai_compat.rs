@@ -212,12 +212,30 @@ impl Provider for OpenAiCompatClient {
             trace::log("request_start", fields);
         }
 
-        // §7.3：只在尚未收到任何 response event 前重试。
+        // §7.3：只在尚未收到任何 response event 前重试。请求发送阶段与流读取阶段
+        // （consume_stream）的传输错误在未收到任何事件时同样可安全重试（网络抖动/
+        // 连接中途断开），收到事件后失败则不可重试（避免事件重复/乱序）。
         for attempt in 0..=MAX_RETRIES {
-            let response = self
-                .send_once(&url, &body, &cancel)
-                .await
-                .map_err(|error| classify_error(error, attempt))?;
+            let response = match self.send_once(&url, &body, &cancel).await {
+                Ok(response) => response,
+                Err(error) => {
+                    // 传输层失败（连接被拒/中断）：未收到任何事件，可安全重试。
+                    if attempt == MAX_RETRIES {
+                        return Err(classify_error(error, attempt));
+                    }
+                    tracing::warn!(
+                        attempt,
+                        error = %error,
+                        "provider: 请求发送失败，重试",
+                    );
+                    let delay = Duration::from_secs(1);
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
+            };
             match response {
                 SendResult::Ok(response) => {
                     let status = response.status();
@@ -226,7 +244,28 @@ impl Provider for OpenAiCompatClient {
                         fields.insert("status".into(), json!(status.as_u16()));
                         trace::log("response_status", fields);
                     }
-                    return consume_stream(response, events, cancel).await;
+                    match consume_stream(response, events.clone(), cancel.clone()).await {
+                        ConsumeResult::Ok(response) => return Ok(response),
+                        ConsumeResult::Failed { error, retryable } => {
+                            if !retryable || matches!(error, ProviderError::Cancelled) {
+                                return Err(error);
+                            }
+                            if attempt == MAX_RETRIES {
+                                return Err(error);
+                            }
+                            // 未收到任何事件：传输层失败，短暂等待后重发请求。
+                            tracing::warn!(
+                                attempt,
+                                error = %error,
+                                "provider: 响应流读取失败且未收到事件，重试",
+                            );
+                            let delay = Duration::from_secs(1);
+                            tokio::select! {
+                                _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+                                _ = tokio::time::sleep(delay) => {}
+                            }
+                        }
+                    }
                 }
                 SendResult::Retryable { retry_after } => {
                     if trace::enabled() {
@@ -247,6 +286,16 @@ impl Provider for OpenAiCompatClient {
         }
         Err(ProviderError::Connection("retry budget exhausted".into()))
     }
+}
+
+/// 流消费结果：区分可安全重试（未收到任何事件）与不可重试的失败。
+enum ConsumeResult {
+    Ok(ProviderResponse),
+    Failed {
+        error: ProviderError,
+        /// 未收到任何 response 事件（§7.3：可安全重发请求）。
+        retryable: bool,
+    },
 }
 
 enum SendResult {
@@ -313,20 +362,37 @@ async fn consume_stream(
     response: reqwest::Response,
     events: tokio::sync::mpsc::Sender<ProviderEvent>,
     cancel: CancellationToken,
-) -> Result<ProviderResponse, ProviderError> {
+) -> ConsumeResult {
     let mut stream = response.bytes_stream().eventsource();
     let mut pending: Vec<PendingToolCall> = Vec::new();
     let mut finish_reason: Option<FinishReason> = None;
     let mut usage = Usage::default();
     let mut received_any = false;
+    // 正常 OpenAI SSE 流以 `[DONE]` 结束；EOF 前未见 [DONE] = 流被截断
+    // （此前静默丢失尾部内容——事件中间中断被当成正常结束）。
+    let mut saw_done = false;
 
     loop {
         let next = tokio::select! {
-            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+            _ = cancel.cancelled() => {
+                return ConsumeResult::Failed {
+                    error: ProviderError::Cancelled,
+                    retryable: false,
+                }
+            }
             next = stream.next() => next,
         };
         let Some(event) = next else { break };
-        let event = event.map_err(|e| ProviderError::Protocol(e.to_string()))?;
+        // 传输层错误（连接中断/响应体解码失败等）在未收到事件时可安全重试。
+        let event = match event {
+            Ok(event) => event,
+            Err(e) => {
+                return ConsumeResult::Failed {
+                    error: ProviderError::Protocol(e.to_string()),
+                    retryable: true,
+                };
+            }
+        };
         if trace::enabled() {
             let mut fields = serde_json::Map::new();
             fields.insert("event_type".into(), json!(event.event));
@@ -334,17 +400,28 @@ async fn consume_stream(
             trace::log("sse_event", fields);
         }
         if event.event == "error" {
-            return Err(ProviderError::Protocol(event.data));
+            return ConsumeResult::Failed {
+                error: ProviderError::Protocol(event.data),
+                retryable: false,
+            };
         }
         if event.event == "ping" || event.data.trim().is_empty() {
             continue;
         }
         // `[DONE]` 标记。
         if event.data.trim() == "[DONE]" {
+            saw_done = true;
             break;
         }
-        let chunk: SseChunk = serde_json::from_str(&event.data)
-            .map_err(|e| ProviderError::Protocol(format!("invalid chunk: {e}")))?;
+        let chunk: SseChunk = match serde_json::from_str(&event.data) {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                return ConsumeResult::Failed {
+                    error: ProviderError::Protocol(format!("invalid chunk: {e}")),
+                    retryable: false,
+                };
+            }
+        };
         received_any = true;
         for choice in &chunk.choices {
             if let Some(content) = &choice.delta.content
@@ -419,8 +496,25 @@ async fn consume_stream(
         }
     }
 
-    if !received_any {
-        return Err(ProviderError::Protocol("empty stream".into()));
+    if !saw_done {
+        // EOF 前未见 [DONE]。部分 provider 不发 [DONE] 但发 finish_reason——
+        // 视为正常结束；两者都无 = 流被截断（服务器中断/网络丢包）。
+        if finish_reason.is_some() {
+            // 正常结束（宽松 provider 路径）。
+        } else if received_any {
+            // 已发出事件：不可重试（避免事件重复/乱序）。
+            return ConsumeResult::Failed {
+                error: ProviderError::Protocol(
+                    "stream ended before [DONE] and no finish_reason".into(),
+                ),
+                retryable: false,
+            };
+        } else {
+            return ConsumeResult::Failed {
+                error: ProviderError::Protocol("empty stream".into()),
+                retryable: true,
+            };
+        }
     }
 
     // §7.3：tool arguments 不完整（未闭合 JSON）时返回协议错误，不能猜补 JSON。
@@ -441,15 +535,26 @@ async fn consume_stream(
                 arguments,
             })
         })
-        .collect::<Result<Vec<_>, ProviderError>>()?;
+        .collect::<Result<Vec<_>, ProviderError>>()
+        .map_err(|error| ConsumeResult::Failed {
+            error,
+            retryable: false,
+        });
+    let tool_calls = match tool_calls {
+        Ok(tool_calls) => tool_calls,
+        Err(failed) => return failed,
+    };
 
     // §30 第 11 条：finish=tool_calls 但没有任何完整 call → 明确协议错误
     // （此前静默返回 Ok，agent 侧看到空 calls 无法推进）。
     let finish_reason = finish_reason.unwrap_or(FinishReason::Error);
     if finish_reason == FinishReason::ToolCalls && tool_calls.is_empty() {
-        return Err(ProviderError::Protocol(
-            "finish_reason=tool_calls but no tool calls received".into(),
-        ));
+        return ConsumeResult::Failed {
+            error: ProviderError::Protocol(
+                "finish_reason=tool_calls but no tool calls received".into(),
+            ),
+            retryable: false,
+        };
     }
 
     if trace::enabled() {
@@ -460,7 +565,7 @@ async fn consume_stream(
         fields.insert("tool_call_count".into(), json!(tool_calls.len()));
         trace::log("finish", fields);
     }
-    Ok(ProviderResponse {
+    ConsumeResult::Ok(ProviderResponse {
         finish_reason,
         usage,
         tool_calls,

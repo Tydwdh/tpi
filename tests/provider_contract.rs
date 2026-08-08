@@ -72,6 +72,54 @@ async fn mock_sse_server(
     (format!("http://{addr}/v1"), handle)
 }
 
+/// 第一个连接接受后立即断开（模拟传输层中断/请求发送失败），
+/// 第二个连接正常返回 SSE——验证请求发送阶段重试。
+async fn mock_sse_server_fail_once(sse_body: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // 第一个请求：接受后立即断开（不写任何响应）。
+        let (first, _) = listener.accept().await.unwrap();
+        drop(first);
+        // 第二个请求：正常返回 SSE。
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let header_end = loop {
+            let n = socket.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                panic!("connection closed before headers");
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]);
+        let content_length: usize = head
+            .lines()
+            .find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse().unwrap())
+            })
+            .unwrap_or(0);
+        while buf.len() < header_end + 4 + content_length {
+            let n = socket.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let response =
+            format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{sse_body}");
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.flush().await.unwrap();
+    });
+    format!("http://{addr}/v1")
+}
+
 /// 通过 mock server 跑一次完整 stream，返回 (response, 捕获的 request body)。
 async fn run_via_mock(
     sse_body: &'static str,
@@ -151,6 +199,201 @@ async fn recorded_text_only_streams_text() {
         })
         .collect();
     assert_eq!(text, "hello world", "recorded SSE 文本必须完整: {events:?}");
+}
+
+/// 传输层中断重试：第一个连接未写任何响应即断开（≈ error decoding
+/// response body），consume_stream 阶段未收到事件时必须重发请求并成功。
+#[tokio::test]
+async fn stream_transport_failure_retries_before_any_event() {
+    let fixture = include_str!("fixtures/provider/text_only.sse");
+    let base_url = mock_sse_server_fail_once(fixture).await;
+    let mut client = OpenAiCompatClient::new(
+        base_url,
+        "client-model".into(),
+        "test-key".into(),
+        None,
+        None,
+        None,
+    );
+    let request = ModelRequest {
+        model: "request-model".into(),
+        messages: vec![ChatMessage::User("hi".into())],
+        tools: Vec::new(),
+        max_output_tokens: None,
+        reasoning: None,
+        context_window: None,
+    };
+    let (tx, mut rx) = mpsc::channel(64);
+    let response = client
+        .stream(request, tx.clone(), CancellationToken::new())
+        .await
+        .expect("传输中断后必须重试成功");
+    drop(tx);
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    assert_eq!(response.finish_reason, FinishReason::Stop);
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::TextDelta(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text, "hello world",
+        "重试后的流必须完整且事件不重复: {events:?}"
+    );
+}
+
+/// 第一个连接返回 200 + SSE 响应头 + 部分 body 后中断（≈ "error decoding
+/// response body"：响应体在流读取阶段被截断），第二个连接正常返回——
+/// 验证 consume_stream 阶段未收到事件时重试。
+#[tokio::test]
+async fn stream_body_truncation_retries_before_any_event() {
+    let fixture = include_str!("fixtures/provider/text_only.sse");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // 第一个请求：写响应头 + 半个 SSE 事件后立即断开。
+        let (mut first, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = first.read(&mut buf).await;
+        let partial = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"hel";
+        let _ = first.write_all(partial.as_bytes()).await;
+        let _ = first.flush().await;
+        drop(first); // 截断：不写完整个 SSE body。
+        // 第二个请求：正常返回 SSE。
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf2: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let header_end = loop {
+            let n = socket.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                panic!("connection closed before headers");
+            }
+            buf2.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf2.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf2[..header_end]);
+        let content_length: usize = head
+            .lines()
+            .find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse().unwrap())
+            })
+            .unwrap_or(0);
+        while buf2.len() < header_end + 4 + content_length {
+            let n = socket.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf2.extend_from_slice(&tmp[..n]);
+        }
+        let response =
+            format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{fixture}");
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.flush().await.unwrap();
+    });
+    let base_url = format!("http://{addr}/v1");
+    let mut client = OpenAiCompatClient::new(
+        base_url,
+        "client-model".into(),
+        "test-key".into(),
+        None,
+        None,
+        None,
+    );
+    let request = ModelRequest {
+        model: "request-model".into(),
+        messages: vec![ChatMessage::User("hi".into())],
+        tools: Vec::new(),
+        max_output_tokens: None,
+        reasoning: None,
+        context_window: None,
+    };
+    let (tx, mut rx) = mpsc::channel(64);
+    let response = client
+        .stream(request, tx.clone(), CancellationToken::new())
+        .await
+        .expect("响应体截断后必须重试成功");
+    drop(tx);
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    assert_eq!(response.finish_reason, FinishReason::Stop);
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::TextDelta(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text, "hello world",
+        "重试后的流必须完整且事件不重复: {events:?}"
+    );
+}
+
+/// 已收到事件后流中断：不可重试（避免事件重复/乱序），直接返回协议错误；
+/// 已到达的部分文本必须仍经事件通道可见。
+#[tokio::test]
+async fn stream_failure_after_events_does_not_retry() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // 唯一连接：写完整响应头 + 一个完整 SSE 事件 + 截断（不再写更多）。
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        let partial = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"wor";
+        let _ = socket.write_all(partial.as_bytes()).await;
+        let _ = socket.flush().await;
+        drop(socket); // 截断。
+    });
+    let base_url = format!("http://{addr}/v1");
+    let mut client = OpenAiCompatClient::new(
+        base_url,
+        "client-model".into(),
+        "test-key".into(),
+        None,
+        None,
+        None,
+    );
+    let request = ModelRequest {
+        model: "request-model".into(),
+        messages: vec![ChatMessage::User("hi".into())],
+        tools: Vec::new(),
+        max_output_tokens: None,
+        reasoning: None,
+        context_window: None,
+    };
+    let (tx, mut rx) = mpsc::channel(64);
+    let result = client
+        .stream(request, tx.clone(), CancellationToken::new())
+        .await;
+    drop(tx);
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    assert!(result.is_err(), "已收到事件后中断必须报错（不可重试）");
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::TextDelta(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "hello ", "已到达的部分文本必须保留: {events:?}");
 }
 
 /// Level 3：one_tool_call.sse → tool call 增量拼接完整、

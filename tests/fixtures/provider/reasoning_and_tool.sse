@@ -5,3 +5,4 @@ data: {"choices":[{"delta":{"content":"我先读取这个文件。","tool_calls"
 data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
 
 data: [DONE]
+

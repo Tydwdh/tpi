@@ -3,3 +3,4 @@ data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_bad","function":
 data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
 
 data: [DONE]
+
