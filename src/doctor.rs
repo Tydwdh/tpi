@@ -1,4 +1,4 @@
-//! 环境诊断（P2：`tpi doctor` / `/doctor`）。
+﻿//! 环境诊断（P2：`tpi doctor` / `/doctor`）。
 //!
 //! 检查项集中在单个函数，CLI 与 TUI 共用同一份报告，
 //! 避免两处维护不同的检查逻辑。
@@ -66,6 +66,7 @@ pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
     // 3. Git Bash（bash 是唯一命令执行通道）。
     let ctx = crate::tool::ToolContext {
         workspace_root: workspace_root.clone(),
+        allow_outside_workspace: true,
         cancel: tokio_util::sync::CancellationToken::new(),
         artifacts_root: home.join("artifacts"),
         session_id: "doctor".into(),

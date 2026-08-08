@@ -6,7 +6,7 @@
 use crate::tool::edit::{self, EditError};
 use crate::tool::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::tool::{
-    ToolContext, path_rejected_outcome, resolve_workspace_path, validate_artifact_component,
+    ToolContext, path_rejected_outcome, resolve_tool_path, validate_artifact_component,
 };
 use camino::Utf8PathBuf;
 use schemars::JsonSchema;
@@ -84,7 +84,7 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
         }
         return read_artifact(ctx, session_id, id, args.start_line, args.line_count);
     }
-    let path = match resolve_workspace_path(&ctx.workspace_root, &args.path) {
+    let path = match resolve_tool_path(ctx, &args.path) {
         Ok(path) => path,
         Err(error) => return path_rejected_outcome("read", error),
     };
@@ -199,7 +199,7 @@ pub fn edit(
     ctx: &ToolContext,
     plan: Option<&crate::tool::edit::CommitPlan>,
 ) -> ToolOutcome {
-    let path = match resolve_workspace_path(&ctx.workspace_root, &args.path) {
+    let path = match resolve_tool_path(ctx, &args.path) {
         Ok(path) => path,
         Err(error) => return path_rejected_outcome("edit", error),
     };
@@ -268,7 +268,7 @@ pub fn write(
     ctx: &ToolContext,
     plan: Option<&crate::tool::edit::CommitPlan>,
 ) -> ToolOutcome {
-    let path = match resolve_workspace_path(&ctx.workspace_root, &args.path) {
+    let path = match resolve_tool_path(ctx, &args.path) {
         Ok(path) => path,
         Err(error) => return path_rejected_outcome("write", error),
     };
@@ -472,6 +472,7 @@ mod tests {
             snapshot_store: Default::default(),
             current_plan: Default::default(),
             interactive: false,
+            allow_outside_workspace: true,
         };
         let outcome = read(
             ReadArgs {

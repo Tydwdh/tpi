@@ -182,6 +182,8 @@ pub const TOOL_STREAM_CAPACITY: usize = 256;
 #[derive(Clone)]
 pub struct ToolContext {
     pub workspace_root: Utf8PathBuf,
+    /// §9.1 自由模式：允许访问 workspace 外的绝对路径（默认 true；false 恢复严格沙箱）。
+    pub allow_outside_workspace: bool,
     pub cancel: CancellationToken,
     /// artifact 根目录（§14.1：`~/.tpi/artifacts`）。
     pub artifacts_root: std::path::PathBuf,
@@ -286,6 +288,32 @@ pub fn resolve_workspace_path(
     Utf8PathBuf::from_path_buf(normalized).map_err(|_| PathResolveError::Invalid)
 }
 
+/// 工具路径解析（§9.1 自由模式）：按 `ctx.allow_outside_workspace` 决定是否
+/// 允许 workspace 外的绝对路径。
+///
+/// - 自由模式（默认 true）：只做词法规范化（拒绝空/NUL），绝对路径可指向任意位置——
+///   与 bash 的自由保持一致（bash 本来就能访问任意路径）；
+/// - 严格模式（false）：走 [`resolve_workspace_path`]（含 junction/symlink 写穿检查）。
+pub fn resolve_tool_path(ctx: &ToolContext, path: &str) -> Result<Utf8PathBuf, PathResolveError> {
+    if !ctx.allow_outside_workspace {
+        return resolve_workspace_path(&ctx.workspace_root, path);
+    }
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(PathResolveError::Empty);
+    }
+    if trimmed.contains('\0') {
+        return Err(PathResolveError::Invalid);
+    }
+    let candidate = Utf8PathBuf::from(trimmed);
+    let joined = if candidate.is_absolute() {
+        candidate
+    } else {
+        ctx.workspace_root.join(candidate)
+    };
+    let normalized = normalize_lexical(joined.as_std_path())?;
+    Utf8PathBuf::from_path_buf(normalized).map_err(|_| PathResolveError::Invalid)
+}
 /// 对路径本身做 canonicalize；失败时逐级向上解析最近存在的祖先。
 ///
 /// 目标尚不存在时（create 场景）`canonicalize` 返回 Err；此时必须解析其父链上
@@ -458,6 +486,7 @@ mod tests {
             snapshot_store: Default::default(),
             current_plan: Default::default(),
             interactive: false,
+            allow_outside_workspace: true,
         };
         let outcome = execute(
             BuiltinTool::Read,

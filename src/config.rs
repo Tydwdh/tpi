@@ -75,6 +75,9 @@ pub struct PrimaryModelFile {
 #[serde(default)]
 pub struct AgentFile {
     pub limits: Option<AgentLimitsFile>,
+    /// 是否允许文件工具访问 workspace 外的绝对路径（§9.1 自由模式；
+    /// 默认 true——个人工具以 AI 自由优先；false 恢复严格 workspace 沙箱）。
+    pub allow_outside_workspace: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,6 +115,9 @@ pub struct Config {
     pub ui_theme: String,
     /// §1 [ui] mode：fullscreen（默认）/ inline（兼容模式）。
     pub ui_mode: crate::tui::terminal::ViewMode,
+    /// §9.1：文件工具（read/edit/write/list/search）是否允许访问 workspace 外路径。
+    /// 默认 true（bash 本来就能自由访问，保持一致）；false 恢复严格沙箱。
+    pub allow_outside_workspace: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +265,7 @@ pub fn load(workspace_root: &Utf8PathBuf, cli_model: Option<&str>) -> Result<Con
             .as_deref()
             .map(crate::tui::terminal::ViewMode::parse)
             .unwrap_or_default(),
+        allow_outside_workspace: merged.agent.allow_outside_workspace.unwrap_or(true),
     })
 }
 
@@ -278,6 +285,10 @@ fn merge(home: ConfigFile, workspace: ConfigFile) -> ConfigFile {
         },
         agent: AgentFile {
             limits: merge_limits(home.agent.limits, workspace.agent.limits),
+            allow_outside_workspace: workspace
+                .agent
+                .allow_outside_workspace
+                .or(home.agent.allow_outside_workspace),
         },
         shell: ShellFile {
             path: workspace.shell.path.or(home.shell.path),
@@ -379,6 +390,7 @@ mod tests {
     fn merge_is_field_level_not_block_level() {
         let home = ConfigFile {
             agent: AgentFile {
+                allow_outside_workspace: None,
                 limits: Some(AgentLimitsFile {
                     max_model_turns: Some(100),
                     max_tool_calls: Some(200),
@@ -392,6 +404,7 @@ mod tests {
         // workspace 只定义 max_parallel_tools：home 的其他 limits 字段必须保留。
         let workspace = ConfigFile {
             agent: AgentFile {
+                allow_outside_workspace: None,
                 limits: Some(AgentLimitsFile {
                     max_model_turns: None,
                     max_tool_calls: None,

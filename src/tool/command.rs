@@ -84,7 +84,7 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
         "text/plain",
     )
     .ok();
-    let exec_cwd = match crate::tool::resolve_workspace_path(&ctx.workspace_root, &args.cwd) {
+    let exec_cwd = match crate::tool::resolve_tool_path(ctx, &args.cwd) {
         Ok(path) => path.to_string(),
         Err(error) => {
             return crate::tool::path_rejected_outcome("bash", error);

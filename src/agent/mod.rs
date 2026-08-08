@@ -700,6 +700,7 @@ error: invalid_arguments
             let access = call.access.clone();
             let ctx = tool::ToolContext {
                 workspace_root: config.workspace_root.clone(),
+                allow_outside_workspace: config.allow_outside_workspace,
                 cancel: cancel.clone(),
                 artifacts_root: config.artifacts_root.clone(),
                 session_id: session.session_id().to_string(),
@@ -764,6 +765,7 @@ error: invalid_arguments
                     .unwrap_or(crate::agent::scheduler::ToolAccess::Pure);
                 let ctx = tool::ToolContext {
                     workspace_root: config.workspace_root.clone(),
+                    allow_outside_workspace: config.allow_outside_workspace,
                     cancel: cancel.clone(),
                     artifacts_root: config.artifacts_root.clone(),
                     session_id: session.session_id().to_string(),

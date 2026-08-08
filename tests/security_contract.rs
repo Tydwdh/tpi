@@ -31,7 +31,8 @@ fn write_through_workspace_junction_is_blocked() {
         .expect("mklink runs");
     assert!(status.success(), "mklink /J 创建 junction 失败");
 
-    let ctx = test_tool_context(&workspace);
+    let mut ctx = test_tool_context(&workspace);
+    ctx.allow_outside_workspace = false; // 本测试验证严格模式
     // 目标文件不存在：canonicalize 失败时必须解析最近存在祖先（junction 本身）。
     // write 需要 commit plan（write-ahead 契约），临时文件也落在 link 目录内。
     let target = workspace.join("link").join("escaped.txt");
@@ -87,7 +88,8 @@ fn resolve_workspace_path_allows_relative_inside_workspace() {
 fn read_rejects_path_outside_workspace() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-    let ctx = test_tool_context(&workspace);
+    let mut ctx = test_tool_context(&workspace);
+    ctx.allow_outside_workspace = false; // 本测试验证严格模式
     let outcome = read(
         ReadArgs {
             path: "../secret.txt".into(),
@@ -103,7 +105,8 @@ fn read_rejects_path_outside_workspace() {
 fn read_rejects_artifact_path_traversal() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-    let ctx = test_tool_context(&workspace);
+    let mut ctx = test_tool_context(&workspace);
+    ctx.allow_outside_workspace = false; // 本测试验证严格模式
     let outcome = read(
         ReadArgs {
             path: "@artifact/../evil/id".into(),
@@ -126,7 +129,8 @@ fn validate_artifact_component_rejects_separators() {
 fn write_rejects_outside_workspace() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-    let ctx = test_tool_context(&workspace);
+    let mut ctx = test_tool_context(&workspace);
+    ctx.allow_outside_workspace = false; // 本测试验证严格模式
     let outcome = write(
         WriteArgs {
             path: "../../escape.txt".into(),
@@ -152,7 +156,8 @@ async fn web_fetch_localhost_is_blocked_without_test_override() {
     tpi::tool::web::set_allow_private_web_targets_for_tests(false);
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-    let ctx = test_tool_context(&workspace);
+    let mut ctx = test_tool_context(&workspace);
+    ctx.allow_outside_workspace = false; // 本测试验证严格模式
     let outcome = web_fetch(
         WebFetchArgs {
             url: "http://127.0.0.1:1/".into(),
@@ -170,7 +175,8 @@ async fn web_fetch_allows_localhost_when_test_override_enabled() {
     tpi::tool::web::set_allow_private_web_targets_for_tests(true);
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-    let ctx = test_tool_context(&workspace);
+    let mut ctx = test_tool_context(&workspace);
+    ctx.allow_outside_workspace = false; // 本测试验证严格模式
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let body = "<html><head><title>Test Page</title></head><body><h1>Hello TPI</h1></body></html>";
@@ -259,4 +265,48 @@ fn scheduler_locks_use_resolved_paths() {
         ResourceId::File(FileScope::Exact(_))
     ));
     assert_eq!(lock_a[0].mode, AccessMode::Write);
+}
+
+/// §9.1 自由模式（allow_outside_workspace=true，默认）：read 允许 workspace 外绝对路径。
+#[test]
+fn read_allows_outside_absolute_path_when_freedom_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().join("project")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "外部文件内容\n").unwrap();
+    let mut ctx = test_tool_context(&workspace);
+    ctx.allow_outside_workspace = true; // 默认即 true；显式声明
+
+    let outcome = read(
+        ReadArgs {
+            path: outside.to_string_lossy().into_owned(),
+            start_line: 1,
+            line_count: 10,
+        },
+        &ctx,
+    );
+    assert_eq!(outcome.status, ToolStatus::Succeeded);
+    assert!(
+        outcome.model_text().contains("外部文件内容"),
+        "自由模式下必须能读取 workspace 外文件: {}",
+        outcome.model_text()
+    );
+}
+
+/// §9.1 自由模式：resolve_tool_path 对 workspace 外绝对路径返回 Ok。
+#[test]
+fn resolve_tool_path_accepts_outside_when_freedom_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().join("project")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let mut ctx = test_tool_context(&workspace);
+    ctx.allow_outside_workspace = true;
+    let outside = dir.path().join("elsewhere/x.txt");
+    let resolved = tpi::tool::resolve_tool_path(&ctx, &outside.to_string_lossy()).unwrap();
+    assert_eq!(resolved.as_std_path(), outside.as_path());
+
+    // 严格模式仍拒绝。
+    ctx.allow_outside_workspace = false;
+    assert!(tpi::tool::resolve_tool_path(&ctx, &outside.to_string_lossy()).is_err());
 }

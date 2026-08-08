@@ -200,3 +200,10 @@
   注：Alt+E 工具详情与 bracketed paste 无法经 ConPTY 输入模拟（由真实终端产生），
   由单元/集成测试覆盖（overlay 渲染/点击、paste 路由、editor unicode）。
 
+## 设计变更（2026-08-08，用户决策）：workspace 逃逸限制改为可配置，默认放开
+- 背景：文件工具（read/edit/write/list/search）此前禁止访问 workspace 外路径，但 bash 本来就能自由访问任意路径——限制与 bash 不对称，用户判定“不如给 AI 自由”。
+- 变更：新增 `[agent] allow_outside_workspace`（默认 `true` = 自由模式；`false` 恢复严格沙箱）。
+  - 自由模式：`resolve_tool_path` 只做词法规范化（拒绝空/NUL），绝对路径可指向任意位置；
+  - 严格模式：维持原 `resolve_workspace_path`（含 junction/symlink 写穿检查）。
+- 接线：`Config → ToolContext.allow_outside_workspace → 各工具`；`/settings` 展示当前模式。
+- 测试：`read_allows_outside_absolute_path_when_freedom_enabled`、`resolve_tool_path_accepts_outside_when_freedom_enabled`；原严格模式测试显式 `allow_outside_workspace=false` 保留。

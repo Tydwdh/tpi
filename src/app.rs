@@ -1,4 +1,4 @@
-//! 应用层（文档 §4.1）：输入路由、生命周期。
+﻿//! 应用层（文档 §4.1）：输入路由、生命周期。
 //!
 //! 活动 run 中的输入路由（§6.2）：
 //! - 普通 Enter：输入排队（pending_message），**当前 run 完成后**作为下一条
@@ -391,7 +391,8 @@ artifacts: {}
 shell: {shell}
 web_search: DuckDuckGo（免费，无需 API key）
 自动打开浏览器: {}
-保留 token: {}",
+保留 token: {}
+允许访问 workspace 外路径: {}",
                             config.source,
                             config.workspace_root,
                             config.sessions_root.display(),
@@ -402,6 +403,11 @@ web_search: DuckDuckGo（免费，无需 API key）
                                 "否"
                             },
                             config.safety_reserve_tokens,
+                            if config.allow_outside_workspace {
+                                "是（AI 自由模式）"
+                            } else {
+                                "否（严格沙箱）"
+                            },
                         ),
                     );
                     renderer

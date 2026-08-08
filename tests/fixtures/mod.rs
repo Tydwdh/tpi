@@ -34,6 +34,7 @@ pub fn test_config(workspace_root: &Utf8PathBuf) -> Config {
         system_prompt_extra: None,
         source: "test".into(),
         ui_theme: "omp".into(),
+        allow_outside_workspace: true,
     }
 }
 
@@ -65,5 +66,6 @@ pub fn test_tool_context(workspace_root: &Utf8PathBuf) -> tpi::tool::ToolContext
         )),
         current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
         interactive: true,
+        allow_outside_workspace: true,
     }
 }
