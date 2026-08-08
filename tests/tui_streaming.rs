@@ -264,12 +264,12 @@ fn reasoning_can_be_folded() {
     let buffer = draw_to_test_backend(&mut view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(
-        rendered.contains("已折叠"),
+        rendered.contains("点击展开"),
         "默认折叠显示提示行: {rendered:?}"
     );
     assert!(!rendered.contains("内部推理过程"));
 
-    // Alt+T 展开后显示原文。
+    // Alt+T 全局展开后显示原文。
     view.reasoning_visible = true;
     let buffer = draw_to_test_backend(&mut view, 80, 12);
     assert!(buffer_text(&buffer).contains("内部推理过程"));

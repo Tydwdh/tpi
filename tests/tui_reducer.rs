@@ -991,3 +991,47 @@ fn esc_closes_sessions_browser_in_one_press() {
         "one Esc must dismiss the whole /sessions browser"
     );
 }
+
+/// §用户诉求：鼠标拖动选择后 Ctrl+C 触发 CopySelection effect（复制到剪贴板）。
+#[test]
+fn ctrl_c_with_selection_triggers_copy_effect() {
+    let mut s = state();
+    // 模拟拖动选择视口第 1-2 行。
+    s.view.selection_start(1);
+    s.view.selection_update(2);
+    s.view.selection_end();
+    assert!(s.view.selection.is_some(), "选区必须存在");
+
+    let effects = reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+    );
+    assert!(
+        effects.contains(&UiEffect::CopySelection),
+        "有选区时 Ctrl+C 必须触发复制: {effects:?}"
+    );
+
+    // 无选区时 Ctrl+C 静默（不复制）。
+    let mut s2 = state();
+    let effects2 = reducer::update(
+        &mut s2,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+    );
+    assert!(
+        !effects2.contains(&UiEffect::CopySelection),
+        "无选区时 Ctrl+C 不复制: {effects2:?}"
+    );
+}
+
+/// §用户诉求：SelectionStart/Update/End 事件更新选择状态（reducer 占位，
+/// app 层直接操作；此处验证不影响其它状态）。
+#[test]
+fn selection_events_are_noop_in_reducer() {
+    let mut s = state();
+    let effects = reducer::update(&mut s, UiEvent::SelectionStart { row: 2 });
+    assert!(effects.is_empty());
+    let effects = reducer::update(&mut s, UiEvent::SelectionUpdate { row: 5 });
+    assert!(effects.is_empty());
+    let effects = reducer::update(&mut s, UiEvent::SelectionEnd);
+    assert!(effects.is_empty());
+}
