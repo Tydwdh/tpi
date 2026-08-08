@@ -1508,8 +1508,23 @@ fn tool_card_lines(
     }
     let mut lines = vec![Line::from(spans)];
 
+    // §用户诉求：edit/write 的独立 diff 字段 → 无论展开与否都默认显示红绿
+    // diff（opencode 式：每次写入后直接可见）。不受折叠状态影响。
+    if let Some(diff_text) = &card.diff {
+        let diff_lines = render_diff_lines(diff_text, theme);
+        for l in diff_lines {
+            // 保留工具卡片的 │ 前缀 + diff 行红绿背景（Line.style 应用整行）。
+            let mut spans = vec![Span::styled("│ ", Style::default().fg(theme.muted))];
+            spans.extend(l.spans.iter().cloned());
+            lines.push(Line::from(spans).style(l.style));
+        }
+    }
+
     // 正文（有严格行数预算）：展开态完整输出 / 运行中实时尾注 / 失败 tail。
-    let show_body = if card.expanded {
+    // card.diff 已独立渲染（上方），此处不再重复显示输出里的 diff 段。
+    let show_body = if card.diff.is_some() {
+        None
+    } else if card.expanded {
         card.output.as_deref()
     } else if let ToolCardState::Running = card.state {
         card.output.as_deref() // 运行中的实时输出（折叠态显示，最多 3 行）
@@ -1517,52 +1532,40 @@ fn tool_card_lines(
         None
     };
     if let Some(body) = show_body {
-        // §用户诉求：edit/write 的独立 diff 字段 → 默认展开显示红绿 diff
-        // （opencode 式：每次写入后直接可见，无需点开）。
-        if let Some(diff_text) = &card.diff {
-            let diff_lines = render_diff_lines(diff_text, theme);
+        // 无独立 diff（非 edit/write）：展开态输出含 `diff:` 段时着色。
+        let diff_idx = find_diff_start(body);
+        if card.expanded && diff_idx.is_some() {
+            let (prefix, diff_part) = match diff_idx {
+                Some(idx) => (&body[..idx], &body[idx..]),
+                None => (body, ""),
+            };
+            for s in prefix.lines() {
+                lines.push(Line::styled(
+                    format!("│ {s}"),
+                    Style::default().fg(theme.text),
+                ));
+            }
+            let diff_lines = render_diff_lines(diff_part, theme);
             for l in diff_lines {
-                // 保留工具卡片的 │ 前缀 + diff 行红绿背景（Line.style 应用整行）。
                 let mut spans = vec![Span::styled("│ ", Style::default().fg(theme.muted))];
                 spans.extend(l.spans.iter().cloned());
                 lines.push(Line::from(spans).style(l.style));
             }
         } else {
-            // 无独立 diff：展开态显示完整输出文本（含 `diff:` 段时着色）。
-            let diff_idx = find_diff_start(body);
-            if card.expanded && diff_idx.is_some() {
-                let (prefix, diff_part) = match diff_idx {
-                    Some(idx) => (&body[..idx], &body[idx..]),
-                    None => (body, ""),
-                };
-                for s in prefix.lines() {
-                    lines.push(Line::styled(
-                        format!("│ {s}"),
-                        Style::default().fg(theme.text),
-                    ));
-                }
-                let diff_lines = render_diff_lines(diff_part, theme);
-                for l in diff_lines {
-                    let mut spans = vec![Span::styled("│ ", Style::default().fg(theme.muted))];
-                    spans.extend(l.spans.iter().cloned());
-                    lines.push(Line::from(spans).style(l.style));
-                }
+            let body_lines: Vec<&str> = body.split('\n').collect();
+            let shown: Vec<&str> = if card.expanded {
+                body_lines
             } else {
-                let body_lines: Vec<&str> = body.split('\n').collect();
-                let shown: Vec<&str> = if card.expanded {
-                    body_lines
+                // 整改 A3：折叠态实时输出只保留最后 3 行。
+                body_lines.iter().rev().take(3).copied().collect::<Vec<_>>()
+            };
+            for s in shown {
+                let style = if card.expanded {
+                    Style::default().fg(theme.text)
                 } else {
-                    // 整改 A3：折叠态实时输出只保留最后 3 行。
-                    body_lines.iter().rev().take(3).copied().collect::<Vec<_>>()
+                    Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
                 };
-                for s in shown {
-                    let style = if card.expanded {
-                        Style::default().fg(theme.text)
-                    } else {
-                        Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
-                    };
-                    lines.push(Line::styled(format!("│ {s}"), style));
-                }
+                lines.push(Line::styled(format!("│ {s}"), style));
             }
         }
         if card.output_truncated && card.expanded {
@@ -2701,6 +2704,50 @@ mod tests {
             .find(|l| l.spans[0].content.starts_with("@@"))
             .expect("找到 @@ 行");
         assert_eq!(hunk.style.fg, Some(theme.primary));
+    }
+
+    /// §用户诉求：edit/write 卡片**未展开**时 diff 也必须显示（默认可见）。
+    #[test]
+    fn tool_card_shows_diff_without_expanding() {
+        let theme = theme::Theme::omp();
+        let card = ToolCard {
+            id: "c1".into(),
+            name: "edit".into(),
+            target: Some("src/lib.rs".into()),
+            command: None,
+            state: ToolCardState::Done {
+                status: crate::tool::outcome::ToolStatus::Succeeded,
+                duration_ms: 10,
+                exit_code: Some(0),
+            },
+            output: Some("status: succeeded\ntool: edit\npath: src/lib.rs\n".into()),
+            diff: Some(
+                "--- a/src/lib.rs\n+++ b/src/lib.rs\n-    let x = 1;\n+    let x = 2;\n".into(),
+            ),
+            output_truncated: false,
+            expanded: false, // 未展开——diff 仍应显示
+            tail: None,
+        };
+        let lines = tool_card_lines(&card, 0, theme, 100);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            text.contains("let x = 1") && text.contains("let x = 2"),
+            "未展开时 diff 必须显示: {text:?}"
+        );
+        // diff 行带红/绿背景。
+        let minus = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("let x = 1")))
+            .expect("找到 - 行");
+        assert_eq!(minus.style.bg, Some(theme.error), "删除行红底");
+        let plus = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("let x = 2")))
+            .expect("找到 + 行");
+        assert_eq!(plus.style.bg, Some(theme.success), "新增行绿底");
     }
 
     #[test]
