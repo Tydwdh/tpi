@@ -33,7 +33,7 @@ fn cjk_emoji_over_card_cap_never_panics_and_stays_bounded() {
     // 单块超大（远超剩余预算）：命中尾部窗口路径。
     view.append_tool_output("c1", multibyte_flood("👨\u{200d}💻", MAX_CARD_OUTPUT * 2));
     let card = view.live.tools.get("c1").expect("live 区必须有卡片");
-    let output = card.output.as_ref().expect("输出必须累积");
+    let output = card.card.output.as_ref().expect("输出必须累积");
     assert!(output.len() <= MAX_CARD_OUTPUT, "len={}", output.len());
     assert!(output.is_char_boundary(0) && output.is_char_boundary(output.len()));
 }

@@ -335,45 +335,16 @@ async fn interactive_loop<P: Provider>(
                             crate::tui::reducer::update(&mut ui_state, UiEvent::Paste(text));
                         }
                         // 鼠标：统一走 Pointer State Machine（§InteractionRefactor），
-                        // 覆盖滚轮/点击/拖动选择/scrollbar，与 run 中同一状态机。
+                        // §PointerHit ⑥：统一鼠标 dispatch（idle 与 run 同一实现）。
                         Some(Event::Mouse(mouse)) => {
-                            use crate::tui::interaction::PointerInput;
-                            use ratatui::crossterm::event::MouseButton;
-                            use ratatui::crossterm::event::MouseEventKind;
-                            // 弹层（Overlay/Modal）打开时点击不动作。
-                            let hit = if ui_state.view.overlay.is_some()
-                                || ui_state.view.modal.is_some()
-                            {
-                                crate::tui::interaction::PointerHit::none()
-                            } else {
-                                pointer_target(&renderer, mouse.column, mouse.row)
-                            };
-                            let input = match mouse.kind {
-                                MouseEventKind::Down(MouseButton::Left) => PointerInput::Down {
-                                    column: mouse.column,
-                                    row: mouse.row,
-                                    hit,
-                                },
-                                MouseEventKind::Drag(MouseButton::Left) => PointerInput::Drag {
-                                    column: mouse.column,
-                                    row: mouse.row,
-                                    hit,
-                                },
-                                MouseEventKind::Up(MouseButton::Left) => PointerInput::Up {
-                                    column: mouse.column,
-                                    row: mouse.row,
-                                    hit,
-                                },
-                                MouseEventKind::Moved => PointerInput::Move {
-                                    column: mouse.column,
-                                    row: mouse.row,
-                                    hit,
-                                },
-                                MouseEventKind::ScrollUp => PointerInput::ScrollUp,
-                                MouseEventKind::ScrollDown => PointerInput::ScrollDown,
-                                _ => continue,
-                            };
-                            let events = pointer_gesture.feed(input);
+                            let overlay_open = ui_state.view.overlay.is_some()
+                                || ui_state.view.modal.is_some();
+                            let events = handle_mouse(
+                                mouse,
+                                &renderer,
+                                &mut pointer_gesture,
+                                overlay_open,
+                            );
                             if !events.is_empty() {
                                 need_draw = true;
                                 for event in events {
@@ -841,6 +812,51 @@ workspace: {}
     Ok(())
 }
 
+/// §PointerHit ⑥：统一 idle/run 的鼠标 dispatch——同一实现，杜绝两处 drift。
+/// 输入 crossterm MouseEvent + renderer + 状态机，输出语义化 UiEvent。
+/// `overlay_open`：弹层打开时点击不动作。
+fn handle_mouse(
+    mouse: ratatui::crossterm::event::MouseEvent,
+    renderer: &Renderer,
+    gesture: &mut crate::tui::interaction::PointerGesture,
+    overlay_open: bool,
+) -> Vec<crate::tui::event::UiEvent> {
+    use crate::tui::interaction::PointerInput;
+    use ratatui::crossterm::event::MouseButton;
+    use ratatui::crossterm::event::MouseEventKind;
+    let hit = if overlay_open {
+        crate::tui::interaction::PointerHit::none()
+    } else {
+        pointer_target(renderer, mouse.column, mouse.row)
+    };
+    let input = match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => PointerInput::Down {
+            column: mouse.column,
+            row: mouse.row,
+            hit,
+        },
+        MouseEventKind::Drag(MouseButton::Left) => PointerInput::Drag {
+            column: mouse.column,
+            row: mouse.row,
+            hit,
+        },
+        MouseEventKind::Up(MouseButton::Left) => PointerInput::Up {
+            column: mouse.column,
+            row: mouse.row,
+            hit,
+        },
+        MouseEventKind::Moved => PointerInput::Move {
+            column: mouse.column,
+            row: mouse.row,
+            hit,
+        },
+        MouseEventKind::ScrollUp => PointerInput::ScrollUp,
+        MouseEventKind::ScrollDown => PointerInput::ScrollDown,
+        _ => return Vec::new(),
+    };
+    gesture.feed(input)
+}
+
 /// §PointerHit：屏幕坐标 → 组合命中（文本 + 可选动作 + 区域）。
 /// 一个 cell 可以是「可选择文本 + 可点击控件」——不再互斥。
 fn pointer_target(
@@ -1032,46 +1048,10 @@ async fn run_interactive<P: Provider>(
                         renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }
                     Some(Event::Mouse(mouse)) => {
-                        use crate::tui::interaction::PointerInput;
-                        use ratatui::crossterm::event::MouseButton;
-                        use ratatui::crossterm::event::MouseEventKind;
-                        // 与空闲态同一状态机（拖选复制在运行中可用）。
-                        let hit = if ui_state.view.overlay.is_some()
-                            || ui_state.view.modal.is_some()
-                        {
-                            crate::tui::interaction::PointerHit::none()
-                        } else {
-                            pointer_target(renderer, mouse.column, mouse.row)
-                        };
-                        let input = match mouse.kind {
-                            MouseEventKind::Down(MouseButton::Left) => PointerInput::Down {
-                                column: mouse.column,
-                                row: mouse.row,
-                                hit,
-                            },
-                            MouseEventKind::Drag(MouseButton::Left) => PointerInput::Drag {
-                                column: mouse.column,
-                                row: mouse.row,
-                                hit,
-                            },
-                            MouseEventKind::Up(MouseButton::Left) => PointerInput::Up {
-                                column: mouse.column,
-                                row: mouse.row,
-                                hit,
-                            },
-                            MouseEventKind::Moved => PointerInput::Move {
-                                column: mouse.column,
-                                row: mouse.row,
-                                hit,
-                            },
-                            MouseEventKind::ScrollUp => PointerInput::ScrollUp,
-                            MouseEventKind::ScrollDown => PointerInput::ScrollDown,
-                            _ => {
-                                renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
-                                continue;
-                            }
-                        };
-                        let events = pointer_gesture.feed(input);
+                        // §PointerHit ⑥：统一鼠标 dispatch（idle 与 run 同一实现）。
+                        let overlay_open = ui_state.view.overlay.is_some()
+                            || ui_state.view.modal.is_some();
+                        let events = handle_mouse(mouse, renderer, &mut pointer_gesture, overlay_open);
                         for event in events {
                             crate::tui::reducer::update(ui_state, event);
                         }

@@ -286,6 +286,14 @@ pub struct StreamingMessage {
     pub truncated: bool,
 }
 
+/// 运行中的工具卡片 + 稳定 EntryId（§PointerHit ⑤：每个 live 对象独立 id，
+/// finish 沿用——finalize 后选区不悬空，tool 输出可选择/复制）。
+#[derive(Debug, Clone)]
+pub struct LiveTool {
+    pub entry_id: EntryId,
+    pub card: ToolCard,
+}
+
 /// 正在变化的 turn 状态（TUI v2 §7.2）：与 finalized transcript 分离。
 ///
 /// 分离收益（§59）：历史 finalized entry 不会因当前 tool output /
@@ -298,8 +306,8 @@ pub struct LiveTurnState {
     pub assistant: Option<StreamingMessage>,
     /// 流式 reasoning 消息（未完成；begin_tool / run 结束时 finalize）。
     pub reasoning: Option<StreamingMessage>,
-    /// 运行中的工具卡片（按 call_id）。
-    pub tools: HashMap<String, ToolCard>,
+    /// 运行中的工具卡片（按 call_id；§PointerHit：每个带稳定 EntryId）。
+    pub tools: HashMap<String, LiveTool>,
     /// 工具启动顺序（finalize/渲染保持视觉顺序）。
     pub tool_order: Vec<String>,
 }
@@ -601,11 +609,14 @@ impl ViewModel {
     pub fn finalize_live(&mut self) {
         self.finalize_streaming();
         // 剩余运行中工具（run 被取消/异常结束时）也提交，保持历史可见。
+        // §PointerHit ⑤：沿用 begin_tool 分配的稳定 id，选区不悬空。
         let order = std::mem::take(&mut self.live.tool_order);
         for call_id in order {
-            if let Some(card) = self.live.tools.remove(&call_id) {
-                let entry_id = self.alloc_entry_id();
-                self.transcript.push(Entry::Tool { id: entry_id, card });
+            if let Some(tool) = self.live.tools.remove(&call_id) {
+                self.transcript.push(Entry::Tool {
+                    id: tool.entry_id,
+                    card: tool.card,
+                });
                 self.note_new_content();
             }
         }
@@ -621,9 +632,11 @@ impl ViewModel {
         self.live.reasoning = None;
         let order = std::mem::take(&mut self.live.tool_order);
         for call_id in order {
-            if let Some(card) = self.live.tools.remove(&call_id) {
-                let entry_id = self.alloc_entry_id();
-                self.transcript.push(Entry::Tool { id: entry_id, card });
+            if let Some(tool) = self.live.tools.remove(&call_id) {
+                self.transcript.push(Entry::Tool {
+                    id: tool.entry_id,
+                    card: tool.card,
+                });
                 self.note_new_content();
             }
         }
@@ -649,12 +662,17 @@ impl ViewModel {
     /// ratio ∈ [0,1] 对应视口顶部在内容中的位置（0 = 顶部，1 = 底部）。
     pub fn scroll_to_ratio(&mut self, ratio: f64) {
         let mut ids: Vec<EntryId> = self.transcript.iter().map(Entry::id).collect();
-        // 与 plan_window 一致：live 区是最后一个 group（哨兵 id）。
-        if self.live.reasoning.is_some()
-            || self.live.assistant.is_some()
-            || !self.live.tools.is_empty()
-        {
-            ids.push(EntryId(u64::MAX));
+        // §PointerHit ⑤：live 区各对象独立 id（与 build_live_group 的组一致）。
+        if let Some(msg) = &self.live.reasoning {
+            ids.push(msg.entry_id);
+        }
+        if let Some(msg) = &self.live.assistant {
+            ids.push(msg.entry_id);
+        }
+        for call_id in &self.live.tool_order {
+            if let Some(tool) = self.live.tools.get(call_id) {
+                ids.push(tool.entry_id);
+            }
         }
         let heights = self.current_heights(&ids);
         let total: usize = heights.iter().sum();
@@ -842,19 +860,23 @@ impl ViewModel {
     ) {
         self.finalize_streaming();
         let call_id = id.into();
+        let entry_id = self.alloc_entry_id();
         self.live.tools.insert(
             call_id.clone(),
-            ToolCard {
-                id: call_id.clone(),
-                name: name.into(),
-                target,
-                command,
-                state: ToolCardState::Running,
-                output: None,
-                diff: None,
-                output_truncated: false,
-                expanded: false,
-                tail: None,
+            LiveTool {
+                entry_id,
+                card: ToolCard {
+                    id: call_id.clone(),
+                    name: name.into(),
+                    target,
+                    command,
+                    state: ToolCardState::Running,
+                    output: None,
+                    diff: None,
+                    output_truncated: false,
+                    expanded: false,
+                    tail: None,
+                },
             },
         );
         self.live.tool_order.push(call_id);
@@ -864,10 +886,11 @@ impl ViewModel {
     pub fn append_tool_output(&mut self, id: impl Into<String>, text: impl Into<String>) {
         let id = id.into();
         let text = text.into();
-        let Some(card) = self.live.tools.get_mut(&id) else {
+        let Some(tool) = self.live.tools.get_mut(&id) else {
             // 兜底：live 区找不到（理论不会：ToolStarted 先于增量）。
             return;
         };
+        let card = &mut tool.card;
         let current = card.output.get_or_insert_with(String::new);
         if current.len() + text.len() > MAX_CARD_OUTPUT {
             card.output_truncated = true;
@@ -1120,27 +1143,31 @@ impl ViewModel {
         let id = id.into();
         let name = name.into();
         let tail = tail.into();
-        if let Some(mut card) = self.live.tools.remove(&id) {
-            card.name = name;
-            card.state = ToolCardState::Done {
+        if let Some(mut tool) = self.live.tools.remove(&id) {
+            tool.card.name = name;
+            tool.card.state = ToolCardState::Done {
                 status,
                 duration_ms,
                 exit_code,
             };
             // §用户诉求：edit/write 的 diff 独立保存（默认展开渲染）。
-            card.diff = diff;
+            tool.card.diff = diff;
             // 完整输出始终保留（成功也可见，Alt+E/鼠标展开）；失败时折叠态显示 tail。
             if !tail.is_empty() {
-                card.output = Some(bound_output(&tail));
+                tool.card.output = Some(bound_output(&tail));
                 if tail.len() > MAX_CARD_OUTPUT {
-                    card.output_truncated = true;
+                    tool.card.output_truncated = true;
                 }
             }
             if status != ToolStatus::Succeeded && !tail.is_empty() {
-                card.tail = Some(bound_tail(&tail));
+                tool.card.tail = Some(bound_tail(&tail));
             }
-            let entry_id = self.alloc_entry_id();
-            self.transcript.push(Entry::Tool { id: entry_id, card });
+            // §PointerHit ⑤：沿用 begin_tool 分配的稳定 id。
+            let entry_id = tool.entry_id;
+            self.transcript.push(Entry::Tool {
+                id: entry_id,
+                card: tool.card,
+            });
             self.note_new_content();
             self.trim_transcript();
             return;
@@ -1527,7 +1554,7 @@ mod tests {
         assert!(card.tail.as_deref().unwrap_or("").contains("错误详情"));
         // 未完成的 call-2 仍在 live 区（§7.2），保持 Running。
         let card2 = view.live.tools.get("call-2").expect("call-2 必须在 live");
-        assert_eq!(card2.state, ToolCardState::Running);
+        assert_eq!(card2.card.state, ToolCardState::Running);
         assert_eq!(
             view.transcript.len(),
             1,
@@ -1719,7 +1746,8 @@ mod tests {
         view.begin_tool("c", "bash", None, None);
         let big = "x".repeat(40 * 1024);
         view.append_tool_output("c", &big);
-        let card = view.live.tools.get("c").expect("live 区必须有卡片");
+        let tool = view.live.tools.get("c").expect("live 区必须有卡片");
+        let card = &tool.card;
         assert!(card.output_truncated, "超过预算必须标记截断");
         assert!(card.output.as_ref().unwrap().len() <= MAX_CARD_OUTPUT);
         // 尾部保留（错误相关输出通常在末尾）。

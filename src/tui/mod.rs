@@ -1300,6 +1300,7 @@ fn build_live_group(
     hits.clear();
     semantic.clear();
     // 流式 reasoning（折叠策略与历史一致：Alt+T 展开 / 点击打开 Overlay）。
+    // §PointerHit ⑤：reasoning 是独立 group（自己的稳定 EntryId）。
     if let Some(msg) = &live.reasoning
         && !msg.text.is_empty()
     {
@@ -1332,9 +1333,18 @@ fn build_live_group(
                 decor_cells: 0,
             });
         }
+        groups.push((
+            msg.entry_id,
+            std::mem::take(out),
+            std::mem::take(hits),
+            std::mem::take(semantic),
+        ));
+        out.clear();
+        hits.clear();
+        semantic.clear();
     }
     // 流式 assistant（Markdown，按 version 缓存）。带左 rail + AI 标签，
-    // 与历史 assistant 消息一致（§16.2 层次感）。
+    // 与历史 assistant 消息一致（§16.2 层次感）。独立 group（稳定 id）。
     if let Some(msg) = &live.assistant
         && !msg.text.is_empty()
     {
@@ -1387,10 +1397,20 @@ fn build_live_group(
                 decor_cells: line_width.saturating_sub(text_width),
             });
         }
+        groups.push((
+            msg.entry_id,
+            std::mem::take(out),
+            std::mem::take(hits),
+            std::mem::take(semantic),
+        ));
+        out.clear();
+        hits.clear();
+        semantic.clear();
     }
-    // 运行中工具卡片（按启动顺序）。
+    // 运行中工具卡片（按启动顺序）。§PointerHit ⑤：每张卡片独立 group/稳定 id。
     for call_id in &live.tool_order {
-        if let Some(card) = live.tools.get(call_id) {
+        if let Some(tool) = live.tools.get(call_id) {
+            let card = &tool.card;
             let card_id = card.id.clone();
             let card_lines = tool_card_lines(card, view.anim_tick, theme, width);
             for (i, line) in card_lines.into_iter().enumerate() {
@@ -1420,24 +1440,17 @@ fn build_live_group(
                     decor_cells: line_width.saturating_sub(text_width),
                 });
             }
+            groups.push((
+                tool.entry_id,
+                std::mem::take(out),
+                std::mem::take(hits),
+                std::mem::take(semantic),
+            ));
+            out.clear();
+            hits.clear();
+            semantic.clear();
         }
     }
-    // §PointerHit：live 区用稳定 EntryId（streaming 期间可选中，finalize 沿用
-    // 同一 id，选区不悬空）。取 assistant 优先，其次 reasoning；无流式文本时
-    // 退回落 point（不可选，仅工具卡片区域）。
-    let live_id = view
-        .live
-        .assistant
-        .as_ref()
-        .map(|m| m.entry_id)
-        .or_else(|| view.live.reasoning.as_ref().map(|m| m.entry_id))
-        .unwrap_or(EntryId(u64::MAX));
-    groups.push((
-        live_id,
-        std::mem::take(out),
-        std::mem::take(hits),
-        std::mem::take(semantic),
-    ));
 }
 
 /// 按条目版本缓存 Markdown 渲染（流式增量只重渲染变化条目，§16.1）。
@@ -3778,7 +3791,6 @@ fn hit_text_maps_screen_column_to_char_offset() {
 /// - 首行 decor = 逻辑行前缀宽度，续行 decor = 0（P0-2 修复）。
 #[test]
 fn wrap_with_semantic_produces_exact_mapping() {
-    use crate::tui::interaction::TextPosition;
     use crate::tui::scroll::EntryId;
     let entry_id = EntryId(1);
     // 模拟 User 消息：rail "│ " + "you  " = 7 cell 装饰，正文 "hello"。
