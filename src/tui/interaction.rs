@@ -210,7 +210,6 @@ impl PointerGesture {
                             // 按下点在转录区：从**按下点**的文本位置开始选。
                             // （tool 主行同时是文本+动作——拖动即选择，不点动作。）
                             if let Some(anchor) = origin_hit.text {
-                                let anchor = anchor;
                                 let current = hit;
                                 self.begin_selecting(anchor, current)
                             } else {

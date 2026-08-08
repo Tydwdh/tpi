@@ -120,7 +120,7 @@ pub struct Renderer {
     /// 已提交到 scrollback 的（折行后）行数（inline 专用）。
     committed_lines: usize,
     /// Markdown 渲染缓存：条目 version → 渲染后的逻辑行。
-    md_cache: HashMap<u64, Vec<Line<'static>>>,
+    md_cache: HashMap<(u64, u16), Vec<Line<'static>>>,
     /// 缓存有效时的终端宽度；宽度变化清空缓存并重置提交位置（§16.1）。
     cache_width: u16,
     /// 最近一帧的转录区矩形（鼠标 hit-test 用）。
@@ -330,7 +330,7 @@ fn render_frame(
     frame: &mut ratatui::Frame,
     view: &mut ViewModel,
     theme: theme::Theme,
-    cache: &mut HashMap<u64, Vec<Line<'static>>>,
+    cache: &mut HashMap<(u64, u16), Vec<Line<'static>>>,
     cache_width: &mut u16,
     committed: &mut usize,
     scrollback: bool,
@@ -494,7 +494,7 @@ fn plan_window(
     area_h: u16,
     committed: usize,
     reset_committed: bool,
-    cache: &mut HashMap<u64, Vec<Line<'static>>>,
+    cache: &mut HashMap<(u64, u16), Vec<Line<'static>>>,
 ) -> FramePlan {
     let width = width.max(1) as usize;
     // 按 entry 构建逻辑行（entry → wrapped 行 + hits + 语义文本）。
@@ -977,7 +977,7 @@ fn full_line_hit(target: HitTarget, width: u16) -> Option<HitRange> {
 fn build_transcript_text(
     view: &ViewModel,
     theme: theme::Theme,
-    cache: &mut HashMap<u64, Vec<Line<'static>>>,
+    cache: &mut HashMap<(u64, u16), Vec<Line<'static>>>,
     width: usize,
 ) -> Vec<EntryGroup> {
     let mut groups: Vec<EntryGroup> = Vec::with_capacity(view.transcript.len());
@@ -1022,7 +1022,9 @@ fn build_transcript_text(
             Entry::Message { line, .. } => match line.kind {
                 // §16.2：用户消息细紫红左 rail + 小型 `you` 标签。
                 LineKind::User => {
-                    let rendered = cached_markdown(cache, line, theme);
+                    // §codex：表格在 rail 前缀之后的内容宽度内布局（防止加 rail 后超宽）。
+                    let content_width = width.saturating_sub(RAIL_WIDTH);
+                    let rendered = cached_markdown(cache, line, theme, content_width);
                     for (i, rendered_line) in rendered.iter().enumerate() {
                         let mut spans = vec![Span::styled(
                             "│ ",
@@ -1059,7 +1061,9 @@ fn build_transcript_text(
                 // §16.2：assistant 消息带左 rail + `AI` 标签（与用户消息呼应，
                 // 形成清晰的双角色层次；正文 Markdown 渲染）。
                 LineKind::Assistant => {
-                    let rendered = cached_markdown(cache, line, theme);
+                    // §codex：表格在 rail 前缀之后的内容宽度内布局。
+                    let content_width = width.saturating_sub(RAIL_WIDTH);
+                    let rendered = cached_markdown(cache, line, theme, content_width);
                     for (i, rendered_line) in rendered.iter().enumerate() {
                         let mut spans = vec![Span::styled(
                             "│ ",
@@ -1285,7 +1289,7 @@ fn build_transcript_text(
 fn build_live_group(
     view: &ViewModel,
     theme: theme::Theme,
-    cache: &mut HashMap<u64, Vec<Line<'static>>>,
+    cache: &mut HashMap<(u64, u16), Vec<Line<'static>>>,
     width: usize,
     out: &mut Vec<Line<'static>>,
     hits: &mut Vec<Option<HitRange>>,
@@ -1348,15 +1352,15 @@ fn build_live_group(
     if let Some(msg) = &live.assistant
         && !msg.text.is_empty()
     {
-        let rendered = if let Some(lines) = cache.get(&msg.version) {
+        let rendered = if let Some(lines) = cache.get(&(msg.version, width as u16)) {
             lines.clone()
         } else {
-            let lines = render_markdown(&msg.text, theme);
+            let lines = render_markdown(&msg.text, theme, Some(width));
             if cache.len() > 2048 {
                 cache.clear();
             }
-            cache.insert(msg.version, lines);
-            cache[&msg.version].clone()
+            cache.insert((msg.version, width as u16), lines);
+            cache[&(msg.version, width as u16)].clone()
         };
         for (i, rendered_line) in rendered.iter().enumerate() {
             let mut spans = vec![Span::styled(
@@ -1453,21 +1457,27 @@ fn build_live_group(
     }
 }
 
+/// §codex 移植：User/Assistant 消息 rail 前缀宽度（`│ you  ` / `│ AI   ` = 7 cell）。
+/// 表格在内容宽度（width - rail）内布局，防止加 rail 后超宽被二次 wrap。
+const RAIL_WIDTH: usize = 7;
+
 /// 按条目版本缓存 Markdown 渲染（流式增量只重渲染变化条目，§16.1）。
 fn cached_markdown(
-    cache: &mut HashMap<u64, Vec<Line<'static>>>,
+    cache: &mut HashMap<(u64, u16), Vec<Line<'static>>>,
     line: &TranscriptLine,
     theme: theme::Theme,
+    width: usize,
 ) -> Vec<Line<'static>> {
-    if let Some(lines) = cache.get(&line.version) {
+    let key = (line.version, width as u16);
+    if let Some(lines) = cache.get(&key) {
         return lines.clone();
     }
-    let lines = render_markdown(&line.text, theme);
+    let lines = render_markdown(&line.text, theme, Some(width));
     if cache.len() > 2048 {
         cache.clear();
     }
-    cache.insert(line.version, lines);
-    cache[&line.version].clone()
+    cache.insert(key, lines);
+    cache[&key].clone()
 }
 
 /// Markdown → 带样式的逻辑行（pulldown-cmark；流式增量下对不完整输入友好）。
@@ -1476,7 +1486,11 @@ fn cached_markdown(
 /// 无序/有序列表、块引用、链接（附 URL）、分隔线。
 /// 标题在本实现中渲染为普通文本（样式化标题留待 API 确认后跟进）。
 /// `pub(crate)`：model 的 canonical semantic text 生成也用它（③ 统一坐标系）。
-pub(crate) fn render_markdown(text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
+pub(crate) fn render_markdown(
+    text: &str,
+    theme: theme::Theme,
+    width: Option<usize>,
+) -> Vec<Line<'static>> {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
     let parser = Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES);
@@ -1584,10 +1598,12 @@ pub(crate) fn render_markdown(text: &str, theme: theme::Theme) -> Vec<Line<'stat
                     style_stack.push(Modifier::UNDERLINED);
                 }
                 Tag::BlockQuote(_) => quote_depth += 1,
-                Tag::Table(_) => {
+                Tag::Table(alignments) => {
                     // 表格开始：flush 当前行，初始化表格收集状态。
                     flush_line(&mut out, &mut current);
-                    table = Some(TableState::new());
+                    let mut t = TableState::new();
+                    t.alignments = alignments;
+                    table = Some(t);
                 }
                 Tag::TableHead => {
                     // 表头行即第一行（与数据行同一收集机制）。
@@ -1673,9 +1689,9 @@ pub(crate) fn render_markdown(text: &str, theme: theme::Theme) -> Vec<Line<'stat
                     }
                 }
                 TagEnd::Table => {
-                    // 表格结束：一次性渲染。
+                    // 表格结束：一次性渲染（§codex：width-aware 列分配 + cell 换行）。
                     if let Some(t) = table.take() {
-                        out.extend(render_table(&t, theme));
+                        out.extend(render_table(&t, theme, width));
                     }
                     flush_line(&mut out, &mut current);
                 }
@@ -1702,6 +1718,8 @@ struct TableState {
     current_cell: Option<String>,
     /// 当前行（已收集完的 cells）。
     current_row: Vec<String>,
+    /// 各列对齐（§codex：从 pulldown 表格分隔行收集）。
+    alignments: Vec<pulldown_cmark::Alignment>,
 }
 
 impl TableState {
@@ -1710,6 +1728,7 @@ impl TableState {
             rows: Vec::new(),
             current_cell: None,
             current_row: Vec::new(),
+            alignments: Vec::new(),
         }
     }
 }
@@ -1723,17 +1742,18 @@ fn table_push_text(table: &mut Option<TableState>, text: &str) {
     }
 }
 
-/// 收集完毕的表格 → 带边框的对齐行（§16.2 增强）。
+/// 收集完毕的表格 → 带边框的对齐行（§codex 移植：width-aware 列分配 +
+/// cell 词级换行 + 多行拼接，每行分隔符都在；窄屏退化为 records）。
 ///
-/// 列宽按 display-width 计算（CJK 按 2 列）；边框用 `│ ─ ┼` 简洁风格：
-/// ```text
-/// ┌────┬────┐
-/// │ a  │ b  │
-/// ├────┼────┤
-/// │ c  │ d  │
-/// └────┴────┘
-/// ```
-fn render_table(table: &TableState, theme: theme::Theme) -> Vec<Line<'static>> {
+/// `width` 为可用内容宽度（None = 不收缩，按自然列宽）。表格行已在此完成
+/// width-aware 布局，外层 `wrap_with_semantic` 不得再按字符切（§codex
+/// `table_lines_prewrapped` 语义）。
+fn render_table(
+    table: &TableState,
+    theme: theme::Theme,
+    width: Option<usize>,
+) -> Vec<Line<'static>> {
+    use pulldown_cmark::Alignment;
     let rows = &table.rows;
     if rows.is_empty() {
         return Vec::new();
@@ -1742,57 +1762,310 @@ fn render_table(table: &TableState, theme: theme::Theme) -> Vec<Line<'static>> {
     if cols == 0 {
         return Vec::new();
     }
-    // 每列最大宽度（表头与数据）。
-    let mut widths = vec![0usize; cols];
-    for row in rows {
-        for (i, cell) in row.iter().enumerate() {
-            let w = unicode_width::UnicodeWidthStr::width(cell.as_str());
-            if w > widths[i] {
-                widths[i] = w;
+    // 第一行视为表头（pulldown：TableHead 直接含 cell，作为第一行入 rows）。
+    let (header, body) = rows.split_first().unwrap_or((&rows[0], &rows[1..]));
+    let normalize = |r: &[String]| -> Vec<String> {
+        let mut v = r.to_vec();
+        v.truncate(cols);
+        v.resize(cols, String::new());
+        v
+    };
+    let header = normalize(header);
+    let body: Vec<Vec<String>> = body.iter().map(|r| normalize(r)).collect();
+    let alignments: Vec<Alignment> = {
+        let mut a = table.alignments.clone();
+        a.resize(cols, Alignment::None);
+        a
+    };
+
+    const GAP: usize = 2;
+    const PADDING: usize = 1;
+    const MIN_COL: usize = 3;
+    let border = Style::default().fg(theme.muted);
+    let header_style = Style::default().fg(theme.text).add_modifier(Modifier::BOLD);
+
+    // 列分类与指标（§codex collect_table_column_metrics）。
+    let metrics: Vec<TableColMetric> = (0..cols)
+        .map(|col| {
+            let mut max_width = crate::tui::text::display_width(&header[col]);
+            let mut body_token_w = 0usize;
+            let mut total_words = 0usize;
+            let mut total_cells = 0usize;
+            let mut long_tokens = 0usize;
+            let mut total_token_count = 0usize;
+            for row in &body {
+                let cell = &row[col];
+                max_width = max_width.max(crate::tui::text::display_width(cell));
+                let mut words = 0usize;
+                for token in cell.split_whitespace() {
+                    let w = crate::tui::text::display_width(token);
+                    body_token_w = body_token_w.max(w);
+                    long_tokens += usize::from(w >= 20);
+                    words += 1;
+                }
+                if words > 0 {
+                    total_words += words;
+                    total_cells += 1;
+                    total_token_count += words;
+                }
+            }
+            let header_token = header[col]
+                .split_whitespace()
+                .map(crate::tui::text::display_width)
+                .max()
+                .unwrap_or(0);
+            let kind = if long_tokens > 0
+                && long_tokens >= total_token_count.saturating_sub(long_tokens)
+            {
+                TableColKind::TokenHeavy
+            } else if total_cells == 0
+                || (total_words as f64 / total_cells as f64) >= 4.0
+                || max_width as f64 / total_cells.max(1) as f64 >= 28.0
+            {
+                TableColKind::Narrative
+            } else {
+                TableColKind::Compact
+            };
+            TableColMetric {
+                max_width,
+                header_token,
+                body_token: body_token_w,
+                kind,
+            }
+        })
+        .collect();
+
+    // 列宽分配（§codex compute_column_widths：收缩到 available_width 内）。
+    let floor_for = |m: &TableColMetric| -> usize {
+        let target = match m.kind {
+            TableColKind::Narrative | TableColKind::TokenHeavy => 16,
+            TableColKind::Compact => m.header_token.max(m.body_token.min(16)),
+        };
+        target.max(MIN_COL).min(m.max_width)
+    };
+    let available = width.map(|w| {
+        let reserved = (cols + 1) + cols.saturating_sub(1) * GAP + cols * PADDING * 2;
+        w.saturating_sub(reserved)
+    });
+    let mut widths: Vec<usize> = metrics.iter().map(|m| m.max_width.max(MIN_COL)).collect();
+    if let Some(max_w) = available {
+        let min_total = cols * MIN_COL;
+        if max_w < min_total {
+            // 窄屏：退化为 records（label: value，逐行）。§codex table_key_value。
+            return render_table_records(&header, &body, theme);
+        }
+        let mut floors: Vec<usize> = metrics.iter().map(floor_for).collect();
+        let floor_total: usize = floors.iter().sum();
+        if floor_total > max_w {
+            let mins = vec![MIN_COL; cols];
+            shrink_columns(&mut floors, &mins, &metrics, floor_total - max_w);
+        }
+        let total: usize = widths.iter().sum();
+        if total > max_w {
+            let remaining = shrink_columns(&mut widths, &floors, &metrics, total - max_w);
+            if remaining > 0 {
+                return render_table_records(&header, &body, theme);
             }
         }
     }
-    let border = Style::default().fg(theme.muted);
-    let header_style = Style::default().fg(theme.text).add_modifier(Modifier::BOLD);
-    let mut out: Vec<Line<'static>> = Vec::new();
 
-    // 分隔线辅助。
-    let row_line = |left: &str, mid: &str, right: &str| -> Line<'static> {
-        let mut s = String::from(left);
-        for (i, w) in widths.iter().enumerate() {
-            s.push_str(&"─".repeat(w + 2));
-            s.push_str(if i + 1 < cols { mid } else { right });
+    // 生成表格行（§codex render_table_separator / render_table_row）。
+    let sep = |ch: char| -> Line<'static> {
+        let text = widths
+            .iter()
+            .map(|w| ch.to_string().repeat(*w + PADDING * 2))
+            .collect::<Vec<_>>()
+            .join(&" ".repeat(GAP));
+        Line::styled(text, border)
+    };
+    let row_line = |cells: &[String], style: Style| -> Vec<Line<'static>> {
+        // 每 cell 在列宽内换行（词边界优先）。
+        let wrapped: Vec<Vec<String>> = cells
+            .iter()
+            .zip(widths.iter())
+            .map(|(cell, w)| wrap_cell_text(cell, *w))
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        let mut out = Vec::with_capacity(height);
+        for line in 0..height {
+            let mut spans: Vec<Span<'static>> = vec![Span::styled("│", border)];
+            for (col, w) in widths.iter().enumerate() {
+                let cell_text = wrapped[col].get(line).cloned().unwrap_or_default();
+                let pad = w.saturating_sub(crate::tui::text::display_width(&cell_text));
+                let (left, right) = match alignments[col] {
+                    Alignment::Left | Alignment::None => (0, pad),
+                    Alignment::Center => (pad / 2, pad - pad / 2),
+                    Alignment::Right => (pad, 0),
+                };
+                spans.push(Span::raw(" ".repeat(PADDING + left)));
+                spans.push(Span::styled(cell_text, style));
+                spans.push(Span::raw(" ".repeat(right + PADDING)));
+                if col + 1 < cols {
+                    spans.push(Span::raw(" ".repeat(GAP)));
+                }
+                spans.push(Span::styled("│", border));
+            }
+            out.push(Line::from(spans));
         }
-        Line::styled(s, border)
+        out
     };
 
-    out.push(row_line("┌", "┬", "┐"));
-    for (ri, row) in rows.iter().enumerate() {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        spans.push(Span::styled("│ ", border));
-        for (i, cell) in row.iter().enumerate() {
-            let pad =
-                widths[i].saturating_sub(unicode_width::UnicodeWidthStr::width(cell.as_str()));
-            let styled = if ri == 0 {
-                Span::styled(format!("{cell}{}", " ".repeat(pad)), header_style)
-            } else {
-                Span::styled(
-                    format!("{cell}{}", " ".repeat(pad)),
-                    Style::default().fg(theme.text),
-                )
-            };
-            spans.push(styled);
-            spans.push(Span::styled(
-                if i + 1 < cols { " │ " } else { " │" },
-                border,
-            ));
-        }
-        out.push(Line::from(spans));
-        if ri == 0 {
-            out.push(row_line("├", "┼", "┤"));
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(2 + body.len() * 2);
+    out.push(sep('━'));
+    out.extend(row_line(&header, header_style));
+    out.push(sep('─'));
+    for (i, row) in body.iter().enumerate() {
+        out.extend(row_line(row, Style::default().fg(theme.text)));
+        if i + 1 < body.len() {
+            out.push(sep('─'));
         }
     }
-    out.push(row_line("└", "┴", "┘"));
+    out.push(sep('━'));
+    out
+}
+
+/// 表格列类型（§codex：宽度收缩优先级）。
+#[derive(Clone, Copy, PartialEq)]
+enum TableColKind {
+    /// 长叙述文本（>=4 词/格 或 >=28 平均宽）。
+    Narrative,
+    /// 长 token（路径/URL/哈希），优先让位。
+    TokenHeavy,
+    /// 短值（计数/状态），抗拒换行。
+    Compact,
+}
+
+/// 表格列指标（§codex collect_table_column_metrics）。
+struct TableColMetric {
+    max_width: usize,
+    header_token: usize,
+    body_token: usize,
+    kind: TableColKind,
+}
+
+/// 按优先级收缩列宽直到总量 ≤ available（§codex shrink_columns）。
+/// 返回无法收缩的剩余量。
+fn shrink_columns(
+    widths: &mut [usize],
+    floors: &[usize],
+    metrics: &[TableColMetric],
+    mut amount: usize,
+) -> usize {
+    for kind in [
+        TableColKind::TokenHeavy,
+        TableColKind::Narrative,
+        TableColKind::Compact,
+    ] {
+        let slack_total: usize = widths
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| metrics[*idx].kind == kind)
+            .map(|(idx, width)| width.saturating_sub(floors[idx]))
+            .sum();
+        let to_remove = amount.min(slack_total);
+        if to_remove == 0 {
+            continue;
+        }
+        // 二分 cap：同类列统一降到 cap，平衡 slack。
+        let mut low = 0usize;
+        let mut high = widths
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| metrics[*idx].kind == kind)
+            .map(|(idx, width)| width.saturating_sub(floors[idx]))
+            .max()
+            .unwrap_or(0);
+        while low < high {
+            let cap = low + (high - low) / 2;
+            let removed: usize = widths
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| metrics[*idx].kind == kind)
+                .map(|(idx, width)| width.saturating_sub(floors[idx]).saturating_sub(cap))
+                .sum();
+            if removed > to_remove {
+                low = cap + 1;
+            } else {
+                high = cap;
+            }
+        }
+        let cap = low;
+        let mut removed = 0usize;
+        for (idx, width) in widths.iter_mut().enumerate() {
+            if metrics[idx].kind != kind {
+                continue;
+            }
+            let reduction = width.saturating_sub(floors[idx]).saturating_sub(cap);
+            *width -= reduction;
+            removed += reduction;
+        }
+        let mut remainder = to_remove - removed;
+        for (idx, width) in widths.iter_mut().enumerate() {
+            if remainder == 0 {
+                break;
+            }
+            if metrics[idx].kind == kind && width.saturating_sub(floors[idx]) == cap {
+                *width -= 1;
+                remainder -= 1;
+            }
+        }
+        amount -= to_remove;
+        if amount == 0 {
+            break;
+        }
+    }
+    amount
+}
+
+/// 在列宽内换行 cell 文本（§codex wrap_cell：词边界优先，保留 CJK cell 宽度）。
+fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for ch in text.chars() {
+        let w = crate::tui::text::char_cell_width(ch);
+        if cur_w + w > width && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push(ch);
+        cur_w += w;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// 窄屏回退：records（label: value，逐行）。§codex table_key_value。
+fn render_table_records(
+    header: &[String],
+    body: &[Vec<String>],
+    theme: theme::Theme,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for row in body {
+        for (col, cell) in row.iter().enumerate() {
+            let label = header.get(col).cloned().unwrap_or_default();
+            let line = if label.is_empty() {
+                cell.clone()
+            } else {
+                format!("{label}: {cell}")
+            };
+            out.push(Line::styled(line, Style::default().fg(theme.text)));
+        }
+        out.push(Line::styled(
+            "─".repeat(20),
+            Style::default().fg(theme.muted),
+        ));
+    }
     out
 }
 
@@ -2633,7 +2906,7 @@ pub fn draw_to_test_backend_mode(
         }
     };
     let theme = theme::Theme::omp();
-    let mut cache: HashMap<u64, Vec<Line<'static>>> = HashMap::new();
+    let mut cache: HashMap<(u64, u16), Vec<Line<'static>>> = HashMap::new();
     let mut cache_width = 0u16;
     let mut committed = 0usize;
     let scrollback = mode == terminal::ViewMode::Inline;
@@ -2678,7 +2951,7 @@ pub fn draw_captured_bytes(view: &mut ViewModel) -> Vec<u8> {
             }
         };
         let theme = theme::Theme::omp();
-        let mut cache: HashMap<u64, Vec<Line<'static>>> = HashMap::new();
+        let mut cache: HashMap<(u64, u16), Vec<Line<'static>>> = HashMap::new();
         let mut cache_width = 0u16;
         let mut committed = 0usize;
         let mut overflow: Vec<Line<'static>> = Vec::new();
@@ -2937,7 +3210,7 @@ mod tests {
     #[test]
     fn markdown_bold_code_and_code_block_render_styled() {
         let theme = theme::Theme::omp();
-        let lines = render_markdown("**加粗** 和 `code`", theme);
+        let lines = render_markdown("**加粗** 和 `code`", theme, None);
         assert_eq!(lines.len(), 1);
         let spans = &lines[0].spans;
         assert!(
@@ -2953,7 +3226,7 @@ mod tests {
             "行内代码必须使用 primary 色: {spans:?}"
         );
 
-        let lines = render_markdown("```rust\nfn main() {}\n```", theme);
+        let lines = render_markdown("```rust\nfn main() {}\n```", theme, None);
         assert_eq!(lines.len(), 1, "代码块渲染为一行");
         assert_eq!(lines[0].spans[0].content, "fn main() {}");
     }
@@ -2961,7 +3234,11 @@ mod tests {
     #[test]
     fn markdown_list_and_link_render() {
         let theme = theme::Theme::omp();
-        let lines = render_markdown("- 第一项\n- 第二项\n\n[链接](https://example.com)", theme);
+        let lines = render_markdown(
+            "- 第一项\n- 第二项\n\n[链接](https://example.com)",
+            theme,
+            None,
+        );
         let text: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
@@ -2977,7 +3254,11 @@ mod tests {
     #[test]
     fn markdown_headings_render_with_level_styles() {
         let theme = theme::Theme::omp();
-        let lines = render_markdown("# 大标题\n\n## 副标题\n\n### 小节\n\n#### 四级\n", theme);
+        let lines = render_markdown(
+            "# 大标题\n\n## 副标题\n\n### 小节\n\n#### 四级\n",
+            theme,
+            None,
+        );
         assert_eq!(lines.len(), 4, "四个标题各一行: {lines:?}");
         // h1 → primary + BOLD。
         let h1 = &lines[0];
@@ -3014,7 +3295,7 @@ mod tests {
     fn markdown_table_renders_with_borders_and_header() {
         let theme = theme::Theme::omp();
         let md = "| 名称 | 数量 |\n| --- | ---: |\n| 苹果 | 3 |\n| 香蕉 | 10 |";
-        let lines = render_markdown(md, theme);
+        let lines = render_markdown(md, theme, None);
         // 期望：顶边框 + 表头 + 分隔 + 2 数据行 + 底边框 = 6 行。
         assert!(lines.len() >= 6, "表格应渲染多行: {lines:?}");
         let text: String = lines
@@ -3041,6 +3322,72 @@ mod tests {
                 .add_modifier
                 .contains(ratatui::style::Modifier::BOLD)),
             "表头必须加粗"
+        );
+    }
+
+    /// §codex 移植：超宽表格在窄 width 下 cell 内换行，且**每个子行分隔符都在**。
+    /// 修复旧实现「列分隔符被通用 wrapper 切碎」的缺陷。
+    #[test]
+    fn markdown_table_wraps_cells_within_width() {
+        let theme = theme::Theme::omp();
+        // 超宽 cell：第 2 列内容很长，窄 width 下必须 cell 内换行。
+        let md =
+            "| # | 现象 |\n| --- | --- |\n| 1 | 这是很长的一段描述，内容远超单列宽度，必须换行 |";
+        let lines = render_markdown(md, theme, Some(24));
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        // 每行宽度 ≤ 24（未被通用 wrapper 切碎）。
+        for line in &lines {
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|s| crate::tui::text::display_width(s.content.as_ref()))
+                .sum();
+            assert!(w <= 24, "表格行不得超宽: '{text}' w={w}");
+        }
+        // 换行后仍有多个含 │ 的行（每行分隔符都在）。
+        let rows_with_border = lines
+            .iter()
+            .filter(|l| l.spans.iter().any(|s| s.content == "│"))
+            .count();
+        assert!(rows_with_border >= 3, "换行后每行都应有分隔符: {text}");
+        // 内容完整保留（不丢字）：按行检查关键片段。
+        let row_texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            row_texts.iter().any(|r| r.contains("这是很长的一段")),
+            "cell 首行片段保留: {text}"
+        );
+        assert!(
+            row_texts.iter().any(|r| r.contains("换行")),
+            "cell 末行片段保留（不丢字）: {text}"
+        );
+    }
+
+    /// §codex 移植：极窄终端下表格退化为 records（label: value，逐行），
+    /// 不产生 0 宽/不可读的输出。
+    #[test]
+    fn markdown_table_degrades_to_records_on_narrow_width() {
+        let theme = theme::Theme::omp();
+        let md = "| 名称 | 值 |\n| --- | --- |\n| alpha | 42 |";
+        let lines = render_markdown(md, theme, Some(8));
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        // 窄屏：records 模式（label: value），仍保留内容。
+        assert!(
+            text.contains("名称") && text.contains("42"),
+            "records 模式仍应保留内容: {text}"
         );
     }
 
@@ -3845,7 +4192,6 @@ fn wrap_with_semantic_produces_exact_mapping() {
 fn arbitrary_char_selection_is_char_precise() {
     use crate::tui::interaction::{TextPosition, cell_to_char, chars_to_cells};
     use crate::tui::model::LineKind;
-    use crate::tui::scroll::EntryId;
     let mut view = ViewModel::default();
     view.push_line(LineKind::Assistant, "hello world");
     let mut cache = HashMap::new();

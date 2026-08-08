@@ -1386,7 +1386,7 @@ fn canonical_semantic_text(kind: LineKind, raw: &str) -> String {
     match kind {
         // markdown 渲染的正文：User/Assistant 走同一 renderer。
         LineKind::User | LineKind::Assistant => {
-            let rendered = crate::tui::render_markdown(raw, crate::tui::theme::Theme::omp());
+            let rendered = crate::tui::render_markdown(raw, crate::tui::theme::Theme::omp(), None);
             rendered
                 .iter()
                 .map(|line| {
