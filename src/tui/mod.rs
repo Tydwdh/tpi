@@ -1,4 +1,4 @@
-//! TUI 渲染层（文档 §16）。
+﻿//! TUI 渲染层（文档 §16）。
 //!
 //! 只有 renderer 可以调用 Crossterm/Ratatui 或写 stdout；Agent、provider、tool
 //! 和日志模块只能发送事件（§16.1、§3.2 不变量 11）。
@@ -1577,8 +1577,26 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
     let Some(menu) = &view.menu else {
         return;
     };
+    let total = menu.items.len();
+    let visible = (rect.height as usize).max(1);
+    // 长菜单（如 /sessions 多会话）：可视窗口跟随选中项，上下用 … 表示有更多；
+    // 否则选中项超出可视区时用户看不到当前选择。
+    let top_ellipsis = total > visible;
+    let bottom_ellipsis = total > visible;
+    let window_rows = visible
+        .saturating_sub(usize::from(top_ellipsis) + usize::from(bottom_ellipsis))
+        .max(1);
+    let start = if total > window_rows {
+        (menu.selected.saturating_sub(window_rows / 2)).min(total - window_rows)
+    } else {
+        0
+    };
+    let end = (start + window_rows).min(total);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (i, (name, desc)) in menu.items.iter().enumerate() {
+    if top_ellipsis {
+        lines.push(Line::styled("…", Style::default().fg(theme.muted)));
+    }
+    for (i, (name, desc)) in menu.items.iter().enumerate().skip(start).take(end - start) {
         let selected = i == menu.selected;
         let (glyph, style) = if selected {
             (
@@ -1599,6 +1617,9 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
             Span::styled(format!("{glyph} {label}"), style),
             Span::styled(format!("  {desc}"), Style::default().fg(theme.muted)),
         ]));
+    }
+    if bottom_ellipsis {
+        lines.push(Line::styled("…", Style::default().fg(theme.muted)));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), rect);
 }

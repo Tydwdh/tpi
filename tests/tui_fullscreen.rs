@@ -282,3 +282,23 @@ fn footer_shows_multi_line_input_hint() {
     let all2: String = row_texts(&buf2).join("\n");
     assert!(!all2.contains("输入"), "单行输入不应显示行数: {all2:?}");
 }
+
+/// 长菜单（/sessions 多会话）可视窗口跟随选中项：选中项始终可见，窗口外项隐藏。
+#[test]
+fn long_menu_window_follows_selection() {
+    let mut view = ViewModel::default();
+    let items: Vec<(String, String)> = (0..20)
+        .map(|i| (format!("sess-{i:02}"), String::new()))
+        .collect();
+    view.menu = Some(tpi::tui::model::MenuView {
+        items,
+        selected: 15,
+        kind: tpi::tui::model::MenuKind::Session,
+    });
+    let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
+    let all: String = row_texts(&buf).join("\n");
+    assert!(all.contains("sess-15"), "选中项必须可见: {all:?}");
+    assert!(all.contains("…"), "超长菜单必须显示省略号: {all:?}");
+    assert!(!all.contains("sess-00"), "窗口外顶部项不应显示: {all:?}");
+    assert!(!all.contains("sess-19"), "窗口外底部项不应显示: {all:?}");
+}
