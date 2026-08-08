@@ -251,3 +251,6 @@
 - 分析最新会话日志（Desktop\test 贪吃蛇任务）与 tpi.log 后发现两个真实 bug：
   1. process-host 输出小帧被丢（P1 数据丢失 + 刷屏告警）：子进程输出 1-3 字节的小块（如 printf 短输出）时帧长 2-4，读取端却要求 payload >= 5，把小帧当“unknown process-host message kind=1”丢弃——真实输出可能完全丢失且日志反复告警。已修：MSG_OUTPUT 帧放宽到 >= 1。回归 read_frame_parses_tiny_output_frames。
   2. 用户取消被记录为“重试”告警（P3 日志误导）：Ctrl-C 取消请求时 send 失败分支仍打 WARN“请求发送失败，重试 error=cancelled”并等待重试。已修：error == "cancelled" 立即返回 ProviderError::Cancelled，不告警不重发。
+## 33. 迭代第19轮（2026-08-08，会话日志：write 失败复盘）
+- 最新会话中模型对已存在文件执行 write 时漏传 revision（先 read 拿到了 revision 却没用），TPI 按设计拒绝（already_exists，零破坏），模型补 revision 后成功——防护有效。
+- 可优化点落地：write 的 already_exists 报错此前不带当前 revision，模型失败后必须再 read 一次才能重试；现在报错直接附“当前 revision: b3:...”（与 edit 的 stale_revision 一致），失败后可直接重试。回归 p2_fixes.rs 断言扩展。

@@ -289,23 +289,8 @@ pub fn write(
     // P2：revision-bound 重写——已存在文件必须带匹配的当前 revision。
     // （新建路径直接走 write_new_file。）
     if path.as_std_path().exists() {
-        let Some(expected) = args.revision.as_deref() else {
-            return ToolOutcome::failed(
-                "write",
-                ModelPayload {
-                    status: ToolStatus::Failed,
-                    program: None,
-                    exit_code: None,
-                    duration_ms: 0,
-                    output: format!(
-                        "status: failed\ntool: write\nerror: already_exists\n\n{} 已存在；整体重写必须提供当前 revision（先 read 获取，或改用 edit）。",
-                        display_path(&ctx.workspace_root, &path),
-                    ),
-                    effect: None,
-                    artifact: None,
-                },
-            );
-        };
+        // 先读当前内容：already_exists 拒绝时把当前 revision 直接告诉模型，
+        // 省去“再 read 一次才能重试”（edit 的 stale_revision 报错同样带 current）。
         let current = match std::fs::read(path.as_std_path()) {
             Ok(raw) => crate::tool::edit::revision_of(&raw),
             Err(e) => {
@@ -317,6 +302,25 @@ pub fn write(
                     },
                 );
             }
+        };
+        let Some(expected) = args.revision.as_deref() else {
+            return ToolOutcome::failed(
+                "write",
+                ModelPayload {
+                    status: ToolStatus::Failed,
+                    program: None,
+                    exit_code: None,
+                    duration_ms: 0,
+                    output: format!(
+                        "status: failed\ntool: write\nerror: already_exists\n\n{} 已存在；整体重写必须提供当前 revision（先 read 获取，或改用 edit）。
+当前 revision: {}",
+                        display_path(&ctx.workspace_root, &path),
+                        current,
+                    ),
+                    effect: None,
+                    artifact: None,
+                },
+            );
         };
         if current != expected {
             return failed_outcome(

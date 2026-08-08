@@ -47,6 +47,11 @@ fn p2_write_rewrite_requires_matching_revision() {
         "已存在文件必须明确拒绝: {}",
         outcome.model_text()
     );
+    assert!(
+        outcome.model_text().contains(&current),
+        "already_exists 报错必须附上当前 revision（模型可直接重试，省一次 read）: {}",
+        outcome.model_text()
+    );
 
     // 2. revision 不匹配 → stale_rejected + hint。
     let plan = tpi::tool::edit::prepare_commit(&target);
