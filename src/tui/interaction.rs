@@ -247,6 +247,35 @@ impl PointerGesture {
     }
 }
 
+/// 终端 cell 列 → 文本 char 偏移（§InteractionRefactor：CJK/emoji 按 cell 宽度
+/// 精确定位，不做 `chars().take(c)` 近似）。`text` 是该行的语义文本，
+/// `column` 是 0-based 终端列。返回该列起始处的 char 索引（越界返回文本长度）。
+///
+/// ASCII：1 char = 1 cell；中文/emoji：1 char = 2 cells；零宽字符 = 0 cell。
+/// 例：`abc你好xyz` 中 cell 3 是「你」的第 1 个 cell → char 索引 3。
+pub fn cell_to_char(text: &str, column: usize) -> usize {
+    let mut char_off = 0usize;
+    let mut cell_off = 0usize;
+    for ch in text.chars() {
+        let w = crate::tui::text::char_cell_width(ch);
+        if cell_off + w > column {
+            break;
+        }
+        cell_off += w;
+        char_off += 1;
+    }
+    char_off
+}
+
+/// 文本行前 `char_count` 个字符占用的 cell 宽度（§InteractionRefactor：
+/// 复制/高亮时把 char 范围投影回 cell 范围）。
+pub fn chars_to_cells(text: &str, char_count: usize) -> usize {
+    text.chars()
+        .take(char_count)
+        .map(crate::tui::text::char_cell_width)
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,5 +419,44 @@ mod tests {
         let _ = g.feed(down(5, 5, PointerTarget::Transcript(tp(1, 5))));
         let events = g.feed(up(5, 5, PointerTarget::Transcript(tp(1, 5))));
         assert!(events.is_empty());
+    }
+
+    /// §InteractionRefactor：cell → char 映射必须按 cell 宽度而非字符数。
+    /// `abc你好xyz`：a/b/c=1cell，你/好=2cells，x/y/z=1cell。
+    #[test]
+    fn cell_to_char_maps_cjk_by_cell_width() {
+        let text = "abc你好xyz";
+        // cell 0-2 → char 0-2（abc）。
+        assert_eq!(cell_to_char(text, 0), 0);
+        assert_eq!(cell_to_char(text, 2), 2);
+        // cell 3-4 → char 3（你，占 2 cells）。
+        assert_eq!(cell_to_char(text, 3), 3);
+        assert_eq!(cell_to_char(text, 4), 3);
+        // cell 5-6 → char 4（好）。
+        assert_eq!(cell_to_char(text, 5), 4);
+        assert_eq!(cell_to_char(text, 6), 4);
+        // cell 7 → char 5（x）。
+        assert_eq!(cell_to_char(text, 7), 5);
+        // 越界 → 文本长度（8 个字符）。
+        assert_eq!(cell_to_char(text, 999), 8);
+    }
+
+    /// chars_to_cells：char 范围 → cell 宽度（CJK 计 2）。
+    #[test]
+    fn chars_to_cells_sums_cjk_width() {
+        assert_eq!(chars_to_cells("abc", 3), 3);
+        assert_eq!(chars_to_cells("abc你好", 5), 3 + 4);
+        assert_eq!(chars_to_cells("你好", 1), 2);
+        assert_eq!(chars_to_cells("你好", 0), 0);
+    }
+
+    /// 混合文本（ASCII + CJK + emoji）的 cell 映射。
+    #[test]
+    fn cell_to_char_handles_emoji_and_mixed() {
+        // 👨‍💻 是 ZWJ 序列：👨(2) + ZWJ(0) + 💻(2)。此处只验证非零宽组合的基本点：
+        let text = "a你😀b";
+        // a=1, 你=2, 😀=2, b=1 → cell 3-4 是 😀。
+        assert_eq!(cell_to_char(text, 3), 2);
+        assert_eq!(cell_to_char(text, 5), 3);
     }
 }

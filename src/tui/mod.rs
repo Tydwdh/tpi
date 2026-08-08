@@ -253,18 +253,9 @@ impl Renderer {
         }
         let index = (row - rect.y) as usize;
         let (entry_id, char_start, text) = self.semantic_rows.get(index)?.as_ref()?;
-        // 屏幕列 → 行内 char 偏移（按 cell 宽度累加）。
+        // 屏幕列 → 行内 char 偏移（按 cell 宽度精确映射，CJK/emoji 正确）。
         let col = column.saturating_sub(rect.x) as usize;
-        let mut char_off = 0usize;
-        let mut cell_off = 0usize;
-        for ch in text.chars() {
-            let w = crate::tui::text::char_cell_width(ch);
-            if cell_off + w > col {
-                break;
-            }
-            cell_off += w;
-            char_off += 1;
-        }
+        let char_off = crate::tui::interaction::cell_to_char(text, col);
         Some(crate::tui::interaction::TextPosition {
             entry_id: *entry_id,
             offset: *char_start + char_off,
