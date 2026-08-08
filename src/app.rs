@@ -337,14 +337,14 @@ async fn interactive_loop<P: Provider>(
                         // 鼠标：统一走 Pointer State Machine（§InteractionRefactor），
                         // 覆盖滚轮/点击/拖动选择/scrollbar，与 run 中同一状态机。
                         Some(Event::Mouse(mouse)) => {
-                            use crate::tui::interaction::{PointerInput, PointerTarget};
+                            use crate::tui::interaction::PointerInput;
                             use ratatui::crossterm::event::MouseButton;
                             use ratatui::crossterm::event::MouseEventKind;
                             // 弹层（Overlay/Modal）打开时点击不动作。
-                            let target = if ui_state.view.overlay.is_some()
+                            let hit = if ui_state.view.overlay.is_some()
                                 || ui_state.view.modal.is_some()
                             {
-                                PointerTarget::None
+                                crate::tui::interaction::PointerHit::none()
                             } else {
                                 pointer_target(&renderer, mouse.column, mouse.row)
                             };
@@ -352,22 +352,22 @@ async fn interactive_loop<P: Provider>(
                                 MouseEventKind::Down(MouseButton::Left) => PointerInput::Down {
                                     column: mouse.column,
                                     row: mouse.row,
-                                    target,
+                                    hit,
                                 },
                                 MouseEventKind::Drag(MouseButton::Left) => PointerInput::Drag {
                                     column: mouse.column,
                                     row: mouse.row,
-                                    target,
+                                    hit,
                                 },
                                 MouseEventKind::Up(MouseButton::Left) => PointerInput::Up {
                                     column: mouse.column,
                                     row: mouse.row,
-                                    target,
+                                    hit,
                                 },
                                 MouseEventKind::Moved => PointerInput::Move {
                                     column: mouse.column,
                                     row: mouse.row,
-                                    target,
+                                    hit,
                                 },
                                 MouseEventKind::ScrollUp => PointerInput::ScrollUp,
                                 MouseEventKind::ScrollDown => PointerInput::ScrollDown,
@@ -841,14 +841,14 @@ workspace: {}
     Ok(())
 }
 
-/// §InteractionRefactor：屏幕坐标 → 指针命中目标。
-/// 优先级：scrollbar（1 列优先）→ 工具/reasoning hit → 转录区文本（语义位置）→ None。
+/// §PointerHit：屏幕坐标 → 组合命中（文本 + 可选动作 + 区域）。
+/// 一个 cell 可以是「可选择文本 + 可点击控件」——不再互斥。
 fn pointer_target(
     renderer: &Renderer,
     column: u16,
     row: u16,
-) -> crate::tui::interaction::PointerTarget {
-    use crate::tui::interaction::PointerTarget;
+) -> crate::tui::interaction::PointerHit {
+    use crate::tui::interaction::{PointerAction, PointerHit, PointerRegion};
     // scrollbar 优先（1 列窄条，避免误判为文本）。
     if let Some(rect) = renderer.scrollbar_rect()
         && column >= rect.x
@@ -856,18 +856,34 @@ fn pointer_target(
         && row >= rect.y
         && row < rect.y + rect.height
     {
-        return PointerTarget::Scrollbar;
+        return PointerHit::scrollbar();
     }
-    if let Some(target) = renderer.hit_target(column, row) {
-        return match target {
-            crate::tui::HitTarget::Tool(id) => PointerTarget::Tool(id),
-            crate::tui::HitTarget::Reasoning(id) => PointerTarget::Reasoning(id),
+    // 转录区：先取文本位置，再叠加动作（若该行可点击）。
+    if let Some(position) = renderer.hit_text(column, row) {
+        let action = match renderer.hit_target(column, row) {
+            Some(crate::tui::HitTarget::Tool(id)) => Some(PointerAction::Tool(id)),
+            Some(crate::tui::HitTarget::Reasoning(id)) => Some(PointerAction::Reasoning(id)),
+            None => None,
+        };
+        return PointerHit {
+            text: Some(position),
+            action,
+            region: PointerRegion::Transcript,
         };
     }
-    if let Some(position) = renderer.hit_text(column, row) {
-        return PointerTarget::Transcript(position);
+    // 非转录文本位置（footer/header 等）：仍可能命中动作（不常见，但保留）。
+    if let Some(target) = renderer.hit_target(column, row) {
+        let action = match target {
+            crate::tui::HitTarget::Tool(id) => Some(PointerAction::Tool(id)),
+            crate::tui::HitTarget::Reasoning(id) => Some(PointerAction::Reasoning(id)),
+        };
+        return PointerHit {
+            text: None,
+            action,
+            region: PointerRegion::Transcript,
+        };
     }
-    PointerTarget::None
+    PointerHit::none()
 }
 /// 执行 reducer 返回的跨边界效果（§27：app 层执行 effect）。
 /// 返回 true 表示请求退出主循环（BUG-004：空闲 Ctrl-C）。
@@ -1025,14 +1041,14 @@ async fn run_interactive<P: Provider>(
                         renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }
                     Some(Event::Mouse(mouse)) => {
-                        use crate::tui::interaction::{PointerInput, PointerTarget};
+                        use crate::tui::interaction::PointerInput;
                         use ratatui::crossterm::event::MouseButton;
                         use ratatui::crossterm::event::MouseEventKind;
                         // 与空闲态同一状态机（拖选复制在运行中可用）。
-                        let target = if ui_state.view.overlay.is_some()
+                        let hit = if ui_state.view.overlay.is_some()
                             || ui_state.view.modal.is_some()
                         {
-                            PointerTarget::None
+                            crate::tui::interaction::PointerHit::none()
                         } else {
                             pointer_target(renderer, mouse.column, mouse.row)
                         };
@@ -1040,22 +1056,22 @@ async fn run_interactive<P: Provider>(
                             MouseEventKind::Down(MouseButton::Left) => PointerInput::Down {
                                 column: mouse.column,
                                 row: mouse.row,
-                                target,
+                                hit,
                             },
                             MouseEventKind::Drag(MouseButton::Left) => PointerInput::Drag {
                                 column: mouse.column,
                                 row: mouse.row,
-                                target,
+                                hit,
                             },
                             MouseEventKind::Up(MouseButton::Left) => PointerInput::Up {
                                 column: mouse.column,
                                 row: mouse.row,
-                                target,
+                                hit,
                             },
                             MouseEventKind::Moved => PointerInput::Move {
                                 column: mouse.column,
                                 row: mouse.row,
-                                target,
+                                hit,
                             },
                             MouseEventKind::ScrollUp => PointerInput::ScrollUp,
                             MouseEventKind::ScrollDown => PointerInput::ScrollDown,

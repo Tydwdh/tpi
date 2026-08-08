@@ -104,7 +104,7 @@ struct FramePlan {
     /// 窗口内每行的语义文本（复制源；与 window 等长）。§InteractionRefactor：
     /// copy 从语义文本提取，不反推渲染结果。每行记录 (entry, 该行在 entry
     /// 语义流中的起始 char 偏移, 语义文本)——hit-test 与复制共用。
-    semantic_rows: Vec<Option<(EntryId, usize, String)>>,
+    semantic_rows: Vec<Option<(EntryId, usize, String, usize)>>,
     overflow: Vec<Line<'static>>,
     committed_after: usize,
 }
@@ -135,7 +135,7 @@ pub struct Renderer {
     /// 最近一帧窗口内每行的语义文本（§InteractionRefactor：Ctrl+C 复制源，
     /// 从语义文本提取，不反推渲染结果）。与窗口行一一对应；每行记录
     /// (entry, 起始 char 偏移, 语义文本)（语义位置 hit-test 用）。
-    semantic_rows: Vec<Option<(EntryId, usize, String)>>,
+    semantic_rows: Vec<Option<(EntryId, usize, String, usize)>>,
 }
 impl Renderer {
     /// 初始化终端（§29-30：raw mode + alternate screen（fullscreen）+ bracketed
@@ -200,7 +200,7 @@ impl Renderer {
         let mut parts: Vec<String> = Vec::new();
         // 窗口内逐行：行所属 entry 落在 [lo.entry_id, hi.entry_id] 区间内，
         // 且行语义 char 范围与 [lo.offset, hi.offset] 有交集 → 提取交集。
-        for (entry_id, char_start, text) in self.semantic_rows.iter().flatten() {
+        for (entry_id, char_start, text, _decor) in self.semantic_rows.iter().flatten() {
             let row_lo = *char_start;
             let row_hi = *char_start + text.chars().count();
             let in_entry_range = match (*entry_id).cmp(&lo.entry_id) {
@@ -252,10 +252,12 @@ impl Renderer {
             return None;
         }
         let index = (row - rect.y) as usize;
-        let (entry_id, char_start, text) = self.semantic_rows.get(index)?.as_ref()?;
-        // 屏幕列 → 行内 char 偏移（按 cell 宽度精确映射，CJK/emoji 正确）。
+        let (entry_id, char_start, text, decor) = self.semantic_rows.get(index)?.as_ref()?;
+        // 屏幕列 → 语义内 cell 列：先扣 rail/icon 前缀宽度（§PointerHit：`│ AI`
+        // 等前缀不参与语义偏移），再按 cell 宽度映射 char（CJK/emoji 精确）。
         let col = column.saturating_sub(rect.x) as usize;
-        let char_off = crate::tui::interaction::cell_to_char(text, col);
+        let semantic_col = col.saturating_sub(*decor);
+        let char_off = crate::tui::interaction::cell_to_char(text, semantic_col);
         Some(crate::tui::interaction::TextPosition {
             entry_id: *entry_id,
             offset: *char_start + char_off,
@@ -575,10 +577,9 @@ fn plan_window(
     // 按全局行切片：逐 entry 取窗口内的行。
     let mut window: Vec<Line<'static>> = Vec::new();
     let mut row_hits: Vec<Option<HitRange>> = Vec::new();
-    // 每窗口行对应的语义文本（复制源；与 window 等长）。§InteractionRefactor：
-    // wrap 时同步折行语义文本，使「视觉行 ↔ 语义字符」一一对应，CJK/emoji 按
-    // cell 宽度正确映射，复制不再从渲染结果反推。每行记录所属 entry。
-    let mut semantic_rows: Vec<Option<(EntryId, usize, String)>> = Vec::new();
+    // 每窗口行对应的语义信息（复制源；与 window 等长）。§PointerHit：
+    // 一次 layout 同步折行语义，记录 (entry, 起始 char, 语义文本, decor_cells)。
+    let mut semantic_rows: Vec<Option<(EntryId, usize, String, usize)>> = Vec::new();
     let mut cursor = 0usize;
     for (entry_id, wrapped, wrapped_hits, semantic_lines) in &wrapped_by_entry {
         let start = cursor;
@@ -591,11 +592,11 @@ fn plan_window(
         let to = (window_start + area_h - start).min(wrapped.len());
         window.extend(wrapped[from..to].iter().cloned());
         row_hits.extend(wrapped_hits[from..to].iter().cloned());
-        // 语义文本按视觉行折行：按同一 cell 宽度折行语义文本，记录每行起始
-        // char 偏移，与视觉行同数对齐（复制与 hit-test 共用）。
+        // 语义文本按视觉行折行（有效宽度 = width - decor_cells，与视觉行
+        // 边界精确一致），记录每行起始 char 偏移与前缀宽度。
         let semantic_wrapped = wrap_semantic_by_visual(semantic_lines, width, wrapped.len());
-        for (char_start, row) in &semantic_wrapped[from..to] {
-            semantic_rows.push(Some((*entry_id, *char_start, row.clone())));
+        for (char_start, row, decor) in &semantic_wrapped[from..to] {
+            semantic_rows.push(Some((*entry_id, *char_start, row.clone(), *decor)));
         }
     }
     // §用户诉求：卡片整行背景填满——有背景色（卡片/surface 或 diff 红绿）的
@@ -647,7 +648,7 @@ fn plan_window(
             .add_modifier(Modifier::REVERSED);
         let (lo, hi) = sel.normalized();
         for (i, row) in semantic_rows.iter().enumerate() {
-            let Some((entry_id, char_start, text)) = row else {
+            let Some((entry_id, char_start, text, _decor)) = row else {
                 continue;
             };
             let row_lo = *char_start;
@@ -819,71 +820,74 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
 pub type HitRange = (HitTarget, u16);
 
 /// 把 entry 语义文本折成与视觉行**行数一致**的语义行（复制源），并返回每行
-/// 在 entry 语义流中的起始 char 偏移。
+/// 的 `(起始 char 偏移, 语义文本, 前缀 decor_cells)`。
 ///
-/// §InteractionRefactor：semantic_lines 是逻辑行的无装饰内容，视觉行是同一
-/// 内容加装饰前缀后折行的结果。此处按同一 cell 宽度独立折行语义文本，
-/// 再按行数对齐（前缀占位可能导致个别行边界差 1 个字符；相比「从渲染结果
-/// 反推」已消除 CJK cell 错位与 padding 污染，且语义始终指向 entry 内容）。
+/// §PointerHit：语义折行使用与视觉行**相同的有效宽度** `width - decor_cells`
+/// （前缀占位后的内容宽度），因此语义行与视觉行的折行边界精确一致——不再是
+/// 两份独立 wrap 的近似对齐。decor_cells 取该逻辑行的前缀宽度。
 fn wrap_semantic_by_visual(
-    semantic_lines: &[String],
+    semantic_lines: &[SemanticLine],
     width: usize,
     visual_lines: usize,
-) -> Vec<(usize, String)> {
+) -> Vec<(usize, String, usize)> {
     let width = width.max(1);
-    // 1. 把语义行文本折行（含显式 \n 与 cell 宽度，与 wrap_lines 同规则），
-    //    记录每行的起始 char 偏移（entry 语义流内累计）。
-    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut out: Vec<(usize, String, usize)> = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
     let mut offset = 0usize;
-    let flush = |out: &mut Vec<(usize, String)>,
+    let mut cur_decor = 0usize;
+    let flush = |out: &mut Vec<(usize, String, usize)>,
                  cur: &mut String,
                  cur_w: &mut usize,
-                 offset: &mut usize| {
+                 offset: &mut usize,
+                 cur_decor: &mut usize| {
         if !cur.is_empty() {
             let start = *offset - cur.chars().count();
-            out.push((start, std::mem::take(cur)));
+            out.push((start, std::mem::take(cur), *cur_decor));
             *cur_w = 0;
+            *cur_decor = 0;
         }
     };
-    for text in semantic_lines {
-        if text.is_empty() {
+    for line in semantic_lines {
+        let decor = line.decor_cells;
+        let effective_width = width.saturating_sub(decor);
+        if line.text.is_empty() {
             if !cur.is_empty() {
-                flush(&mut out, &mut cur, &mut cur_w, &mut offset);
+                flush(&mut out, &mut cur, &mut cur_w, &mut offset, &mut cur_decor);
             }
-            out.push((offset, String::new()));
-            offset += 1; // 空行仍占一个换行语义位
+            out.push((offset, String::new(), decor));
+            offset += 1;
             continue;
         }
-        for ch in text.chars() {
+        for ch in line.text.chars() {
             if ch == '\n' {
                 if !cur.is_empty() {
-                    flush(&mut out, &mut cur, &mut cur_w, &mut offset);
+                    flush(&mut out, &mut cur, &mut cur_w, &mut offset, &mut cur_decor);
                 } else {
-                    out.push((offset, String::new()));
+                    out.push((offset, String::new(), decor));
                 }
                 offset += 1;
                 continue;
             }
             let w = crate::tui::text::char_cell_width(ch);
-            if cur_w + w > width && !cur.is_empty() {
-                flush(&mut out, &mut cur, &mut cur_w, &mut offset);
+            if cur_w + w > effective_width && !cur.is_empty() {
+                flush(&mut out, &mut cur, &mut cur_w, &mut offset, &mut cur_decor);
+                cur_decor = decor;
             }
             cur.push(ch);
             cur_w += w;
             offset += 1;
         }
         if !cur.is_empty() {
-            flush(&mut out, &mut cur, &mut cur_w, &mut offset);
+            flush(&mut out, &mut cur, &mut cur_w, &mut offset, &mut cur_decor);
         }
     }
     if !cur.is_empty() {
-        flush(&mut out, &mut cur, &mut cur_w, &mut offset);
+        flush(&mut out, &mut cur, &mut cur_w, &mut offset, &mut cur_decor);
     }
-    // 2. 与视觉行数对齐：语义行不足则补空行，超出的丢弃（折叠截断场景）。
+    // 与视觉行数对齐：不足补空行，超出截断（折叠截断场景）。
     if out.len() < visual_lines {
-        out.resize(visual_lines, (offset, String::new()));
+        out.resize(visual_lines, (offset, String::new(), 0));
     } else {
         out.truncate(visual_lines);
     }
@@ -891,14 +895,26 @@ fn wrap_semantic_by_visual(
 }
 
 /// 按 entry 分组的渲染结果：(EntryId, 逻辑行, 逐行 hits, 逐行语义文本)。
-/// hits 与 lines 等长；semantic_lines 与 lines 等长，每行是该逻辑行的
-/// **无装饰语义文本**（复制源，§InteractionRefactor：copy 从内容提取，
-/// 不反推渲染结果）。工具卡片的行对应卡片 id（鼠标点击展开）。
+/// 单个逻辑行的语义信息（复制/选中/高亮的事实源）。
+///
+/// - `text`：该逻辑行的**无装饰语义文本**（复制源，不含 rail/icon 等前缀）。
+/// - `decor_cells`：该逻辑行视觉渲染中前缀装饰占用的 cell 宽度。语义文本
+///   在视觉行中的起始 cell 列 = decor_cells；精确的 cell↔char 映射依赖它
+///   （§PointerHit：`│ AI` 等前缀不参与语义偏移）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticLine {
+    text: String,
+    decor_cells: usize,
+}
+
+/// 按 entry 分组的渲染结果：(EntryId, 逻辑行, 逐行 hits, 逐行语义信息)。
+/// hits 与 lines 等长；semantic 与 lines 等长，每行是逻辑行的无装饰语义。
+/// 工具卡片的行对应卡片 id（鼠标点击展开）。
 type EntryGroup = (
     EntryId,
     Vec<Line<'static>>,
     Vec<Option<HitRange>>,
-    Vec<String>,
+    Vec<SemanticLine>,
 );
 
 /// entry 是否命中当前 active_hit（§24 点击高亮）：hits 中任意一行与
@@ -933,16 +949,30 @@ fn build_transcript_text(
     let mut groups: Vec<EntryGroup> = Vec::with_capacity(view.transcript.len());
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut hits: Vec<Option<HitRange>> = Vec::new();
-    let mut semantic: Vec<String> = Vec::new();
+    let mut semantic: Vec<SemanticLine> = Vec::new();
     let push_hit = |lines: &mut Vec<Line<'static>>,
                     hits: &mut Vec<Option<HitRange>>,
-                    semantic: &mut Vec<String>,
+                    semantic: &mut Vec<SemanticLine>,
                     line: Line<'static>,
                     hit: Option<HitRange>,
                     semantic_text: String| {
+        // decor_cells = 视觉行总宽 - 语义正文宽（rail/icon 前缀占位）。
+        // 语义文本是纯内容，视觉行含装饰前缀；差值即前缀 cell 宽度。
+        let line_width = unicode_width::UnicodeWidthStr::width(
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .as_str(),
+        );
+        let text_width = unicode_width::UnicodeWidthStr::width(semantic_text.as_str());
+        let decor_cells = line_width.saturating_sub(text_width);
         lines.push(line);
         hits.push(hit);
-        semantic.push(semantic_text);
+        semantic.push(SemanticLine {
+            text: semantic_text,
+            decor_cells,
+        });
     };
     // 搜索命中集合（高亮用，§14）：只作用于 transcript，live 区不参与。
     let hit_ids: std::collections::HashSet<EntryId> = view
@@ -1225,7 +1255,7 @@ fn build_live_group(
     width: usize,
     out: &mut Vec<Line<'static>>,
     hits: &mut Vec<Option<HitRange>>,
-    semantic: &mut Vec<String>,
+    semantic: &mut Vec<SemanticLine>,
     groups: &mut Vec<EntryGroup>,
 ) {
     let live = &view.live;
@@ -1241,14 +1271,19 @@ fn build_live_group(
     {
         if view.reasoning_visible {
             for s in msg.text.split('\n') {
+                let rendered = format!("思考 {s}");
+                let decor = unicode_width::UnicodeWidthStr::width("思考 ") as usize;
                 out.push(Line::styled(
-                    format!("思考 {s}"),
+                    rendered.clone(),
                     Style::default()
                         .fg(theme.muted)
                         .add_modifier(Modifier::ITALIC),
                 ));
                 hits.push(None);
-                semantic.push(s.to_string());
+                semantic.push(SemanticLine {
+                    text: s.to_string(),
+                    decor_cells: decor,
+                });
             }
         } else {
             out.push(Line::styled(
@@ -1258,7 +1293,10 @@ fn build_live_group(
                     .add_modifier(Modifier::ITALIC),
             ));
             hits.push(None);
-            semantic.push(String::new());
+            semantic.push(SemanticLine {
+                text: String::new(),
+                decor_cells: 0,
+            });
         }
     }
     // 流式 assistant（Markdown，按 version 缓存）。带左 rail + AI 标签，
@@ -1299,9 +1337,21 @@ fn build_live_group(
                 .iter()
                 .map(|s| s.content.as_ref())
                 .collect::<String>();
-            out.push(Line::from(spans));
+            let line = Line::from(spans);
+            let line_width = unicode_width::UnicodeWidthStr::width(
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .as_str(),
+            );
+            let text_width = unicode_width::UnicodeWidthStr::width(semantic_text.as_str());
+            out.push(line);
             hits.push(None);
-            semantic.push(semantic_text);
+            semantic.push(SemanticLine {
+                text: semantic_text,
+                decor_cells: line_width.saturating_sub(text_width),
+            });
         }
     }
     // 运行中工具卡片（按启动顺序）。
@@ -1327,9 +1377,14 @@ fn build_live_group(
                 } else {
                     card_semantic_content(card, i, &raw_text)
                 };
+                let line_width = unicode_width::UnicodeWidthStr::width(raw_text.as_str());
+                let text_width = unicode_width::UnicodeWidthStr::width(semantic_text.as_str());
                 out.push(line);
                 hits.push(hit);
-                semantic.push(semantic_text);
+                semantic.push(SemanticLine {
+                    text: semantic_text,
+                    decor_cells: line_width.saturating_sub(text_width),
+                });
             }
         }
     }
@@ -3608,4 +3663,67 @@ fn selection_highlights_selected_window_rows() {
     };
     assert!(has_reversed(1) && has_reversed(2), "选中行 1-2 必须高亮");
     assert!(!has_reversed(0) && !has_reversed(3), "未选中行不高亮");
+}
+
+/// §InteractionRefactor：plan_window 的语义映射与视觉行必须对齐——
+/// semantic_rows 每行都能定位到对应 entry 的文本，且语义文本能命中真实内容。
+#[test]
+fn semantic_rows_align_with_window_and_map_text() {
+    use crate::tui::scroll::EntryId;
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::Assistant, "hello world");
+    view.push_line(LineKind::Assistant, "second line");
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
+    // 语义行与窗口行等长（每 entry 至少 1 行）。
+    assert_eq!(
+        plan.semantic_rows.len(),
+        plan.window.len(),
+        "semantic_rows 必须与 window 等长"
+    );
+    assert!(!plan.semantic_rows.is_empty());
+    // 每行都带 entry 归属；语义文本 = 消息正文（无 rail 前缀）。
+    for row in plan.semantic_rows.iter() {
+        let (entry_id, _start, text, _decor) = row.as_ref().expect("窗口行必须有语义映射");
+        assert!(
+            *entry_id == EntryId(1) || *entry_id == EntryId(2),
+            "归属错误 entry: {entry_id:?}"
+        );
+        assert!(!text.starts_with("│"), "语义文本不得含 rail 前缀: {text:?}");
+        assert!(!text.is_empty(), "正文行语义文本不得为空");
+    }
+    // 语义文本必须能被定位：entry 1 的语义文本就是 "hello world"（markdown 渲染无装饰）。
+    let e1_text = plan
+        .semantic_rows
+        .iter()
+        .find_map(|r| {
+            let (id, _, t, _) = r.as_ref()?;
+            (*id == EntryId(1)).then(|| t.clone())
+        })
+        .expect("entry 1 必须有语义行");
+    assert!(
+        e1_text.contains("hello"),
+        "entry1 语义文本错误: {e1_text:?}"
+    );
+}
+
+/// §InteractionRefactor：hit_text 从屏幕坐标命中语义位置——CJK 按 cell 宽度。
+#[test]
+fn hit_text_maps_screen_column_to_char_offset() {
+    use crate::tui::interaction::{TextPosition, cell_to_char};
+    // 纯函数直接验证（渲染层 hit_text 复用同一映射）。
+    let text = "abc你好xyz";
+    assert_eq!(cell_to_char(text, 3), 3, "你 的第 1 个 cell 是 char 3");
+    assert_eq!(cell_to_char(text, 4), 3, "你 的第 2 个 cell 仍是 char 3");
+    assert_eq!(cell_to_char(text, 5), 4, "好 的第 1 个 cell 是 char 4");
+    // TextPosition 构造与排序。
+    let a = TextPosition {
+        entry_id: EntryId(1),
+        offset: 3,
+    };
+    let b = TextPosition {
+        entry_id: EntryId(1),
+        offset: 5,
+    };
+    assert!(a < b);
 }
