@@ -1,4 +1,4 @@
-//! TUI 渲染层（文档 §16）。
+﻿//! TUI 渲染层（文档 §16）。
 //!
 //! 只有 renderer 可以调用 Crossterm/Ratatui 或写 stdout；Agent、provider、tool
 //! 和日志模块只能发送事件（§16.1、§3.2 不变量 11）。
@@ -371,8 +371,8 @@ fn render_frame(
 
     // 操作型 Modal（§42：/help /settings /doctor 等；覆盖显示，Esc 关闭）。
     if view.modal.is_some() {
-        let w = area.width.min(88).saturating_sub(4).max(40);
-        let h = trans_area.height.min(28).saturating_sub(2).max(10);
+        let w = modal_width(area.width);
+        let h = modal_height(trans_area.height);
         let x = area.x + (area.width.saturating_sub(w)) / 2;
         let y = trans_area.y + trans_area.height.saturating_sub(h) / 2;
         draw_modal(frame, Rect::new(x, y, w, h), view, theme);
@@ -380,7 +380,7 @@ fn render_frame(
 
     // 搜索框（§14：Ctrl+F；悬浮在转录区顶部）。
     if let Some(search) = &view.search {
-        let w = area.width.clamp(24, 56);
+        let w = area.width.min(56).max(1);
         let x = area.x + (area.width.saturating_sub(w)) / 2;
         let y = trans_area.y;
         let hit_info = if search.query.is_empty() {
@@ -406,8 +406,8 @@ fn render_frame(
 
     // 详情 Overlay（整改 B：覆盖显示，不重写 scrollback；Esc 关闭）。
     if view.overlay.is_some() {
-        let w = area.width.min(88).saturating_sub(4).max(40);
-        let h = trans_area.height.min(28).saturating_sub(2).max(10);
+        let w = modal_width(area.width);
+        let h = modal_height(trans_area.height);
         let x = area.x + (area.width.saturating_sub(w)) / 2;
         let y = trans_area.y + trans_area.height.saturating_sub(h) / 2;
         draw_overlay(frame, Rect::new(x, y, w, h), view, theme);
@@ -555,9 +555,7 @@ fn wrap_lines_with_hits(
         for span in line.spans {
             let style = span.style;
             for ch in span.content.chars() {
-                let w = unicode_width::UnicodeWidthChar::width(ch)
-                    .unwrap_or(0)
-                    .max(1);
+                let w = crate::tui::text::char_cell_width(ch);
                 if cur_w + w > width && !cur.is_empty() {
                     flush(&mut out, &mut out_hits, &mut cur, &mut cur_w, &mut cur_hit);
                     cur_hit = hit.clone();
@@ -594,9 +592,7 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
         for span in line.spans {
             let style = span.style;
             for ch in span.content.chars() {
-                let w = unicode_width::UnicodeWidthChar::width(ch)
-                    .unwrap_or(0)
-                    .max(1);
+                let w = crate::tui::text::char_cell_width(ch);
                 if cur_w + w > width && !cur.is_empty() {
                     out.push(Line::from(std::mem::take(&mut cur)));
                     cur_w = 0;
@@ -710,17 +706,27 @@ fn build_transcript_text(
                     }
                 }
                 LineKind::System => {
-                    for (i, s) in line.text.split('\n').enumerate() {
-                        let prefix = if i == 0 { "系统 " } else { "    " };
+                    // PM：纯分隔线按终端宽度铺满（此前固定 40 个 ─，窄屏折行、宽屏过短）。
+                    if !line.text.is_empty() && line.text.chars().all(|c| c == '─') {
                         push_hit(
                             &mut out,
                             &mut hits,
-                            Line::styled(
-                                format!("{prefix}{s}"),
-                                Style::default().fg(theme.warning),
-                            ),
+                            Line::styled("─".repeat(width), Style::default().fg(theme.warning)),
                             None,
                         );
+                    } else {
+                        for (i, s) in line.text.split('\n').enumerate() {
+                            let prefix = if i == 0 { "系统 " } else { "    " };
+                            push_hit(
+                                &mut out,
+                                &mut hits,
+                                Line::styled(
+                                    format!("{prefix}{s}"),
+                                    Style::default().fg(theme.warning),
+                                ),
+                                None,
+                            );
+                        }
                     }
                 }
             },
@@ -1006,29 +1012,36 @@ fn tool_card_lines(
             crate::tool::outcome::ToolStatus::Rejected => ("⊘", theme.warning),
         },
     };
-
-    // metadata（固定右侧区域）：duration [· exit code] [· 状态词]。
+    // metadata（固定右侧区域）：duration [· exit code]。
+    // PM：成功卡的 `exit 0` 是噪声且占宽度，只在非成功时显示退出码。
     let mut meta = String::new();
     if let ToolCardState::Done {
+        status,
         duration_ms,
         exit_code,
         ..
     } = &card.state
     {
         meta.push_str(&fmt_duration(*duration_ms));
-        if let Some(code) = exit_code {
+        if *status != crate::tool::outcome::ToolStatus::Succeeded
+            && let Some(code) = exit_code
+        {
             meta.push_str(&format!(" · exit {code}"));
         }
     }
     let meta_w = unicode_width::UnicodeWidthStr::width(meta.as_str());
-    let name_w = unicode_width::UnicodeWidthStr::width(card.name.as_str());
     let icon_w = 2; // "✓ " 等 icon + 空格
-    // 预算分配：icon + name + target + meta（各 1 空格分隔）。
-    let target_budget = width
-        .saturating_sub(icon_w + 1 + name_w + 1 + meta_w + 1)
-        .max(4);
-    let target = card.target.as_deref().unwrap_or("");
-    let target = truncate_display(target, target_budget);
+    // 预算分配（保证主行单行，§16.2/整改 A2）：
+    // icon + name + target + meta（各 1 空格分隔）；name 超宽先截断，target 无余量则丢弃。
+    let name_max = width.saturating_sub(icon_w + 1 + meta_w + 1);
+    let name = truncate_display(card.name.as_str(), name_max.max(1));
+    let name_w = unicode_width::UnicodeWidthStr::width(name.as_str());
+    let target_budget = width.saturating_sub(icon_w + 1 + name_w + 1 + meta_w + 1);
+    let target = if target_budget >= 1 {
+        truncate_display(card.target.as_deref().unwrap_or(""), target_budget)
+    } else {
+        String::new()
+    };
 
     let mut spans = vec![Span::styled(
         format!("{icon} "),
@@ -1037,7 +1050,7 @@ fn tool_card_lines(
             .add_modifier(Modifier::BOLD),
     )];
     spans.push(Span::styled(
-        card.name.clone(),
+        name,
         Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     ));
     if !target.is_empty() {
@@ -1102,14 +1115,13 @@ fn tool_card_lines(
 
 /// 按 display width 截断（超宽加 …），保证主行不溢出。
 fn truncate_display(text: &str, max_width: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
     if unicode_width::UnicodeWidthStr::width(text) <= max_width {
         return text.to_string();
     }
     let mut out = String::new();
     let mut w = 0usize;
     for ch in text.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+        let cw = crate::tui::text::char_cell_width(ch);
         if w + cw + 1 > max_width {
             out.push('…');
             return out;
@@ -1247,7 +1259,7 @@ fn draw_footer(
     // §16：Locked 期间的新内容提示（End 一键返回最新）。
     if view.pending_below > 0 {
         spans.push(Span::styled(
-            format!(" · ↓{} 条新内容 · End 返回最新", view.pending_below),
+            format!(" · ↓{} 条新内容 · Ctrl+End 返回最新", view.pending_below),
             Style::default().fg(theme.warning),
         ));
     }
@@ -1369,6 +1381,20 @@ fn input_cursor_cell(input: &str, cursor: usize, width: u16) -> (u16, u16) {
 /// 详情 Overlay（整改 B）：带边框对话框，展示 command/output/status；
 /// Esc 关闭、PgUp/PgDn 内部滚动；不修改 scrollback。
 /// 操作型 Modal（§42）：标题 + 正文（内部滚动，Esc 关闭，PgUp/PgDn 翻页）。
+
+/// Modal/Overlay 宽度：优先 ≤88-4，但绝不超过终端宽度-2（窄屏不溢出）。
+fn modal_width(area_width: u16) -> u16 {
+    let max_w = area_width.saturating_sub(2).max(1);
+    let pref = area_width.min(88).saturating_sub(4);
+    pref.min(max_w).max(max_w.min(10))
+}
+
+/// Modal/Overlay 高度：优先 ≤28-2，但绝不超过转录区高度-2（小终端不溢出）。
+fn modal_height(area_height: u16) -> u16 {
+    let max_h = area_height.saturating_sub(2).max(1);
+    let pref = area_height.min(28).saturating_sub(2);
+    pref.min(max_h).max(max_h.min(10))
+}
 fn draw_modal(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: theme::Theme) {
     let Some(modal) = &view.modal else {
         return;
@@ -1881,6 +1907,23 @@ mod tests {
         assert_eq!(input_scroll_offset(2, 3, 8), 0);
         // 极端：区域高度 0 不 panic（clamp 到 1）。
         assert_eq!(input_scroll_offset(5, 10, 0), 5);
+    }
+
+    /// PM：Modal/Overlay 尺寸在窄屏/小终端下不溢出（此前 max(40)/max(10) 会超屏）。
+    #[test]
+    fn modal_size_clamps_to_terminal() {
+        // 常规：优先 88-4=84，但受 width-2 限制。
+        assert_eq!(modal_width(80), 76);
+        assert_eq!(modal_width(120), 84);
+        // 窄屏：不超过 width-2。
+        assert_eq!(modal_width(30), 26);
+        assert_eq!(modal_width(20), 16);
+        assert_eq!(modal_width(10), 8);
+        assert!(modal_width(40) <= 38);
+        // 高度：不超过 trans_area.height-2。
+        assert_eq!(modal_height(24), 22);
+        assert_eq!(modal_height(10), 8);
+        assert_eq!(modal_height(40), 26);
     }
     #[test]
     fn activity_height_scales_with_terminal_rows() {

@@ -164,3 +164,11 @@ mod tests {
         assert_eq!(truncate_middle_utf8("你好", 100, "…"), "你好");
     }
 }
+
+/// 单个字符的显示宽度（0 = 零宽：组合符/ZWJ/控制符）。
+///
+/// 之前各处用 `width(ch).unwrap_or(0).max(1)`，把 ZWJ/组合符也算 1 列，
+/// 导致 emoji 序列（如 👨‍💻）在折行/光标列计算时漂移。终端实际按 0 列渲染。
+pub fn char_cell_width(ch: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+}

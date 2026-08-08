@@ -175,3 +175,15 @@
   排队消息自动执行、resize、/new 切换、鼠标滚轮后输入存活、/quit 干净退出）。
 - 验收脚本：`scripts/interactive_acceptance.js`（仓库外 npm i node-pty 后运行）。
 - Alt+E overlay 与 bracketed paste 由真实终端产生，ConPTY 无法模拟，由单元测试覆盖。
+
+## 16. PM 视角 TUI 显示审计（2026-08-08）
+发现并修复的“显示会出问题”的点（按影响排序）：
+1. footer 提示误写“End 返回最新”，实际快捷键是 Ctrl+End —— 已改文案并加断言。
+2. 成功工具卡显示 `exit 0`（噪声且占宽度）—— 只在非成功时显示退出码；失败卡仍显示。
+3. 窄终端（<44 列）Modal/Overlay 比屏幕宽、搜索框溢出 —— modal_width/height 与搜索框改为不超过终端尺寸（含单测）。
+4. 系统分隔线固定 40 个 `─`：窄屏折行成两行、宽屏过短 —— 纯分隔线按终端宽度铺满（单测）。
+5. emoji/组合字符宽度：`max(1)` 把 ZWJ/组合符算 1 列导致光标/折行漂移 —— 新增统一 `char_cell_width`（零宽=0），editor 与 wrap 全部使用（含单测）。
+6. 工具卡主行在窄屏预算不足时会折行 —— 预算改为 name 优先截断、target 无余量即丢弃，保证单行（40 列单测）。
+7. /help 快捷键说明补齐：Ctrl+End/Ctrl+Home/Alt+O/Alt+[/]、Modal 滚动、滚动条。
+
+已确认无需修改：footer 长内容在窄屏被裁剪（Paragraph 不折行，属预期）；搜索命中无高亮（产品取舍，留待后续）。

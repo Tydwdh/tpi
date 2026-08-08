@@ -465,9 +465,13 @@ web_search: DuckDuckGo（免费，无需 API key）
                         ));
                     }
                     text.push_str(
-                        "快捷键：Shift+Enter 换行 · ↑/↓ 多行/历史 · Tab 命令补全 ·                          @文件 引用补全 · Alt+T 思考折叠 · Alt+E 展开工具输出 ·                          Ctrl+F 搜索 · Ctrl+U 清空 · Ctrl+A/E 行首/行尾 ·                          PgUp/PgDn 翻页 · 滚轮滚动 · 点击工具卡片展开 · Ctrl-C 取消 run",
+                        "快捷键：Shift+Enter 换行 · ↑/↓ 多行/历史 · Tab 命令补全 ·
+                        @文件 引用补全 · Alt+T 思考折叠 · Alt+E/Alt+O 工具详情 ·
+                        Alt+[/] 切换工具 · Ctrl+F 搜索 · Ctrl+U 清空 ·
+                        Ctrl+A/E 行首/行尾 · PgUp/PgDn 翻页 · 滚轮/滚动条滚动 ·
+                        Ctrl+Home 顶部 · Ctrl+End 最新 · Modal ↑/↓ 滚动 ·
+                        点击工具卡片展开 · Ctrl-C 取消 run",
                     );
-                    ui_state.view.open_modal("/help", text);
                     renderer
                         .draw(&mut ui_state.view)
                         .map_err(|e| e.to_string())?;

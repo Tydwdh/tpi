@@ -51,14 +51,11 @@ impl Editor {
         unicode_width::UnicodeWidthStr::width(&self.text[start..self.cursor])
     }
 
-    /// 在 [start, end) 内按 display 列定位字符偏移（越界 → 行尾）。
     fn col_to_offset(&self, start: usize, end: usize, col: usize) -> usize {
         let mut width = 0usize;
         let mut offset = end;
         for (i, ch) in self.text[start..end].char_indices() {
-            let w = unicode_width::UnicodeWidthChar::width(ch)
-                .unwrap_or(0)
-                .max(1);
+            let w = crate::tui::text::char_cell_width(ch);
             if width + w > col {
                 offset = start + i;
                 break;
@@ -461,5 +458,21 @@ mod p2_word_edit_tests {
         assert_eq!(e.cursor, 4);
         e.move_word_right();
         assert_eq!(e.cursor, 8);
+    }
+}
+
+#[cfg(test)]
+mod zero_width_tests {
+    use super::Editor;
+
+    /// 零宽字符（组合符/ZWJ）不推进列宽（此前 per-char max(1) 导致光标漂移）。
+    #[test]
+    fn zero_width_chars_do_not_advance_column() {
+        let mut editor = Editor::new();
+        editor.set_text("e\u{301}x".to_string()); // e + combining acute + x
+        editor.end();
+        assert_eq!(editor.cursor_col(), 2, "组合符不占列宽");
+        // col 1 应定位到 x 起始（组合符不占列）。
+        assert_eq!(editor.col_to_offset(0, editor.text.len(), 1), 3);
     }
 }

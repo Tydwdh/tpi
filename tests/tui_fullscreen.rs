@@ -122,6 +122,10 @@ fn fullscreen_pending_below_hint_renders() {
     let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
     let all: String = row_texts(&buf).join("\n");
     assert!(all.contains("条新内容"), "scroll lock 提示应可见: {all:?}");
+    assert!(
+        all.contains("Ctrl+End") && all.contains("返回最新"),
+        "提示必须写明 Ctrl+End（此前误写 End）: {all:?}"
+    );
 }
 
 /// §24：全屏历史必须有垂直 scrollbar——右侧 1 列，thumb 按 visual 行数比例。
@@ -180,4 +184,84 @@ fn long_transcript_2000_entries_renders_stably() {
     view.scroll_up(50);
     let buf2 = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
     assert_eq!(buf2.area().width, 80);
+}
+
+/// PM：分隔线按终端宽度铺满——窄屏不折行（此前固定 40 个 ─ 在 30 列会折成两行）。
+#[test]
+fn system_separator_fills_width_without_wrap() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::Assistant, "内容");
+    view.push_line(LineKind::System, "─".repeat(40));
+    let buf = draw_to_test_backend_mode(&mut view, 30, 12, ViewMode::Fullscreen);
+    let texts = row_texts(&buf);
+    let rule_rows = texts
+        .iter()
+        .filter(|s| {
+            let s = s.trim_end_matches('│').trim(); // 去掉 scrollbar 列
+            !s.is_empty() && s.chars().all(|c| c == '─')
+        })
+        .count();
+    assert_eq!(rule_rows, 1, "分隔线必须单行铺满（不折行）: {texts:?}");
+}
+/// PM：窄屏（40 列）下工具卡主行仍保持单行（此前预算不足时可能折行）。
+#[test]
+fn tool_card_stays_single_line_on_narrow_terminal() {
+    let mut view = ViewModel::default();
+    let long = format!("cargo test -- --nocapture {}", "x".repeat(200));
+    view.begin_tool("c", "bash", Some(long.clone()), Some(long));
+    view.finish_tool(
+        "c",
+        "bash",
+        tpi::tool::outcome::ToolStatus::Failed,
+        123_456,
+        Some(101),
+        "error[E0308]",
+    );
+    let buf = draw_to_test_backend_mode(&mut view, 40, 12, ViewMode::Fullscreen);
+    let rows: Vec<&[ratatui::buffer::Cell]> = buf.content().chunks(40).collect();
+    let card_row = rows
+        .iter()
+        .position(|r| r.iter().any(|cell| cell.symbol() == "✗"))
+        .expect("卡片行存在");
+    let width = 40;
+    let following = rows[card_row + 1..]
+        .iter()
+        .take_while(|r| r[..width - 1].iter().any(|cell| cell.symbol() != " ")) // 排除 scrollbar 列
+        .count();
+    assert!(
+        following <= 1,
+        "窄屏卡片主行必须单行（后续最多 1 行失败 tail）: following={following}"
+    );
+}
+
+/// PM：成功工具卡不再显示 `exit 0`（噪声），失败卡仍显示退出码。
+#[test]
+fn success_card_hides_exit_zero_failure_keeps_it() {
+    let mut view = ViewModel::default();
+    view.begin_tool("c", "bash", Some("cargo test".into()), None);
+    view.finish_tool(
+        "c",
+        "bash",
+        tpi::tool::outcome::ToolStatus::Succeeded,
+        100,
+        Some(0),
+        "",
+    );
+    let buf = draw_to_test_backend_mode(&mut view, 80, 12, ViewMode::Fullscreen);
+    let all: String = row_texts(&buf).join("\n");
+    assert!(!all.contains("exit"), "成功卡不应显示 exit 文本: {all:?}");
+
+    let mut view2 = ViewModel::default();
+    view2.begin_tool("c", "bash", Some("cargo test".into()), None);
+    view2.finish_tool(
+        "c",
+        "bash",
+        tpi::tool::outcome::ToolStatus::Failed,
+        100,
+        Some(101),
+        "boom",
+    );
+    let buf2 = draw_to_test_backend_mode(&mut view2, 80, 12, ViewMode::Fullscreen);
+    let all2: String = row_texts(&buf2).join("\n");
+    assert!(all2.contains("exit101"), "失败卡必须显示退出码: {all2:?}");
 }
