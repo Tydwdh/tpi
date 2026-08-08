@@ -239,3 +239,6 @@
 ## 迭代记录（2026-08-08 续 9）
 - SEARCH-CTRLU-001（P2，行为不一致）：搜索打开时 Ctrl+U 把 'u' 插入搜索词（/help 写“Ctrl+U 清空”）。已修：搜索模式 Ctrl+U 清空 query。回归：search_ctrl_u_clears_query。
 - PRUNE-SYMLINK-001（P2，删除安全）：walk_files 用 path.is_dir()（跟随 symlink），prune 可能递归进外部目录并删除文件。已修：DirEntry.file_type() 不跟随链接；symlink 目录不递归。回归：walk_files_does_not_follow_symlink_dirs（unix）。
+## 迭代记录（2026-08-08 续 10）
+- SLASH-ENTER-QUIT-001（P2，误触退出）：命令菜单默认选中第一项且 Enter 补全+提交；第一项是 quit → “/”+回车直接退出。已修：SLASH_COMMANDS 重排（help 第一、quit 最后）。回归：slash_enter_defaults_to_help_not_quit。
+- ESC-CLEAR-001（P3，人体工学记录项落地）：idle 且输入非空时 Esc 现在清空输入（此前无操作；运行中取消、弹层/菜单关闭语义不变）。回归：esc_idle_clears_input。

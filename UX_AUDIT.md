@@ -239,3 +239,6 @@
 ## 28. 迭代第14轮（2026-08-08）
 - 搜索框 Ctrl+U 失效（真 bug）：Ctrl+F 搜索打开时按 Ctrl+U（/help 承诺“清空”）会把字母 u 插入搜索词，而不是清空——因为搜索键路由把 Ctrl+U 当普通字符。已修：搜索模式 Ctrl+U 清空 query。回归 search_ctrl_u_clears_query。
 - prune 符号链接安全（真 bug，删除工具）：tpi prune 的 walk_files 用 path.is_dir()（跟随符号链接），~/.tpi/sessions 或 artifacts 里若有指向外部的符号链接目录，会把外部文件也按过期删除。已修：用 DirEntry.file_type()（不跟随链接）判断，symlink 目录不递归、symlink 文件只删链接本身。回归 walk_files_does_not_follow_symlink_dirs（unix）。
+## 29. 迭代第15轮（2026-08-08）
+- 斜杠菜单默认项陷阱（P2，真 bug）：命令补全菜单第一项是 /quit，输入 “/” + 回车（默认选中第一项并提交）会直接退出 TPI——探索菜单时误触即退出。已修：SLASH_COMMANDS 重排，help 第一、quit 最后；“/”+回车默认 /help。回归 slash_enter_defaults_to_help_not_quit。
+- 空闲 Esc 清空输入（P3，第 4 节记录项落地）：idle 且输入非空时 Esc 清空当前输入（运行中 Esc 仍取消、弹层/菜单优先语义不变）。回归 esc_idle_clears_input。

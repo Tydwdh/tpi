@@ -55,10 +55,11 @@ pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 
 /// 斜杠命令单一来源（/help 与补全菜单共用；描述原生中文，§16.3）。
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("quit", "退出 TPI"),
+    // “/ + 回车”默认选中第一项：首项必须是安全命令（help），
+    // 不能是 quit，否则探索菜单时输“/”再回车会直接退出。
+    ("help", "显示帮助与快捷键"),
     ("settings", "查看生效配置及来源"),
     ("model", "查看当前模型"),
-    ("help", "显示帮助与快捷键"),
     ("session", "查看会话与成本"),
     ("sessions", "浏览并恢复历史会话"),
     ("new", "开始新会话"),
@@ -67,6 +68,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("diff", "查看本轮全部文件 diff"),
     ("doctor", "环境检查（config/模型/API key/Git Bash）"),
     ("compact", "手动压缩上下文"),
+    ("quit", "退出 TPI"),
 ];
 
 /// 鼠标 hit 目标（点击转录行打开详情 Overlay）。

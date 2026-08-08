@@ -199,6 +199,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             } else if state.running {
                 // §6.2：Esc 打断当前 run（等价 Ctrl-C，保留 session）。
                 effects.push(UiEffect::CancelRun);
+            } else if !state.editor.text().is_empty() {
+                // 空闲时 Esc 清空当前输入（人体工学：“退出当前输入”的通用假设）。
+                state.editor.clear();
+                state.sync_input();
+                refresh_menus(state);
             }
         }
         KeyCode::Backspace => {

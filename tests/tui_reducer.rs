@@ -892,6 +892,35 @@ fn search_ctrl_u_clears_query() {
     );
 }
 
+#[test]
+fn slash_enter_defaults_to_help_not_quit() {
+    let mut s = state();
+    reducer::update(&mut s, UiEvent::Paste("/".into()));
+    assert!(s.view.menu.is_some(), "typing / opens the command menu");
+    assert_eq!(s.view.menu.as_ref().unwrap().selected, 0);
+    reducer::update(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        s.pending_messages.front().map(String::as_str),
+        Some("/help"),
+        "typing / + Enter must default to /help, never /quit"
+    );
+}
+
+#[test]
+fn esc_idle_clears_input() {
+    let mut s = state();
+    reducer::update(&mut s, UiEvent::Paste("abc".into()));
+    reducer::update(&mut s, key(KeyCode::Esc));
+    assert!(s.editor.text().is_empty(), "idle Esc must clear the input");
+    assert!(s.view.input.is_empty());
+    // Empty input: Esc is a no-op with no effects.
+    let effects = reducer::update(&mut s, key(KeyCode::Esc));
+    assert!(
+        effects.is_empty(),
+        "idle Esc on empty input must not produce effects"
+    );
+}
+
 /// /sessions 是“菜单 + Modal 指令”组合：Enter 仍应恢复选中 session（例外路径）。
 #[test]
 fn sessions_menu_enter_still_works_with_modal_open() {
