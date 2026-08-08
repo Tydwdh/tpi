@@ -200,3 +200,8 @@
 2. Ctrl-C 在搜索打开时直接退出/取消（人体工学陷阱）：改为优先关闭搜索，再按一次才退出；回归测试。
 3. Modal/Overlay 打开时输入光标仍显示/闪烁：`should_show_input_cursor` 增加 modal/overlay 条件，打开弹层即隐藏输入光标。
 4. footer 信息优先级：排队/新内容提示移到 ctx/tokens 之前，窄屏不再被挤掉。
+
+## 19. 迭代第5轮（2026-08-08）
+1. 弹层输入屏蔽（真 bug）：Modal/Overlay 打开时普通按键会写入后台 composer，关弹层后输入框出现乱码——现在只放行 Esc/导航键/（菜单打开时的 Enter），其余按键 no-op。回归：modal_blocks_composer_typing / overlay_blocks_composer_typing / sessions_menu_enter_still_works_with_modal_open。
+2. 搜索命中高亮（人体工学）：命中条目整段下划线（保留原 fg），未命中不变；回归 search_highlight_underlines_matched_entries。
+3. ConPTY 交互验收回归：9/9 通过（scripts/interactive_acceptance.js，NODE_PATH=临时 node_modules）。

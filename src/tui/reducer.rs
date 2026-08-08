@@ -1,4 +1,4 @@
-﻿//! Reducer（TPI_TUI_V2_TASK §26-27）：`update(state, event) -> Vec<UiEffect>`。
+//! Reducer（TPI_TUI_V2_TASK §26-27）：`update(state, event) -> Vec<UiEffect>`。
 //!
 //! 只修改状态，不运行 provider/bash，不写 stdout。跨边界动作
 //! （退出/取消 run/恢复 session）以 effect 返回，由 app 层执行。
@@ -100,6 +100,18 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
         return effects;
     }
 
+    // 弹层（Modal/Overlay）打开时：只响应导航/关闭/菜单键，普通按键不得写入 composer
+    // （否则用户打字全进后台输入框，关弹层后输入框出现乱码）。
+    let blocking = state.view.overlay.is_some() || state.view.modal.is_some();
+    if blocking {
+        let allowed = matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+        ) || (key.code == KeyCode::Enter && state.view.menu.is_some());
+        if !allowed {
+            return effects;
+        }
+    }
     // §14：搜索打开时按键路由进搜索（输入/跳转/关闭）。
     if state.view.overlay.is_none() && state.view.modal.is_none() && state.view.search.is_some() {
         return handle_search_key(state, key, &mut effects);

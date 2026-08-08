@@ -627,3 +627,74 @@ fn ctrl_c_closes_search_instead_of_quitting_or_cancelling() {
     );
     assert!(effects2.contains(&UiEffect::Quit));
 }
+
+/// 弹层打开时普通按键不得写入 composer（关弹层后输入框不应出现乱码）。
+#[test]
+fn modal_blocks_composer_typing() {
+    let mut s = state();
+    s.view.open_modal("/help", "内容");
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+    );
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+    );
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    assert!(
+        s.editor.text().is_empty(),
+        "弹层打开时输入不得进入 composer"
+    );
+    assert!(s.view.input.is_empty());
+    assert!(s.pending_messages.is_empty(), "Enter 不得在弹层打开时提交");
+
+    // 导航键仍然有效：Down 滚动 Modal。
+    reducer::update(&mut s, key(KeyCode::Down));
+    assert_eq!(s.view.modal.as_ref().unwrap().scroll, 1);
+    // Esc 关闭。
+    reducer::update(&mut s, key(KeyCode::Esc));
+    assert!(s.view.modal.is_none());
+    // 关闭后可正常输入。
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+    );
+    assert_eq!(s.editor.text(), "b");
+}
+
+/// Overlay 打开时同样屏蔽 composer 输入；鼠标/点击由 app 层处理。
+#[test]
+fn overlay_blocks_composer_typing() {
+    let mut s = state();
+    s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
+    s.view
+        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err");
+    reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
+    assert!(s.view.overlay.is_some());
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+    );
+    assert!(
+        s.editor.text().is_empty(),
+        "Overlay 打开时输入不得进入 composer"
+    );
+}
+
+/// /sessions 是“菜单 + Modal 指令”组合：Enter 仍应恢复选中 session（例外路径）。
+#[test]
+fn sessions_menu_enter_still_works_with_modal_open() {
+    let mut s = state();
+    s.view.open_modal("/sessions", "会话列表");
+    s.view.menu = Some(tpi::tui::model::MenuView {
+        items: vec![("sess-1".into(), "label".into())],
+        selected: 0,
+        kind: tpi::tui::model::MenuKind::Session,
+    });
+    reducer::update(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.pending_session.as_deref(), Some("sess-1"));
+}

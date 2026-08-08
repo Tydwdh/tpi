@@ -632,6 +632,12 @@ fn build_transcript_text(
         lines.push(line);
         hits.push(hit);
     };
+    // 搜索命中集合（高亮用，§14）：只作用于 transcript，live 区不参与。
+    let hit_ids: std::collections::HashSet<EntryId> = view
+        .search
+        .as_ref()
+        .map(|s| s.hits.iter().copied().collect())
+        .unwrap_or_default();
     for entry in view.transcript.iter() {
         let entry_id = entry.id();
         out.clear();
@@ -741,6 +747,26 @@ fn build_transcript_text(
                     );
                 }
             }
+        }
+        // §14 高亮：命中条目整段加下划线（保留原有 fg 样式）。
+        if hit_ids.contains(&entry_id) {
+            let highlighted = std::mem::take(&mut out)
+                .into_iter()
+                .map(|line| {
+                    Line::from(
+                        line.spans
+                            .into_iter()
+                            .map(|span| {
+                                Span::styled(
+                                    span.content,
+                                    span.style.add_modifier(Modifier::UNDERLINED),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            out = highlighted;
         }
         groups.push((
             entry_id,
@@ -2131,4 +2157,32 @@ fn cursor_hidden_during_run_when_input_empty() {
     view2.status = StatusLine::Idle;
     let s2 = String::from_utf8_lossy(&draw_captured_bytes(&mut view2)).into_owned();
     assert!(s2.contains("\x1b[?25h"), "空闲必须显示光标: {s2:?}");
+}
+
+/// §14 高亮：搜索命中条目整段带下划线，未命中条目不带。
+#[test]
+fn search_highlight_underlines_matched_entries() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::Assistant, "占位行");
+    view.push_line(LineKind::Assistant, "第一条 hello 内容");
+    view.push_line(LineKind::Assistant, "第二条 world 内容");
+    view.open_search();
+    view.update_search_query("hello");
+    let buf = draw_to_test_backend(&mut view, 80, 12);
+    let mut matched_underlined = false;
+    let mut unmatched_not_underlined = true;
+    for y in 0..12u16 {
+        for x in 0..80u16 {
+            let cell = &buf[(x, y)];
+            match cell.symbol() {
+                "h" => matched_underlined = cell.modifier.contains(Modifier::UNDERLINED),
+                "w" => {
+                    unmatched_not_underlined = !cell.modifier.contains(Modifier::UNDERLINED);
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(matched_underlined, "命中条目必须带下划线高亮");
+    assert!(unmatched_not_underlined, "未命中条目不得带下划线");
 }
