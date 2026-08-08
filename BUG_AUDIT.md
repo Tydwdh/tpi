@@ -228,3 +228,5 @@
 - MODAL-PASTE-001（P2，与弹层输入屏蔽同族）：Modal/Overlay 打开时 Paste 写入后台 composer（按键屏蔽覆盖不到独立 Paste 事件）。已修：弹层打开时 Paste no-op。回归：paste_blocked_while_modal_or_overlay_open。
 - MODAL-PAGE-001（P2，BUG-013 同族）：Modal 打开时 PgUp/PgDn 与鼠标滚轮滚动背后 transcript 而非 Modal。已修：优先滚动 modal，其次 overlay，最后 transcript。回归：page_and_wheel_scroll_modal_when_open。
 - LOCKED-INDICATOR-001（P2，UX 审计遗留）：历史浏览（Locked）且无新内容时无状态提示，用户不知道不在 Follow。已修：footer 显示“历史浏览中 · Ctrl+End 返回最新”。回归：footer_shows_history_browsing_indicator_when_locked。
+## 迭代记录（2026-08-08 续 6）
+- MODAL-CLICK-001（P2，与弹层输入屏蔽同族）：Modal 打开时鼠标点击未屏蔽——点击工具卡在 Modal 后面再开 overlay（浮层叠加、Esc 需关两次），点击 scrollbar 滚动背后 transcript。已修：app 层 mouse_ui_event 在 Overlay/Modal 任一打开时 Down/Drag 不动作；reducer 对 ClickTool/ClickReasoning/ScrollbarClick 增加防御性屏蔽。回归：clicks_blocked_while_modal_open / clicks_blocked_while_overlay_open。

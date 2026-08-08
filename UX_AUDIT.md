@@ -228,3 +228,5 @@
 - 弹层 Paste 屏蔽（真 bug，与弹层输入屏蔽同族）：Modal/Overlay 打开时 Paste（独立事件，按键屏蔽覆盖不到）会写入后台 composer，关弹层后输入框出现乱码——现改为弹层打开时 Paste no-op。回归 paste_blocked_while_modal_or_overlay_open。
 - Modal 翻页/滚轮（人体工学，BUG-013 同族）：Modal 打开时 PgUp/PgDn 与鼠标滚轮此前滚动背后 transcript；现改为滚动 Modal 自身（↑/↓ 已支持）。回归 page_and_wheel_scroll_modal_when_open。
 - Locked 状态提示（人体工学，第 3/9 节遗留）：历史浏览（Locked）且无新内容时 footer 显示“历史浏览中 · Ctrl+End 返回最新”。回归 footer_shows_history_browsing_indicator_when_locked。
+## 25. 迭代第11轮（2026-08-08）
+- 弹层鼠标点击屏蔽（真 bug，与弹层输入屏蔽同族）：此前只在 overlay 打开时屏蔽鼠标点击；Modal 打开时点击工具卡会在 Modal 后面再打开一个 overlay（两个浮层叠加、Esc 要关两次），点击 scrollbar 会滚动 Modal 背后的 transcript。已修：Overlay/Modal 任一打开时，鼠标 Down/Drag 一律不动作；reducer 侧 ClickTool/ClickReasoning/ScrollbarClick 也加防御性屏蔽。回归 clicks_blocked_while_modal_open / clicks_blocked_while_overlay_open。

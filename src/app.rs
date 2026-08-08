@@ -711,8 +711,9 @@ fn mouse_ui_event(
         MouseEventKind::ScrollUp => Some(UiEvent::MouseScrollUp),
         MouseEventKind::ScrollDown => Some(UiEvent::MouseScrollDown),
         MouseEventKind::Down(_) => {
-            if ui_state.view.overlay.is_some() {
-                // Overlay 打开时点击外部不动作。
+            if ui_state.view.overlay.is_some() || ui_state.view.modal.is_some() {
+                // 弹层（Overlay/Modal）打开时点击不动作：
+                // 不得打开后台 overlay，也不得滚动背后 transcript。
                 None
             } else if let Some(event) = scrollbar_click(&mouse) {
                 Some(event)
@@ -727,7 +728,7 @@ fn mouse_ui_event(
         }
         MouseEventKind::Drag(_) => {
             // §24：拖拽 scrollbar thumb 持续跳转；其他位置不动作。
-            if ui_state.view.overlay.is_none() {
+            if ui_state.view.overlay.is_none() && ui_state.view.modal.is_none() {
                 scrollbar_click(&mouse)
             } else {
                 None

@@ -471,14 +471,23 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             Vec::new()
         }
         UiEvent::ClickTool(id) => {
+            if state.view.modal.is_some() || state.view.overlay.is_some() {
+                return Vec::new(); // 弹层打开时鼠标点击不得打开后台 overlay
+            }
             state.view.open_tool_overlay(id);
             Vec::new()
         }
         UiEvent::ClickReasoning(id) => {
+            if state.view.modal.is_some() || state.view.overlay.is_some() {
+                return Vec::new();
+            }
             state.view.open_reasoning_overlay(id);
             Vec::new()
         }
         UiEvent::ScrollbarClick(row) => {
+            if state.view.modal.is_some() || state.view.overlay.is_some() {
+                return Vec::new(); // 弹层打开时不得滚动背后 transcript
+            }
             // §24：scrollbar 点击/拖拽 → 按比例跳到绝对位置。
             let area = state.view.transcript_rows.max(1) as f64;
             state.view.scroll_to_ratio(row as f64 / area);

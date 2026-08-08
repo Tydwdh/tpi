@@ -751,6 +751,52 @@ fn page_and_wheel_scroll_modal_when_open() {
     );
 }
 
+#[test]
+fn clicks_blocked_while_modal_open() {
+    let mut s = state();
+    for i in 0..50 {
+        s.view.push_line(LineKind::Assistant, format!("line {i}"));
+    }
+    s.view.scroll_up(20); // enter Locked so a scrollbar click would otherwise move the viewport
+    let locked_before = s.view.scroll_mode.clone();
+    let scroll_before = s.view.transcript_scroll;
+    s.view.open_modal("/help", "content");
+    reducer::update(&mut s, UiEvent::ScrollbarClick(5));
+    assert_eq!(
+        s.view.scroll_mode, locked_before,
+        "scrollbar click must not scroll transcript while Modal is open"
+    );
+    assert_eq!(s.view.transcript_scroll, scroll_before);
+    // ClickTool must not open an overlay behind the modal.
+    s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
+    s.view
+        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err");
+    reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
+    assert!(
+        s.view.overlay.is_none(),
+        "tool click must not open an overlay behind Modal"
+    );
+}
+
+#[test]
+fn clicks_blocked_while_overlay_open() {
+    let mut s = state();
+    for i in 0..50 {
+        s.view.push_line(LineKind::Assistant, format!("line {i}"));
+    }
+    s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
+    s.view
+        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err");
+    reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
+    assert!(s.view.overlay.is_some());
+    let scroll_before = s.view.transcript_scroll;
+    reducer::update(&mut s, UiEvent::ScrollbarClick(5));
+    assert_eq!(
+        s.view.transcript_scroll, scroll_before,
+        "scrollbar click must not scroll transcript while Overlay is open"
+    );
+}
+
 /// /sessions 是“菜单 + Modal 指令”组合：Enter 仍应恢复选中 session（例外路径）。
 #[test]
 fn sessions_menu_enter_still_works_with_modal_open() {
