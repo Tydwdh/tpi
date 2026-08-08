@@ -643,6 +643,19 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
 /// hits 与 lines 等长，工具卡片的行对应卡片 id（鼠标点击展开）。
 type EntryGroup = (EntryId, Vec<Line<'static>>, Vec<Option<HitTarget>>);
 
+/// entry 是否命中当前 active_hit（§24 点击高亮）：hits 中任意一行与
+/// active_hit 相等即为命中（工具卡片所有行共享同一 hit）。
+fn entry_matches_active_hit(
+    _entry_id: &EntryId,
+    hits: &[Option<HitTarget>],
+    active: &Option<HitTarget>,
+) -> bool {
+    match active {
+        Some(target) => hits.iter().any(|h| h.as_ref() == Some(target)),
+        None => false,
+    }
+}
+
 /// 把转录条目渲染为逻辑行（Message 按类型着色/加 rail；Tool 渲染为卡片）。
 ///
 /// 返回按 entry 分组的结果（含 live 哨兵组，§7.2）。
@@ -814,6 +827,28 @@ fn build_transcript_text(
                                 Span::styled(
                                     span.content,
                                     span.style.add_modifier(Modifier::UNDERLINED),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            out = highlighted;
+        }
+        // §24：鼠标点击展开的工具卡片/reasoning 行高亮（Overlay 打开期间，
+        // 反馈"点到了哪一行"）。
+        if entry_matches_active_hit(&entry_id, &hits, &view.active_hit) {
+            let active_bg = theme.surface;
+            let highlighted = std::mem::take(&mut out)
+                .into_iter()
+                .map(|line| {
+                    Line::from(
+                        line.spans
+                            .into_iter()
+                            .map(|span| {
+                                Span::styled(
+                                    span.content,
+                                    span.style.bg(active_bg).add_modifier(Modifier::BOLD),
                                 )
                             })
                             .collect::<Vec<_>>(),

@@ -332,6 +332,9 @@ pub struct ViewModel {
     pub pending_queue_len: usize,
     /// 思考内容是否展开（Alt+T 切换，§16.2：thinking 可折叠）。
     pub reasoning_visible: bool,
+    /// 鼠标点击命中的目标（工具卡片/reasoning 行；§24 高亮反馈）。
+    /// Overlay 打开期间该行高亮；关闭 Overlay 后清除。
+    pub active_hit: Option<crate::tui::HitTarget>,
     /// 本会话累计 token 用量（AgentOutcome.usage 累积，§16.2：无 pricing 时显示 usage）。
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -374,6 +377,7 @@ impl Default for ViewModel {
             transcript_rows: 0,
             pending_queue_len: 0,
             reasoning_visible: false,
+            active_hit: None,
             input_tokens: 0,
             output_tokens: 0,
             anim_tick: 0,
@@ -430,6 +434,7 @@ impl ViewModel {
         self.overlay = None;
         self.modal = None;
         self.search = None;
+        self.active_hit = None;
     }
 
     /// BUG-006：会话切换/恢复后把模型上下文（history）重建到屏幕，
@@ -913,6 +918,8 @@ impl ViewModel {
                 && card.id == id
             {
                 self.overlay = Some(OverlayState::for_tool(card));
+                // §24：点击后高亮命中行（Overlay 打开期间）。
+                self.active_hit = Some(crate::tui::HitTarget::Tool(id));
                 return;
             }
         }
@@ -930,6 +937,8 @@ impl ViewModel {
             return;
         }
         self.overlay = Some(OverlayState::for_reasoning(&line.text));
+        // §24：点击后高亮命中行。
+        self.active_hit = Some(crate::tui::HitTarget::Reasoning(id));
     }
 
     /// 打开操作型 Modal（§42）。
@@ -940,6 +949,7 @@ impl ViewModel {
     /// 关闭 Overlay（Esc）。
     pub fn close_overlay(&mut self) {
         self.overlay = None;
+        self.active_hit = None;
     }
 
     /// 关闭 Modal（Esc；优先级低于 Overlay，§49）。
@@ -1677,5 +1687,26 @@ mod p2_card_nav_tests {
             kinds,
             vec![LineKind::User, LineKind::Assistant, LineKind::Tool]
         );
+    }
+
+    /// §24：点击工具卡片设置 active_hit（高亮反馈），关闭 Overlay 清除。
+    #[test]
+    fn tool_overlay_sets_and_clears_active_hit() {
+        let mut view = ViewModel::default();
+        view.begin_tool("call-1", "bash", Some("run".into()), None);
+        view.finish_tool("call-1", "bash", ToolStatus::Succeeded, 10, Some(0), "");
+        assert!(view.active_hit.is_none(), "初始无高亮");
+
+        view.open_tool_overlay("call-1");
+        assert!(
+            matches!(&view.active_hit, Some(crate::tui::HitTarget::Tool(id)) if id == "call-1"),
+            "点击后必须设置 active_hit: {:?}",
+            view.active_hit
+        );
+        assert!(view.overlay.is_some(), "Overlay 打开");
+
+        view.close_overlay();
+        assert!(view.active_hit.is_none(), "关闭 Overlay 清除高亮");
+        assert!(view.overlay.is_none());
     }
 }
