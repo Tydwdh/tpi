@@ -20,9 +20,6 @@ use tokio_util::sync::CancellationToken;
 
 /// 最大尝试次数（含首次请求；§7.3：指数退避，最多 4 次）。
 const MAX_ATTEMPTS: u32 = 4;
-/// 重试总时间预算：超过该时间不再等待，直接上报失败（§7.3：网络长时间不可用
-/// 时不能让用户无限等待；pre-stream 阶段总等待上限）。
-const MAX_RETRY_ELAPSED: Duration = Duration::from_secs(15);
 /// 首次退避基准（第 0 次重试）；每次尝试翻倍：500ms → 1s → 2s。
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
@@ -52,7 +49,14 @@ impl OpenAiCompatClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
-            client: reqwest::Client::new(),
+            // 请求超时（§7.3）：连接建立/首字节/整体各设上限，防止网络 hang
+            // 导致单次 send 无限阻塞——此前无超时，一次慢请求可耗尽整个重试
+            // 预算（日志：`connection failed: attempt 0`，实际已卡 3 分钟）。
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -230,11 +234,10 @@ impl Provider for OpenAiCompatClient {
         // （consume_stream）的传输错误在未收到任何事件时同样可安全重试（网络抖动/
         // 连接中途断开），收到事件后失败则不可重试（避免事件重复/乱序）。
         //
-        // 退避策略（§7.3）：指数退避 + jitter；`MAX_RETRY_ELAPSED` 总时间预算内
-        // 最多 `MAX_ATTEMPTS` 次尝试；服务端 `Retry-After` 大于本地退避时尊重服务端。
-        let started = std::time::Instant::now();
+        // 退避策略（§7.3）：指数退避 + jitter；最多 `MAX_ATTEMPTS` 次尝试；
+        // 服务端 `Retry-After` 大于本地退避时尊重服务端。
+        // 每次请求有 timeout=60s，总墙钟上限由 MAX_ATTEMPTS×timeout 隐式约束。
         let mut attempt: u32 = 0;
-        let retry_budget = MAX_RETRY_ELAPSED.saturating_sub(INITIAL_BACKOFF);
         loop {
             let response = match self.send_once(&url, &body, &cancel).await {
                 Ok(response) => response,
@@ -245,7 +248,10 @@ impl Provider for OpenAiCompatClient {
                         return Err(ProviderError::Cancelled);
                     }
                     // 传输层失败（连接被拒/中断）：未收到任何事件，可安全重试。
-                    if attempt + 1 >= MAX_ATTEMPTS || started.elapsed() >= retry_budget {
+                    // 上限只由 MAX_ATTEMPTS 决定（每次请求已有 timeout=60s，
+                    // 总墙钟上限由 4 次×60s 隐式约束）——不能把「本次请求耗时」
+                    // 计入预算，否则一次慢请求（如连接 hang）会吞掉全部重试。
+                    if attempt + 1 >= MAX_ATTEMPTS {
                         return Err(classify_error(error, attempt));
                     }
                     let delay = backoff_delay(attempt, None);
@@ -276,7 +282,7 @@ impl Provider for OpenAiCompatClient {
                             if !retryable || matches!(error, ProviderError::Cancelled) {
                                 return Err(error);
                             }
-                            if attempt + 1 >= MAX_ATTEMPTS || started.elapsed() >= retry_budget {
+                            if attempt + 1 >= MAX_ATTEMPTS {
                                 return Err(error);
                             }
                             // 未收到任何事件：传输层失败，短暂等待后重发请求。
@@ -303,7 +309,7 @@ impl Provider for OpenAiCompatClient {
                         );
                         trace::log("retryable", fields);
                     }
-                    if attempt + 1 >= MAX_ATTEMPTS || started.elapsed() >= retry_budget {
+                    if attempt + 1 >= MAX_ATTEMPTS {
                         return Err(ProviderError::RateLimited(format!(
                             "attempt {attempt}: retry budget exhausted"
                         )));
