@@ -563,6 +563,17 @@ fn wrap_lines_with_hits(
         for span in line.spans {
             let style = span.style;
             for ch in span.content.chars() {
+                if ch == '\n' {
+                    // §22：显式换行结束当前行（多行文本/粘贴的 \n 必须换行）。
+                    if !cur.is_empty() {
+                        flush(&mut out, &mut out_hits, &mut cur, &mut cur_w, &mut cur_hit);
+                        cur_hit = hit.clone();
+                    } else {
+                        out.push(Line::default());
+                        out_hits.push(hit.clone());
+                    }
+                    continue;
+                }
                 let w = crate::tui::text::char_cell_width(ch);
                 if cur_w + w > width && !cur.is_empty() {
                     flush(&mut out, &mut out_hits, &mut cur, &mut cur_w, &mut cur_hit);
@@ -600,6 +611,17 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
         for span in line.spans {
             let style = span.style;
             for ch in span.content.chars() {
+                if ch == '\n' {
+                    // §22：显式换行符结束当前行（多行输入/粘贴的 \n 必须换行，
+                    // 否则被当宽度 0 字符拼进一行，区域高度与光标计算全错位）。
+                    if !cur.is_empty() {
+                        out.push(Line::from(std::mem::take(&mut cur)));
+                        cur_w = 0;
+                    } else {
+                        out.push(Line::default());
+                    }
+                    continue;
+                }
                 let w = crate::tui::text::char_cell_width(ch);
                 if cur_w + w > width && !cur.is_empty() {
                     out.push(Line::from(std::mem::take(&mut cur)));
@@ -1797,32 +1819,19 @@ fn input_cursor_cell(input: &str, cursor: usize, width: u16) -> (u16, u16) {
         }
         c
     };
-    let budget = width.saturating_sub(PROMPT_WIDTH).max(1) as usize;
-    let wrapped = wrap_lines(vec![Line::from(Span::raw(input.to_string()))], budget);
-    let cursor_cells =
-        PROMPT_WIDTH + unicode_width::UnicodeWidthStr::width(&input[..cursor]) as u16;
-    // 空输入：wrap 结果为空，循环不会执行——光标必须停在 prompt 右侧（修复“首次打开光标在 ❯ 左边”）。
-    if wrapped.is_empty() {
+    if input.is_empty() {
+        // 空输入：光标必须停在 prompt 右侧（修复“首次打开光标在 ❯ 左边”）。
         return (0, PROMPT_WIDTH);
     }
-    let mut row = 0u16;
-    let mut col = 0u16;
-    let mut line_start = PROMPT_WIDTH;
-    let line_count = wrapped.len();
-    for (i, line) in wrapped.iter().enumerate() {
-        let line_end = line_start + line.width() as u16;
-        if cursor_cells <= line_end || i + 1 == line_count {
-            row = i as u16;
-            col = if i == 0 {
-                // 第 0 行：光标位置含 prompt 前缀（draw_input 的 x = area.x + col）。
-                cursor_cells
-            } else {
-                cursor_cells.saturating_sub(line_start)
-            };
-            break;
-        }
-        line_start = line_end;
-    }
+    let budget = width.saturating_sub(PROMPT_WIDTH).max(1) as usize;
+    // 光标前的文本按 `\n` + 宽度折行 → 折成逻辑行；定位光标所在逻辑行。
+    let before = &input[..cursor];
+    let wrapped_before = wrap_lines(vec![Line::from(Span::raw(before.to_string()))], budget);
+    // 光标后的内容决定光标所在行的列：该行已折行的最后一行宽度 = 光标列。
+    let row = wrapped_before.len().saturating_sub(1) as u16;
+    let col = wrapped_before.last().map(|l| l.width()).unwrap_or(0) as u16;
+    // 第 0 行含 prompt；续行从内容起点（无 prompt）。
+    let col = if row == 0 { PROMPT_WIDTH + col } else { col };
     (row, col)
 }
 
@@ -2710,6 +2719,47 @@ fn input_cursor_empty_input_sits_right_of_prompt() {
     assert_eq!(input_cursor_cell("", 0, 80), (0, 2));
     assert_eq!(input_cursor_cell("", 0, 10), (0, 2));
     assert_eq!(input_cursor_cell("", 0, 1), (0, 2));
+}
+
+/// §22 回归：多行粘贴（含换行）时光标定位正确——不漂移、不跑出输入区。
+#[test]
+fn multiline_input_cursor_stays_inside_lines() {
+    // 粘贴 3 行文本；光标在末尾。
+    let pasted = "第一行\n第二行\n第三行";
+    let (row, col) = input_cursor_cell(pasted, pasted.len(), 40);
+    assert_eq!(
+        row, 2,
+        "光标应落在最后一行（第 3 行, index 2）: ({row},{col})"
+    );
+    assert_eq!(
+        col, 6,
+        "第 3 行内容宽度 6（无 prompt，仅首行有）: ({row},{col})"
+    );
+
+    // 粘贴 3 行 + 窄宽度（每行折行）：光标仍应在可视行内。
+    let narrow = "aaaaaaaaaa\nbbbbbbbbbb\ncccccccccc"; // 每行 10 字符
+    let (row, col) = input_cursor_cell(narrow, narrow.len(), 8); // 预算 6
+    assert!(row >= 2, "窄屏多行后光标行必须在末尾附近: ({row},{col})");
+
+    // 光标在中间行：第 2 行末尾。
+    let idx = "第一行\n第二行".len();
+    let (row, _) = input_cursor_cell(pasted, idx, 40);
+    assert_eq!(row, 1, "光标在第 2 行: ({row})");
+}
+
+/// §22：input_area_rows 对多行输入返回多行（≤8），空输入 1 行。
+#[test]
+fn multiline_input_area_grows() {
+    let mut view = ViewModel::default();
+    assert_eq!(input_area_rows(&view, 80), 1, "空输入 1 行");
+    view.input = "第一行\n第二行\n第三行".into();
+    assert_eq!(input_area_rows(&view, 80), 3, "3 行输入 → 3 行区域");
+    // 超 8 行 → clamp 8（内部滚动）。
+    view.input = (0..10)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(input_area_rows(&view, 80), 8, "超 8 行 clamp 到 8");
 }
 
 /// 修复：Overlay 必须先 Clear 覆盖区，否则底层 transcript 文字透出（背景干扰）。
