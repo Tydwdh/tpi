@@ -1040,26 +1040,37 @@ impl ViewModel {
 
     /// 提取选中文本（§PointerHit：copy 从语义文本提取，不依赖当前 viewport
     /// 快照）。选区指向 (entry, offset)，这里从 transcript 的 entry 内容重建
-    /// 语义文本——resize/滚动后仍精确。
+    /// 语义文本——resize/滚动后仍精确。streaming 期间（live 区）同样可提取，
+    /// finalize 后沿用同一稳定 id（§⑥）。
     pub fn selected_text(&self) -> String {
         let Some(selection) = self.selection else {
             return String::new();
         };
         let (lo, hi) = selection.normalized();
-        let mut parts: Vec<String> = Vec::new();
+        // 收集候选 (entry_id, text)：transcript + live 流式消息。
+        let mut candidates: Vec<(EntryId, String)> = Vec::new();
         for entry in &self.transcript {
             let entry_id = entry.id();
-            if entry_id < lo.entry_id || entry_id > hi.entry_id {
-                continue;
-            }
             let text = match entry {
                 Entry::Message { line, .. } => line.text.clone(),
                 Entry::Tool { card, .. } => card_semantic_text(card),
             };
+            candidates.push((entry_id, text));
+        }
+        if let Some(msg) = &self.live.assistant {
+            candidates.push((msg.entry_id, msg.text.clone()));
+        }
+        if let Some(msg) = &self.live.reasoning {
+            candidates.push((msg.entry_id, msg.text.clone()));
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for (entry_id, text) in candidates {
+            if entry_id < lo.entry_id || entry_id > hi.entry_id {
+                continue;
+            }
             if text.is_empty() {
                 continue;
             }
-            // 计算该 entry 在选区内的 char 范围。
             let total = text.chars().count();
             let (sel_lo, sel_hi) = if entry_id == lo.entry_id && entry_id == hi.entry_id {
                 (lo.offset.min(total), hi.offset.min(total))
@@ -2010,5 +2021,40 @@ mod p2_card_nav_tests {
             offset: 6,
         });
         assert_eq!(view.selected_text(), "world\nsecond");
+    }
+
+    /// §PointerHit：streaming 期间选中的稳定 id 在 finalize 后仍有效——
+    /// 运行中拖选 → Agent 输出结束 → Ctrl+C 复制不悬空。
+    #[test]
+    fn streaming_selection_survives_finalize() {
+        use crate::tui::interaction::TextPosition;
+        use crate::tui::scroll::EntryId;
+        let mut view = ViewModel::default();
+        view.push_stream_delta(LineKind::Assistant, "streaming content");
+        // streaming 期间选中（entry_id 已分配）。
+        let live_id = view
+            .live
+            .assistant
+            .as_ref()
+            .expect("streaming 消息必须有 entry_id")
+            .entry_id;
+        view.selection_start(TextPosition {
+            entry_id: live_id,
+            offset: 0,
+        });
+        view.selection_update(TextPosition {
+            entry_id: live_id,
+            offset: 9,
+        });
+        assert_eq!(view.selected_text(), "streaming");
+        // finalize：沿用同一 id，选区不悬空。
+        view.finalize_streaming();
+        let finalized = view.transcript.last().expect("finalize 后必须提交").id();
+        assert_eq!(finalized, live_id, "finalize 必须沿用 streaming 的稳定 id");
+        assert_eq!(
+            view.selected_text(),
+            "streaming",
+            "finalize 后选区仍指向同一内容"
+        );
     }
 }
