@@ -99,8 +99,9 @@ pub enum PointerInput {
 /// - `Pressed + Up`：按下/抬起 target 一致 → `Click`；否则无动作。
 /// - `Selecting + Up`：结束选择（选区保留），**不再触发 click**。
 /// - `DraggingScrollbar + Drag`：滚动；`Up` → 结束。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum PointerGesture {
+    #[default]
     Idle,
     Pressed {
         origin_column: u16,
@@ -116,12 +117,6 @@ pub enum PointerGesture {
 
 /// 拖动进入 selection 的最小位移（cells；Manhattan 距离）。
 const DRAG_THRESHOLD: i32 = 2;
-
-impl Default for PointerGesture {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
 
 impl PointerGesture {
     /// 喂入一个指针事件，返回要发给 reducer 的语义事件。

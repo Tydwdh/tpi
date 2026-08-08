@@ -407,9 +407,9 @@ fn render_frame(
     let input_rows = input_area_rows(view, area.width);
     let plan_rows = plan_area_rows(view);
 
-    // §8.1：自下而上 = footer(1) → input(1..8) → plan(0..N) → transcript(Min) → header(2)。
-    // header 2 行 = 标题行 + 分隔线（§16.2 增强）。
-    let mut constraints: Vec<Constraint> = vec![Constraint::Length(2), Constraint::Min(1)];
+    // §视觉瘦身：去掉常驻 Header（信息与 footer 重复），transcript 上移到顶部。
+    // 自下而上 = footer(1) → input(1..8) → plan(0..N) → transcript(Min)。
+    let mut constraints: Vec<Constraint> = vec![Constraint::Min(1)];
     if plan_rows > 0 {
         constraints.push(Constraint::Length(plan_rows));
     }
@@ -420,8 +420,6 @@ fn render_frame(
         .constraints(constraints)
         .split(area);
     let mut idx = 0;
-    let header_area = chunks[idx];
-    idx += 1;
     let trans_area = chunks[idx];
     idx += 1;
     let plan_area = if plan_rows > 0 {
@@ -435,9 +433,7 @@ fn render_frame(
     idx += 1;
     let footer_area = chunks[idx];
 
-    draw_header(frame, header_area, view, theme);
-
-    // §24：fullscreen 在转录区右侧预留 1 列 scrollbar（inline 兼容模式不预留）。
+    // §视觉瘦身：scrollbar 预留 1 列（inline 兼容模式不预留）。
     let scrollbar_enabled = mode == terminal::ViewMode::Fullscreen && trans_area.width >= 2;
     let transcript_width = if scrollbar_enabled {
         trans_area.width - 1
@@ -1143,11 +1139,12 @@ fn build_transcript_text(
                 let card_id = card.id.clone();
                 let card_lines = tool_card_lines(card, view.anim_tick, theme, width);
                 for (i, line) in card_lines.into_iter().enumerate() {
-                    // §用户诉求：整行可点击（点击任意位置展开/收缩 diff）。
-                    let hit = Some((HitTarget::Tool(card_id.clone()), width as u16));
-                    // §用户诉求：卡片背景色（surface），形成 opencode 式卡片感
-                    // （与 transcript 区分）。diff 行保留红绿背景（本身高亮）。
-                    let is_diff_line = i > 0 && card.diff.is_some();
+                    // §视觉瘦身：只主行可点击（icon+name 区域），内容行留给文本选择。
+                    let hit = if i == 0 {
+                        Some((HitTarget::Tool(card_id.clone()), width as u16))
+                    } else {
+                        None
+                    };
                     // 语义文本：主行去 icon 前缀（首个 "✓ " 等），内容行原样。
                     let semantic_text = if i == 0 {
                         card_semantic_header(card)
@@ -1159,26 +1156,8 @@ fn build_transcript_text(
                             .collect::<String>();
                         card_semantic_content(card, i, &raw)
                     };
-                    let styled_line = if is_diff_line {
-                        line
-                    } else {
-                        Line::from(
-                            line.spans
-                                .iter()
-                                .map(|span| {
-                                    Span::styled(span.content.clone(), span.style.bg(theme.surface))
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    };
-                    push_hit(
-                        &mut out,
-                        &mut hits,
-                        &mut semantic,
-                        styled_line,
-                        hit,
-                        semantic_text,
-                    );
+                    // §视觉瘦身：卡片扁平化——无 surface 背景；diff 行本身红绿。
+                    push_hit(&mut out, &mut hits, &mut semantic, line, hit, semantic_text);
                 }
             }
         }
@@ -1346,8 +1325,7 @@ fn build_live_group(
                 } else {
                     None
                 };
-                // §用户诉求：卡片背景（surface）；diff 行保留红绿。
-                let is_diff_line = i > 0 && card.diff.is_some();
+                // §视觉瘦身：卡片扁平化——主行无 surface 背景；diff 行保留红绿。
                 let raw_text = line
                     .spans
                     .iter()
@@ -1358,19 +1336,7 @@ fn build_live_group(
                 } else {
                     card_semantic_content(card, i, &raw_text)
                 };
-                let styled = if is_diff_line {
-                    line
-                } else {
-                    Line::from(
-                        line.spans
-                            .iter()
-                            .map(|span| {
-                                Span::styled(span.content.clone(), span.style.bg(theme.surface))
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                };
-                out.push(styled);
+                out.push(line);
                 hits.push(hit);
                 semantic.push(semantic_text);
             }
@@ -2177,61 +2143,6 @@ fn draw_footer(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// 顶部标题栏（§16.2 增强）：`TPI · workspace · 会话状态`——常驻标识，
-/// 与 footer（状态/用量）区分：header 是身份，footer 是实时状态。
-fn draw_header(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: theme::Theme) {
-    let muted = Style::default().fg(theme.muted);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    // 品牌标识：TPI + 工作区（身份）。
-    spans.push(Span::styled(
-        "TPI",
-        Style::default()
-            .fg(theme.primary)
-            .add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(" · ", muted));
-    let workspace = if view.workspace.is_empty() {
-        "（当前目录）".to_string()
-    } else {
-        view.workspace.clone()
-    };
-    spans.push(Span::styled(workspace, Style::default().fg(theme.text)));
-    // 会话模式：fullscreen/inline + 历史浏览状态（右侧）。
-    let right = if view.scroll_mode != ScrollMode::Follow {
-        format!("⇕ 历史浏览 · Ctrl+End 回最新")
-    } else {
-        String::new()
-    };
-    if !right.is_empty() {
-        // 右侧对齐：用填充实现（终端宽度内计算）。
-        let left_text = spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<Vec<_>>()
-            .join("");
-        let left_w = unicode_width::UnicodeWidthStr::width(left_text.as_str());
-        let pad = area.width as usize;
-        if pad > left_w + right.len() + 2 {
-            spans.push(Span::raw(" ".repeat(pad - left_w - right.len())));
-        }
-        spans.push(Span::styled(right, Style::default().fg(theme.warning)));
-    }
-    // 文本行 + 分隔线（area 高 2：第 0 行标题，第 1 行 muted 线）。
-    let line = Line::from(spans);
-    frame.render_widget(
-        Paragraph::new(line),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    let sep = Rect::new(area.x, area.y + 1, area.width, 1);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            Style::default().fg(theme.surface_subtle),
-        ))),
-        sep,
-    );
-}
-
 /// §24：全屏历史垂直 scrollbar——1 列，thumb 比例按 visual 行数（不是 entry 数）。
 /// 内容不超一屏时画空轨道（布局稳定，不随内容增长跳变）。
 fn draw_scrollbar(
@@ -2776,9 +2687,9 @@ mod tests {
         assert!(view.pending_below >= 1, "Locked 时新内容必须计数");
     }
 
-    /// §用户诉求：工具卡片整行可点击（点击任意位置展开/收缩 diff）。
+    /// §视觉瘦身：工具卡片只有主行可点击（内容行留给文本选择，避免与拖选冲突）。
     #[test]
-    fn tool_card_all_rows_clickable() {
+    fn tool_card_only_header_clickable() {
         let mut view = ViewModel::default();
         view.begin_tool("c1", "bash", Some("cmd".into()), None);
         view.finish_tool(
@@ -2792,14 +2703,15 @@ mod tests {
         );
         let mut cache = HashMap::new();
         let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
-        // row_hits 与 window 等长；所有行都应可点击（end_col = 整行宽度）。
+        // row_hits 与 window 等长；只有第 0 行（主行）可点击，正文行为 None。
         assert!(plan.window.len() >= 2, "卡片含主行+正文: {:?}", plan.window);
-        for hit in plan.row_hits.iter() {
-            assert!(
-                matches!(hit, Some((HitTarget::Tool(id), end)) if id == "c1" && *end > 0),
-                "卡片每行都可点击（整行）: {:?}",
-                hit
-            );
+        assert!(
+            matches!(&plan.row_hits[0], Some((HitTarget::Tool(id), end)) if id == "c1" && *end > 0),
+            "主行必须可点击: {:?}",
+            plan.row_hits[0]
+        );
+        for hit in plan.row_hits.iter().skip(1) {
+            assert!(hit.is_none(), "正文行不可点击（留给文本选择）: {hit:?}");
         }
     }
 
@@ -3623,9 +3535,9 @@ fn search_highlight_underlines_matched_entries() {
     assert!(unmatched_not_underlined, "未命中条目不得带下划线");
 }
 
-/// §16.2 增强：顶部 header（TPI 品牌 + workspace）与消息双角色 rail（you/AI）。
+/// §视觉瘦身：不再有常驻 header（信息并入 footer）；消息双角色 rail（you/AI）。
 #[test]
-fn header_and_role_rails_render() {
+fn role_rails_render_without_header() {
     let mut view = ViewModel {
         model_name: "test-model".into(),
         workspace: "tpi".into(),
@@ -3635,18 +3547,15 @@ fn header_and_role_rails_render() {
     view.push_line(LineKind::Assistant, "hi there");
     let buffer = draw_to_test_backend(&mut view, 60, 10);
 
-    // header 第 0 行包含品牌 + workspace。
-    let header_text: String = (0..60)
-        .map(|x| {
-            buffer
-                .cell((x, 0))
-                .map(|c| c.symbol().chars().next().unwrap_or(' '))
-                .unwrap_or(' ')
-        })
-        .collect();
-    assert!(
-        header_text.contains("TPI") && header_text.contains("tpi"),
-        "header 必须含品牌与 workspace: {header_text:?}"
+    // 视觉瘦身：header 已移除，transcript 上移到第 0 行（不再有品牌行）。
+    let top_symbol = buffer
+        .cell((0, 0))
+        .map(|c| c.symbol().to_string())
+        .unwrap_or_default();
+    assert_ne!(
+        top_symbol.as_str(),
+        "T",
+        "无常驻 header：transcript 从第 0 行开始（首 cell 是 rail │ 而非品牌）"
     );
 
     // 消息 rail：整屏文本应含 you 与 AI 标签。

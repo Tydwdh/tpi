@@ -59,20 +59,20 @@ fn fullscreen_fills_entire_terminal_at_common_sizes() {
 
 #[test]
 fn fullscreen_transcript_gets_all_remaining_height() {
-    // 24 行终端：header(2) + footer(1) + input(1) + transcript 应占剩余。
+    // 24 行终端：footer(1) + input(1) + transcript 占其余（无 header）。
     let mut view = busy_view(30);
     let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
     let texts = row_texts(&buf);
-    // header 占前 2 行；transcript 从第 3 行开始（assistant 文本）。
+    // 视觉瘦身：无常驻 header，transcript 从第 0 行开始。
     assert!(
-        texts.first().map(|s| s.contains("TPI")).unwrap_or(false),
-        "首行必须是 header（品牌标识）: {:?}",
+        !texts.first().map(|s| s.contains("TPI")).unwrap_or(false),
+        "无常驻 header（信息并入 footer）: {:?}",
         texts.first()
     );
     assert!(
-        texts.get(2).map(|s| s.contains("第")).unwrap_or(false),
-        "transcript 应从 header 之后开始: {:?}",
-        texts.get(2)
+        texts.first().map(|s| s.contains("第")).unwrap_or(false),
+        "transcript 从第 0 行开始: {:?}",
+        texts.first()
     );
     // 底部三行是 input 区与 footer：footer 含模型名。
     assert!(texts[texts.len() - 1].contains("fake-model"));
@@ -240,17 +240,14 @@ fn system_separator_fills_width_without_wrap() {
     view.push_line(LineKind::System, "─".repeat(40));
     let buf = draw_to_test_backend_mode(&mut view, 30, 12, ViewMode::Fullscreen);
     let texts = row_texts(&buf);
-    // header 分隔线在第 1 行（index 1）；transcript 内的系统分隔线应只有 1 条。
+    // 视觉瘦身：无常驻 header，transcript 内只有 1 条系统分隔线（铺满不折行）。
     let rule_rows = texts
         .iter()
-        .enumerate()
-        .filter(|(i, s)| {
-            if *i <= 1 {
-                return false; // header 及其分隔线
-            }
+        .map(|s| {
             let s = s.trim_end_matches('│').trim(); // 去掉 scrollbar 列
             !s.is_empty() && s.chars().all(|c| c == '─')
         })
+        .filter(|is_rule| *is_rule)
         .count();
     assert_eq!(rule_rows, 1, "分隔线必须单行铺满（不折行）: {texts:?}");
 }
