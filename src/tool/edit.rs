@@ -1117,6 +1117,58 @@ mod tests {
         assert_eq!(error.code(), "overlap");
     }
 
+    /// §10.3：相邻 replacement（end == start，不重叠）必须正确应用——
+    /// 从后往前替换时不得因前面 replacement 已改内容而错位（回归：edit 损坏文件）。
+    #[test]
+    fn adjacent_replacements_apply_without_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("lib.rs")).unwrap();
+        let original = "pub fn add(a: i32, b: i32) -> i32 {\n    a - b\n}\npub fn abs(x: i32) -> i32 {\n    if x < 0 { -x } else { x }\n}\n";
+        std::fs::write(path.as_std_path(), original).unwrap();
+        let revision = revision_of(original.as_bytes());
+        // 两个相邻 replacement（前一个替换 add 主体，后一个替换 add 尾部 + abs 开头）。
+        let result = apply_edit(
+            &path,
+            &revision,
+            &[
+                Replacement {
+                    old_text: "pub fn add(a: i32, b: i32) -> i32 {\n    a - b\n}".into(),
+                    new_text: "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}".into(),
+                },
+                Replacement {
+                    old_text: "pub fn abs(x: i32)".into(),
+                    new_text: "pub fn abs(x: i64)".into(),
+                },
+            ],
+        )
+        .expect("相邻 replacement 应成功");
+        // apply_edit 只计算新内容（写盘在 commit_edit）；从 result 验证。
+        let content = String::from_utf8_lossy(&result.new_raw).into_owned();
+        assert!(
+            content.contains("a + b"),
+            "add 必须替换: {content:?}"
+        );
+        assert!(
+            content.contains("pub fn abs(x: i64)"),
+            "abs 必须替换: {content:?}"
+        );
+        assert!(
+            !content.contains("a - b"),
+            "不应残留 a - b: {content:?}"
+        );
+        // 不损坏：add 函数头只能出现一次完整定义。
+        assert_eq!(
+            content.matches("pub fn add(a: i32, b: i32) -> i32 {").count(),
+            1,
+            "add 函数头不得重复: {content:?}"
+        );
+        // abs 替换后不出现 x: i32 的 abs 签名。
+        assert!(
+            !content.contains("pub fn abs(x: i32)"),
+            "abs 旧签名不得残留: {content:?}"
+        );
+    }
+
     #[test]
     fn crlf_file_keeps_untouched_bytes_and_encodes_newline() {
         let dir = tempfile::tempdir().unwrap();
@@ -1220,3 +1272,5 @@ mod p1_lru_tests {
         assert!(store.get(&Utf8PathBuf::from("c.txt"), &rev_c1).is_some());
     }
 }
+
+
