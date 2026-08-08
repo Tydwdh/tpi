@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod app;
 pub mod auth;
+pub mod clipboard;
 pub mod config;
 pub mod context;
 pub mod doctor;

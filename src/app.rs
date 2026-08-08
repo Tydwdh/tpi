@@ -1,4 +1,4 @@
-﻿//! 应用层（文档 §4.1）：输入路由、生命周期。
+//! 应用层（文档 §4.1）：输入路由、生命周期。
 //!
 //! 活动 run 中的输入路由（§6.2）：
 //! - 普通 Enter：输入排队（pending_message），**当前 run 完成后**作为下一条
@@ -303,6 +303,10 @@ async fn interactive_loop<P: Provider>(
     // `/retry` 目标：上一次因 provider 失败而中断的 turn 的用户消息。
     // 成功完成后清空；失败/中断后保留，供用户一键重试（§4.3）。
     let mut last_failed_message: Option<String> = None;
+    // 鼠标按下位置（§用户诉求：区分点击展开 vs 拖动选择）。
+    let mut mouse_down: Option<(u16, u16)> = None;
+    // 正在拖动选择中（按下后位移超过阈值）。
+    let mut drag_selecting = false;
 
     loop {
         // BUG-003：存在排队输入（初始 prompt / run 期间提交的消息 / /sessions 选择）
@@ -319,7 +323,7 @@ async fn interactive_loop<P: Provider>(
                             let effects = crate::tui::reducer::update(&mut ui_state, UiEvent::Key(key));
                             let mut quit = false;
                             for effect in effects {
-                                if execute_ui_effect(effect, &mut ui_state, current_cancel.clone()) {
+                                if execute_ui_effect(effect, &mut ui_state, &mut renderer, current_cancel.clone()) {
                                     quit = true;
                                 }
                             }
@@ -332,19 +336,77 @@ async fn interactive_loop<P: Provider>(
                             need_draw = true;
                             crate::tui::reducer::update(&mut ui_state, UiEvent::Paste(text));
                         }
-                        // 鼠标：滚轮翻页、点击工具卡片展开、悬浮高亮（空闲态）；
+                        // 鼠标：滚轮翻页、点击工具卡片展开、悬浮高亮、拖动选择（空闲态）。
                         Some(Event::Mouse(mouse)) => {
+                            use ratatui::crossterm::event::MouseButton;
                             use ratatui::crossterm::event::MouseEventKind;
-                            if matches!(mouse.kind, MouseEventKind::Moved) {
-                                // §24 hover：直接 hit-test 更新 view.hover_hit。
-                                let hit = renderer.hit_target(mouse.column, mouse.row);
-                                if ui_state.view.hover_hit != hit {
-                                    ui_state.view.set_hover_hit(hit);
-                                    need_draw = true;
+                            match mouse.kind {
+                                MouseEventKind::Moved => {
+                                    // §24 hover：直接 hit-test 更新 view.hover_hit。
+                                    let hit = renderer.hit_target(mouse.column, mouse.row);
+                                    if ui_state.view.hover_hit != hit {
+                                        ui_state.view.set_hover_hit(hit);
+                                        need_draw = true;
+                                    }
                                 }
-                            } else if let Some(event) = mouse_ui_event(&ui_state, &renderer, mouse) {
-                                need_draw = true;
-                                crate::tui::reducer::update(&mut ui_state, event);
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    // 记录按下位置（区分点击 vs 拖动选择）。
+                                    mouse_down = Some((mouse.column, mouse.row));
+                                }
+                                MouseEventKind::Drag(MouseButton::Left) => {
+                                    if let Some((start_col, start_row)) = mouse_down {
+                                        let col_delta =
+                                            (mouse.column as i32 - start_col as i32).abs();
+                                        let row_delta =
+                                            (mouse.row as i32 - start_row as i32).abs();
+                                        // 位移超过阈值 → 进入拖动选择（转录区内）。
+                                        if !drag_selecting && (col_delta + row_delta) > 2 {
+                                            if let Some(rect) = renderer.transcript_rect()
+                                                && mouse.row >= rect.y
+                                                && mouse.row < rect.y + rect.height
+                                            {
+                                                let view_row = mouse.row - rect.y;
+                                                ui_state.view.selection_start(view_row);
+                                                drag_selecting = true;
+                                                need_draw = true;
+                                            }
+                                        }
+                                        if drag_selecting {
+                                            if let Some(rect) = renderer.transcript_rect() {
+                                                let view_row = mouse.row
+                                                    .saturating_sub(rect.y)
+                                                    .min(rect.height.saturating_sub(1));
+                                                ui_state.view.selection_update(view_row);
+                                                need_draw = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                MouseEventKind::Up(MouseButton::Left) => {
+                                    if drag_selecting {
+                                        // 结束选择（选区保留，Ctrl+C 复制）。
+                                        ui_state.view.selection_end();
+                                        drag_selecting = false;
+                                        mouse_down = None;
+                                        need_draw = true;
+                                    } else {
+                                        mouse_down = None;
+                                        if let Some(event) =
+                                            mouse_ui_event(&ui_state, &renderer, mouse)
+                                        {
+                                            need_draw = true;
+                                            crate::tui::reducer::update(&mut ui_state, event);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    if let Some(event) =
+                                        mouse_ui_event(&ui_state, &renderer, mouse)
+                                    {
+                                        need_draw = true;
+                                        crate::tui::reducer::update(&mut ui_state, event);
+                                    }
+                                }
                             }
                         }
                         Some(Event::Resize(_, _)) => {
@@ -856,6 +918,7 @@ fn mouse_ui_event(
 fn execute_ui_effect(
     effect: UiEffect,
     ui_state: &mut UiState,
+    renderer: &mut Renderer,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 ) -> bool {
     match effect {
@@ -873,6 +936,25 @@ fn execute_ui_effect(
         UiEffect::Quit => true,
         // ResumeSession 由交互主循环处理（/sessions 菜单）。
         UiEffect::ResumeSession(_) => false,
+        // §用户诉求：复制选中文本到剪贴板（Win32 OpenClipboard + CF_UNICODETEXT）。
+        UiEffect::CopySelection => {
+            let text = ui_state
+                .view
+                .selection
+                .as_ref()
+                .map(|sel| renderer.selection_text(sel))
+                .unwrap_or_default();
+            if !text.is_empty() {
+                crate::clipboard::set_text(&text);
+                ui_state.view.push_line(
+                    LineKind::System,
+                    format!("已复制 {} 行到剪贴板", text.lines().count()),
+                );
+            }
+            // 复制后清除选区（高亮消失）。
+            ui_state.view.selection_clear();
+            false
+        }
     }
 }
 
@@ -951,6 +1033,26 @@ async fn run_interactive<P: Provider>(
                                         LineKind::System,
                                         "已发送取消（Esc）；保留 session",
                                     );
+                                }
+                                // §用户诉求：Ctrl+C 有选区时复制（run 中也可复制）。
+                                UiEffect::CopySelection => {
+                                    let text = ui_state
+                                        .view
+                                        .selection
+                                        .as_ref()
+                                        .map(|sel| renderer.selection_text(sel))
+                                        .unwrap_or_default();
+                                    if !text.is_empty() {
+                                        crate::clipboard::set_text(&text);
+                                        ui_state.view.push_line(
+                                            LineKind::System,
+                                            format!(
+                                                "已复制 {} 行到剪贴板",
+                                                text.lines().count()
+                                            ),
+                                        );
+                                    }
+                                    ui_state.view.selection_clear();
                                 }
                                 UiEffect::Quit | UiEffect::ResumeSession(_) => {
                                     // run 中不会产生（reducer 仅空闲时产生）。

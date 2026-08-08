@@ -18,6 +18,12 @@ pub enum UiEvent {
     MouseScrollDown,
     /// 鼠标移动（§24 hover 高亮；命中可点击行时高亮显示）。
     MouseMoved { column: u16, row: u16 },
+    /// 应用内选择复制（§用户诉求）：鼠标按下开始拖动选择。
+    SelectionStart { row: u16 },
+    /// 拖动更新选择范围。
+    SelectionUpdate { row: u16 },
+    /// 释放鼠标结束选择（选区保留）。
+    SelectionEnd,
     /// 鼠标点击命中工具卡片（Renderer hit-test 后）。
     ClickTool(String),
     /// 鼠标点击命中折叠的 reasoning 行（Renderer hit-test 后；EntryId §4.1）。

@@ -312,9 +312,13 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             }
         }
         KeyCode::Char(c) => {
-            // Ctrl+C：只复制（§用户诉求）。Windows Terminal 选中文本后由终端
-            // 复制；未选中时到达应用的 Ctrl+C 静默忽略，避免输入 'c'。
+            // Ctrl+C：应用内选择复制（§用户诉求）。有选区 → 复制到剪贴板
+            //（CopySelection，app 层执行）；无选区 → 静默忽略（不输入 'c'，
+            // 不取消/退出——取消统一用 Esc）。
             if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
+                if state.view.selection.is_some() {
+                    effects.push(UiEffect::CopySelection);
+                }
                 return effects;
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'u' {
@@ -525,6 +529,11 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             // 此处仅标记重绘由 app 处理。
             Vec::new()
         }
+        // §用户诉求：应用内选择复制。选择状态由 app 层直接更新
+        //（需要 Renderer 的转录区坐标做 hit-test），reducer 只做穷尽占位。
+        UiEvent::SelectionStart { .. }
+        | UiEvent::SelectionUpdate { .. }
+        | UiEvent::SelectionEnd => Vec::new(),
         UiEvent::ClickTool(id) => {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new(); // 弹层打开时鼠标点击不得打开后台 overlay

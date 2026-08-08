@@ -10,4 +10,6 @@ pub enum UiEffect {
     CancelRun,
     /// 恢复指定 session（/sessions 菜单 Enter 选中）。
     ResumeSession(String),
+    /// 复制选中文本到剪贴板（§用户诉求：Ctrl+C 有选区时复制；无选区忽略）。
+    CopySelection,
 }

@@ -14,6 +14,36 @@ use crate::tool::outcome::ToolStatus;
 use crate::tool::plan::Plan;
 use crate::tui::scroll::{EntryId, ScrollAnchor, ScrollMode};
 
+/// 应用内选择状态（§用户诉求：拖动选择 + Ctrl+C 复制）。
+/// 基于视口内行号（0..transcript_rows）：拖动选择屏幕上可见的行，
+/// 复制时把这些行的文本写入剪贴板。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionState {
+    /// 选择起始行（视口内；含）。
+    pub start_row: u16,
+    /// 选择结束行（视口内；含）。
+    pub end_row: u16,
+    /// 是否正在拖动（未释放；拖动中实时更新 end_row）。
+    pub dragging: bool,
+}
+
+impl SelectionState {
+    pub fn new(start_row: u16) -> Self {
+        Self {
+            start_row,
+            end_row: start_row,
+            dragging: true,
+        }
+    }
+
+    /// 是否选中给定视口行。
+    pub fn contains(&self, row: u16) -> bool {
+        let lo = self.start_row.min(self.end_row);
+        let hi = self.start_row.max(self.end_row);
+        row >= lo && row <= hi
+    }
+}
+
 /// 转录行类型（§16.2：普通工具可见、plan call 隐藏由 UI 策略决定）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptLine {
@@ -338,6 +368,10 @@ pub struct ViewModel {
     /// 鼠标悬浮命中的目标（§24 hover 高亮）：光标停在可点击行上时
     /// 该行显示 hover 反馈（反转/下划线），移开即清除。
     pub hover_hit: Option<crate::tui::HitTarget>,
+    /// 应用内选择复制（§用户诉求：拖动选择 + Ctrl+C 复制，不依赖终端原生
+    /// 选择——mouse capture 保留，点击展开与拖选用位移阈值区分）。
+    /// `Some` = 正在选择或已有选区（选区高亮直到清除/复制）。
+    pub selection: Option<SelectionState>,
     /// 本会话累计 token 用量（AgentOutcome.usage 累积，§16.2：无 pricing 时显示 usage）。
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -389,6 +423,7 @@ impl Default for ViewModel {
             reasoning_visible: false,
             active_hit: None,
             hover_hit: None,
+            selection: None,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -453,6 +488,7 @@ impl ViewModel {
         self.search = None;
         self.active_hit = None;
         self.hover_hit = None;
+        self.selection = None;
     }
 
     /// BUG-006：会话切换/恢复后把模型上下文（history）重建到屏幕，
@@ -974,6 +1010,31 @@ impl ViewModel {
     /// 移开/不可点 → 清除。
     pub fn set_hover_hit(&mut self, hit: Option<crate::tui::HitTarget>) {
         self.hover_hit = hit;
+    }
+
+    /// 开始应用内选择（§用户诉求：鼠标按下开始拖动选择）。
+    pub fn selection_start(&mut self, row: u16) {
+        self.selection = Some(SelectionState::new(row));
+    }
+
+    /// 拖动更新选择范围（含起止行；顺序由 start/end 大小决定）。
+    pub fn selection_update(&mut self, row: u16) {
+        if let Some(sel) = &mut self.selection {
+            sel.end_row = row;
+            sel.dragging = true;
+        }
+    }
+
+    /// 释放鼠标：结束拖动（选区保留，等待复制/清除）。
+    pub fn selection_end(&mut self) {
+        if let Some(sel) = &mut self.selection {
+            sel.dragging = false;
+        }
+    }
+
+    /// 清除选区（点击空白处 / 开始新选择时先清旧选区）。
+    pub fn selection_clear(&mut self) {
+        self.selection = None;
     }
 
     /// 关闭 Modal（Esc；优先级低于 Overlay，§49）。
@@ -1794,5 +1855,38 @@ mod p2_card_nav_tests {
         view.set_hover_hit(Some(crate::tui::HitTarget::Reasoning(EntryId(1))));
         view.reset_for_new_session();
         assert!(view.hover_hit.is_none());
+    }
+
+    /// §用户诉求：应用内选择状态——开始/更新/结束/清除/包含判断。
+    #[test]
+    fn selection_state_lifecycle() {
+        let mut view = ViewModel::default();
+        assert!(view.selection.is_none());
+
+        view.selection_start(2);
+        let sel = view.selection.as_ref().expect("开始选择");
+        assert!(sel.dragging);
+        assert_eq!(sel.start_row, 2);
+        assert_eq!(sel.end_row, 2);
+
+        view.selection_update(5);
+        let sel = view.selection.as_ref().unwrap();
+        assert_eq!(sel.end_row, 5);
+        // 选区随 end 变：start=2, end=5 → {2,3,4,5}。
+        assert!(sel.contains(2) && sel.contains(5));
+        assert!(sel.contains(3) && sel.contains(4));
+        assert!(!sel.contains(1) && !sel.contains(6));
+        // 反向拖动（end 从 5 回到 1）：start=2, end=1 → {1,2}。
+        view.selection_update(1);
+        let sel = view.selection.as_ref().unwrap();
+        assert!(sel.contains(1) && sel.contains(2));
+        assert!(!sel.contains(3) && !sel.contains(0));
+
+        view.selection_end();
+        let sel = view.selection.as_ref().unwrap();
+        assert!(!sel.dragging, "释放后结束拖动");
+
+        view.selection_clear();
+        assert!(view.selection.is_none());
     }
 }

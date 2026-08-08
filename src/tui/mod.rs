@@ -127,6 +127,8 @@ pub struct Renderer {
     hits_valid: bool,
     /// 最近一帧 scrollbar 矩形（§24 鼠标点击/拖拽 hit-test）。
     last_scrollbar_rect: Option<Rect>,
+    /// 最近一帧窗口内每行的纯文本（§用户诉求：Ctrl+C 复制选中行）。
+    last_window_text: Vec<String>,
 }
 impl Renderer {
     /// 初始化终端（§29-30：raw mode + alternate screen（fullscreen）+ bracketed
@@ -148,6 +150,7 @@ impl Renderer {
             last_row_hits: Vec::new(),
             hits_valid: false,
             last_scrollbar_rect: None,
+            last_window_text: Vec::new(),
         })
     }
 
@@ -175,6 +178,22 @@ impl Renderer {
     /// §24：最近一帧 scrollbar 矩形（鼠标点击/拖拽 hit-test；app 层优先判断）。
     pub fn scrollbar_rect(&self) -> Option<Rect> {
         self.last_scrollbar_rect
+    }
+
+    /// 最近一帧转录区矩形（§用户诉求：拖动选择基于转录区行号）。
+    pub fn transcript_rect(&self) -> Option<Rect> {
+        self.last_transcript_rect
+    }
+
+    /// 提取选中行的文本（§用户诉求：Ctrl+C 复制；selection 基于视口行号，
+    /// 从最近窗口文本取对应行）。
+    pub fn selection_text(&self, sel: &crate::tui::model::SelectionState) -> String {
+        let lo = sel.start_row.min(sel.end_row) as usize;
+        let hi = sel.start_row.max(sel.end_row) as usize;
+        self.last_window_text
+            .get(lo..=hi.min(self.last_window_text.len().saturating_sub(1)))
+            .unwrap_or(&[])
+            .join("\n")
     }
 
     /// 距上次 draw 是否已过帧间隔（§16.1：16 ms 合并）。
@@ -234,6 +253,12 @@ impl Renderer {
             self.last_row_hits = plan.row_hits;
             self.hits_valid = true;
             self.last_scrollbar_rect = plan.scrollbar_rect;
+            // §用户诉求：保存窗口纯文本供 Ctrl+C 复制选中行。
+            self.last_window_text = plan
+                .window
+                .iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
         }
         // §16.1：闭合且不再变化的行提交到 scrollback（活动区上方；仅 inline）。
         // fullscreen：alternate screen 内直接绘制整个终端，无 scrollback。
@@ -497,6 +522,22 @@ fn plan_window(
         let to = (window_start + area_h - start).min(wrapped.len());
         window.extend(wrapped[from..to].iter().cloned());
         row_hits.extend(wrapped_hits[from..to].iter().cloned());
+    }
+    // §用户诉求：应用内选择高亮——选中视口行用强调背景（覆盖 active/hover）。
+    if let Some(sel) = &view.selection {
+        let selected = Style::default()
+            .bg(theme.surface)
+            .add_modifier(Modifier::REVERSED);
+        for (i, line) in window.iter_mut().enumerate() {
+            if sel.contains(i as u16) {
+                *line = Line::from(
+                    line.spans
+                        .iter()
+                        .map(|span| Span::styled(span.content.clone(), selected))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
     }
     let (overflow, committed_after) = if reset_committed {
         (Vec::new(), window_start)
@@ -2396,6 +2437,10 @@ mod tests {
         for i in 0..10 {
             view.push_line(LineKind::Assistant, format!("line {i}"));
         }
+        let mut view = ViewModel::default();
+        for i in 0..10 {
+            view.push_line(LineKind::Assistant, format!("line {i}"));
+        }
         let mut cache = HashMap::new();
         // 先提交 6 行。
         let plan = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
@@ -3156,4 +3201,29 @@ fn tool_name_style_is_category_colored() {
     assert_eq!(tool_name_style("read", theme).fg, Some(theme.accent));
     assert_eq!(tool_name_style("web_search", theme).fg, Some(theme.warning));
     assert_eq!(tool_name_style("unknown", theme).fg, Some(theme.text));
+}
+
+/// §用户诉求：应用内选择高亮——选中视口行加反转样式。
+#[test]
+fn selection_highlights_selected_window_rows() {
+    let mut view = ViewModel::default();
+    for i in 0..6 {
+        view.push_line(LineKind::Assistant, format!("line {i}"));
+    }
+    // 选择视口第 1-2 行（反转背景）。
+    view.selection_start(1);
+    view.selection_update(2);
+    view.selection_end();
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 6, 0, false, &mut cache);
+    // 每行 1 个 visual row；行 0..5 对应 window[0..6]。
+    assert_eq!(plan.window.len(), 6, "6 条消息各一行: {:?}", plan.window);
+    let has_reversed = |idx: usize| {
+        plan.window[idx]
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+    };
+    assert!(has_reversed(1) && has_reversed(2), "选中行 1-2 必须高亮");
+    assert!(!has_reversed(0) && !has_reversed(3), "未选中行不高亮");
 }
