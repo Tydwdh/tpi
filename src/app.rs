@@ -890,7 +890,7 @@ fn pointer_target(
 fn execute_ui_effect(
     effect: UiEffect,
     ui_state: &mut UiState,
-    renderer: &mut Renderer,
+    _renderer: &mut Renderer,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 ) -> bool {
     match effect {
@@ -908,14 +908,10 @@ fn execute_ui_effect(
         UiEffect::Quit => true,
         // ResumeSession 由交互主循环处理（/sessions 菜单）。
         UiEffect::ResumeSession(_) => false,
-        // §用户诉求：复制选中文本到剪贴板（Win32 OpenClipboard + CF_UNICODETEXT）。
+        // §PointerHit：复制选中文本到剪贴板。copy 从 ViewModel 语义文本提取
+        //（不依赖当前 viewport 快照；Renderer 只负责几何映射）。
         UiEffect::CopySelection => {
-            let text = ui_state
-                .view
-                .selection
-                .as_ref()
-                .map(|sel| renderer.selection_text(sel))
-                .unwrap_or_default();
+            let text = ui_state.view.selected_text();
             if !text.is_empty() {
                 crate::clipboard::set_text(&text);
                 ui_state.view.push_line(
@@ -1009,14 +1005,9 @@ async fn run_interactive<P: Provider>(
                                         "已发送取消（Esc）；保留 session",
                                     );
                                 }
-                                // §用户诉求：Ctrl+C 有选区时复制（run 中也可复制）。
+                                // §PointerHit：Ctrl+C 有选区时复制（run 中也可复制）。
                                 UiEffect::CopySelection => {
-                                    let text = ui_state
-                                        .view
-                                        .selection
-                                        .as_ref()
-                                        .map(|sel| renderer.selection_text(sel))
-                                        .unwrap_or_default();
+                                    let text = ui_state.view.selected_text();
                                     if !text.is_empty() {
                                         crate::clipboard::set_text(&text);
                                         ui_state.view.push_line(

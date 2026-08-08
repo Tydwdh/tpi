@@ -192,60 +192,8 @@ impl Renderer {
         self.last_transcript_rect
     }
 
-    /// 提取选中文本（§InteractionRefactor：Ctrl+C 复制；基于语义选区
-    /// (entry + 逻辑 char 偏移)，从语义文本流提取，不反推渲染结果。
-    /// 跨 entry 用 \n 连接；CJK 按 cell 宽度正确映射。
-    pub fn selection_text(&self, sel: &crate::tui::interaction::TextSelection) -> String {
-        let (lo, hi) = sel.normalized();
-        let mut parts: Vec<String> = Vec::new();
-        // 窗口内逐行：行所属 entry 落在 [lo.entry_id, hi.entry_id] 区间内，
-        // 且行语义 char 范围与 [lo.offset, hi.offset] 有交集 → 提取交集。
-        for (entry_id, char_start, text, _decor) in self.semantic_rows.iter().flatten() {
-            let row_lo = *char_start;
-            let row_hi = *char_start + text.chars().count();
-            let in_entry_range = match (*entry_id).cmp(&lo.entry_id) {
-                std::cmp::Ordering::Less => false,
-                std::cmp::Ordering::Greater => {
-                    if hi.entry_id == lo.entry_id {
-                        false
-                    } else {
-                        *entry_id <= hi.entry_id
-                    }
-                }
-                std::cmp::Ordering::Equal => true,
-            };
-            if !in_entry_range {
-                continue;
-            }
-            // 计算该行在全局选区内的有效 char 范围。
-            let (sel_lo, sel_hi) = if *entry_id == lo.entry_id && *entry_id == hi.entry_id {
-                (lo.offset, hi.offset)
-            } else if *entry_id == lo.entry_id {
-                (lo.offset, usize::MAX)
-            } else if *entry_id == hi.entry_id {
-                (usize::MIN, hi.offset)
-            } else {
-                (usize::MIN, usize::MAX)
-            };
-            let from = row_lo.max(sel_lo).min(row_hi);
-            let to = row_hi.min(sel_hi).min(row_hi);
-            if from >= to {
-                continue;
-            }
-            let from_char = from - row_lo;
-            let to_char = to - row_lo;
-            let slice: String = text
-                .chars()
-                .skip(from_char)
-                .take(to_char - from_char)
-                .collect();
-            parts.push(slice);
-        }
-        parts.join("\n")
-    }
-
-    /// 屏幕坐标 → 语义位置（§InteractionRefactor：hit-test 从布局映射得到
-    /// entry + 逻辑 char 偏移；CJK 按 cell 宽度精确定位）。
+    /// 屏幕坐标 → 语义位置（§PointerHit：hit-test 从布局映射得到
+    /// entry + 逻辑 char 偏移；CJK 按 cell 宽度精确定位，扣 rail 前缀）。
     pub fn hit_text(&self, column: u16, row: u16) -> Option<crate::tui::interaction::TextPosition> {
         let rect = self.last_transcript_rect?;
         if column < rect.x || row < rect.y || row >= rect.y + rect.height {

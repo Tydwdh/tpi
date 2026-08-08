@@ -1019,6 +1019,47 @@ impl ViewModel {
         self.selection = None;
     }
 
+    /// 提取选中文本（§PointerHit：copy 从语义文本提取，不依赖当前 viewport
+    /// 快照）。选区指向 (entry, offset)，这里从 transcript 的 entry 内容重建
+    /// 语义文本——resize/滚动后仍精确。
+    pub fn selected_text(&self) -> String {
+        let Some(selection) = self.selection else {
+            return String::new();
+        };
+        let (lo, hi) = selection.normalized();
+        let mut parts: Vec<String> = Vec::new();
+        for entry in &self.transcript {
+            let entry_id = entry.id();
+            if entry_id < lo.entry_id || entry_id > hi.entry_id {
+                continue;
+            }
+            let text = match entry {
+                Entry::Message { line, .. } => line.text.clone(),
+                Entry::Tool { card, .. } => card_semantic_text(card),
+            };
+            if text.is_empty() {
+                continue;
+            }
+            // 计算该 entry 在选区内的 char 范围。
+            let total = text.chars().count();
+            let (sel_lo, sel_hi) = if entry_id == lo.entry_id && entry_id == hi.entry_id {
+                (lo.offset.min(total), hi.offset.min(total))
+            } else if entry_id == lo.entry_id {
+                (lo.offset.min(total), total)
+            } else if entry_id == hi.entry_id {
+                (0, hi.offset.min(total))
+            } else {
+                (0, total)
+            };
+            if sel_lo >= sel_hi {
+                continue;
+            }
+            let slice: String = text.chars().skip(sel_lo).take(sel_hi - sel_lo).collect();
+            parts.push(slice);
+        }
+        parts.join("\n")
+    }
+
     /// 关闭 Modal（Esc；优先级低于 Overlay，§49）。
     pub fn close_modal(&mut self) {
         self.modal = None;
@@ -1262,6 +1303,29 @@ fn bound_tail(tail: &str) -> String {
     let mut out = String::from("…");
     let suffix: String = tail.chars().rev().take(MAX_CHARS).collect();
     out.extend(suffix.chars().rev());
+    out
+}
+
+/// 工具卡片的语义文本（§PointerHit：copy 从内容提取，不反推渲染结果）。
+/// 主行 `name target` + 内容（diff 优先，否则 output，否则 tail）。
+fn card_semantic_text(card: &ToolCard) -> String {
+    let mut out = card.name.clone();
+    if let Some(target) = &card.target
+        && !target.is_empty()
+    {
+        out.push(' ');
+        out.push_str(target);
+    }
+    let body = card
+        .diff
+        .as_deref()
+        .or_else(|| card.output.as_deref())
+        .or_else(|| card.tail.as_deref())
+        .unwrap_or_default();
+    if !body.is_empty() {
+        out.push('\n');
+        out.push_str(body.trim_end());
+    }
     out
 }
 
@@ -1891,5 +1955,41 @@ mod p2_card_nav_tests {
 
         view.selection_clear();
         assert!(view.selection.is_none());
+    }
+
+    /// §PointerHit：selected_text 从 ViewModel 语义文本提取（不依赖 viewport）。
+    /// 选区指向 (entry, offset)，resize/滚动后仍精确；无选区返回空。
+    #[test]
+    fn selected_text_extracts_from_transcript_entries() {
+        use crate::tui::interaction::TextPosition;
+        use crate::tui::scroll::EntryId;
+        let mut view = ViewModel::default();
+        view.push_line(LineKind::User, "hello world");
+        view.push_line(LineKind::Assistant, "second line");
+
+        // 无选区 → 空。
+        assert_eq!(view.selected_text(), "");
+
+        // 选区：entry 1 的 offset 0..5 → "hello"。
+        view.selection_start(TextPosition {
+            entry_id: EntryId(1),
+            offset: 0,
+        });
+        view.selection_update(TextPosition {
+            entry_id: EntryId(1),
+            offset: 5,
+        });
+        assert_eq!(view.selected_text(), "hello");
+
+        // 跨 entry：entry 1 offset 6 → entry 2 offset 6 → "world\nsecond"。
+        view.selection_start(TextPosition {
+            entry_id: EntryId(1),
+            offset: 6,
+        });
+        view.selection_update(TextPosition {
+            entry_id: EntryId(2),
+            offset: 6,
+        });
+        assert_eq!(view.selected_text(), "world\nsecond");
     }
 }
