@@ -1,4 +1,4 @@
-﻿//! TUI 渲染层（文档 §16）。
+//! TUI 渲染层（文档 §16）。
 //!
 //! 只有 renderer 可以调用 Crossterm/Ratatui 或写 stdout；Agent、provider、tool
 //! 和日志模块只能发送事件（§16.1、§3.2 不变量 11）。
@@ -1318,7 +1318,17 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: t
     frame.render_widget(Paragraph::new(wrapped).scroll((scroll_rows, 0)), area);
     let y = area.y + (cursor_row - scroll_rows);
     let x = area.x + cursor_col;
-    frame.set_cursor_position((x, y));
+    // 光标可见性：ratatui 每帧 set_cursor_position 都会 show_cursor，导致模型输出期间光标一直闪烁。
+    // 运行中且输入为空时隐藏（用户主要在看输出；一旦开始输入（排队）就恢复显示）。
+    if should_show_input_cursor(&view.status, view.input.is_empty()) {
+        frame.set_cursor_position((x, y));
+    }
+}
+
+/// 输入光标可见性策略（产品规则，可单测）：空闲恒显示；运行中仅在已有输入时显示
+/// （正在排队输入需要光标；否则隐藏，避免模型输出期间光标一直闪烁）。
+fn should_show_input_cursor(status: &StatusLine, input_empty: bool) -> bool {
+    matches!(status, StatusLine::Idle) || !input_empty
 }
 
 /// BUG-008：输入区内部滚动的可见基准——保证光标行落在 `area` 内。
@@ -1357,6 +1367,10 @@ fn input_cursor_cell(input: &str, cursor: usize, width: u16) -> (u16, u16) {
     let wrapped = wrap_lines(vec![Line::from(Span::raw(input.to_string()))], budget);
     let cursor_cells =
         PROMPT_WIDTH + unicode_width::UnicodeWidthStr::width(&input[..cursor]) as u16;
+    // 空输入：wrap 结果为空，循环不会执行——光标必须停在 prompt 右侧（修复“首次打开光标在 ❯ 左边”）。
+    if wrapped.is_empty() {
+        return (0, PROMPT_WIDTH);
+    }
     let mut row = 0u16;
     let mut col = 0u16;
     let mut line_start = PROMPT_WIDTH;
@@ -1508,6 +1522,8 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
         .borders(ratatui::widgets::Borders::ALL)
         .border_style(Style::default().fg(theme.primary))
         .title(" Tool details ");
+    // 先清空 Overlay 覆盖区域，否则底层 transcript 文字会透过内容间隙显示（用户反馈“思考悬浮窗被其他文字干扰背景”）。
+    frame.render_widget(ratatui::widgets::Clear, rect);
     frame.render_widget(
         ratatui::widgets::Paragraph::new(window)
             .block(block)
@@ -2021,4 +2037,76 @@ mod tests {
         );
         assert!(text.contains("✓"), "成功状态图标");
     }
+}
+
+/// 修复：空输入时光标必须停在 prompt 右侧（此前 wrap 为空 → (0,0)，光标跑到 ❯ 左边）。
+#[test]
+fn input_cursor_empty_input_sits_right_of_prompt() {
+    assert_eq!(input_cursor_cell("", 0, 80), (0, 2));
+    assert_eq!(input_cursor_cell("", 0, 10), (0, 2));
+    assert_eq!(input_cursor_cell("", 0, 1), (0, 2));
+}
+
+/// 修复：Overlay 必须先 Clear 覆盖区，否则底层 transcript 文字透出（背景干扰）。
+#[test]
+fn overlay_clears_background_before_rendering() {
+    let mut view = ViewModel::default();
+    for _ in 0..40 {
+        view.push_line(LineKind::Assistant, "背景文字X".repeat(4));
+    }
+    view.begin_tool("c", "bash", Some("cmd".into()), None);
+    view.finish_tool(
+        "c",
+        "bash",
+        crate::tool::outcome::ToolStatus::Failed,
+        1,
+        Some(1),
+        "err",
+    );
+    view.open_tool_overlay(String::from("c"));
+    let buf = draw_to_test_backend(&mut view, 80, 24);
+    // overlay 居中 (2,1,76,20)；内部底部行 (40,19) 不在内容上 → 必须被清空为空格。
+    assert_eq!(
+        buf[(40, 19)].symbol(),
+        " ",
+        "Overlay 内部未覆盖区域必须清空，不得透出背景文字"
+    );
+}
+
+/// 修复：模型输出（Running + 空输入）期间隐藏光标，避免一直闪烁；空闲时显示。
+#[test]
+fn cursor_hidden_during_run_when_input_empty() {
+    // 产品规则：空闲恒显示；运行中仅输入非空时显示。
+    assert!(should_show_input_cursor(&StatusLine::Idle, true));
+    assert!(should_show_input_cursor(&StatusLine::Idle, false));
+    assert!(!should_show_input_cursor(
+        &StatusLine::Running {
+            turn: 1,
+            tool: "x".into()
+        },
+        true
+    ));
+    assert!(should_show_input_cursor(
+        &StatusLine::Running {
+            turn: 1,
+            tool: "x".into()
+        },
+        false
+    ));
+
+    // 字节级：运行中 + 空输入的帧必须发出隐藏序列（绘制期间不得 set_cursor_position）。
+    let mut view = ViewModel::default();
+    view.status = StatusLine::Running {
+        turn: 1,
+        tool: "模型生成中".into(),
+    };
+    view.input = String::new();
+    let s = String::from_utf8_lossy(&draw_captured_bytes(&mut view)).into_owned();
+    assert!(s.contains("\x1b[?25l"), "运行中必须隐藏光标: {s:?}");
+
+    // 空闲帧必须显示光标。
+    let mut view2 = ViewModel::default();
+    view2.status = StatusLine::Idle;
+    let s2 = String::from_utf8_lossy(&draw_captured_bytes(&mut view2)).into_owned();
+    assert!(s2.contains("\x1b[?25h"), "空闲必须显示光标: {s2:?}");
 }

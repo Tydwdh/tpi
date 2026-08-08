@@ -187,3 +187,10 @@
 7. /help 快捷键说明补齐：Ctrl+End/Ctrl+Home/Alt+O/Alt+[/]、Modal 滚动、滚动条。
 
 已确认无需修改：footer 长内容在窄屏被裁剪（Paragraph 不折行，属预期）；搜索命中无高亮（产品取舍，留待后续）。
+
+## 17. 用户实测反馈修复（2026-08-08）
+1. 思考/工具详情 Overlay 背景被 transcript 文字透出干扰 —— draw_overlay 缺 Clear，已补（先清空覆盖区再渲染）。
+2. 回车发送后文本仍留在输入框 —— submit 清空 editor 后未同步 view.input，已补 sync_input。
+3. 首次打开光标在 ❯ 左边 —— 空输入时 wrap 结果为空、行列未赋值（0,0），已改为停在 prompt 右侧（0,2）。
+4. 模型输出期间光标一直闪烁 —— ratatui 每帧 set_cursor_position 都会 show_cursor；新增 should_show_input_cursor：空闲恒显示、运行中仅输入非空时显示（正在排队输入仍可见），其余时间隐藏。
+全部有回归测试（submit_clears_input_projection / overlay_clears_background_before_rendering / input_cursor_empty_input_sits_right_of_prompt / cursor_hidden_during_run_when_input_empty）。

@@ -1,4 +1,4 @@
-//! Reducer（TPI_TUI_V2_TASK §26-27）：`update(state, event) -> Vec<UiEffect>`。
+﻿//! Reducer（TPI_TUI_V2_TASK §26-27）：`update(state, event) -> Vec<UiEffect>`。
 //!
 //! 只修改状态，不运行 provider/bash，不写 stdout。跨边界动作
 //! （退出/取消 run/恢复 session）以 effect 返回，由 app 层执行。
@@ -136,6 +136,8 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             if !text.is_empty() {
                 state.push_pending(text);
             }
+            // 提交后 editor 已清空，必须同步 view.input，否则发送的文本仍显示在输入框。
+            state.sync_input();
             refresh_menus(state);
         }
         KeyCode::Tab => {

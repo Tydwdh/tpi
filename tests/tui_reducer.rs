@@ -579,3 +579,25 @@ fn ctrl_home_jumps_to_top() {
         "Ctrl+Home 应跳到第一条 entry（首条 id=1）"
     );
 }
+
+/// 修复：回车发送后输入框不得残留文本（submit 清空 editor 后必须同步 view.input）。
+#[test]
+fn submit_clears_input_projection() {
+    let mut s = state();
+    for ch in "你好 world".chars() {
+        reducer::update(
+            &mut s,
+            UiEvent::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+        );
+    }
+    reducer::update(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        s.pending_messages.front().map(String::as_str),
+        Some("你好 world")
+    );
+    assert!(s.editor.text().is_empty(), "editor 必须清空");
+    assert!(
+        s.view.input.is_empty(),
+        "view.input 必须同步清空（发送后输入框不得残留文本）"
+    );
+}
