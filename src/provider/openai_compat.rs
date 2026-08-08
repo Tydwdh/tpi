@@ -320,7 +320,11 @@ impl Provider for OpenAiCompatClient {
 /// - 否则指数退避 `500ms * 2^attempt` + 随机 jitter（±40%）。
 fn backoff_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
     let base = INITIAL_BACKOFF * (1u32 << attempt.min(3));
-    let jitter = if cfg!(test) { 1.0 } else { 0.6 + random_ratio() * 0.8 };
+    let jitter = if cfg!(test) {
+        1.0
+    } else {
+        0.6 + random_ratio() * 0.8
+    };
     let local = base.mul_f64(jitter);
     match retry_after {
         Some(server) if server > local => server,

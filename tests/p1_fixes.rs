@@ -1,4 +1,4 @@
-﻿//! P1 修复回归测试（fix.md 外部审查报告，第二批）。
+//! P1 修复回归测试（fix.md 外部审查报告，第二批）。
 //!
 //! - P1-1：取消后 session 已提交的 assistant 内容必须同步进 outcome.messages；
 //! - P1-2：max_tool_calls 超限必须是独立的 MaxToolCalls reason，不是 Error。
@@ -13,9 +13,10 @@ use tokio_util::sync::CancellationToken;
 use tpi::agent;
 use tpi::ids::RunId;
 use tpi::provider::{
-    ChatMessage, ModelRequest, Provider, ProviderError, ProviderEvent, ProviderResponse,
+    ChatMessage, FinishReason, ModelRequest, Provider, ProviderError, ProviderEvent,
+    ProviderResponse,
 };
-use tpi::session::{CompletionReason, SessionEvent, SessionLog};
+use tpi::session::{CompletionReason, SessionEvent, SessionLog, Usage};
 
 /// P1-1：发送部分文本后以 Cancelled 结束的 provider。
 struct CancelAfterDeltaProvider;
@@ -312,7 +313,9 @@ impl Provider for InterruptAfterDeltaProvider {
         _cancel: CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
         events
-            .send(ProviderEvent::TextDelta("问题在 src/tool/files.rs 的 write...".into()))
+            .send(ProviderEvent::TextDelta(
+                "问题在 src/tool/files.rs 的 write...".into(),
+            ))
             .await
             .map_err(|_| ProviderError::Protocol("closed".into()))?;
         events
@@ -467,5 +470,272 @@ async fn unavailable_connect_fails_without_recorded_attempt() {
             }
         )),
         "连接失败 reason 必须是 ProviderUnavailable: {events:?}"
+    );
+}
+
+/// §4.3 第二阶段：text-only 断联后自动续写。第一次调用发 partial 后报 Connection
+/// 错误，第二次调用（续写 request）正常返回 continuation。验证：
+/// - run 正常结束（reason=Stop，不是 Interrupted）；
+/// - 提交的 assistant content = partial + continuation（合并到同一 turn）；
+/// - 续写 request 带 recovery instruction（harness metadata）且续写内容不重复。
+struct RecoverThenSucceedProvider {
+    /// 已执行过的调用次数（第一次发 partial+断联，之后按 request 判断）。
+    calls: u32,
+}
+
+impl RecoverThenSucceedProvider {
+    fn new() -> Self {
+        Self { calls: 0 }
+    }
+}
+
+impl Provider for RecoverThenSucceedProvider {
+    fn model_name(&self) -> &str {
+        "recover-then-succeed"
+    }
+
+    async fn stream(
+        &mut self,
+        request: ModelRequest,
+        events: mpsc::Sender<ProviderEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderResponse, ProviderError> {
+        self.calls += 1;
+        if self.calls >= 2 {
+            // 第二次调用（续写）：必须看到 recovery instruction。
+            assert!(
+                request.messages.iter().any(|m| {
+                    matches!(m, ChatMessage::User(text) if text.contains("transport failure"))
+                }),
+                "续写 request 必须注入 recovery instruction（harness metadata）"
+            );
+            events
+                .send(ProviderEvent::TextDelta("因为 target_exists 分支".into()))
+                .await
+                .map_err(|_| ProviderError::Protocol("closed".into()))?;
+            return Ok(ProviderResponse {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+                tool_calls: Vec::new(),
+            });
+        }
+        // 第一次调用：发 partial 后断联。
+        events
+            .send(ProviderEvent::TextDelta(
+                "问题在 src/tool/files.rs 的 write...".into(),
+            ))
+            .await
+            .map_err(|_| ProviderError::Protocol("closed".into()))?;
+        Err(ProviderError::Connection("connection reset".into()))
+    }
+}
+
+/// §4.3 第二阶段：text-only 断联后自动续写成功——合并为同一 turn。
+#[tokio::test]
+async fn text_only_interrupt_auto_continues_and_merges() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = RecoverThenSucceedProvider::new();
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, mut rx) = mpsc::channel(16);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        &[],
+        "hello".into(),
+        tx,
+        CancellationToken::new(),
+        false,
+        false,
+    )
+    .await
+    .expect("自动续写后 run 必须正常结束");
+
+    drain.abort();
+    assert_eq!(outcome.reason, CompletionReason::Stop);
+    assert!(
+        outcome.assistant_text.contains("write...")
+            && outcome.assistant_text.contains("target_exists"),
+        "提交内容必须合并 partial + continuation: {}",
+        outcome.assistant_text
+    );
+    assert!(
+        !outcome.assistant_text.contains("transport failure"),
+        "recovery instruction 不得进入提交内容（harness metadata）"
+    );
+
+    // session：提交的 assistant 消息 = 合并后的完整 turn。
+    let events = tpi::session::read_events(session.path()).unwrap();
+    let committed = events.iter().find_map(|e| match e {
+        SessionEvent::AssistantMessageCommitted { message } => Some(message.content.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        committed.as_deref(),
+        Some("问题在 src/tool/files.rs 的 write...因为 target_exists 分支"),
+        "session 必须提交合并后的完整 assistant turn"
+    );
+}
+
+/// §4.3 第二阶段：每次 attempt 都断联（首次 + 续写）——续写再失败不得无限循环，
+/// 以 ProviderInterrupted 结束（额度用尽）。
+struct AlwaysInterruptProvider;
+
+impl Provider for AlwaysInterruptProvider {
+    fn model_name(&self) -> &str {
+        "always-interrupt"
+    }
+
+    async fn stream(
+        &mut self,
+        _request: ModelRequest,
+        events: mpsc::Sender<ProviderEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderResponse, ProviderError> {
+        events
+            .send(ProviderEvent::TextDelta("又断一次".into()))
+            .await
+            .map_err(|_| ProviderError::Protocol("closed".into()))?;
+        Err(ProviderError::Connection("flaky network".into()))
+    }
+}
+
+/// §4.3 第二阶段：续写再次断联时不得无限循环——以 ProviderInterrupted 结束，
+/// 且 session 记录两次 AssistantAttemptInterrupted。
+#[tokio::test]
+async fn recovery_capped_after_one_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = AlwaysInterruptProvider;
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, mut rx) = mpsc::channel(16);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        &[],
+        "hello".into(),
+        tx,
+        CancellationToken::new(),
+        false,
+        false,
+    )
+    .await
+    .expect("run 以正常结果结束");
+
+    drain.abort();
+    assert_eq!(outcome.reason, CompletionReason::ProviderInterrupted);
+
+    let events = tpi::session::read_events(session.path()).unwrap();
+    let interrupted = events
+        .iter()
+        .filter(|e| matches!(e, SessionEvent::AssistantAttemptInterrupted { .. }))
+        .count();
+    assert_eq!(interrupted, 2, "首次 + 续写各记录一次中断: {events:?}");
+}
+
+/// §4.3 第二阶段：已收到 tool delta 后断联——**不自动续写**（partial JSON 恢复
+/// 风险大）。若 agent 错误地触发第二次调用（续写），stream 内 panic。
+struct ToolDeltaThenDisconnectProvider {
+    calls: u32,
+}
+
+impl Provider for ToolDeltaThenDisconnectProvider {
+    fn model_name(&self) -> &str {
+        "tool-delta-then-disconnect"
+    }
+
+    async fn stream(
+        &mut self,
+        _request: ModelRequest,
+        events: mpsc::Sender<ProviderEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderResponse, ProviderError> {
+        self.calls += 1;
+        if self.calls > 1 {
+            panic!("tool delta 后断联不得触发续写（第二次调用）");
+        }
+        // 收到 tool delta（不完整 JSON），随后断联。
+        events
+            .send(ProviderEvent::ToolCallStarted {
+                index: 0,
+                id: "call_1".into(),
+                name: "edit".into(),
+            })
+            .await
+            .map_err(|_| ProviderError::Protocol("closed".into()))?;
+        events
+            .send(ProviderEvent::ToolArgumentsDelta {
+                index: 0,
+                chunk: "{\"path\": \"src/ma".into(),
+            })
+            .await
+            .map_err(|_| ProviderError::Protocol("closed".into()))?;
+        Err(ProviderError::Connection("flaky".into()))
+    }
+}
+
+/// §4.3 第二阶段：tool delta 后断联必须以 ProviderInterrupted 结束且不触发续写。
+#[tokio::test]
+async fn tool_delta_interrupt_does_not_auto_continue() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = ToolDeltaThenDisconnectProvider { calls: 0 };
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, mut rx) = mpsc::channel(16);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        &[],
+        "hello".into(),
+        tx,
+        CancellationToken::new(),
+        false,
+        false,
+    )
+    .await
+    .expect("run 以正常结果结束");
+
+    drain.abort();
+    assert_eq!(outcome.reason, CompletionReason::ProviderInterrupted);
+    assert_eq!(provider.calls, 1, "tool delta 后断联不得触发续写");
+
+    // 记录中断且 saw_tool_calls=true。
+    let events = tpi::session::read_events(session.path()).unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SessionEvent::AssistantAttemptInterrupted {
+                saw_tool_calls: true,
+                ..
+            }
+        )),
+        "中断事件必须标记 saw_tool_calls=true: {events:?}"
     );
 }

@@ -462,6 +462,13 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
         RuntimeEvent::PlanUpdated { plan } => {
             view.plan = Some(plan);
         }
+        RuntimeEvent::StreamRecovering { attempt } => {
+            // §4.3 第二阶段：text-only 断联后自动续写，不打断用户。
+            view.push_line(
+                LineKind::System,
+                format!("⟳ 模型连接中断，正在自动续写…（第 {attempt} 次）"),
+            );
+        }
     }
 }
 

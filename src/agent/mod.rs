@@ -27,6 +27,23 @@ use camino::Utf8PathBuf;
 /// 内建 system prompt（§23 草案）。
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
 
+/// §4.3 第二阶段：text-only attempt 断联后的最大自动续写次数。
+/// 只允许一次（防无限续写循环）；已出现 tool delta 的 attempt 不自动续。
+pub const MAX_STREAM_RECOVERIES: u32 = 1;
+
+/// 续写请求注入的 recovery instruction（§4.3：harness control metadata，
+/// 不进 durable conversation，不进 session）。
+const STREAM_RECOVERY_INSTRUCTION: &str = "\
+The previous assistant generation was interrupted by a transport failure.
+
+Partial assistant output already shown to the user:
+---
+{partial}
+---
+
+Continue the same response from where it was interrupted.
+Do not repeat the already emitted text.";
+
 /// 单轮 run 的结果。
 pub struct AgentOutcome {
     pub reason: CompletionReason,
@@ -105,6 +122,8 @@ pub enum RuntimeEvent {
     BudgetWarning,
     /// `update_plan` 提交后的独立 UI 状态；不作为聊天流水的一部分。
     PlanUpdated { plan: crate::tool::plan::Plan },
+    /// 流中断后正在自动续写（第二阶段 §4.3：text-only attempt 恢复）。
+    StreamRecovering { attempt: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,162 +309,66 @@ pub async fn run<P: Provider>(
             }
         }
 
-        // 3. 构建 context projection 并发起一次请求（§6.2 第 3-4 步）。
-        let request = ModelRequest {
-            model: config.model.name.clone(),
-            messages: build_context(
-                config,
-                &messages,
-                crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
-            ),
-            tools: tool_defs.clone(),
-            max_output_tokens: config.model.max_output_tokens,
-            reasoning: config.model.reasoning.clone(),
-            context_window: config.model.context_window,
-        };
-        // 上下文占用投影（TUI 用量条；请求前发送）。
-        if let Some(window) = config.model.context_window {
-            let usable = crate::context::usable_input(
-                window,
-                config.model.max_output_tokens.unwrap_or(0) as u64,
-                config.safety_reserve_tokens,
-            );
-            let system_prompt = system_prompt_text(
-                config,
-                crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
-            );
-            let projected = crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
-            let _ = ui
-                .send(RuntimeEvent::ContextUsage { projected, usable })
-                .await;
-        }
-        let (event_tx, mut event_rx) = mpsc::channel(crate::provider::EVENT_CHANNEL_CAPACITY);
-
-        // 必须在 provider 请求进行时消费 channel：等请求结束后再 drain 不但不是真正
-        // streaming，达到 channel 容量时还会让 provider 与 agent 相互等待。
-        let stream = provider.stream(request, event_tx, cancel.clone());
-        tokio::pin!(stream);
+        // 3. 构建 context projection 并发起请求（§6.2 第 3-4 步）。
+        // §4.3 第二阶段：text-only attempt 断联后自动续写（最多 1 次）。
+        // `content`/`saw_any_semantic`/`saw_tool_calls` 跨 attempt 累积
+        // （整个 model turn 的事实）；`stream_recoveries` 是已续写次数。
+        let mut stream_recoveries: u32 = 0;
         let mut content = String::new();
-        // §4.3：流中断分类需要知道是否已产生语义内容（文本/工具调用）。
-        // 统一消费入口：主 select 分支与所有 drain 分支共用，保证标志与 UI 同步。
         let mut saw_any_semantic = false;
         let mut saw_tool_calls = false;
-        let response = loop {
-            tokio::select! {
-                Some(event) = event_rx.recv() => {
-                    consume_stream_event(
-                        event,
-                        request_id,
-                        &mut content,
-                        &mut saw_any_semantic,
-                        &mut saw_tool_calls,
-                        &ui,
-                    )
+
+        let response = 'attempt: loop {
+            // 构建 request：续写 attempt 在 messages 尾部注入 recovery instruction
+            //（harness control metadata：不进 session、不进对话投影）。
+            let request_messages = if stream_recoveries == 0 {
+                messages.clone()
+            } else {
+                let mut recovery = messages.clone();
+                let instruction = STREAM_RECOVERY_INSTRUCTION.replace("{partial}", &content);
+                recovery.push(ChatMessage::User(instruction));
+                recovery
+            };
+            let request = ModelRequest {
+                model: config.model.name.clone(),
+                messages: build_context(
+                    config,
+                    &request_messages,
+                    crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+                ),
+                tools: tool_defs.clone(),
+                max_output_tokens: config.model.max_output_tokens,
+                reasoning: config.model.reasoning.clone(),
+                context_window: config.model.context_window,
+            };
+            // 上下文占用投影（TUI 用量条；请求前发送）。
+            if let Some(window) = config.model.context_window {
+                let usable = crate::context::usable_input(
+                    window,
+                    config.model.max_output_tokens.unwrap_or(0) as u64,
+                    config.safety_reserve_tokens,
+                );
+                let system_prompt = system_prompt_text(
+                    config,
+                    crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+                );
+                let projected =
+                    crate::context::estimate_request(&system_prompt, &request_messages, &tool_defs);
+                let _ = ui
+                    .send(RuntimeEvent::ContextUsage { projected, usable })
                     .await;
-                }
-                result = &mut stream => {
-                    let response = match result {
-                        Ok(response) => response,
-                        Err(crate::provider::ProviderError::Cancelled) => {
-                            // 先收完 provider 返回前已入队的残余 delta（与 Ok 分支一致），
-                            // 否则取消时已到达的文本可能丢失（P1-1 测试场景）。
-                            while let Ok(event) = event_rx.try_recv() {
-                                consume_stream_event(
-                                    event,
-                                    request_id,
-                                    &mut content,
-                                    &mut saw_any_semantic,
-                                    &mut saw_tool_calls,
-                                    &ui,
-                                )
-                                .await;
-                            }
-                            // §6.2/§11.5：取消（Esc/Ctrl-C）是正常结束——提交已到达的内容，
-                            // 记录 Cancelled 原因并保留 session，而不是让 run 以错误退出。
-                            if !content.is_empty() {
-                                assistant_text = content.clone();
-                                session
-                                    .append_event(&SessionEvent::AssistantMessageCommitted {
-                                        message: AssistantMessage {
-                                            content: content.clone(),
-                                            tool_calls: Vec::new(),
-                                        },
-                                    })
-                                    .and_then(|_| session.sync_data())
-                                    .map_err(|e| RunFailure::Session(e.to_string()))?;
-                                // P1-1：已提交 session 的内容必须同步进 outcome.messages，
-                                // 否则继续对话时模型上下文与 session 事实不一致。
-                                messages.push(ChatMessage::Assistant {
-                                    content: content.clone(),
-                                    tool_calls: Vec::new(),
-                                });
-                            // §16：区分取消来源——watchdog 超时不是用户取消。
-                            }
-                            let cause = cancel_cause.load(std::sync::atomic::Ordering::SeqCst);
-                            let cancel_reason =
-                                crate::agent::limits::cancel_reason_for_cause(cause);
-                            session
-                                .append_event(&SessionEvent::RunCompleted {
-                                    reason: cancel_reason,
-                                    usage: usage_total,
-                                })
-                                .and_then(|_| session.sync_data())
-                                .map_err(|e| RunFailure::Session(e.to_string()))?;
-                            break 'run_loop cancel_reason;
-                        }
-                        Err(e) => {
-                            // 错误详情记录到日志（§19.2：provider 错误可诊断）。
-                            tracing::error!(%request_id, error = %e, "provider request failed");
-                            // 先收完已入队的残余 delta（与 Cancelled 分支一致）。
-                            while let Ok(event) = event_rx.try_recv() {
-                                consume_stream_event(
-                                    event,
-                                    request_id,
-                                    &mut content,
-                                    &mut saw_any_semantic,
-                                    &mut saw_tool_calls,
-                                    &ui,
-                                )
-                                .await;
-                            }
-                            // §4.3：区分"未收到任何语义事件"（连接不可用）与
-                            // "已收到部分内容后断联"（记录 interrupted attempt）。
-                            // partial content 已发给 UI 但不是一个完整 turn：
-                            // 不提交为 AssistantMessageCommitted，写入记录型事件。
-                            if saw_any_semantic {
-                                let cause = interrupt_cause(&e);
-                                session
-                                    .append_event(&SessionEvent::AssistantAttemptInterrupted {
-                                        request_id,
-                                        content: content.clone(),
-                                        cause,
-                                        saw_tool_calls,
-                                    })
-                                    .and_then(|_| session.sync_data())
-                                    .map_err(|e2| RunFailure::Session(e2.to_string()))?;
-                                session
-                                    .append_event(&SessionEvent::RunCompleted {
-                                        reason: CompletionReason::ProviderInterrupted,
-                                        usage: usage_total,
-                                    })
-                                    .and_then(|_| session.sync_data())
-                                    .map_err(|e2| RunFailure::Session(e2.to_string()))?;
-                                // 保留 partial 供 UI/outcome 展示，但不动 messages（不是已提交事实）。
-                                assistant_text = content.clone();
-                                break 'run_loop CompletionReason::ProviderInterrupted;
-                            }
-                            session
-                                .append_event(&SessionEvent::RunCompleted {
-                                    reason: CompletionReason::ProviderUnavailable,
-                                    usage: usage_total,
-                                })
-                                .ok();
-                            return Err(RunFailure::Provider(e.to_string()));
-                        }
-                    };
-                    // provider 返回后仍可能有已经入队的末尾 delta；这些发送都已完成，
-                    // 因而非阻塞 drain 即可，也不会依赖 future 内部 Sender 的析构时机。
-                    while let Ok(event) = event_rx.try_recv() {
+            }
+            let (event_tx, mut event_rx) = mpsc::channel(crate::provider::EVENT_CHANNEL_CAPACITY);
+
+            // 必须在 provider 请求进行时消费 channel：等请求结束后再 drain 不但不是真正
+            // streaming，达到 channel 容量时还会让 provider 与 agent 相互等待。
+            let stream = provider.stream(request, event_tx, cancel.clone());
+            tokio::pin!(stream);
+            // §4.3：流中断分类需要知道是否已产生语义内容（文本/工具调用）。
+            // 统一消费入口：主 select 分支与所有 drain 分支共用，保证标志与 UI 同步。
+            let response = loop {
+                tokio::select! {
+                    Some(event) = event_rx.recv() => {
                         consume_stream_event(
                             event,
                             request_id,
@@ -456,9 +379,148 @@ pub async fn run<P: Provider>(
                         )
                         .await;
                     }
-                    break response;
+                    result = &mut stream => {
+                        let response = match result {
+                            Ok(response) => response,
+                            Err(crate::provider::ProviderError::Cancelled) => {
+                                // 先收完 provider 返回前已入队的残余 delta（与 Ok 分支一致），
+                                // 否则取消时已到达的文本可能丢失（P1-1 测试场景）。
+                                while let Ok(event) = event_rx.try_recv() {
+                                    consume_stream_event(
+                                        event,
+                                        request_id,
+                                        &mut content,
+                                        &mut saw_any_semantic,
+                                        &mut saw_tool_calls,
+                                        &ui,
+                                    )
+                                    .await;
+                                }
+                                // §6.2/§11.5：取消（Esc/Ctrl-C）是正常结束——提交已到达的内容，
+                                // 记录 Cancelled 原因并保留 session，而不是让 run 以错误退出。
+                                if !content.is_empty() {
+                                    assistant_text = content.clone();
+                                    session
+                                        .append_event(&SessionEvent::AssistantMessageCommitted {
+                                            message: AssistantMessage {
+                                                content: content.clone(),
+                                                tool_calls: Vec::new(),
+                                            },
+                                        })
+                                        .and_then(|_| session.sync_data())
+                                        .map_err(|e| RunFailure::Session(e.to_string()))?;
+                                    // P1-1：已提交 session 的内容必须同步进 outcome.messages，
+                                    // 否则继续对话时模型上下文与 session 事实不一致。
+                                    messages.push(ChatMessage::Assistant {
+                                        content: content.clone(),
+                                        tool_calls: Vec::new(),
+                                    });
+                                // §16：区分取消来源——watchdog 超时不是用户取消。
+                                }
+                                let cause = cancel_cause.load(std::sync::atomic::Ordering::SeqCst);
+                                let cancel_reason =
+                                    crate::agent::limits::cancel_reason_for_cause(cause);
+                                session
+                                    .append_event(&SessionEvent::RunCompleted {
+                                        reason: cancel_reason,
+                                        usage: usage_total,
+                                    })
+                                    .and_then(|_| session.sync_data())
+                                    .map_err(|e| RunFailure::Session(e.to_string()))?;
+                                break 'run_loop cancel_reason;
+                            }
+                            Err(e) => {
+                                // 错误详情记录到日志（§19.2：provider 错误可诊断）。
+                                tracing::error!(%request_id, error = %e, "provider request failed");
+                                // 先收完已入队的残余 delta（与 Cancelled 分支一致）。
+                                while let Ok(event) = event_rx.try_recv() {
+                                    consume_stream_event(
+                                        event,
+                                        request_id,
+                                        &mut content,
+                                        &mut saw_any_semantic,
+                                        &mut saw_tool_calls,
+                                        &ui,
+                                    )
+                                    .await;
+                                }
+                                // §4.3 第二阶段：text-only attempt 断联 → 自动续写一次。
+                                // 条件：已产生文本（非连接不可用）、未出现 tool delta（partial
+                                // JSON 恢复风险大）、还有续写额度。
+                                if saw_any_semantic && !saw_tool_calls && stream_recoveries < MAX_STREAM_RECOVERIES
+                                {
+                                    let cause = interrupt_cause(&e);
+                                    session
+                                        .append_event(&SessionEvent::AssistantAttemptInterrupted {
+                                            request_id,
+                                            content: content.clone(),
+                                            cause,
+                                            saw_tool_calls: false,
+                                        })
+                                        .and_then(|_| session.sync_data())
+                                        .map_err(|e2| RunFailure::Session(e2.to_string()))?;
+                                    let _ = ui
+                                        .send(RuntimeEvent::StreamRecovering {
+                                            attempt: stream_recoveries + 1,
+                                        })
+                                        .await;
+                                    stream_recoveries += 1;
+                                    // 续写请求（content 已累积 partial，recovery instruction
+                                    // 在下一个 attempt 循环开头注入 request）。
+                                    continue 'attempt;
+                                }
+                                // §4.3：区分"未收到任何语义事件"（连接不可用）与
+                                // "已收到部分内容后断联"（记录 interrupted attempt）。
+                                // partial content 已发给 UI 但不是一个完整 turn：
+                                // 不提交为 AssistantMessageCommitted，写入记录型事件。
+                                if saw_any_semantic {
+                                    let cause = interrupt_cause(&e);
+                                    session
+                                        .append_event(&SessionEvent::AssistantAttemptInterrupted {
+                                            request_id,
+                                            content: content.clone(),
+                                            cause,
+                                            saw_tool_calls,
+                                        })
+                                        .and_then(|_| session.sync_data())
+                                        .map_err(|e2| RunFailure::Session(e2.to_string()))?;
+                                    session
+                                        .append_event(&SessionEvent::RunCompleted {
+                                            reason: CompletionReason::ProviderInterrupted,
+                                            usage: usage_total,
+                                        })
+                                        .and_then(|_| session.sync_data())
+                                        .map_err(|e2| RunFailure::Session(e2.to_string()))?;
+                                    // 保留 partial 供 UI/outcome 展示，但不动 messages（不是已提交事实）。
+                                    assistant_text = content.clone();
+                                    break 'run_loop CompletionReason::ProviderInterrupted;
+                                }
+                                session
+                                    .append_event(&SessionEvent::RunCompleted {
+                                        reason: CompletionReason::ProviderUnavailable,
+                                        usage: usage_total,
+                                    })
+                                    .ok();
+                                return Err(RunFailure::Provider(e.to_string()));
+                            }
+                        };
+                        // provider 返回后仍可能有已经入队的末尾 delta；这些发送都已完成，
+                        // 因而非阻塞 drain 即可，也不会依赖 future 内部 Sender 的析构时机。
+                        while let Ok(event) = event_rx.try_recv() {
+                            consume_stream_event(
+                                event,
+                                request_id,
+                                &mut content,
+                                &mut saw_any_semantic,
+                                &mut saw_tool_calls,
+                                &ui,
+                            )
+                            .await;
+                        }
+                        break 'attempt response;
+                    }
                 }
-            }
+            };
         };
         // provider 返回的 usage 是本次请求的用量；跨轮累加（§2.2/§12.4）。
         usage_total.input_tokens += response.usage.input_tokens;
