@@ -128,6 +128,27 @@ fn fullscreen_pending_below_hint_renders() {
     );
 }
 
+/// History browsing (Locked): footer must show the state hint; Follow must not.
+#[test]
+fn footer_shows_history_browsing_indicator_when_locked() {
+    let mut view = busy_view(100);
+    view.scroll_up(50);
+    let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
+    let all: String = row_texts(&buf).join("\n");
+    assert!(
+        all.contains("历史浏览中"),
+        "Locked must show the history browsing hint: {all:?}"
+    );
+
+    let mut view2 = busy_view(100);
+    let buf2 = draw_to_test_backend_mode(&mut view2, 80, 24, ViewMode::Fullscreen);
+    let all2: String = row_texts(&buf2).join("\n");
+    assert!(
+        !all2.contains("历史浏览中"),
+        "Follow must NOT show the history browsing hint: {all2:?}"
+    );
+}
+
 /// §24：全屏历史必须有垂直 scrollbar——右侧 1 列，thumb 按 visual 行数比例。
 #[test]
 fn fullscreen_shows_scrollbar_at_right_edge() {

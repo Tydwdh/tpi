@@ -16,6 +16,8 @@ pub struct Editor {
     preferred_column: Option<usize>,
     history: Vec<String>,
     history_pos: Option<usize>,
+    /// Draft saved when entering history browsing; restored when returning to newest.
+    draft: Option<String>,
 }
 
 /// 历史条数上限（防长会话内存增长）。
@@ -228,6 +230,7 @@ impl Editor {
         self.text.clear();
         self.cursor = 0;
         self.preferred_column = None;
+        self.draft = None;
     }
 
     /// 提交当前输入：trim 后返回，清空编辑区并入历史（去重）。
@@ -235,6 +238,7 @@ impl Editor {
         let text = self.text.trim().to_string();
         self.clear();
         self.history_pos = None;
+        self.draft = None;
         if !text.is_empty() && self.history.last().map(String::as_str) != Some(text.as_str()) {
             self.history.push(text.clone());
             if self.history.len() > HISTORY_CAP {
@@ -250,6 +254,11 @@ impl Editor {
         if self.history.is_empty() {
             return;
         }
+        // First entry into history browsing: save the current draft so it can be
+        // restored when the user navigates back to the newest slot.
+        if self.history_pos.is_none() {
+            self.draft = Some(self.text.clone());
+        }
         let next = match self.history_pos {
             None => Some(self.history.len() - 1),
             Some(i) if i > 0 => Some(i - 1),
@@ -261,12 +270,12 @@ impl Editor {
         }
     }
 
-    /// 历史向下浏览（更新的一条；到底后回到空输入）。
+    /// 历史向下浏览（更新的一条；到底后恢复进入历史前的草稿）。
     pub fn history_down(&mut self) {
         let next = match self.history_pos {
-            None => None,
+            None => return, // Not browsing history: Down must not clear the input.
             Some(i) if i + 1 < self.history.len() => Some(i + 1),
-            Some(_) => None, // 到达最新一条之后再按 → 空输入
+            Some(_) => None, // At newest: restore the pre-browsing draft.
         };
         match next {
             Some(i) => {
@@ -275,7 +284,8 @@ impl Editor {
             }
             None => {
                 self.history_pos = None;
-                self.clear();
+                let draft = self.draft.take().unwrap_or_default();
+                self.set_text(draft);
             }
         }
     }
@@ -459,6 +469,31 @@ mod p2_word_edit_tests {
         e.move_word_right();
         assert_eq!(e.cursor, 8);
     }
+}
+
+#[test]
+fn history_browsing_preserves_draft() {
+    let mut editor = Editor::new();
+    editor.insert_str("cmd1");
+    editor.submit();
+    editor.insert_str("my draft");
+    // Entering history browsing saves the draft.
+    editor.history_up();
+    assert_eq!(editor.text, "cmd1");
+    // Returning to the newest slot restores the draft.
+    editor.history_down();
+    assert_eq!(editor.text, "my draft");
+}
+
+#[test]
+fn history_down_without_browsing_keeps_input() {
+    let mut editor = Editor::new();
+    editor.insert_str("abc");
+    editor.history_down();
+    assert_eq!(
+        editor.text, "abc",
+        "Down without browsing must not clear the input"
+    );
 }
 
 #[cfg(test)]

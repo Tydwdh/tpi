@@ -223,3 +223,8 @@
 - MENU-BG-001（P2，反馈复核补漏）：命令补全菜单浮层未 Clear，未选中行透出 transcript 背景文字（与“思考悬浮窗背景干扰”同族）。已修：draw_menu 渲染前 Clear 覆盖区。回归：menu_clears_background_before_rendering。
 - CURSOR-SEARCH-001（P2，反馈复核补漏）：Ctrl+F 搜索打开时 composer 硬件光标仍显示/闪烁（should_show_input_cursor 只覆盖 modal/overlay）。已修：搜索打开即隐藏输入光标。回归：cursor_hidden_during_run_when_input_empty（新增搜索字节级断言）。
 - OVERLAY-TITLE-001（P3）：思考（reasoning）悬浮窗边框标题硬编码 “Tool details”，信息错误。已修：按 overlay 类型显示 “思考（reasoning）”。回归：reasoning_overlay_uses_thinking_border_title。
+## 迭代记录（2026-08-08 续 5）
+- HIST-DRAFT-001（P2）：↑ 进入 prompt history 后 ↓ 回最新会清空/丢失输入（history_down None 分支直接 clear），且未浏览历史时按 ↓ 也误清空。已修：进入历史前保存草稿，回最新恢复；未浏览时 ↓ no-op。回归：history_browsing_preserves_draft / history_down_without_browsing_keeps_input。
+- MODAL-PASTE-001（P2，与弹层输入屏蔽同族）：Modal/Overlay 打开时 Paste 写入后台 composer（按键屏蔽覆盖不到独立 Paste 事件）。已修：弹层打开时 Paste no-op。回归：paste_blocked_while_modal_or_overlay_open。
+- MODAL-PAGE-001（P2，BUG-013 同族）：Modal 打开时 PgUp/PgDn 与鼠标滚轮滚动背后 transcript 而非 Modal。已修：优先滚动 modal，其次 overlay，最后 transcript。回归：page_and_wheel_scroll_modal_when_open。
+- LOCKED-INDICATOR-001（P2，UX 审计遗留）：历史浏览（Locked）且无新内容时无状态提示，用户不知道不在 Follow。已修：footer 显示“历史浏览中 · Ctrl+End 返回最新”。回归：footer_shows_history_browsing_indicator_when_locked。

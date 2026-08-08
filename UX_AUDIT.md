@@ -223,3 +223,8 @@
   2. Ctrl+F 搜索打开时，输入光标仍显示在 composer（打字进搜索框、光标却在输入框，视觉误导）。should_show_input_cursor 增加 search 条件，搜索打开即隐藏；字节级回归（\x1b[?25l）追加进 cursor_hidden_during_run_when_input_empty。
   3. 思考（reasoning）悬浮窗边框标题此前硬编码 “Tool details” —— 现按 overlay 类型显示 “思考（reasoning）”。回归 reasoning_overlay_uses_thinking_border_title。
 - 全量测试通过（145 lib + 全部集成套件）。
+## 24. 迭代第10轮（2026-08-08）
+- 历史浏览草稿保护（人体工学）：↑ 进入 prompt history 前保存当前草稿，↓ 回到最新槽位时恢复草稿（此前直接清空/丢输入）；未浏览历史时按 ↓ 不再误清空输入。回归 history_browsing_preserves_draft / history_down_without_browsing_keeps_input；up_down_moves_within_multiline_then_falls_back_to_history 断言更新为恢复草稿。
+- 弹层 Paste 屏蔽（真 bug，与弹层输入屏蔽同族）：Modal/Overlay 打开时 Paste（独立事件，按键屏蔽覆盖不到）会写入后台 composer，关弹层后输入框出现乱码——现改为弹层打开时 Paste no-op。回归 paste_blocked_while_modal_or_overlay_open。
+- Modal 翻页/滚轮（人体工学，BUG-013 同族）：Modal 打开时 PgUp/PgDn 与鼠标滚轮此前滚动背后 transcript；现改为滚动 Modal 自身（↑/↓ 已支持）。回归 page_and_wheel_scroll_modal_when_open。
+- Locked 状态提示（人体工学，第 3/9 节遗留）：历史浏览（Locked）且无新内容时 footer 显示“历史浏览中 · Ctrl+End 返回最新”。回归 footer_shows_history_browsing_indicator_when_locked。

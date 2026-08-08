@@ -298,9 +298,13 @@ fn up_down_moves_within_multiline_then_falls_back_to_history() {
         "历史命令",
         "第一行再 ↑ 应进入 prompt history"
     );
-    // ↓ 从历史向下：历史语义（到底后清空回空输入）。
+    // ↓ 从历史向下：到最新槽位时恢复进入历史前的草稿（不丢输入）。
     reducer::update(&mut s, key(KeyCode::Down));
-    assert_eq!(s.editor.text(), "", "历史向下到底 = 空输入");
+    assert_eq!(
+        s.editor.text(),
+        "第一行\n第二行",
+        "历史向下回最新 = 恢复草稿"
+    );
 }
 
 #[test]
@@ -682,6 +686,68 @@ fn overlay_blocks_composer_typing() {
     assert!(
         s.editor.text().is_empty(),
         "Overlay 打开时输入不得进入 composer"
+    );
+}
+
+#[test]
+fn paste_blocked_while_modal_or_overlay_open() {
+    // Paste while Modal is open must not write into the composer (keys are already blocked).
+    let mut s = state();
+    s.view.open_modal("/help", "content");
+    reducer::update(&mut s, UiEvent::Paste("junk".into()));
+    assert!(
+        s.editor.text().is_empty(),
+        "Paste must not reach composer while Modal is open"
+    );
+    assert!(s.view.input.is_empty());
+
+    // Overlay blocks Paste the same way.
+    let mut s2 = state();
+    s2.view.begin_tool("c1", "bash", Some("cmd".into()), None);
+    s2.view
+        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err");
+    reducer::update(&mut s2, UiEvent::ClickTool("c1".into()));
+    assert!(s2.view.overlay.is_some());
+    reducer::update(&mut s2, UiEvent::Paste("junk".into()));
+    assert!(
+        s2.editor.text().is_empty(),
+        "Paste must not reach composer while Overlay is open"
+    );
+    reducer::update(&mut s2, key(KeyCode::Esc));
+    assert!(s2.view.overlay.is_none());
+    reducer::update(&mut s2, UiEvent::Paste("ok".into()));
+    assert_eq!(
+        s2.editor.text(),
+        "ok",
+        "Paste returns to composer after closing the overlay"
+    );
+}
+
+/// While Modal is open, PgUp/PgDn and wheel must scroll the Modal, not the transcript behind.
+#[test]
+fn page_and_wheel_scroll_modal_when_open() {
+    let mut s = state();
+    s.view.open_modal("/help", "line1\nline2\nline3\nline4");
+    let before = s.view.transcript_scroll;
+    reducer::update(&mut s, key(KeyCode::PageDown));
+    assert_eq!(
+        s.view.modal.as_ref().unwrap().scroll,
+        10,
+        "PgDn must scroll the Modal"
+    );
+    reducer::update(&mut s, UiEvent::MouseScrollDown);
+    assert_eq!(
+        s.view.modal.as_ref().unwrap().scroll,
+        13,
+        "wheel must scroll the Modal"
+    );
+    reducer::update(&mut s, UiEvent::MouseScrollUp);
+    assert_eq!(s.view.modal.as_ref().unwrap().scroll, 10);
+    reducer::update(&mut s, key(KeyCode::PageUp));
+    assert_eq!(s.view.modal.as_ref().unwrap().scroll, 0);
+    assert_eq!(
+        s.view.transcript_scroll, before,
+        "scrolling while Modal is open must not move the transcript behind"
     );
 }
 

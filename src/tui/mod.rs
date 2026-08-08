@@ -1258,6 +1258,13 @@ fn draw_footer(
             Style::default().fg(theme.warning),
         ));
     }
+    // 历史浏览（Locked）状态提示：没有新内容时用户仍需要知道自己不在 Follow 模式。
+    if view.scroll_mode != ScrollMode::Follow && view.pending_below == 0 {
+        spans.push(Span::styled(
+            " · 历史浏览中 · Ctrl+End 返回最新",
+            Style::default().fg(theme.warning),
+        ));
+    }
     // 整改 D：footer 固定顺序 workspace · model · state · ctx · tokens · 提示。
     // 上下文用量条（§对比：gemini-cli ContextUsageDisplay；projected/usable）。
     if let Some((projected, usable)) = view.context_usage

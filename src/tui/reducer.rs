@@ -271,14 +271,18 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             refresh_menus(state);
         }
         KeyCode::PageUp => {
-            if let Some(overlay) = &mut state.view.overlay {
+            if let Some(modal) = &mut state.view.modal {
+                modal.scroll = modal.scroll.saturating_sub(10);
+            } else if let Some(overlay) = &mut state.view.overlay {
                 overlay.scroll = overlay.scroll.saturating_sub(10);
             } else {
                 state.view.scroll_up(8);
             }
         }
         KeyCode::PageDown => {
-            if let Some(overlay) = &mut state.view.overlay {
+            if let Some(modal) = &mut state.view.modal {
+                modal.scroll = modal.scroll.saturating_add(10);
+            } else if let Some(overlay) = &mut state.view.overlay {
                 overlay.scroll = overlay.scroll.saturating_add(10);
             } else {
                 state.view.scroll_down(8);
@@ -423,10 +427,12 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             Vec::new()
         }
         UiEvent::Paste(text) => {
-            if state.view.overlay.is_none()
-                && state.view.modal.is_none()
-                && state.view.search.is_some()
-            {
+            // While a Modal/Overlay is open, Paste must not write into the composer
+            // behind it (keys are already blocked; Paste is a separate event).
+            if state.view.overlay.is_some() || state.view.modal.is_some() {
+                return Vec::new();
+            }
+            if state.view.search.is_some() {
                 // BUG-014：搜索打开时粘贴应进入搜索框，而不是 composer。
                 let mut query = state
                     .view
@@ -445,7 +451,9 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
         }
         UiEvent::Key(key) => handle_key(state, key),
         UiEvent::MouseScrollUp => {
-            if let Some(overlay) = &mut state.view.overlay {
+            if let Some(modal) = &mut state.view.modal {
+                modal.scroll = modal.scroll.saturating_sub(3);
+            } else if let Some(overlay) = &mut state.view.overlay {
                 overlay.scroll = overlay.scroll.saturating_sub(3);
             } else {
                 state.view.scroll_up(3);
@@ -453,7 +461,9 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             Vec::new()
         }
         UiEvent::MouseScrollDown => {
-            if let Some(overlay) = &mut state.view.overlay {
+            if let Some(modal) = &mut state.view.modal {
+                modal.scroll = modal.scroll.saturating_add(3);
+            } else if let Some(overlay) = &mut state.view.overlay {
                 overlay.scroll = overlay.scroll.saturating_add(3);
             } else {
                 state.view.scroll_down(3);
