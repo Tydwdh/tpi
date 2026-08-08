@@ -298,8 +298,9 @@ fn render_frame(
     let input_rows = input_area_rows(view, area.width);
     let plan_rows = plan_area_rows(view);
 
-    // §8.1：自下而上 = footer(1) → input(1..8) → plan(0..N) → transcript(Min)。
-    let mut constraints: Vec<Constraint> = vec![Constraint::Min(1)];
+    // §8.1：自下而上 = footer(1) → input(1..8) → plan(0..N) → transcript(Min) → header(2)。
+    // header 2 行 = 标题行 + 分隔线（§16.2 增强）。
+    let mut constraints: Vec<Constraint> = vec![Constraint::Length(2), Constraint::Min(1)];
     if plan_rows > 0 {
         constraints.push(Constraint::Length(plan_rows));
     }
@@ -310,6 +311,8 @@ fn render_frame(
         .constraints(constraints)
         .split(area);
     let mut idx = 0;
+    let header_area = chunks[idx];
+    idx += 1;
     let trans_area = chunks[idx];
     idx += 1;
     let plan_area = if plan_rows > 0 {
@@ -322,6 +325,8 @@ fn render_frame(
     let input_area = chunks[idx];
     idx += 1;
     let footer_area = chunks[idx];
+
+    draw_header(frame, header_area, view, theme);
 
     // §24：fullscreen 在转录区右侧预留 1 列 scrollbar（inline 兼容模式不预留）。
     let scrollbar_enabled = mode == terminal::ViewMode::Fullscreen && trans_area.width >= 2;
@@ -651,26 +656,50 @@ fn build_transcript_text(
                 LineKind::User => {
                     let rendered = cached_markdown(cache, line, theme);
                     for (i, rendered_line) in rendered.iter().enumerate() {
-                        let mut spans = vec![Span::styled("│ ", Style::default().fg(theme.accent))];
+                        let mut spans = vec![Span::styled(
+                            "│ ",
+                            Style::default()
+                                .fg(theme.accent)
+                                .add_modifier(Modifier::BOLD),
+                        )];
                         if i == 0 {
                             spans.push(Span::styled(
-                                "you ",
+                                "you  ",
                                 Style::default()
                                     .fg(theme.accent)
                                     .add_modifier(Modifier::BOLD),
                             ));
                         } else {
-                            spans.push(Span::raw("    "));
+                            spans.push(Span::raw("     "));
                         }
                         spans.extend(rendered_line.spans.iter().cloned());
                         push_hit(&mut out, &mut hits, Line::from(spans), None);
                     }
                 }
-                // §16.2：assistant 无填充卡片，正文为主（Markdown 渲染）。
+                // §16.2：assistant 消息带左 rail + `AI` 标签（与用户消息呼应，
+                // 形成清晰的双角色层次；正文 Markdown 渲染）。
                 LineKind::Assistant => {
                     let rendered = cached_markdown(cache, line, theme);
-                    out.extend(rendered.iter().cloned());
-                    hits.extend(rendered.iter().map(|_| None));
+                    for (i, rendered_line) in rendered.iter().enumerate() {
+                        let mut spans = vec![Span::styled(
+                            "│ ",
+                            Style::default()
+                                .fg(theme.primary)
+                                .add_modifier(Modifier::BOLD),
+                        )];
+                        if i == 0 {
+                            spans.push(Span::styled(
+                                "AI   ",
+                                Style::default()
+                                    .fg(theme.primary)
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                        } else {
+                            spans.push(Span::raw("     "));
+                        }
+                        spans.extend(rendered_line.spans.iter().cloned());
+                        push_hit(&mut out, &mut hits, Line::from(spans), None);
+                    }
                 }
                 // §16.2：thinking dim italic，可折叠（Alt+T）；点击打开原文 Overlay。
                 LineKind::Reasoning => {
@@ -825,7 +854,8 @@ fn build_live_group(
             hits.push(None);
         }
     }
-    // 流式 assistant（Markdown，按 version 缓存）。
+    // 流式 assistant（Markdown，按 version 缓存）。带左 rail + AI 标签，
+    // 与历史 assistant 消息一致（§16.2 层次感）。
     if let Some(msg) = &live.assistant
         && !msg.text.is_empty()
     {
@@ -839,8 +869,27 @@ fn build_live_group(
             cache.insert(msg.version, lines);
             cache[&msg.version].clone()
         };
-        out.extend(rendered.iter().cloned());
-        hits.extend(rendered.iter().map(|_| None));
+        for (i, rendered_line) in rendered.iter().enumerate() {
+            let mut spans = vec![Span::styled(
+                "│ ",
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            if i == 0 {
+                spans.push(Span::styled(
+                    "AI   ",
+                    Style::default()
+                        .fg(theme.primary)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::raw("     "));
+            }
+            spans.extend(rendered_line.spans.iter().cloned());
+            out.push(Line::from(spans));
+            hits.push(None);
+        }
     }
     // 运行中工具卡片（按启动顺序）。
     for call_id in &live.tool_order {
@@ -1015,6 +1064,19 @@ fn flush_line(out: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>) {
     }
 }
 
+/// 工具名语义色（§16.2 增强）：bash=info（执行）、edit/write=success（写文件）、
+/// read/list/search=accent（读/检索）、web_*=warning（网络）、其余=text。
+fn tool_name_style(name: &str, theme: theme::Theme) -> Style {
+    let color = match name {
+        "bash" | "run" => theme.info,
+        "edit" | "write" => theme.success,
+        "read" | "list" | "search" => theme.accent,
+        "web_search" | "web_fetch" => theme.warning,
+        _ => theme.text,
+    };
+    Style::default().fg(color)
+}
+
 /// 工具卡片主行（整改 A2/A3）：`icon name target…  metadata` 恒为单个 visual line。
 ///
 /// - icon/status 语义色；name 正常亮度 BOLD；target muted（display-width ellipsis）；
@@ -1078,9 +1140,11 @@ fn tool_card_lines(
             .fg(status_style)
             .add_modifier(Modifier::BOLD),
     )];
+    // 工具名按类别着色（§16.2 增强：bash=info、edit/write=success、
+    // read/list/search=accent、其余=text），帮助快速识别工具种类。
     spans.push(Span::styled(
-        name,
-        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        name.clone(),
+        tool_name_style(&card.name, theme).add_modifier(Modifier::BOLD),
     ));
     if !target.is_empty() {
         spans.push(Span::raw(" "));
@@ -1313,6 +1377,61 @@ fn draw_footer(
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// 顶部标题栏（§16.2 增强）：`TPI · workspace · 会话状态`——常驻标识，
+/// 与 footer（状态/用量）区分：header 是身份，footer 是实时状态。
+fn draw_header(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: theme::Theme) {
+    let muted = Style::default().fg(theme.muted);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // 品牌标识：TPI + 工作区（身份）。
+    spans.push(Span::styled(
+        "TPI",
+        Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(" · ", muted));
+    let workspace = if view.workspace.is_empty() {
+        "（当前目录）".to_string()
+    } else {
+        view.workspace.clone()
+    };
+    spans.push(Span::styled(workspace, Style::default().fg(theme.text)));
+    // 会话模式：fullscreen/inline + 历史浏览状态（右侧）。
+    let right = if view.scroll_mode != ScrollMode::Follow {
+        format!("⇕ 历史浏览 · Ctrl+End 回最新")
+    } else {
+        String::new()
+    };
+    if !right.is_empty() {
+        // 右侧对齐：用填充实现（终端宽度内计算）。
+        let left_text = spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        let left_w = unicode_width::UnicodeWidthStr::width(left_text.as_str());
+        let pad = area.width as usize;
+        if pad > left_w + right.len() + 2 {
+            spans.push(Span::raw(" ".repeat(pad - left_w - right.len())));
+        }
+        spans.push(Span::styled(right, Style::default().fg(theme.warning)));
+    }
+    // 文本行 + 分隔线（area 高 2：第 0 行标题，第 1 行 muted 线）。
+    let line = Line::from(spans);
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let sep = Rect::new(area.x, area.y + 1, area.width, 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(theme.surface_subtle),
+        ))),
+        sep,
+    );
 }
 
 /// §24：全屏历史垂直 scrollbar——1 列，thumb 比例按 visual 行数（不是 entry 数）。
@@ -2428,4 +2547,57 @@ fn search_highlight_underlines_matched_entries() {
     }
     assert!(matched_underlined, "命中条目必须带下划线高亮");
     assert!(unmatched_not_underlined, "未命中条目不得带下划线");
+}
+
+/// §16.2 增强：顶部 header（TPI 品牌 + workspace）与消息双角色 rail（you/AI）。
+#[test]
+fn header_and_role_rails_render() {
+    let mut view = ViewModel {
+        model_name: "test-model".into(),
+        workspace: "tpi".into(),
+        ..Default::default()
+    };
+    view.push_line(LineKind::User, "hello");
+    view.push_line(LineKind::Assistant, "hi there");
+    let buffer = draw_to_test_backend(&mut view, 60, 10);
+
+    // header 第 0 行包含品牌 + workspace。
+    let header_text: String = (0..60)
+        .map(|x| {
+            buffer
+                .cell((x, 0))
+                .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                .unwrap_or(' ')
+        })
+        .collect();
+    assert!(
+        header_text.contains("TPI") && header_text.contains("tpi"),
+        "header 必须含品牌与 workspace: {header_text:?}"
+    );
+
+    // 消息 rail：整屏文本应含 you 与 AI 标签。
+    let mut all = String::new();
+    for y in 0..10u16 {
+        for x in 0..60u16 {
+            all.push(
+                buffer
+                    .cell((x, y))
+                    .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                    .unwrap_or(' '),
+            );
+        }
+    }
+    assert!(all.contains("you"), "用户消息必须有 you rail: {all:?}");
+    assert!(all.contains("AI"), "assistant 消息必须有 AI rail: {all:?}");
+}
+
+/// §16.2 增强：工具名按类别着色（bash=info 色，编辑类=success 色）。
+#[test]
+fn tool_name_style_is_category_colored() {
+    let theme = theme::Theme::omp();
+    assert_eq!(tool_name_style("bash", theme).fg, Some(theme.info));
+    assert_eq!(tool_name_style("edit", theme).fg, Some(theme.success));
+    assert_eq!(tool_name_style("read", theme).fg, Some(theme.accent));
+    assert_eq!(tool_name_style("web_search", theme).fg, Some(theme.warning));
+    assert_eq!(tool_name_style("unknown", theme).fg, Some(theme.text));
 }
