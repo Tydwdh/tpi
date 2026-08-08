@@ -18,8 +18,13 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-/// 重试上限（§7.3：最多重试 2 次）。
-const MAX_RETRIES: u32 = 2;
+/// 最大尝试次数（含首次请求；§7.3：指数退避，最多 4 次）。
+const MAX_ATTEMPTS: u32 = 4;
+/// 重试总时间预算：超过该时间不再等待，直接上报失败（§7.3：网络长时间不可用
+/// 时不能让用户无限等待；pre-stream 阶段总等待上限）。
+const MAX_RETRY_ELAPSED: Duration = Duration::from_secs(15);
+/// 首次退避基准（第 0 次重试）；每次尝试翻倍：500ms → 1s → 2s。
+const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
 /// OpenAI-compatible adapter（P0-4：只保存连接级状态）。
 ///
@@ -215,7 +220,13 @@ impl Provider for OpenAiCompatClient {
         // §7.3：只在尚未收到任何 response event 前重试。请求发送阶段与流读取阶段
         // （consume_stream）的传输错误在未收到任何事件时同样可安全重试（网络抖动/
         // 连接中途断开），收到事件后失败则不可重试（避免事件重复/乱序）。
-        for attempt in 0..=MAX_RETRIES {
+        //
+        // 退避策略（§7.3）：指数退避 + jitter；`MAX_RETRY_ELAPSED` 总时间预算内
+        // 最多 `MAX_ATTEMPTS` 次尝试；服务端 `Retry-After` 大于本地退避时尊重服务端。
+        let started = std::time::Instant::now();
+        let mut attempt: u32 = 0;
+        let retry_budget = MAX_RETRY_ELAPSED.saturating_sub(INITIAL_BACKOFF);
+        loop {
             let response = match self.send_once(&url, &body, &cancel).await {
                 Ok(response) => response,
                 Err(error) => {
@@ -225,19 +236,20 @@ impl Provider for OpenAiCompatClient {
                         return Err(ProviderError::Cancelled);
                     }
                     // 传输层失败（连接被拒/中断）：未收到任何事件，可安全重试。
-                    if attempt == MAX_RETRIES {
+                    if attempt + 1 >= MAX_ATTEMPTS || started.elapsed() >= retry_budget {
                         return Err(classify_error(error, attempt));
                     }
+                    let delay = backoff_delay(attempt, None);
                     tracing::warn!(
                         attempt,
                         error = %error,
+                        backoff_ms = delay.as_millis(),
                         "provider: 请求发送失败，重试",
                     );
-                    let delay = Duration::from_secs(1);
-                    tokio::select! {
-                        _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-                        _ = tokio::time::sleep(delay) => {}
+                    if !wait_or_cancelled(&cancel, delay).await {
+                        return Err(ProviderError::Cancelled);
                     }
+                    attempt += 1;
                     continue;
                 }
             };
@@ -255,20 +267,21 @@ impl Provider for OpenAiCompatClient {
                             if !retryable || matches!(error, ProviderError::Cancelled) {
                                 return Err(error);
                             }
-                            if attempt == MAX_RETRIES {
+                            if attempt + 1 >= MAX_ATTEMPTS || started.elapsed() >= retry_budget {
                                 return Err(error);
                             }
                             // 未收到任何事件：传输层失败，短暂等待后重发请求。
+                            let delay = backoff_delay(attempt, None);
                             tracing::warn!(
                                 attempt,
                                 error = %error,
+                                backoff_ms = delay.as_millis(),
                                 "provider: 响应流读取失败且未收到事件，重试",
                             );
-                            let delay = Duration::from_secs(1);
-                            tokio::select! {
-                                _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-                                _ = tokio::time::sleep(delay) => {}
+                            if !wait_or_cancelled(&cancel, delay).await {
+                                return Err(ProviderError::Cancelled);
                             }
+                            attempt += 1;
                         }
                     }
                 }
@@ -281,15 +294,55 @@ impl Provider for OpenAiCompatClient {
                         );
                         trace::log("retryable", fields);
                     }
-                    let delay = retry_after.unwrap_or(Duration::from_secs(1));
-                    tokio::select! {
-                        _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-                        _ = tokio::time::sleep(delay) => {}
+                    if attempt + 1 >= MAX_ATTEMPTS || started.elapsed() >= retry_budget {
+                        return Err(ProviderError::RateLimited(format!(
+                            "attempt {attempt}: retry budget exhausted"
+                        )));
                     }
+                    let delay = backoff_delay(attempt, retry_after);
+                    tracing::warn!(
+                        attempt,
+                        backoff_ms = delay.as_millis(),
+                        "provider: 服务端要求退避，等待后重试",
+                    );
+                    if !wait_or_cancelled(&cancel, delay).await {
+                        return Err(ProviderError::Cancelled);
+                    }
+                    attempt += 1;
                 }
             }
         }
-        Err(ProviderError::Connection("retry budget exhausted".into()))
+    }
+}
+
+/// 计算本次重试的等待时长（§7.3）：
+/// - `retry_after`（服务端 `Retry-After`）大于本地退避时尊重服务端；
+/// - 否则指数退避 `500ms * 2^attempt` + 随机 jitter（±40%）。
+fn backoff_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    let base = INITIAL_BACKOFF * (1u32 << attempt.min(3));
+    let jitter = if cfg!(test) { 1.0 } else { 0.6 + random_ratio() * 0.8 };
+    let local = base.mul_f64(jitter);
+    match retry_after {
+        Some(server) if server > local => server,
+        _ => local,
+    }
+}
+
+/// 0..1 的伪随机比例（jitter 用；不用引全局 RNG 依赖）。
+fn random_ratio() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    ((nanos % 10_000) as f64) / 10_000.0
+}
+
+/// 等待 `delay`；期间用户取消则返回 false（不重发请求）。
+async fn wait_or_cancelled(cancel: &CancellationToken, delay: Duration) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
     }
 }
 
@@ -715,4 +768,25 @@ fn sse_transport_error_retryable_only_before_any_event() {
         !sse_transport_error_retryable(true),
         "已收到事件：不可重试（避免重复文本/工具调用）"
     );
+}
+
+/// §7.3：指数退避，测试环境 jitter=1.0（确定性）。
+#[test]
+fn backoff_doubles_per_attempt() {
+    let first = backoff_delay(0, None);
+    let second = backoff_delay(1, None);
+    let third = backoff_delay(2, None);
+    assert_eq!(first, INITIAL_BACKOFF, "attempt 0 = 初始退避");
+    assert_eq!(second, INITIAL_BACKOFF * 2, "attempt 1 翻倍");
+    assert_eq!(third, INITIAL_BACKOFF * 4, "attempt 2 再翻倍");
+}
+
+/// §7.3：服务端 Retry-After 大于本地退避时尊重服务端；否则用本地退避。
+#[test]
+fn retry_after_respected_when_larger() {
+    let local = backoff_delay(0, None);
+    let server_longer = Duration::from_secs(30);
+    assert_eq!(backoff_delay(0, Some(server_longer)), server_longer);
+    let server_shorter = Duration::from_millis(10);
+    assert_eq!(backoff_delay(0, Some(server_shorter)), local);
 }

@@ -295,8 +295,21 @@ pub fn resolve_workspace_path(
 ///   与 bash 的自由保持一致（bash 本来就能访问任意路径）；
 /// - 严格模式（false）：走 [`resolve_workspace_path`]（含 junction/symlink 写穿检查）。
 pub fn resolve_tool_path(ctx: &ToolContext, path: &str) -> Result<Utf8PathBuf, PathResolveError> {
-    if !ctx.allow_outside_workspace {
-        return resolve_workspace_path(&ctx.workspace_root, path);
+    resolve_write_path(&ctx.workspace_root, path, ctx.allow_outside_workspace)
+}
+
+/// 写工具提交计划/恢复元数据的路径解析（§9.1 自由模式）：
+/// `allow_outside_workspace=true` → 词法规范化（绝对路径可用，与 bash 一致）；
+/// `false` → 严格 workspace 沙箱（含 junction/symlink 写穿检查）。
+/// agent 层 plan/recovery 与 tool 层执行必须使用同一解析，否则自由模式下
+/// 写 workspace 外文件会在提交计划阶段被误拒（missing_commit_plan）。
+pub fn resolve_write_path(
+    workspace_root: &Utf8PathBuf,
+    path: &str,
+    allow_outside_workspace: bool,
+) -> Result<Utf8PathBuf, PathResolveError> {
+    if !allow_outside_workspace {
+        return resolve_workspace_path(workspace_root, path);
     }
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -309,7 +322,7 @@ pub fn resolve_tool_path(ctx: &ToolContext, path: &str) -> Result<Utf8PathBuf, P
     let joined = if candidate.is_absolute() {
         candidate
     } else {
-        ctx.workspace_root.join(candidate)
+        workspace_root.join(candidate)
     };
     let normalized = normalize_lexical(joined.as_std_path())?;
     Utf8PathBuf::from_path_buf(normalized).map_err(|_| PathResolveError::Invalid)

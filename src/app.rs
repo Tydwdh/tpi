@@ -130,6 +130,10 @@ pub async fn run(
         if outcome.reason == crate::session::CompletionReason::WallTimeExceeded {
             eprintln!("警告：run 达到 wall-time 预算被自动取消（非用户取消）");
         }
+        // §4.3：流中断且已有 partial——输出 partial 但明确提示不完整（stderr）。
+        if outcome.reason == crate::session::CompletionReason::ProviderInterrupted {
+            eprintln!("警告：模型连接中断，以下为不完整的部分输出；session 已保留。");
+        }
         // §18.3：`-p` 模式 stdout 只输出最终答案。
         if !outcome.assistant_text.is_empty() {
             println!("{}", outcome.assistant_text);
@@ -193,6 +197,13 @@ pub async fn run_prompt_once<P: Provider>(
     if outcome.reason == crate::session::CompletionReason::Error {
         return Err(format!(
             "run 以 Error 结束（长度限制/内容过滤/协议错误）；session 记录: {}",
+            session.path().display()
+        ));
+    }
+    if outcome.reason == crate::session::CompletionReason::ProviderUnavailable {
+        // 未收到任何内容：明确报错（无 partial 可输出）。
+        return Err(format!(
+            "无法连接模型（重试后仍失败）；session 记录: {}",
             session.path().display()
         ));
     }
@@ -882,6 +893,20 @@ async fn run_interactive<P: Provider>(
             ui_state.view.push_line(
                 LineKind::System,
                 "上下文仍超出模型窗口（压缩后仍无法容纳）。请 /new 开启新会话，或检查配置中的 context_window。",
+            );
+        }
+        crate::session::CompletionReason::ProviderInterrupted => {
+            // §4.3：流中断且已有 partial——partial 已保留在 transcript 与 session，
+            // 明确提示而不是让用户以为整个 turn 丢了。
+            ui_state.view.push_line(
+                LineKind::System,
+                "⚠ 模型连接中断，已保留本次部分输出和 session 状态；可重新发送继续。",
+            );
+        }
+        crate::session::CompletionReason::ProviderUnavailable => {
+            ui_state.view.push_line(
+                LineKind::System,
+                "⚠ 无法连接模型（重试后仍失败）；session 已保留，可稍后重试。",
             );
         }
         crate::session::CompletionReason::WallTimeExceeded => {

@@ -326,10 +326,22 @@ pub async fn run<P: Provider>(
         let stream = provider.stream(request, event_tx, cancel.clone());
         tokio::pin!(stream);
         let mut content = String::new();
+        // §4.3：流中断分类需要知道是否已产生语义内容（文本/工具调用）。
+        // 统一消费入口：主 select 分支与所有 drain 分支共用，保证标志与 UI 同步。
+        let mut saw_any_semantic = false;
+        let mut saw_tool_calls = false;
         let response = loop {
             tokio::select! {
                 Some(event) = event_rx.recv() => {
-                    forward_provider_event(event, request_id, &mut content, &ui).await;
+                    consume_stream_event(
+                        event,
+                        request_id,
+                        &mut content,
+                        &mut saw_any_semantic,
+                        &mut saw_tool_calls,
+                        &ui,
+                    )
+                    .await;
                 }
                 result = &mut stream => {
                     let response = match result {
@@ -338,7 +350,15 @@ pub async fn run<P: Provider>(
                             // 先收完 provider 返回前已入队的残余 delta（与 Ok 分支一致），
                             // 否则取消时已到达的文本可能丢失（P1-1 测试场景）。
                             while let Ok(event) = event_rx.try_recv() {
-                                forward_provider_event(event, request_id, &mut content, &ui).await;
+                                consume_stream_event(
+                                    event,
+                                    request_id,
+                                    &mut content,
+                                    &mut saw_any_semantic,
+                                    &mut saw_tool_calls,
+                                    &ui,
+                                )
+                                .await;
                             }
                             // §6.2/§11.5：取消（Esc/Ctrl-C）是正常结束——提交已到达的内容，
                             // 记录 Cancelled 原因并保留 session，而不是让 run 以错误退出。
@@ -376,9 +396,47 @@ pub async fn run<P: Provider>(
                         Err(e) => {
                             // 错误详情记录到日志（§19.2：provider 错误可诊断）。
                             tracing::error!(%request_id, error = %e, "provider request failed");
+                            // 先收完已入队的残余 delta（与 Cancelled 分支一致）。
+                            while let Ok(event) = event_rx.try_recv() {
+                                consume_stream_event(
+                                    event,
+                                    request_id,
+                                    &mut content,
+                                    &mut saw_any_semantic,
+                                    &mut saw_tool_calls,
+                                    &ui,
+                                )
+                                .await;
+                            }
+                            // §4.3：区分"未收到任何语义事件"（连接不可用）与
+                            // "已收到部分内容后断联"（记录 interrupted attempt）。
+                            // partial content 已发给 UI 但不是一个完整 turn：
+                            // 不提交为 AssistantMessageCommitted，写入记录型事件。
+                            if saw_any_semantic {
+                                let cause = interrupt_cause(&e);
+                                session
+                                    .append_event(&SessionEvent::AssistantAttemptInterrupted {
+                                        request_id,
+                                        content: content.clone(),
+                                        cause,
+                                        saw_tool_calls,
+                                    })
+                                    .and_then(|_| session.sync_data())
+                                    .map_err(|e2| RunFailure::Session(e2.to_string()))?;
+                                session
+                                    .append_event(&SessionEvent::RunCompleted {
+                                        reason: CompletionReason::ProviderInterrupted,
+                                        usage: usage_total,
+                                    })
+                                    .and_then(|_| session.sync_data())
+                                    .map_err(|e2| RunFailure::Session(e2.to_string()))?;
+                                // 保留 partial 供 UI/outcome 展示，但不动 messages（不是已提交事实）。
+                                assistant_text = content.clone();
+                                break 'run_loop CompletionReason::ProviderInterrupted;
+                            }
                             session
                                 .append_event(&SessionEvent::RunCompleted {
-                                    reason: CompletionReason::Error,
+                                    reason: CompletionReason::ProviderUnavailable,
                                     usage: usage_total,
                                 })
                                 .ok();
@@ -388,7 +446,15 @@ pub async fn run<P: Provider>(
                     // provider 返回后仍可能有已经入队的末尾 delta；这些发送都已完成，
                     // 因而非阻塞 drain 即可，也不会依赖 future 内部 Sender 的析构时机。
                     while let Ok(event) = event_rx.try_recv() {
-                        forward_provider_event(event, request_id, &mut content, &ui).await;
+                        consume_stream_event(
+                            event,
+                            request_id,
+                            &mut content,
+                            &mut saw_any_semantic,
+                            &mut saw_tool_calls,
+                            &ui,
+                        )
+                        .await;
                     }
                     break response;
                 }
@@ -500,6 +566,29 @@ pub async fn run<P: Provider>(
     })
 }
 
+/// 消费一个 provider 流事件：更新语义内容标志并投影到 UI。
+///
+/// 主 select 分支与所有 drain 分支共用，保证 `saw_any_semantic`/`saw_tool_calls`
+/// 与实际已消费事件一致（§4.3：断联分类依赖该标志）。
+async fn consume_stream_event(
+    event: ProviderEvent,
+    request_id: RequestId,
+    content: &mut String,
+    saw_any_semantic: &mut bool,
+    saw_tool_calls: &mut bool,
+    ui: &mpsc::Sender<RuntimeEvent>,
+) {
+    match &event {
+        ProviderEvent::TextDelta(_) => *saw_any_semantic = true,
+        ProviderEvent::ToolCallStarted { .. } | ProviderEvent::ToolArgumentsDelta { .. } => {
+            *saw_any_semantic = true;
+            *saw_tool_calls = true;
+        }
+        ProviderEvent::ReasoningDelta(_) | ProviderEvent::Usage(_) => {}
+    }
+    forward_provider_event(event, request_id, content, ui).await;
+}
+
 /// 把 provider 的单个增量同时投影到 session 待提交内容和 TUI。
 async fn forward_provider_event(
     event: ProviderEvent,
@@ -531,6 +620,20 @@ async fn forward_provider_event(
         ProviderEvent::ToolCallStarted { .. }
         | ProviderEvent::ToolArgumentsDelta { .. }
         | ProviderEvent::Usage(_) => {}
+    }
+}
+
+/// 把 provider 错误分类为会话中断原因（§4.3）。
+fn interrupt_cause(error: &crate::provider::ProviderError) -> crate::session::InterruptCause {
+    use crate::provider::ProviderError;
+    use crate::session::InterruptCause;
+    match error {
+        ProviderError::Connection(_) => InterruptCause::Connection,
+        ProviderError::Http(_) => InterruptCause::Connection,
+        ProviderError::Protocol(_) => InterruptCause::Protocol,
+        ProviderError::RateLimited(_) => InterruptCause::RateLimited,
+        ProviderError::Auth(_) => InterruptCause::Auth,
+        ProviderError::Cancelled => InterruptCause::Other,
     }
 }
 
@@ -656,9 +759,19 @@ error: invalid_arguments
         // write-ahead（§14.2）：wave 内写工具先持久化 ToolStarted。
         for call in &wave {
             let source = &calls[call.source_index];
-            let plan = write_tool_plan(call.tool, source, &config.workspace_root);
-            let recovery =
-                recovery_metadata(call.tool, source, plan.as_ref(), &config.workspace_root);
+            let plan = write_tool_plan(
+                call.tool,
+                source,
+                &config.workspace_root,
+                config.allow_outside_workspace,
+            );
+            let recovery = recovery_metadata(
+                call.tool,
+                source,
+                plan.as_ref(),
+                &config.workspace_root,
+                config.allow_outside_workspace,
+            );
             if tool::requires_write_ahead(call.tool) {
                 session
                     .write_ahead_tool(source.call_id, recovery)
@@ -737,7 +850,12 @@ error: invalid_arguments
                     .await;
             }
 
-            let plan = write_tool_plan(tool, &calls[source_index], &config.workspace_root);
+            let plan = write_tool_plan(
+                tool,
+                &calls[source_index],
+                &config.workspace_root,
+                config.allow_outside_workspace,
+            );
             // §10.7 第 6 步：backup 保留到 ToolCompleted 持久化之后；
             // 记录清理路径（成功后删除），崩溃恢复窗口依赖 backup 存在。
             if let Some(backup) = plan.as_ref().and_then(|p| p.backup_path.as_ref()) {
@@ -1122,6 +1240,7 @@ fn write_tool_plan(
     tool: BuiltinTool,
     call: &ToolCall,
     workspace_root: &Utf8PathBuf,
+    allow_outside_workspace: bool,
 ) -> Option<tool::edit::CommitPlan> {
     match tool {
         BuiltinTool::Edit | BuiltinTool::Write => {
@@ -1137,7 +1256,9 @@ fn write_tool_plan(
                     parsed.path
                 }
             };
-            let target_path = crate::tool::resolve_workspace_path(workspace_root, &target).ok()?;
+            let target_path =
+                crate::tool::resolve_write_path(workspace_root, &target, allow_outside_workspace)
+                    .ok()?;
             Some(tool::edit::prepare_commit(&target_path))
         }
         _ => None,
@@ -1150,6 +1271,7 @@ fn recovery_metadata(
     call: &ToolCall,
     plan: Option<&tool::edit::CommitPlan>,
     workspace_root: &Utf8PathBuf,
+    allow_outside_workspace: bool,
 ) -> Option<RecoveryMetadata> {
     let plan_paths = |plan: &tool::edit::CommitPlan| {
         (
@@ -1164,7 +1286,12 @@ fn recovery_metadata(
             let parsed = serde_json::from_str::<tool::edit::EditArgs>(arguments).ok()?;
             let (temp, backup) = plan_paths(plan?);
             // §9.1：内部记录使用绝对路径（session 是内部事实源；恢复器据此定位文件）。
-            let target = crate::tool::resolve_workspace_path(workspace_root, &parsed.path).ok()?;
+            let target = crate::tool::resolve_write_path(
+                workspace_root,
+                &parsed.path,
+                allow_outside_workspace,
+            )
+            .ok()?;
             Some(RecoveryMetadata {
                 tool: "edit".into(),
                 target_path: target.to_string(),
@@ -1176,7 +1303,12 @@ fn recovery_metadata(
         (BuiltinTool::Write, arguments) => {
             let parsed = serde_json::from_str::<tool::files::WriteArgs>(arguments).ok()?;
             let (temp, backup) = plan_paths(plan?);
-            let target = crate::tool::resolve_workspace_path(workspace_root, &parsed.path).ok()?;
+            let target = crate::tool::resolve_write_path(
+                workspace_root,
+                &parsed.path,
+                allow_outside_workspace,
+            )
+            .ok()?;
             Some(RecoveryMetadata {
                 tool: "write".into(),
                 target_path: target.to_string(),

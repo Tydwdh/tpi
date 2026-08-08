@@ -725,7 +725,7 @@ async fn provider_failure_keeps_session_recoverable() {
     .await;
     assert!(result.is_err(), "provider 失败必须传播为 Err");
 
-    // session 保留：UserSubmitted 已持久化 + RunCompleted(Error)，可恢复。
+    // session 保留：UserSubmitted 已持久化 + RunCompleted(ProviderUnavailable)，可恢复。
     let events = tpi::session::read_events(session.path()).unwrap();
     let kinds: Vec<&str> = events.iter().map(|e| e.type_name()).collect();
     assert!(
@@ -743,7 +743,11 @@ async fn provider_failure_keeps_session_recoverable() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(reason, tpi::session::CompletionReason::Error);
+    assert_eq!(
+        reason,
+        tpi::session::CompletionReason::ProviderUnavailable,
+        "连接失败（未收到任何事件）reason 必须是 ProviderUnavailable（§4.3，此前归为 Error）"
+    );
 }
 
 #[allow(deprecated)]

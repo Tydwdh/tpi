@@ -296,3 +296,176 @@ async fn p1_10_manual_compaction_runs_at_next_boundary() {
         "force 压缩必须提交 CompactionCommitted（context_window=None 时自动压缩不会触发）: {events:?}"
     );
 }
+
+/// §4.3：已发出部分文本后连接断开的 provider。
+struct InterruptAfterDeltaProvider;
+
+impl Provider for InterruptAfterDeltaProvider {
+    fn model_name(&self) -> &str {
+        "interrupt-after-delta"
+    }
+
+    async fn stream(
+        &mut self,
+        _request: ModelRequest,
+        events: mpsc::Sender<ProviderEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderResponse, ProviderError> {
+        events
+            .send(ProviderEvent::TextDelta("问题在 src/tool/files.rs 的 write...".into()))
+            .await
+            .map_err(|_| ProviderError::Protocol("closed".into()))?;
+        events
+            .send(ProviderEvent::TextDelta("因为 target_exists 分支".into()))
+            .await
+            .map_err(|_| ProviderError::Protocol("closed".into()))?;
+        Err(ProviderError::Connection("connection reset by peer".into()))
+    }
+}
+
+/// §4.3：已收到部分内容后断联——run 以 ProviderInterrupted 正常结束，
+/// partial content 写入 AssistantAttemptInterrupted（record 事件），
+/// 不丢、不进入对话投影（不是完整 turn）。
+#[tokio::test]
+async fn interrupted_attempt_records_partial_and_keeps_session_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = InterruptAfterDeltaProvider;
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, mut rx) = mpsc::channel(16);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        &[],
+        "hello".into(),
+        tx,
+        CancellationToken::new(),
+        false,
+        false,
+    )
+    .await
+    .expect("interrupted run 以正常结果结束（非 Err）");
+
+    drain.abort();
+    assert_eq!(outcome.reason, CompletionReason::ProviderInterrupted);
+    // 用户看到的 partial 必须保留在 outcome（UI 展示用）。
+    assert!(
+        outcome.assistant_text.contains("target_exists"),
+        "partial output 必须保留: {}",
+        outcome.assistant_text
+    );
+
+    // session 事实：AssistantAttemptInterrupted（不是 AssistantMessageCommitted）。
+    let events = tpi::session::read_events(session.path()).unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SessionEvent::AssistantAttemptInterrupted {
+                content,
+                cause: tpi::session::InterruptCause::Connection,
+                saw_tool_calls: false,
+                ..
+            } if content.contains("target_exists")
+        )),
+        "session 必须记录中断 attempt（connection cause, partial content）: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::AssistantMessageCommitted { .. })),
+        "中断的 attempt 不得伪装成已提交 assistant 消息"
+    );
+
+    // 不进入对话投影：messages 只有 user 消息。
+    assert!(
+        !outcome
+            .messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::Assistant { .. })),
+        "partial 不是完整 turn，不得进入上下文"
+    );
+}
+
+/// §4.3：未收到任何语义事件就连接失败——run 以 Err(RunFailure::Provider) 结束，
+/// reason 记为 ProviderUnavailable，且没有任何 AssistantAttemptInterrupted。
+struct UnavailableProvider;
+
+impl Provider for UnavailableProvider {
+    fn model_name(&self) -> &str {
+        "unavailable-provider"
+    }
+
+    async fn stream(
+        &mut self,
+        _request: ModelRequest,
+        _events: mpsc::Sender<ProviderEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderResponse, ProviderError> {
+        Err(ProviderError::Connection("connect timeout".into()))
+    }
+}
+
+#[tokio::test]
+async fn unavailable_connect_fails_without_recorded_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = UnavailableProvider;
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, mut rx) = mpsc::channel(16);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let result = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        &[],
+        "hello".into(),
+        tx,
+        CancellationToken::new(),
+        false,
+        false,
+    )
+    .await;
+    drain.abort();
+    let error = match result {
+        Ok(_) => panic!("连接失败必须返回 Err"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("provider failure"),
+        "必须是 provider failure: {error}"
+    );
+
+    let events = tpi::session::read_events(session.path()).unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::AssistantAttemptInterrupted { .. })),
+        "未收到内容不得记录中断 attempt"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SessionEvent::RunCompleted {
+                reason: CompletionReason::ProviderUnavailable,
+                ..
+            }
+        )),
+        "连接失败 reason 必须是 ProviderUnavailable: {events:?}"
+    );
+}

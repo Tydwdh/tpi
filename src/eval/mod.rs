@@ -292,6 +292,8 @@ fn stats_from_events(events: &[(i128, SessionEvent)]) -> EvalStats {
             SessionEvent::UserSubmitted { .. } => start_ts = Some(*ts),
             SessionEvent::RunStarted { .. } => stats.run_calls += 1,
             SessionEvent::AssistantMessageCommitted { .. } => stats.turns += 1,
+            // 中断的 attempt 不是完整 turn：不计入 turns（§4.3 语义区分）。
+            SessionEvent::AssistantAttemptInterrupted { .. } => {}
             SessionEvent::ToolRequested { call } => {
                 stats.tool_calls += 1;
                 tool_name.insert(call.call_id.to_string(), call.name.clone());

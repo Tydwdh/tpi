@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use crate::ids::{EventId, RunId, SessionId, ToolCallId};
+use crate::ids::{EventId, RequestId, RunId, SessionId, ToolCallId};
 use crate::provider::{ChatMessage, ToolCall};
 use crate::tool::outcome::StoredToolOutcome;
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,10 @@ pub enum CompletionReason {
     ContextOverflow,
     /// §16：wall-clock 预算到期被 watchdog 自动取消（不是用户取消）。
     WallTimeExceeded,
+    /// provider 连接不可用（未收到任何语义事件；pre-stream 重试预算耗尽）。
+    ProviderUnavailable,
+    /// 流中途断联且已收到部分文本（已记录 `AssistantAttemptInterrupted`）。
+    ProviderInterrupted,
     /// 长度限制、内容过滤或协议错误。
     Error,
 }
@@ -98,6 +102,21 @@ pub struct RecoveryMetadata {
     pub backup_path: Option<String>,
 }
 
+/// 会话中断原因（§4.3：provider 断联是记录型事实，不伪装成已提交内容）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InterruptCause {
+    /// 连接/传输层失败（DNS/reset/timeout/5xx 等）。
+    Connection,
+    /// 收到事件后的协议错误（SSE 截断、解析失败、流在 [DONE] 前结束等）。
+    Protocol,
+    /// 服务端限流（429）。
+    RateLimited,
+    /// 认证失败（401/403）。
+    Auth,
+    /// 其他/未知。
+    Other,
+}
+
 /// Durable session 事件（文档 §4.3 的完整枚举）。
 ///
 /// 只有已提交事实才能成为事件：私有 reasoning、未提交的流式增量
@@ -113,6 +132,15 @@ pub enum SessionEvent {
     },
     AssistantMessageCommitted {
         message: AssistantMessage,
+    },
+    /// 流中断的 assistant attempt（§4.3）：与 [`AssistantMessageCommitted`] 语义不同——
+    /// 这不是一个完整 turn，不进入对话历史投影；只记录"部分输出曾存在"这一事实，
+    /// 供恢复/诊断与 UI 一致性。partial content 已发给 UI 但未提交为上下文。
+    AssistantAttemptInterrupted {
+        request_id: RequestId,
+        content: String,
+        cause: InterruptCause,
+        saw_tool_calls: bool,
     },
     ToolRequested {
         call: ToolCall,
@@ -146,6 +174,7 @@ impl SessionEvent {
             SessionEvent::UserSubmitted { .. } => "user_submitted",
             SessionEvent::RunStarted { .. } => "run_started",
             SessionEvent::AssistantMessageCommitted { .. } => "assistant_message_committed",
+            SessionEvent::AssistantAttemptInterrupted { .. } => "assistant_attempt_interrupted",
             SessionEvent::ToolRequested { .. } => "tool_requested",
             SessionEvent::ToolStarted { .. } => "tool_started",
             SessionEvent::ToolCompleted { .. } => "tool_completed",
@@ -182,6 +211,9 @@ pub enum EventBody {
     AssistantMessageCommitted {
         payload: AssistantMessageCommittedPayload,
     },
+    AssistantAttemptInterrupted {
+        payload: AssistantAttemptInterruptedPayload,
+    },
     ToolRequested {
         payload: ToolRequestedPayload,
     },
@@ -216,6 +248,14 @@ pub struct RunStartedPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantMessageCommittedPayload {
     pub message: AssistantMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssistantAttemptInterruptedPayload {
+    pub request_id: RequestId,
+    pub content: String,
+    pub cause: InterruptCause,
+    pub saw_tool_calls: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,6 +313,19 @@ impl Envelope {
                     },
                 }
             }
+            SessionEvent::AssistantAttemptInterrupted {
+                request_id,
+                content,
+                cause,
+                saw_tool_calls,
+            } => EventBody::AssistantAttemptInterrupted {
+                payload: AssistantAttemptInterruptedPayload {
+                    request_id: *request_id,
+                    content: content.clone(),
+                    cause: cause.clone(),
+                    saw_tool_calls: *saw_tool_calls,
+                },
+            },
             SessionEvent::ToolRequested { call } => EventBody::ToolRequested {
                 payload: ToolRequestedPayload { call: call.clone() },
             },
@@ -338,6 +391,14 @@ impl Envelope {
             EventBody::AssistantMessageCommitted { payload } => {
                 SessionEvent::AssistantMessageCommitted {
                     message: payload.message.clone(),
+                }
+            }
+            EventBody::AssistantAttemptInterrupted { payload } => {
+                SessionEvent::AssistantAttemptInterrupted {
+                    request_id: payload.request_id,
+                    content: payload.content.clone(),
+                    cause: payload.cause.clone(),
+                    saw_tool_calls: payload.saw_tool_calls,
                 }
             }
             EventBody::ToolRequested { payload } => SessionEvent::ToolRequested {
@@ -852,5 +913,55 @@ mod tests {
             ),
             "WallTimeExceeded 必须可序列化/反序列化"
         );
+    }
+
+    /// §4.3：AssistantAttemptInterrupted 是记录型事件——partial content 持久化但
+    /// 不进入对话投影（与 AssistantMessageCommitted 语义区分）。
+    #[test]
+    fn assistant_attempt_interrupted_round_trips_and_skips_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = PathBuf::from(dir.path());
+        let mut log = SessionLog::create(
+            &dir.path().join("sessions"),
+            workspace.as_path(),
+            RunId::new_v7(),
+        )
+        .unwrap();
+        log.append_event(&SessionEvent::UserSubmitted {
+            content: "hello".into(),
+        })
+        .unwrap();
+        log.append_event(&SessionEvent::AssistantAttemptInterrupted {
+            request_id: RequestId::new_v7(),
+            content: "部分输出已经".into(),
+            cause: InterruptCause::Connection,
+            saw_tool_calls: false,
+        })
+        .unwrap();
+        log.append_event(&SessionEvent::RunCompleted {
+            reason: CompletionReason::ProviderInterrupted,
+            usage: Usage::default(),
+        })
+        .unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        let events = read_events(&path).unwrap();
+        assert!(
+            matches!(
+                events.get(1),
+                Some(SessionEvent::AssistantAttemptInterrupted {
+                    content,
+                    cause: InterruptCause::Connection,
+                    saw_tool_calls: false,
+                    ..
+                }) if content == "部分输出已经"
+            ),
+            "中断事件必须可序列化/反序列化"
+        );
+        // 投影：中断的 attempt 不产生 assistant 消息，也不中断后续投影。
+        let messages = replay_messages(&path).unwrap();
+        assert_eq!(messages.len(), 1, "只有 user 消息进入投影");
+        assert!(matches!(messages[0], ChatMessage::User(_)));
     }
 }
