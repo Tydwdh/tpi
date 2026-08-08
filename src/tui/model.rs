@@ -745,26 +745,32 @@ impl ViewModel {
             let heights = self.current_heights(&ids);
             let top_row = crate::tui::scroll::row_of(&ids, &heights, entry, row);
             let total: usize = heights.iter().sum();
-            let area = self.transcript_rows as usize;
-            // 到底后保持 Locked（End 显式回 Follow，§10）。
+            let area = self.transcript_rows.max(1) as usize;
             let new_top = crate::tui::scroll::move_by_rows(&ids, &heights, top_row, delta as isize);
             let new_row = crate::tui::scroll::row_of(&ids, &heights, new_top.0, new_top.1);
             if new_row + area >= total {
-                // 已到最底：仍 Locked（不自动 Follow），但清空 pending。
-                self.pending_below = 0;
+                // 滚到最底部：回到 Follow（新内容自动跟随）。
+                // 此前保持 Locked 会让用户滚到底后新内容不再自动跟上，
+                // 反复滚动无视觉变化，表现为"滚动卡住"（§10 体验修复）。
+                self.follow_tail();
+                return;
             }
             self.lock_to(new_top.0, new_top.1);
         }
     }
 
     /// 滚动基准行：Locked = 当前锚点；Follow = 最近布局的视口顶部行
-    /// （无布局信息时锚定最早条目）。
+    /// （无布局信息时锚定**内容末尾**——从 Follow 底部上翻符合直觉，
+    /// 而不是跳到第一条）。
     fn scroll_base(&self) -> Option<(EntryId, usize)> {
         match self.scroll_mode {
             ScrollMode::Locked(anchor) => Some((anchor.entry_id, anchor.row_in_entry)),
-            ScrollMode::Follow => self
-                .layout_top
-                .or_else(|| self.transcript.first().map(|e| (e.id(), 0))),
+            ScrollMode::Follow => self.layout_top.or_else(|| {
+                // 未布局：锚定末尾（Follow 视口底部 = 内容最后一行）。
+                let last = self.transcript.last()?;
+                let height = self.entry_heights.get(&last.id()).copied().unwrap_or(1);
+                Some((last.id(), height.saturating_sub(1)))
+            }),
         }
     }
 

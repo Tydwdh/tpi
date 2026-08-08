@@ -1880,6 +1880,92 @@ mod tests {
         assert_eq!(plan2.committed_after, 6);
     }
 
+    /// §58 回归：Follow → PgUp（进 Locked）→ PgDn 到底 → 新内容 → 再 PgDn 必须能滚到底。
+    /// 防止「滚动无反应」（scroll_down 在 Follow 直接 return + Locked 到底后不自动跟随）。
+    #[test]
+    fn scroll_up_then_down_with_new_content_is_not_stuck() {
+        let mut view = ViewModel::default();
+        for i in 0..8 {
+            view.push_line(LineKind::Assistant, format!("line {i}"));
+        }
+        let mut cache = HashMap::new();
+        // 布局：Follow，视口 4 行 → 顶部行 = 4（显示 line4-7）。
+        let plan = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        assert_eq!(plan.window.len(), 4);
+        let window_text: String = plan
+            .window
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            window_text.contains("line 7"),
+            "Follow 显示尾部: {window_text}"
+        );
+
+        // PgUp 两次（每次 8 行，实际 clamp 到顶）：应进入 Locked 并锚定顶部。
+        view.scroll_up(8);
+        view.scroll_up(8);
+        assert!(
+            matches!(view.scroll_mode, ScrollMode::Locked(_)),
+            "PgUp 必须进入 Locked"
+        );
+        let plan_top = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let window_text: String = plan_top
+            .window
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            window_text.contains("line 0"),
+            "PgUp 后应显示顶部: {window_text}"
+        );
+
+        // 新内容到达（模拟 run 中）→ 仍 Locked（视口不动）。
+        view.push_line(LineKind::Assistant, "line 8 new".to_string());
+        let plan_new = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let window_text: String = plan_new
+            .window
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            !window_text.contains("line 8 new"),
+            "Locked 时新内容不移动视口"
+        );
+
+        // PgDn 回到底部（多次）：最终应能看到新内容（可滚回最新）。
+        for _ in 0..10 {
+            view.scroll_down(8);
+        }
+        let plan_bottom = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let window_text: String = plan_bottom
+            .window
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            window_text.contains("line 8 new"),
+            "PgDn 到底后应能看到新内容（不得卡住）: {window_text}"
+        );
+        // 滚到底自动回 Follow：新内容继续自动跟随（§10 体验修复）。
+        assert_eq!(
+            view.scroll_mode,
+            ScrollMode::Follow,
+            "滚到底后必须自动回到 Follow（新内容自动跟随，不再卡住）"
+        );
+        view.push_line(LineKind::Assistant, "line 9 newest".to_string());
+        let plan_newest = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let window_text: String = plan_newest
+            .window
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            window_text.contains("line 9 newest"),
+            "回 Follow 后新内容自动跟随: {window_text}"
+        );
+    }
+
     #[test]
     fn markdown_bold_code_and_code_block_render_styled() {
         let theme = theme::Theme::omp();
