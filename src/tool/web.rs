@@ -34,6 +34,8 @@ AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const DDG_HTML_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 /// Bing HTML 端点（免费回退引擎；可能对异常流量返回人机验证页）。
 const BING_ENDPOINT: &str = "https://www.bing.com/search";
+/// Yahoo HTML 端点（免费第三回退引擎；对异常流量容忍度较高）。
+const YAHOO_ENDPOINT: &str = "https://search.yahoo.com/search";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct WebSearchArgs {
@@ -194,8 +196,9 @@ async fn read_bounded_bytes(response: reqwest::Response, limit: usize) -> Result
 /// web_search（§17：只用于发现来源；结果摘要不是最终证据）。
 ///
 /// 免费方案：主引擎 DuckDuckGo HTML 端点；失败（人机验证/无结果/HTTP
-/// 错误）时自动回退 Bing HTML 端点——不同网络环境下至少一个可用。
-/// 两个引擎都返回人机验证页时给出汇总错误，不产生乱码输出。
+/// 错误）时依次回退 Bing、Yahoo HTML 端点——不同网络环境下至少一个可用
+/// （本机实测 DDG/Bing 可能同时返回人机验证页，Yahoo 通常可用）。
+/// 全部引擎都失败时给出汇总错误，不产生乱码输出。
 pub async fn web_search(args: WebSearchArgs, _ctx: &ToolContext) -> ToolOutcome {
     let count = args.count.clamp(1, 20);
     let query = build_search_query(&args);
@@ -207,20 +210,26 @@ pub async fn web_search(args: WebSearchArgs, _ctx: &ToolContext) -> ToolOutcome 
             tracing::warn!(error = %ddg_error, "web_search: DDG 失败，回退 Bing");
             match search_bing(&query, freshness).await {
                 Ok(hits) => search_succeeded(&args, hits, count),
-                Err(bing_error) => ToolOutcome::failed(
-                    "web_search",
-                    ModelPayload {
-                        status: ToolStatus::Failed,
-                        program: None,
-                        exit_code: None,
-                        duration_ms: 0,
-                        output: format!(
-                            "status: failed\ntool: web_search\nerror: both_engines_failed\n\nDuckDuckGo: {ddg_error}\nBing: {bing_error}"
+                Err(bing_error) => {
+                    tracing::warn!(error = %bing_error, "web_search: Bing 失败，回退 Yahoo");
+                    match search_yahoo(&query, freshness).await {
+                        Ok(hits) => search_succeeded(&args, hits, count),
+                        Err(yahoo_error) => ToolOutcome::failed(
+                            "web_search",
+                            ModelPayload {
+                                status: ToolStatus::Failed,
+                                program: None,
+                                exit_code: None,
+                                duration_ms: 0,
+                                output: format!(
+                                    "status: failed\ntool: web_search\nerror: all_engines_failed\n\nDuckDuckGo: {ddg_error}\nBing: {bing_error}\nYahoo: {yahoo_error}"
+                                ),
+                                effect: None,
+                                artifact: None,
+                            },
                         ),
-                        effect: None,
-                        artifact: None,
-                    },
-                ),
+                    }
+                }
             }
         }
     }
@@ -344,6 +353,34 @@ fn bing_freshness(value: &str) -> Option<&'static str> {
         "pd_1w" => Some(r#"interval="7""#),
         "pd_1m" => Some(r#"interval="30""#),
         "pd_1y" => Some(r#"interval="365""#),
+        _ => None,
+    }
+}
+
+/// Yahoo 引擎：无结果/人机验证/错误时返回 Err。
+async fn search_yahoo(query: &str, freshness: Option<&str>) -> Result<Vec<DdgHit>, String> {
+    let mut url = format!("{YAHOO_ENDPOINT}?p={}", urlencode(query));
+    if let Some(age) = freshness.and_then(yahoo_freshness) {
+        url.push_str(&format!("&age={age}"));
+    }
+    let body = fetch_search_html(&url).await?;
+    if is_yahoo_captcha(&body) {
+        return Err("bot_challenge: Yahoo 返回人机验证页（疑似流量异常）".into());
+    }
+    let hits = parse_yahoo_results(&body);
+    if hits.is_empty() {
+        return Err("no_results: Yahoo 无结果（或页面结构变化）".into());
+    }
+    Ok(hits)
+}
+
+/// Yahoo 的 age 参数（1d/1w/1m/1y）。
+fn yahoo_freshness(value: &str) -> Option<&'static str> {
+    match value {
+        "pd_1d" => Some("1d"),
+        "pd_1w" => Some("1w"),
+        "pd_1m" => Some("1m"),
+        "pd_1y" => Some("1y"),
         _ => None,
     }
 }
@@ -627,6 +664,109 @@ fn base64url_decode(value: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+// ---- Yahoo HTML 端点（第三回退引擎）----
+
+/// Yahoo HTML 端点的人机验证页特征。
+pub fn is_yahoo_captcha(html: &str) -> bool {
+    html.contains("yid-captcha")
+        || html.contains("Please verify you are a human")
+        || html.contains("captcha")
+        || html.contains("challenge")
+}
+
+/// 解析 Yahoo HTML 结果页。
+///
+/// 结构：`<li><div class="dd algo ...">` 每块一个结果；标题
+/// `<div class="compTitle..."><a ... href="https://r.search.yahoo.com/.../RU=<enc>/RK=...">`；
+/// 摘要 `<div class="compText"><p ...><span ...>snippet</span>`。
+pub fn parse_yahoo_results(html: &str) -> Vec<DdgHit> {
+    let mut hits = Vec::new();
+    for block in html.split("dd algo").skip(1) {
+        // 跳过广告/推广块（Yahoo 广告通常含 promo/ad 标记）。
+        if block.contains("promo") || block.contains("algo-ad") {
+            continue;
+        }
+        let Some((title, raw_href)) = extract_yahoo_title(block) else {
+            continue;
+        };
+        let url = decode_yahoo_href(&raw_href);
+        if url.is_empty() || title.is_empty() {
+            continue;
+        }
+        let snippet = extract_yahoo_snippet(block).unwrap_or_default();
+        hits.push(DdgHit {
+            title,
+            url,
+            snippet,
+        });
+    }
+    hits
+}
+
+/// 提取 Yahoo 标题块的链接（compTitle 下的 `<a href>`）与标题文本
+/// （`<h3 class="title">` 内第一个 span 文本）。
+fn extract_yahoo_title(block: &str) -> Option<(String, String)> {
+    let marker = block.find("compTitle")?;
+    let rest = &block[marker..];
+    let anchor_start = rest.find("<a ")?;
+    let after = &rest[anchor_start..];
+    let tag_end = after.find('>')?;
+    let href = extract_href_attr(&after[..tag_end]);
+    // 标题在 h3.title 的 span 内（a 内还有 favicon/域名 span，不能整体取）。
+    let h3 = rest.find("<h3")?;
+    let seg = &rest[h3..];
+    let span_start = seg.find("<span")?;
+    let after_span = &seg[span_start..];
+    let span_tag_end = after_span.find('>')?;
+    let inner = &after_span[span_tag_end + 1..];
+    let close = inner.find("</span>")?;
+    let text = strip_tags(&inner[..close]);
+    Some((text, href))
+}
+
+/// 提取 Yahoo 摘要（compText 块内第一个非空 p/span 文本）。
+fn extract_yahoo_snippet(block: &str) -> Option<String> {
+    let start = block.find("compText")?;
+    let after = &block[start..];
+    // 依次尝试 p 与 span 容器，取第一个非空文本。
+    for container in ["<p", "<span"] {
+        let Some(c_start) = after.find(container) else {
+            continue;
+        };
+        let seg = &after[c_start..];
+        let Some(tag_end) = seg.find('>') else {
+            continue;
+        };
+        let inner = &seg[tag_end + 1..];
+        let close_marker = if container == "<p" { "</p>" } else { "</span>" };
+        let Some(close) = inner.find(close_marker) else {
+            continue;
+        };
+        let text = strip_tags(&inner[..close]);
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// 还原 Yahoo 跳转链接：`https://r.search.yahoo.com/.../RU=<urlencoded>/RK=...`。
+/// 非跳转链接原样返回。
+fn decode_yahoo_href(href: &str) -> String {
+    let decoded = decode_html_entities(href);
+    if let Some(ru) = decoded.find("/RU=") {
+        let value = &decoded[ru + 4..];
+        let value = value.split('/').next().unwrap_or("");
+        let value = percent_decode(value);
+        if value.starts_with("http://") || value.starts_with("https://") {
+            return value;
+        }
+    }
+    if let Some(rest) = decoded.strip_prefix("//") {
+        return format!("https://{rest}");
+    }
+    decoded
 }
 
 /// web_fetch（§17：限制 redirect、响应体大小和 timeout；HTML 转换）。
@@ -1059,6 +1199,70 @@ mod tests {
         let real = r#"var CfConfig ={"lang":"en","verifyEndpoint":"https://www.bing.com/challenge/verify?partner=7","captchaSuccessPostMessage":"verificationComplete"};"#;
         assert!(is_bing_captcha(real));
         assert!(!is_bing_captcha(&bing_fixture()));
+    }
+
+    // ---- Yahoo 第三回退引擎 ----
+
+    /// 真实端点 fixture：3 个 dd algo 结果块（含 r.search.yahoo.com 重定向）。
+    fn yahoo_fixture() -> String {
+        include_str!("../../tests/fixtures/yahoo_results.html").to_string()
+    }
+
+    #[test]
+    fn parses_yahoo_fixture_decodes_redirects() {
+        let hits = parse_yahoo_results(&yahoo_fixture());
+        assert!(!hits.is_empty(), "必须解析出结果");
+        // RU= 参数还原真实 URL（percent 解码）。
+        for hit in &hits {
+            assert!(
+                hit.url.starts_with("https://") || hit.url.starts_with("http://"),
+                "URL 必须为绝对地址: {}",
+                hit.url
+            );
+            assert!(
+                !hit.url.contains("r.search.yahoo.com"),
+                "重定向链接必须还原: {}",
+                hit.url
+            );
+            assert!(!hit.title.is_empty(), "标题非空");
+            assert!(
+                !hit.title.contains("https://") && !hit.title.contains("›"),
+                "标题不得混入 URL 路径: {}",
+                hit.title
+            );
+            assert!(!hit.snippet.is_empty(), "摘要非空: {}", hit.title);
+        }
+    }
+
+    #[test]
+    fn yahoo_captcha_page_is_detected() {
+        let real = r#"<div id="yid-captcha">Please verify you are a human</div>"#;
+        assert!(is_yahoo_captcha(real));
+        assert!(!is_yahoo_captcha(&yahoo_fixture()));
+    }
+
+    #[test]
+    fn decode_yahoo_href_handles_redirect_and_plain() {
+        // 真实格式：/RU=https%3a%2f%2fwww.rust-lang.org%2ftools%2finstall/RK=2/RS=xxx
+        assert_eq!(
+            decode_yahoo_href(
+                "https://r.search.yahoo.com/_ylt=abc/RU=https%3a%2f%2frust-lang.org%2f/RK=2/RS=xyz"
+            ),
+            "https://rust-lang.org/"
+        );
+        assert_eq!(
+            decode_yahoo_href("https://plain.example/page"),
+            "https://plain.example/page"
+        );
+    }
+
+    #[test]
+    fn yahoo_freshness_maps_brave_syntax() {
+        assert_eq!(yahoo_freshness("pd_1d"), Some("1d"));
+        assert_eq!(yahoo_freshness("pd_1w"), Some("1w"));
+        assert_eq!(yahoo_freshness("pd_1m"), Some("1m"));
+        assert_eq!(yahoo_freshness("pd_1y"), Some("1y"));
+        assert_eq!(yahoo_freshness("nonsense"), None);
     }
 
     #[test]
