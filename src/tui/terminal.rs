@@ -8,9 +8,7 @@ use std::io::{BufWriter, Stdout};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-};
+use ratatui::crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste};
 use ratatui::crossterm::execute;
 
 /// 视口模式（§1：默认 fullscreen；inline 仅为兼容模式）。
@@ -62,8 +60,15 @@ impl TerminalDriver {
                 )?;
             }
             execute!(std::io::stdout(), EnableBracketedPaste)?;
-            // 鼠标 capture 失败不致命（§32：部分终端不支持；滚轮/点击降级）。
-            let _ = execute!(std::io::stdout(), EnableMouseCapture);
+            // §opencode 对齐：鼠标捕获用自定义 ANSI 序列——只启用点击/拖动
+            // （?1000h ?1002h ?1006h），**禁用 any-event（?1003h）**。这样：
+            // 应用可接收点击/拖动（展开工具、滚动），终端拖选文本仍可用
+            // （?1003h 一旦启用，终端会吞掉所有鼠标移动，文本选择失效）。
+            // 先显式 ?1003l 复位（部分终端三序列一族，last-wins）。
+            let _ = std::io::Write::write_all(
+                &mut std::io::stdout(),
+                b"\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h",
+            );
             let (_, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
             let height = inline_activity_height(rows);
             let viewport = match mode {
