@@ -213,6 +213,8 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.view.jump_to_top();
             } else {
                 state.editor.home();
+                // Home 只改光标位置，必须同步投影，否则硬件光标停在旧位置。
+                state.sync_input();
             }
         }
         KeyCode::End => {
@@ -221,6 +223,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.view.follow_tail();
             } else {
                 state.editor.end();
+                state.sync_input();
             }
         }
         KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
@@ -298,10 +301,12 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'a' {
                 state.editor.home();
+                state.sync_input(); // Ctrl+A 同样要同步光标投影
                 return effects;
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'e' {
                 state.editor.end();
+                state.sync_input();
                 return effects;
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'w' {

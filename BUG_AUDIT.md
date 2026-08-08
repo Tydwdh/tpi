@@ -230,3 +230,6 @@
 - LOCKED-INDICATOR-001（P2，UX 审计遗留）：历史浏览（Locked）且无新内容时无状态提示，用户不知道不在 Follow。已修：footer 显示“历史浏览中 · Ctrl+End 返回最新”。回归：footer_shows_history_browsing_indicator_when_locked。
 ## 迭代记录（2026-08-08 续 6）
 - MODAL-CLICK-001（P2，与弹层输入屏蔽同族）：Modal 打开时鼠标点击未屏蔽——点击工具卡在 Modal 后面再开 overlay（浮层叠加、Esc 需关两次），点击 scrollbar 滚动背后 transcript。已修：app 层 mouse_ui_event 在 Overlay/Modal 任一打开时 Down/Drag 不动作；reducer 对 ClickTool/ClickReasoning/ScrollbarClick 增加防御性屏蔽。回归：clicks_blocked_while_modal_open / clicks_blocked_while_overlay_open。
+## 迭代记录（2026-08-08 续 7）
+- WIN-UTF8-001（P2，Windows 中文系统）：启动未设控制台代码页 → GBK/936 下 UTF-8 输出乱码（-p/TUI/错误信息），config init/auth 中文输入同样受影响。已修：main() 启动 SetConsoleCP/SetConsoleOutputCP(65001) + doctor console 检查。
+- CURSOR-SYNC-001（P2）：Home/End/Ctrl+A/Ctrl+E 未同步 view.input_cursor，硬件光标停在旧位置直到下次输入。已修：四处补 sync_input。回归：home_end_sync_input_cursor_projection。

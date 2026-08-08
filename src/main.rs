@@ -110,7 +110,23 @@ enum AuthCommand {
     Status { provider: String },
 }
 
+/// Windows 控制台默认代码页（中文系统为 GBK/936）会把 UTF-8 输出显示成乱码；
+/// 启动时把输入/输出代码页切到 UTF-8（Win10+ 稳定支持；重定向到文件/管道不受影响）。
+#[cfg(windows)]
+fn setup_console_utf8() {
+    use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+    const CP_UTF8: u32 = 65001;
+    unsafe {
+        SetConsoleCP(CP_UTF8);
+        SetConsoleOutputCP(CP_UTF8);
+    }
+}
+
+#[cfg(not(windows))]
+fn setup_console_utf8() {}
+
 fn main() {
+    setup_console_utf8();
     // §11.5：单二进制 process-host 模式（隐藏进程，等待控制管道上的 start token）。
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("__process-host") {

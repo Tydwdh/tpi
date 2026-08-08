@@ -797,6 +797,39 @@ fn clicks_blocked_while_overlay_open() {
     );
 }
 
+#[test]
+fn home_end_sync_input_cursor_projection() {
+    let mut s = state();
+    reducer::update(&mut s, UiEvent::Paste("abc".into()));
+    assert_eq!(s.view.input_cursor, s.editor.cursor);
+    reducer::update(&mut s, key(KeyCode::Home));
+    assert_eq!(
+        s.view.input_cursor, 0,
+        "Home must sync the cursor projection"
+    );
+    reducer::update(&mut s, key(KeyCode::End));
+    assert_eq!(
+        s.view.input_cursor, 3,
+        "End must sync the cursor projection"
+    );
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+    );
+    assert_eq!(
+        s.view.input_cursor, 0,
+        "Ctrl+A must sync the cursor projection"
+    );
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+    );
+    assert_eq!(
+        s.view.input_cursor, 3,
+        "Ctrl+E must sync the cursor projection"
+    );
+}
+
 /// /sessions 是“菜单 + Modal 指令”组合：Enter 仍应恢复选中 session（例外路径）。
 #[test]
 fn sessions_menu_enter_still_works_with_modal_open() {

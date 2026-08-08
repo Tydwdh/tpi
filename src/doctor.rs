@@ -110,6 +110,22 @@ pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
         });
     }
 
+    // 4.5 控制台 UTF-8（Windows 中文系统 GBK 代码页会显示乱码）。
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::GetConsoleOutputCP;
+        let cp = unsafe { GetConsoleOutputCP() };
+        checks.push(DoctorCheck {
+            name: "console",
+            ok: cp == 65001,
+            detail: if cp == 65001 {
+                "控制台输出代码页 = UTF-8 (65001)".into()
+            } else {
+                format!("控制台输出代码页 = {cp}（中文系统可能显示乱码，重启后 TPI 会自动切换）")
+            },
+        });
+    }
+
     // 5. workspace 可写。
     let ws_writable = std::fs::File::create(workspace_root.join(".doctor-probe"))
         .and_then(|mut f| std::io::Write::write_all(&mut f, b"x"))

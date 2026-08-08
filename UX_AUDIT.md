@@ -230,3 +230,6 @@
 - Locked 状态提示（人体工学，第 3/9 节遗留）：历史浏览（Locked）且无新内容时 footer 显示“历史浏览中 · Ctrl+End 返回最新”。回归 footer_shows_history_browsing_indicator_when_locked。
 ## 25. 迭代第11轮（2026-08-08）
 - 弹层鼠标点击屏蔽（真 bug，与弹层输入屏蔽同族）：此前只在 overlay 打开时屏蔽鼠标点击；Modal 打开时点击工具卡会在 Modal 后面再打开一个 overlay（两个浮层叠加、Esc 要关两次），点击 scrollbar 会滚动 Modal 背后的 transcript。已修：Overlay/Modal 任一打开时，鼠标 Down/Drag 一律不动作；reducer 侧 ClickTool/ClickReasoning/ScrollbarClick 也加防御性屏蔽。回归 clicks_blocked_while_modal_open / clicks_blocked_while_overlay_open。
+## 26. 迭代第12轮（2026-08-08）
+- Windows 控制台 UTF-8（真 bug，中文系统）：启动时未切换控制台代码页，GBK/936 控制台（cmd/PowerShell 旧 conhost）会把 UTF-8 输出（-p 答案、TUI、错误信息）显示成乱码。已修：main() 启动即 SetConsoleCP/SetConsoleOutputCP(65001)；doctor 新增 console 检查项。输入（config init/auth 中文）也随输入 CP 切换受益。
+- 光标投影不同步（真 bug）：Home/End/Ctrl+A/Ctrl+E 只移动 editor 光标，未调用 sync_input()，view.input_cursor 停留在旧位置——按完键硬件光标不跟着走，直到下一次输入才纠正。已修：四处分支补 sync_input。回归 home_end_sync_input_cursor_projection。
