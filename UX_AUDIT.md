@@ -236,3 +236,6 @@
 ## 27. 迭代第13轮（2026-08-08）
 - 搜索打开时键盘翻页失效（真 bug，行为不一致）：Ctrl+F 搜索打开时，鼠标滚轮能滚动 transcript，但 PgUp/PgDn/Ctrl+Home/Ctrl+End 被搜索键路由吞掉，键盘无法浏览上下文。已修：搜索模式路由 PgUp/PgDn 滚动、Ctrl+Home 顶部、Ctrl+End 回最新（搜索保持打开）。回归 search_mode_keeps_transcript_navigation_keys。
 - 滚轮步长 3 → 5 行（第 3 节建议落地）：长对话滚轮浏览更快；Modal/Overlay 内部滚轮同步 5 行。测试同步更新。
+## 28. 迭代第14轮（2026-08-08）
+- 搜索框 Ctrl+U 失效（真 bug）：Ctrl+F 搜索打开时按 Ctrl+U（/help 承诺“清空”）会把字母 u 插入搜索词，而不是清空——因为搜索键路由把 Ctrl+U 当普通字符。已修：搜索模式 Ctrl+U 清空 query。回归 search_ctrl_u_clears_query。
+- prune 符号链接安全（真 bug，删除工具）：tpi prune 的 walk_files 用 path.is_dir()（跟随符号链接），~/.tpi/sessions 或 artifacts 里若有指向外部的符号链接目录，会把外部文件也按过期删除。已修：用 DirEntry.file_type()（不跟随链接）判断，symlink 目录不递归、symlink 文件只删链接本身。回归 walk_files_does_not_follow_symlink_dirs（unix）。

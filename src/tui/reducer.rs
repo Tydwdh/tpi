@@ -30,6 +30,12 @@ fn handle_search_key(
 ) -> Vec<UiEffect> {
     match key.code {
         KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'u' {
+                // Ctrl+U 在搜索框也应清空搜索词（与 composer 一致），
+                // 不得把 'u' 当普通字符插入。
+                state.view.update_search_query("");
+                return std::mem::take(effects);
+            }
             if c == 'f' && key.modifiers.contains(KeyModifiers::CONTROL) {
                 // Ctrl+F 已打开：无操作。
             } else {

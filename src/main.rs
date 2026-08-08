@@ -314,13 +314,45 @@ fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        // 不跟随符号链目录：prnune 只应在 TPI 管理目录内递归，
+        // 否则链到外部目录时会把外部文件也删掉（安全陷阱）。
+        // 符号链文件本身可收集：remove_file 只删链接不触及目标。
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
             files.extend(walk_files(&path));
-        } else if path.is_file() {
+        } else if ft.is_file() || ft.is_symlink() {
             files.push(path);
         }
     }
     files
+}
+
+/// 断言：prnune 遍历不得跟随符号链目录（防止删除 TPI 目录外的文件）。
+#[cfg(unix)]
+#[test]
+fn walk_files_does_not_follow_symlink_dirs() {
+    use std::os::unix::fs::symlink;
+    let tmp = std::env::temp_dir().join(format!("tpi-prune-test-{}", std::process::id()));
+    let sessions = tmp.join("sessions");
+    let outside = tmp.join("outside");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), b"x").unwrap();
+    std::fs::write(sessions.join("keep.txt"), b"x").unwrap();
+    let link = sessions.join("link");
+    symlink(&outside, &link).unwrap();
+    let files = walk_files(&sessions);
+    let paths: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    assert!(
+        !paths.iter().any(|p| p.contains("secret.txt")),
+        "不得跟随 symlink 目录收集外部文件: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("keep.txt")),
+        "正常文件仍应收集: {paths:?}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// P2：`tpi init`——交互式生成 ~/.tpi/config.toml。

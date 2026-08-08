@@ -864,6 +864,34 @@ fn search_mode_keeps_transcript_navigation_keys() {
     assert_eq!(s.view.scroll_mode, ScrollMode::Follow);
 }
 
+#[test]
+fn search_ctrl_u_clears_query() {
+    let mut s = state();
+    s.view.push_line(LineKind::Assistant, "hello world");
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+    );
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+    );
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+    );
+    assert_eq!(s.view.search.as_ref().unwrap().query, "hi");
+    // Ctrl+U must clear the search query (consistent with the composer), not type "u".
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+    );
+    assert!(
+        s.view.search.as_ref().unwrap().query.is_empty(),
+        "Ctrl+U must clear the search query"
+    );
+}
+
 /// /sessions 是“菜单 + Modal 指令”组合：Enter 仍应恢复选中 session（例外路径）。
 #[test]
 fn sessions_menu_enter_still_works_with_modal_open() {

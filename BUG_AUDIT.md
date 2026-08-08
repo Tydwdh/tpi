@@ -236,3 +236,6 @@
 ## 迭代记录（2026-08-08 续 8）
 - SEARCH-KEY-001（P2，行为不一致）：Ctrl+F 搜索打开时 PgUp/PgDn/Ctrl+Home/Ctrl+End 被 handle_search_key 吞掉，而鼠标滚轮可滚动 transcript——键盘无法浏览上下文。已修：搜索模式放行 PgUp/PgDn/Ctrl+Home/Ctrl+End。回归：search_mode_keeps_transcript_navigation_keys。
 - WHEEL-STEP-001（P3，人体工学建议落地）：滚轮步长 3 → 5 行（Modal/Overlay 内部同步）；event.rs 文档同步。
+## 迭代记录（2026-08-08 续 9）
+- SEARCH-CTRLU-001（P2，行为不一致）：搜索打开时 Ctrl+U 把 'u' 插入搜索词（/help 写“Ctrl+U 清空”）。已修：搜索模式 Ctrl+U 清空 query。回归：search_ctrl_u_clears_query。
+- PRUNE-SYMLINK-001（P2，删除安全）：walk_files 用 path.is_dir()（跟随 symlink），prune 可能递归进外部目录并删除文件。已修：DirEntry.file_type() 不跟随链接；symlink 目录不递归。回归：walk_files_does_not_follow_symlink_dirs（unix）。
