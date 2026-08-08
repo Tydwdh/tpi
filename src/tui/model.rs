@@ -304,6 +304,8 @@ pub struct ViewModel {
     pub transcript: Vec<Entry>,
     pub input: String,
     pub input_cursor: usize,
+    /// 过渡提示（footer 显示；下一次键盘/鼠标操作清除）。
+    pub transient_hint: Option<String>,
     pub plan: Option<Plan>,
     pub status: StatusLine,
     pub model_name: String,
@@ -357,6 +359,7 @@ impl Default for ViewModel {
             transcript: Vec::new(),
             input: String::new(),
             input_cursor: 0,
+            transient_hint: None,
             plan: None,
             status: StatusLine::Idle,
             model_name: "?".into(),

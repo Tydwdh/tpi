@@ -244,3 +244,6 @@
 - 空闲 Esc 清空输入（P3，第 4 节记录项落地）：idle 且输入非空时 Esc 清空当前输入（运行中 Esc 仍取消、弹层/菜单优先语义不变）。回归 esc_idle_clears_input。
 ## 30. 迭代第16轮（2026-08-08）
 - /sessions 恢复后残留弹层（真 bug）：/sessions 同时打开 Modal（提示）+ Session 菜单；Enter 选中恢复时只关菜单，Modal“会话列表”仍盖在新加载的会话上，必须再按一次 Esc。已修：选中会话时一并关闭 Modal；Esc 也一次关闭整个 /sessions 浏览器（Modal + Session 菜单）。回归 sessions_menu_enter_still_works_with_modal_open（断言扩展）/ esc_closes_sessions_browser_in_one_press。
+## 31. 迭代第17轮（2026-08-08）
+- Alt+Up/Alt+Down 静默无反馈（P3，UX 审计第 4 节遗留）：transcript 没有 User 消息时按 Alt+Up/Down 无任何反应，用户不知道是“没消息可跳”还是按键失效。已修：新增 transient_hint——无 User 消息时 footer 显示“没有用户消息可跳转”，下一次键盘/鼠标/粘贴操作后消失。回归 alt_up_down_shows_hint_when_no_user_message / footer_shows_transient_hint。
+- 真实终端验收：node-pty（ConPTY）驱动 tpi.exe 交互验收 9/9 通过（含第 15/16 轮改动后的回归）。

@@ -244,3 +244,6 @@
 - ESC-CLEAR-001（P3，人体工学记录项落地）：idle 且输入非空时 Esc 现在清空输入（此前无操作；运行中取消、弹层/菜单关闭语义不变）。回归：esc_idle_clears_input。
 ## 迭代记录（2026-08-08 续 11）
 - SESSIONS-MODAL-001（P2）：/sessions 的 Modal+菜单组合在 Enter 恢复后 Modal 残留盖住新会话；Esc 也要按两次才能完全关闭。已修：Session 菜单 Enter 关闭 modal；Esc 遇 Session 菜单一并关闭。回归：esc_closes_sessions_browser_in_one_press + sessions_menu_enter_still_works_with_modal_open 断言扩展。
+## 迭代记录（2026-08-08 续 12）
+- ALTJUMP-HINT-001（P3，UX 审计遗留）：无 User 消息时 Alt+Up/Down 静默。已修：ViewModel.transient_hint + footer 渲染 + 下一次交互清除；Alt+Up/Down 失败时设置提示。回归：alt_up_down_shows_hint_when_no_user_message / footer_shows_transient_hint。
+- 交互验收（真实 ConPTY）：9/9 通过（node-pty 驱动，覆盖第 15/16 轮改动后基本流、Ctrl-C、滚动、多工具、排队、resize、/new、滚轮）。

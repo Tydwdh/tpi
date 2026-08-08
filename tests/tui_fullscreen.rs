@@ -149,6 +149,26 @@ fn footer_shows_history_browsing_indicator_when_locked() {
     );
 }
 
+#[test]
+fn footer_shows_transient_hint() {
+    let mut view = busy_view(3);
+    view.transient_hint = Some("没有用户消息可跳转".into());
+    let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
+    let all: String = row_texts(&buf).join("\n");
+    assert!(
+        all.contains("没有用户消息可跳转"),
+        "footer must show the transient hint: {all:?}"
+    );
+
+    let mut view2 = busy_view(3);
+    let buf2 = draw_to_test_backend_mode(&mut view2, 80, 24, ViewMode::Fullscreen);
+    let all2: String = row_texts(&buf2).join("\n");
+    assert!(
+        !all2.contains("没有用户消息可跳转"),
+        "no hint by default: {all2:?}"
+    );
+}
+
 /// §24：全屏历史必须有垂直 scrollbar——右侧 1 列，thumb 按 visual 行数比例。
 #[test]
 fn fullscreen_shows_scrollbar_at_right_edge() {

@@ -1297,6 +1297,13 @@ fn draw_footer(
             muted,
         ));
     }
+    // 过渡提示（如“没有用户消息可跳转”）：下一次键盘/鼠标操作后消失。
+    if let Some(hint) = &view.transient_hint {
+        spans.push(Span::styled(
+            format!(" · {hint}"),
+            Style::default().fg(theme.warning),
+        ));
+    }
     // 兼容模式提示：仅 inline 且 scrollback 不可用时显示（fullscreen 正常模式）。
     if !scrollback && mode == terminal::ViewMode::Inline {
         spans.push(Span::styled(

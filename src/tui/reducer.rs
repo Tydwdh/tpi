@@ -92,6 +92,8 @@ fn handle_search_key(
 /// 键盘路由优先级（§11）：Overlay > Modal > Search > Menu > Composer。
 fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
     let mut effects = Vec::new();
+    // 过渡提示下一次键盘操作清除（同一个键可重新设置）。
+    state.view.transient_hint = None;
 
     // BUG-004：Ctrl-C 必须在 raw mode 下作为按键处理（Windows 下 crossterm raw
     // mode 清除 ENABLE_PROCESSED_INPUT，Ctrl-C 不会产生 CTRL_C_EVENT，tokio 的
@@ -263,10 +265,14 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
         }
         KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
             // §13：Alt+Up 跳到上一条 User entry（基于 EntryId 查找）。
-            state.view.jump_to_user_turn(false);
+            if !state.view.jump_to_user_turn(false) {
+                state.view.transient_hint = Some("没有用户消息可跳转".into());
+            }
         }
         KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-            state.view.jump_to_user_turn(true);
+            if !state.view.jump_to_user_turn(true) {
+                state.view.transient_hint = Some("没有用户消息可跳转".into());
+            }
         }
         KeyCode::Up => {
             if state.view.menu.is_some() {
@@ -467,6 +473,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             Vec::new()
         }
         UiEvent::Paste(text) => {
+            state.view.transient_hint = None;
             // While a Modal/Overlay is open, Paste must not write into the composer
             // behind it (keys are already blocked; Paste is a separate event).
             if state.view.overlay.is_some() || state.view.modal.is_some() {
@@ -491,6 +498,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
         }
         UiEvent::Key(key) => handle_key(state, key),
         UiEvent::MouseScrollUp => {
+            state.view.transient_hint = None;
             if let Some(modal) = &mut state.view.modal {
                 modal.scroll = modal.scroll.saturating_sub(5);
             } else if let Some(overlay) = &mut state.view.overlay {
@@ -501,6 +509,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             Vec::new()
         }
         UiEvent::MouseScrollDown => {
+            state.view.transient_hint = None;
             if let Some(modal) = &mut state.view.modal {
                 modal.scroll = modal.scroll.saturating_add(5);
             } else if let Some(overlay) = &mut state.view.overlay {

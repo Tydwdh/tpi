@@ -921,6 +921,38 @@ fn esc_idle_clears_input() {
     );
 }
 
+#[test]
+fn alt_up_down_shows_hint_when_no_user_message() {
+    let mut s = state();
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+    );
+    assert_eq!(
+        s.view.transient_hint.as_deref(),
+        Some("没有用户消息可跳转"),
+        "Alt+Up with no User message must show a hint"
+    );
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)),
+    );
+    assert_eq!(
+        s.view.transient_hint.as_deref(),
+        Some("没有用户消息可跳转"),
+        "Alt+Down with no User message must show a hint"
+    );
+    // Next key press clears the transient hint.
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+    );
+    assert!(
+        s.view.transient_hint.is_none(),
+        "next key must clear the hint"
+    );
+}
+
 /// /sessions 是“菜单 + Modal 指令”组合：Enter 仍应恢复选中 session（例外路径）。
 #[test]
 fn sessions_menu_enter_still_works_with_modal_open() {
