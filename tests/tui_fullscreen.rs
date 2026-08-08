@@ -265,3 +265,20 @@ fn success_card_hides_exit_zero_failure_keeps_it() {
     let all2: String = row_texts(&buf2).join("\n");
     assert!(all2.contains("exit101"), "失败卡必须显示退出码: {all2:?}");
 }
+
+/// 多行输入时 footer 显示行数提示（人体工学：>8 行内部滚动也可见）。
+#[test]
+fn footer_shows_multi_line_input_hint() {
+    let mut view = ViewModel::default();
+    view.input = "第一行\n第二行\n第三行".into();
+    view.input_cursor = view.input.len();
+    let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
+    let all: String = row_texts(&buf).join("\n");
+    assert!(all.contains("输入3行"), "多行输入必须显示行数: {all:?}");
+
+    let mut view2 = ViewModel::default();
+    view2.input = "单行".into();
+    let buf2 = draw_to_test_backend_mode(&mut view2, 80, 24, ViewMode::Fullscreen);
+    let all2: String = row_texts(&buf2).join("\n");
+    assert!(!all2.contains("输入"), "单行输入不应显示行数: {all2:?}");
+}

@@ -1240,6 +1240,12 @@ fn draw_footer(
     }
 
     // 优先级：状态 → 排队/新内容提示 → ctx → tokens → 兼容模式（窄屏先保提示，不被 ctx/tokens 挤掉）。
+
+    // 多行输入提示（人体工学）：输入含换行时显示当前行数（>8 行内部滚动也可见）。
+    let input_lines = view.input.matches('\n').count() + 1;
+    if input_lines > 1 {
+        spans.push(Span::styled(format!(" · 输入 {input_lines} 行"), muted));
+    }
     if view.pending_queue_len > 0 {
         spans.push(Span::styled(
             format!(" · 已排队 {} 条消息", view.pending_queue_len),
