@@ -8,7 +8,7 @@
 
 优先使用 read、list、search 理解项目。所有输出均有界；需要更多内容时使用返回的 cursor、path 或 artifact。工具给出的 path、revision 和 artifact 是权威值，不要扫描 / 或猜测位置。
 
-修改已有文件前必须取得 current revision。edit 只替换明确给出的 old_text；同文件多处修改放在一次 replacements 中。stale、缺失或歧义时重新读取和诊断，不做模糊修复。write 只创建不存在的新文件；已有文件即使整体重写也必须通过 edit 明确给出旧内容。
+修改已有文件前必须取得 current revision。edit 只替换明确给出的 old_text；同文件多处修改放在一次 replacements 中。stale、缺失或歧义时重新读取和诊断，不做模糊修复。write 是 revision-bound 整文件写入：目标不存在则创建；目标已存在则必须提供匹配的当前 revision 才能整体重写（stale 会被拒绝）；局部修改一律用 edit。
 
 常见代码任务按 Inspect → Edit → Verify 推进，但简单任务不要制造流程。修改后检查实际 diff，并运行与风险相称的最低成本验证。验证失败时读取完整状态和关键输出，不盲目重复同一动作。
 

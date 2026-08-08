@@ -4,7 +4,7 @@
 //! - 内部使用 `logical_lf_text`（去 BOM、CRLF→LF）作为匹配空间，
 //!   但写回时只替换命中的原始 byte ranges，未触及字节原样保留（§10.5）。
 //! - 第一版严格拒绝 stale revision，不自动 fuzzy rebase（§10.3 第 12 条）。
-//! - `write` 只创建新文件（§10.6）。
+//! - `write` 是 revision-bound 整文件写入：新建或提供匹配 revision 的整体重写（§10.6）。
 //! - M3：Windows 提交使用 `ReplaceFileW` + 同卷唯一 backup（§10.7）；
 //!   成功校验 backup digest，失败/校验不符进入可诊断恢复。
 
@@ -787,7 +787,8 @@ fn write_temp_synced_from(temp_path: &std::path::Path, bytes: &[u8]) -> std::io:
     Ok(())
 }
 
-/// create-only 写入（§10.6）：temp + sync + no-clobber move。
+/// write 的新建路径（§10.6）：temp + sync + no-clobber move；
+/// 仅当目标不存在时走此路径（已存在文件走 revision 校验后的整体重写）。
 pub fn write_new_file(
     path: &Utf8PathBuf,
     content: &[u8],

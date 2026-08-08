@@ -34,6 +34,123 @@ fn schema_value<T: schemars::JsonSchema>(tool: &'static str) -> serde_json::Valu
     }
 }
 
+/// 参数校验失败（§8.2 预检）：serde 错误 + 期望的参数 JSON shape。
+///
+/// 模型可见消息经 [`std::fmt::Display`] 渲染：先给 serde 具体错误，
+/// 再给结构化 expected shape（字段名+类型），模型据此自纠错，不必重新猜。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgsError {
+    pub tool: &'static str,
+    /// serde 解析/校验的底层错误详情（如 `missing field \`path\``）。
+    pub detail: String,
+    /// 期望的参数 shape（由 schemars schema 渲染，§5.2 同源）。
+    pub expected_shape: String,
+}
+
+impl std::fmt::Display for ArgsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid {} args: {}\n\nexpected shape:\n{}",
+            self.tool, self.detail, self.expected_shape
+        )
+    }
+}
+
+/// 泛型解析入口：反序列化失败时，从同一 schemars schema 渲染期望 shape。
+fn parse_args_typed<T>(
+    tool: &'static str,
+    arguments: &str,
+    to_validated: impl FnOnce(T) -> ValidatedArgs,
+) -> Result<ValidatedArgs, ArgsError>
+where
+    T: serde::de::DeserializeOwned + schemars::JsonSchema,
+{
+    serde_json::from_str::<T>(arguments)
+        .map(to_validated)
+        .map_err(|error| ArgsError {
+            tool,
+            detail: error.to_string(),
+            expected_shape: render_expected_shape(&schema_value::<T>(tool)),
+        })
+}
+
+/// 从 schemars root schema 渲染紧凑的期望 shape（`{ field: type, ... }`）。
+fn render_expected_shape(schema: &serde_json::Value) -> String {
+    let definitions = schema
+        .get("definitions")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    render_schema_node(schema, &definitions)
+}
+
+/// 递归渲染 schema 节点；`$ref` 就地解析到 definitions，保持 shape 自包含。
+fn render_schema_node(node: &serde_json::Value, definitions: &serde_json::Value) -> String {
+    if let Some(reference) = node.get("$ref").and_then(|v| v.as_str())
+        && let Some(name) = reference.strip_prefix("#/definitions/")
+        && let Some(target) = definitions.get(name)
+    {
+        return render_schema_node(target, definitions);
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(parts) = node.get(key).and_then(|v| v.as_array()) {
+            return parts
+                .iter()
+                .map(|part| render_schema_node(part, definitions))
+                .collect::<Vec<_>>()
+                .join(" | ");
+        }
+    }
+    if let Some(variants) = node.get("enum").and_then(|v| v.as_array()) {
+        return variants
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+    let type_name = |value: &serde_json::Value| {
+        value
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("any")
+            .to_string()
+    };
+    match type_name(node).as_str() {
+        "object" => {
+            let Some(properties) = node.get("properties").and_then(|p| p.as_object()) else {
+                return "object".into();
+            };
+            let required: std::collections::BTreeSet<&str> = node
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|array| array.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let fields = properties.iter().map(|(name, property)| {
+                let optional = if required.contains(name.as_str()) {
+                    ""
+                } else {
+                    "?"
+                };
+                format!(
+                    "{name}{optional}: {}",
+                    render_schema_node(property, definitions)
+                )
+            });
+            format!("{{ {} }}", fields.collect::<Vec<_>>().join(", "))
+        }
+        "array" => {
+            let items = node
+                .get("items")
+                .map(|items| render_schema_node(items, definitions));
+            match items {
+                Some(items) => format!("[{items}]"),
+                None => "[]".into(),
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
 /// 内置工具集合（§8.1 静态分发）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinTool {
@@ -78,7 +195,11 @@ impl BuiltinTool {
                 "Atomically edit one file using revision-bound exact text replacement. Only the explicit old_text is replaced; adjacent content is never implicitly deleted. All replacements are validated before the file is written; the whole batch applies or nothing does."
             }
             BuiltinTool::Write => {
-                "Create a new file with the given content. Fails with already_exists if the target already exists; existing files must be modified through edit."
+                "Write an entire file.
+
+If the file does not exist, creates it.
+If the file already exists, `revision` is required and must match the
+current revision. Use `edit` instead for localized changes."
             }
             BuiltinTool::Bash => {
                 "Run a command through Git Bash with `set -o pipefail` enabled (pipeline failures are visible). This is the only execution tool: use it for programs, builds, tests, git, pipelines, redirection, globs and compound commands. Write Bash syntax; the host is Windows, never mix PowerShell syntax."
@@ -116,35 +237,23 @@ impl BuiltinTool {
     }
 
     /// 校验并解析参数（§8.2：schema 校验是预检的一部分）。
-    pub fn parse_args(&self, arguments: &str) -> Result<ValidatedArgs, String> {
+    pub fn parse_args(&self, arguments: &str) -> Result<ValidatedArgs, ArgsError> {
         match self {
-            BuiltinTool::Read => serde_json::from_str::<files::ReadArgs>(arguments)
-                .map(ValidatedArgs::Read)
-                .map_err(|e| format!("invalid read args: {e}")),
-            BuiltinTool::List => serde_json::from_str::<search::ListArgs>(arguments)
-                .map(ValidatedArgs::List)
-                .map_err(|e| format!("invalid list args: {e}")),
-            BuiltinTool::Search => serde_json::from_str::<search::SearchArgs>(arguments)
-                .map(ValidatedArgs::Search)
-                .map_err(|e| format!("invalid search args: {e}")),
-            BuiltinTool::Edit => serde_json::from_str::<edit::EditArgs>(arguments)
-                .map(ValidatedArgs::Edit)
-                .map_err(|e| format!("invalid edit args: {e}")),
-            BuiltinTool::Write => serde_json::from_str::<files::WriteArgs>(arguments)
-                .map(ValidatedArgs::Write)
-                .map_err(|e| format!("invalid write args: {e}")),
-            BuiltinTool::Bash => serde_json::from_str::<command::BashArgs>(arguments)
-                .map(ValidatedArgs::Bash)
-                .map_err(|e| format!("invalid bash args: {e}")),
-            BuiltinTool::UpdatePlan => serde_json::from_str::<plan::UpdatePlanArgs>(arguments)
-                .map(ValidatedArgs::UpdatePlan)
-                .map_err(|e| format!("invalid update_plan args: {e}")),
-            BuiltinTool::WebSearch => serde_json::from_str::<web::WebSearchArgs>(arguments)
-                .map(ValidatedArgs::WebSearch)
-                .map_err(|e| format!("invalid web_search args: {e}")),
-            BuiltinTool::WebFetch => serde_json::from_str::<web::WebFetchArgs>(arguments)
-                .map(ValidatedArgs::WebFetch)
-                .map_err(|e| format!("invalid web_fetch args: {e}")),
+            BuiltinTool::Read => parse_args_typed("read", arguments, ValidatedArgs::Read),
+            BuiltinTool::List => parse_args_typed("list", arguments, ValidatedArgs::List),
+            BuiltinTool::Search => parse_args_typed("search", arguments, ValidatedArgs::Search),
+            BuiltinTool::Edit => parse_args_typed("edit", arguments, ValidatedArgs::Edit),
+            BuiltinTool::Write => parse_args_typed("write", arguments, ValidatedArgs::Write),
+            BuiltinTool::Bash => parse_args_typed("bash", arguments, ValidatedArgs::Bash),
+            BuiltinTool::UpdatePlan => {
+                parse_args_typed("update_plan", arguments, ValidatedArgs::UpdatePlan)
+            }
+            BuiltinTool::WebSearch => {
+                parse_args_typed("web_search", arguments, ValidatedArgs::WebSearch)
+            }
+            BuiltinTool::WebFetch => {
+                parse_args_typed("web_fetch", arguments, ValidatedArgs::WebFetch)
+            }
         }
     }
 }
@@ -541,5 +650,37 @@ mod tests {
         .await;
         assert_eq!(outcome.status, outcome::ToolStatus::Succeeded);
         assert!(outcome.model_text().contains("hello 世界"));
+    }
+
+    /// C2：parse_args 对非法参数返回结构化 expected shape（字段名+类型），
+    /// 而不是只有 serde 的裸错误字符串——模型据此可自纠错。
+    #[test]
+    fn parse_args_invalid_reports_expected_shape() {
+        let err = BuiltinTool::Edit.parse_args("{}").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected shape"),
+            "错误必须说明期望 shape: {msg}"
+        );
+        assert!(msg.contains("path"), "expected shape 必须含 path: {msg}");
+        assert!(
+            msg.contains("revision"),
+            "expected shape 必须含 revision: {msg}"
+        );
+        assert!(
+            msg.contains("replacements"),
+            "expected shape 必须含 replacements: {msg}"
+        );
+
+        let err = BuiltinTool::Write.parse_args("{}").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected shape"),
+            "write: 错误必须说明期望 shape: {msg}"
+        );
+        assert!(
+            msg.contains("content"),
+            "write: expected shape 必须含 content: {msg}"
+        );
     }
 }
