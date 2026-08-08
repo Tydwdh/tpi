@@ -818,29 +818,49 @@ fn build_transcript_text(
                         push_hit(&mut out, &mut hits, Line::from(spans), None);
                     }
                 }
-                // §16.2：thinking dim italic，可折叠（Alt+T）；点击打开原文 Overlay。
+                // §用户诉求：thinking 与工具统一折叠——未展开显示前 N 行 +
+                // "… 点击展开"，展开显示全文（点击行切换）。
                 LineKind::Reasoning => {
-                    if view.is_reasoning_expanded(entry_id) {
-                        for (i, s) in line.text.split('\n').enumerate() {
-                            let prefix = if i == 0 { "思考 " } else { "    " };
-                            push_hit(
-                                &mut out,
-                                &mut hits,
-                                Line::styled(
-                                    format!("{prefix}{s}"),
-                                    Style::default()
-                                        .fg(theme.muted)
-                                        .add_modifier(Modifier::ITALIC),
-                                ),
-                                None,
-                            );
-                        }
+                    const THINKING_COLLAPSED: usize = 6;
+                    let all_lines: Vec<&str> = line.text.split('\n').collect();
+                    let overflow = all_lines.len() > THINKING_COLLAPSED;
+                    let expanded = view.is_reasoning_expanded(entry_id);
+                    let shown = if expanded || !overflow {
+                        &all_lines[..]
                     } else {
+                        &all_lines[..THINKING_COLLAPSED]
+                    };
+                    let clickable = overflow; // 只有溢出才可点击展开
+                    for (i, s) in shown.iter().enumerate() {
+                        let prefix = if i == 0 { "思考 " } else { "    " };
+                        let hit = if clickable && i == 0 {
+                            full_line_hit(HitTarget::Reasoning(entry_id), width as u16)
+                        } else {
+                            None
+                        };
                         push_hit(
                             &mut out,
                             &mut hits,
                             Line::styled(
-                                "◇ 思考 · 点击展开",
+                                format!("{prefix}{s}"),
+                                Style::default()
+                                    .fg(theme.muted)
+                                    .add_modifier(Modifier::ITALIC),
+                            ),
+                            hit,
+                        );
+                    }
+                    if overflow {
+                        let hint = if expanded {
+                            "思考 · 点击折叠".to_string()
+                        } else {
+                            format!("… 点击展开思考（共 {} 行）", all_lines.len())
+                        };
+                        push_hit(
+                            &mut out,
+                            &mut hits,
+                            Line::styled(
+                                hint,
                                 Style::default()
                                     .fg(theme.muted)
                                     .add_modifier(Modifier::ITALIC),
@@ -1529,106 +1549,79 @@ fn tool_card_lines(
     }
     let mut lines = vec![Line::from(spans)];
 
-    // §用户诉求：edit/write 的独立 diff 字段 → 默认显示红绿 diff，但限制
-    // 长度（折叠态前 N 行 + 提示，点击展开看完整；opencode 式）。
-    if let Some(diff_text) = &card.diff {
-        const DIFF_COLLAPSED_LINES: usize = 12;
-        let diff_lines = render_diff_lines(diff_text, theme);
-        let total = diff_lines.len();
-        let shown: Vec<&Line<'static>> = if card.expanded {
-            diff_lines.iter().collect()
+    // §用户诉求：所有工具内容统一折叠（opencode 式）——
+    // - 有 diff（edit/write）：渲染红绿 diff，未展开显示前 N 行 + "… 点击展开"；
+    // - 无 diff（bash 等）：渲染输出文本，同样前 N 行 + "… 点击展开"；
+    // - 已展开：显示全部内容。
+    const COLLAPSED_LINES: usize = 10;
+
+    // 确定「内容行」：diff 优先，否则 output。统一折叠。
+    let content_lines: Vec<Line<'static>> = if let Some(diff_text) = &card.diff {
+        render_diff_lines(diff_text, theme)
+    } else if let Some(body) = card.output.as_deref() {
+        let diff_idx = find_diff_start(body);
+        // 输出里含 `diff:` 段 → diff 部分着色，其余普通。
+        if let Some(idx) = diff_idx {
+            let mut out = Vec::new();
+            for s in body[..idx].lines() {
+                out.push(Line::styled(s.to_string(), Style::default().fg(theme.text)));
+            }
+            out.extend(render_diff_lines(&body[idx..], theme));
+            out
         } else {
-            diff_lines.iter().take(DIFF_COLLAPSED_LINES).collect()
-        };
-        for l in &shown {
-            // 保留工具卡片的 │ 前缀 + diff 行红绿背景（Line.style 应用整行）。
-            let mut spans = vec![Span::styled("│ ", Style::default().fg(theme.muted))];
+            body.lines()
+                .map(|s| Line::styled(s.to_string(), Style::default().fg(theme.text)))
+                .collect()
+        }
+    } else if let Some(tail) = card.tail.as_deref() {
+        // 无完整 output（失败摘要）→ 显示 tail（错误诊断）。
+        tail.lines()
+            .map(|s| {
+                Line::styled(
+                    s.to_string(),
+                    Style::default().fg(theme.error).add_modifier(Modifier::DIM),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let total = content_lines.len();
+    let overflow = total > COLLAPSED_LINES;
+    let shown = if card.expanded || !overflow {
+        content_lines.as_slice()
+    } else {
+        &content_lines[..COLLAPSED_LINES]
+    };
+    let is_diff_content = card.diff.is_some();
+    for (i, l) in shown.iter().enumerate() {
+        // diff 行保留红绿背景；普通行用默认（背景由 build 层 surface 填）。
+        let prefix = "│ ";
+        if is_diff_content {
+            let mut spans = vec![Span::styled(prefix, Style::default().fg(theme.muted))];
             spans.extend(l.spans.iter().cloned());
             lines.push(Line::from(spans).style(l.style));
-        }
-        if total > shown.len() {
-            // 折叠提示：未展开时显示剩余行数。
-            let hint = if card.expanded {
-                "点击卡片折叠".to_string()
-            } else {
-                format!("… 点击展开剩余 {} 行", total - shown.len())
-            };
-            lines.push(Line::styled(
-                format!("│ {hint}"),
-                Style::default()
-                    .fg(theme.info)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-        }
-    }
-
-    // 正文（有严格行数预算）：展开态完整输出 / 运行中实时尾注 / 失败 tail。
-    // card.diff 已独立渲染（上方），此处不再重复显示输出里的 diff 段。
-    let show_body = if card.diff.is_some() {
-        None
-    } else if card.expanded {
-        card.output.as_deref()
-    } else if let ToolCardState::Running = card.state {
-        card.output.as_deref() // 运行中的实时输出（折叠态显示，最多 3 行）
-    } else {
-        None
-    };
-    if let Some(body) = show_body {
-        // 无独立 diff（非 edit/write）：展开态输出含 `diff:` 段时着色。
-        let diff_idx = find_diff_start(body);
-        if card.expanded && diff_idx.is_some() {
-            let (prefix, diff_part) = match diff_idx {
-                Some(idx) => (&body[..idx], &body[idx..]),
-                None => (body, ""),
-            };
-            for s in prefix.lines() {
-                lines.push(Line::styled(
-                    format!("│ {s}"),
-                    Style::default().fg(theme.text),
-                ));
-            }
-            let diff_lines = render_diff_lines(diff_part, theme);
-            for l in diff_lines {
-                let mut spans = vec![Span::styled("│ ", Style::default().fg(theme.muted))];
-                spans.extend(l.spans.iter().cloned());
-                lines.push(Line::from(spans).style(l.style));
-            }
         } else {
-            let body_lines: Vec<&str> = body.split('\n').collect();
-            let shown: Vec<&str> = if card.expanded {
-                body_lines
-            } else {
-                // 整改 A3：折叠态实时输出只保留最后 3 行。
-                body_lines.iter().rev().take(3).copied().collect::<Vec<_>>()
-            };
-            for s in shown {
-                let style = if card.expanded {
-                    Style::default().fg(theme.text)
-                } else {
-                    Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
-                };
-                lines.push(Line::styled(format!("│ {s}"), style));
-            }
-        }
-        if card.output_truncated && card.expanded {
-            lines.push(Line::styled(
-                "│ …（输出超预算被截断；完整内容可通过 read @artifact 读取）",
-                Style::default().fg(theme.muted),
-            ));
+            let _ = i;
+            let mut spans = vec![Span::styled(prefix, Style::default().fg(theme.muted))];
+            spans.extend(l.spans.iter().cloned());
+            lines.push(Line::from(spans));
         }
     }
-    if !card.expanded
-        && let Some(tail) = &card.tail
-    {
-        // 整改 A3：失败 tail 最多 4 行（取尾部——错误诊断在输出末尾）。
-        let tail_lines: Vec<&str> = tail.split('\n').collect();
-        let last: Vec<&str> = tail_lines.iter().rev().take(4).copied().collect();
-        for s in last.into_iter().rev() {
-            lines.push(Line::styled(
-                format!("│ {s}"),
-                Style::default().fg(theme.error).add_modifier(Modifier::DIM),
-            ));
-        }
+    // 统一折叠提示（opencode 式：溢出才显示，点击展开/收缩）。
+    if overflow {
+        let hint = if card.expanded {
+            "点击折叠".to_string()
+        } else {
+            format!("… 点击展开（共 {} 行）", total)
+        };
+        lines.push(Line::styled(
+            format!("│ {hint}"),
+            Style::default()
+                .fg(theme.info)
+                .add_modifier(Modifier::ITALIC),
+        ));
     }
     lines
 }
@@ -3008,12 +3001,13 @@ mod tests {
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(!text.contains("progress 1"), "折叠态只显示最近输出: {text}");
-        assert!(text.contains("progress 7"), "最新输出可见: {text}");
+        // §统一折叠（opencode 式）：运行中显示输出开头（前 10 行），不足 10 行全显。
+        assert!(text.contains("progress 1"), "运行中显示输出开头: {text}");
         assert!(
-            !text.contains("progress 5") || !text.contains("progress 4"),
-            "折叠态实时输出最多 3 行（progress 1-4 不应全部可见）: {text}"
+            text.contains("progress 7"),
+            "全部 7 行可见（<10 行不折叠）: {text}"
         );
+        assert!(!text.contains("点击展开"), "7 行 < 10 行不显示折叠提示");
     }
 
     #[test]
