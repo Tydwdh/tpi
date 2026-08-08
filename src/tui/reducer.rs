@@ -72,6 +72,31 @@ fn handle_search_key(
 /// 键盘路由优先级（§11）：Overlay > Modal > Search > Menu > Composer。
 fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
     let mut effects = Vec::new();
+
+    // BUG-004：Ctrl-C 必须在 raw mode 下作为按键处理（Windows 下 crossterm raw
+    // mode 清除 ENABLE_PROCESSED_INPUT，Ctrl-C 不会产生 CTRL_C_EVENT，tokio 的
+    // ctrl_c() 信号 handler 不会触发；此前 reducer 直接忽略该按键 → 取消失效）。
+    // 语义与 Esc 同层：Overlay > Modal > Menu > 运行中取消；空闲时退出。
+    // （`ctrl_c()` handler 保留，作为 -p 模式/非 raw 场景的兜底。）
+    let is_ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
+    if is_ctrl_c {
+        if state.view.overlay.is_some() {
+            state.view.close_overlay();
+        } else if state.view.modal.is_some() {
+            state.view.close_modal();
+        } else if state.view.menu.is_some() {
+            state.view.menu = None;
+        } else if state.running {
+            // §6.2：Ctrl-C 打断当前 run（等价 Esc，保留 session）。
+            effects.push(UiEffect::CancelRun);
+        } else {
+            // 空闲 Ctrl-C：退出 TUI（与 ctrl_c handler 的语义一致）。
+            effects.push(UiEffect::Quit);
+        }
+        return effects;
+    }
+
     // §14：搜索打开时按键路由进搜索（输入/跳转/关闭）。
     if state.view.overlay.is_none() && state.view.modal.is_none() && state.view.search.is_some() {
         return handle_search_key(state, key, &mut effects);
@@ -109,7 +134,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.editor.submit()
             };
             if !text.is_empty() {
-                state.pending_message = Some(text);
+                state.push_pending(text);
             }
             refresh_menus(state);
         }
@@ -165,7 +190,14 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             }
             state.sync_input();
         }
-        KeyCode::Home => state.editor.home(),
+        KeyCode::Home => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                // §25：Ctrl+Home 跳到历史最顶部。
+                state.view.jump_to_top();
+            } else {
+                state.editor.home();
+            }
+        }
         KeyCode::End => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 // 整改 C：Ctrl+End 恢复 follow-tail（scroll lock 中）。
@@ -188,6 +220,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 {
                     menu.selected = (menu.selected + menu.items.len() - 1) % menu.items.len();
                 }
+            } else if let Some(modal) = &mut state.view.modal {
+                // BUG-013：Modal 提示 ↑/↓ 滚动——让提示与实际行为一致。
+                modal.scroll = modal.scroll.saturating_sub(1);
+            } else if let Some(overlay) = &mut state.view.overlay {
+                overlay.scroll = overlay.scroll.saturating_sub(1);
             } else if !state.editor.move_up() {
                 // §12：到第一 logical line 后才进入 prompt history。
                 state.editor.history_up();
@@ -203,6 +240,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 {
                     menu.selected = (menu.selected + 1) % menu.items.len();
                 }
+            } else if let Some(modal) = &mut state.view.modal {
+                // BUG-013：Modal ↑/↓ 滚动。
+                modal.scroll = modal.scroll.saturating_add(1);
+            } else if let Some(overlay) = &mut state.view.overlay {
+                overlay.scroll = overlay.scroll.saturating_add(1);
             } else if !state.editor.move_down() {
                 // §12：到最后一个 logical line 后才进入 prompt history。
                 state.editor.history_down();
@@ -226,9 +268,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             }
         }
         KeyCode::Char(c) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
-                return effects; // Ctrl-C 由 ctrl_c handler 处理。
-            }
+            // Ctrl-C 已在 handle_key 顶部处理（BUG-004）；此处不再忽略。
             if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'u' {
                 state.editor.clear();
                 state.sync_input();
@@ -366,9 +406,24 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             Vec::new()
         }
         UiEvent::Paste(text) => {
-            state.editor.insert_str(&text);
-            state.sync_input();
-            refresh_menus(state);
+            if state.view.overlay.is_none()
+                && state.view.modal.is_none()
+                && state.view.search.is_some()
+            {
+                // BUG-014：搜索打开时粘贴应进入搜索框，而不是 composer。
+                let mut query = state
+                    .view
+                    .search
+                    .as_ref()
+                    .map(|s| s.query.clone())
+                    .unwrap_or_default();
+                query.push_str(&text);
+                state.view.update_search_query(&query);
+            } else {
+                state.editor.insert_str(&text);
+                state.sync_input();
+                refresh_menus(state);
+            }
             Vec::new()
         }
         UiEvent::Key(key) => handle_key(state, key),
@@ -394,6 +449,12 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
         }
         UiEvent::ClickReasoning(id) => {
             state.view.open_reasoning_overlay(id);
+            Vec::new()
+        }
+        UiEvent::ScrollbarClick(row) => {
+            // §24：scrollbar 点击/拖拽 → 按比例跳到绝对位置。
+            let area = state.view.transcript_rows.max(1) as f64;
+            state.view.scroll_to_ratio(row as f64 / area);
             Vec::new()
         }
         UiEvent::Agent(event) => {

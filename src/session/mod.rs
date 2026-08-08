@@ -69,6 +69,8 @@ pub enum CompletionReason {
     Cancelled,
     /// 压缩与 prune 后上下文仍超出模型窗口（P1-4：不再发起必然失败的请求）。
     ContextOverflow,
+    /// §16：wall-clock 预算到期被 watchdog 自动取消（不是用户取消）。
+    WallTimeExceeded,
     /// 长度限制、内容过滤或协议错误。
     Error,
 }
@@ -818,5 +820,37 @@ mod tests {
         let reopened = SessionLog::open(&sessions_root, workspace.as_std_path(), session_id)
             .expect("open session");
         assert_eq!(reopened.seq(), 5, "恢复 seq 必须基于 max_seq（P0-12）");
+    }
+
+    /// §16：WallTimeExceeded 是新增完成原因，必须能持久化并读回（session 文件兼容）。
+    #[test]
+    fn wall_time_exceeded_round_trips_through_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = PathBuf::from(dir.path());
+        let mut log = SessionLog::create(
+            &dir.path().join("sessions"),
+            workspace.as_path(),
+            RunId::new_v7(),
+        )
+        .unwrap();
+        log.append_event(&SessionEvent::RunCompleted {
+            reason: CompletionReason::WallTimeExceeded,
+            usage: Usage::default(),
+        })
+        .unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        let events = read_events(&path).unwrap();
+        assert!(
+            matches!(
+                events.first(),
+                Some(SessionEvent::RunCompleted {
+                    reason: CompletionReason::WallTimeExceeded,
+                    ..
+                })
+            ),
+            "WallTimeExceeded 必须可序列化/反序列化"
+        );
     }
 }

@@ -84,6 +84,22 @@ pub enum HitTarget {
 /// TUI v2（§29）：终端生命周期已抽到 [`terminal::TerminalDriver`]，
 /// Renderer 不再直接触碰 crossterm。
 /// `draw` 是唯一写 stdout 的路径。帧合并由 [`should_draw`](Self::should_draw) 控制。
+struct FramePlan {
+    /// 活动区窗口内容（已按宽度折行的逻辑行，直接渲染）。
+    window: Vec<Line<'static>>,
+    /// 窗口内每行对应的工具卡片 id（鼠标点击展开；消息行为 None）。
+    row_hits: Vec<Option<HitTarget>>,
+    /// 转录区屏幕矩形（鼠标 hit-test）。
+    transcript_rect: Rect,
+    /// scrollbar 屏幕矩形（fullscreen 1 列；§24）。
+    scrollbar_rect: Option<Rect>,
+    /// 当前窗口起始全局行（scrollbar 比例用，§24）。
+    window_start: usize,
+    /// 内容总 visual 行数（scrollbar 比例用，§24）。
+    total_rows: usize,
+    overflow: Vec<Line<'static>>,
+    committed_after: usize,
+}
 pub struct Renderer {
     driver: terminal::TerminalDriver,
     last_draw: Option<Instant>,
@@ -105,20 +121,9 @@ pub struct Renderer {
     last_row_hits: Vec<Option<HitTarget>>,
     /// 已提交到 scrollback 的行数（折叠/展开状态变化时 hit 失效，置空）。
     hits_valid: bool,
+    /// 最近一帧 scrollbar 矩形（§24 鼠标点击/拖拽 hit-test）。
+    last_scrollbar_rect: Option<Rect>,
 }
-
-/// 一帧的布局结果：待提交到 scrollback 的行与新的提交位置。
-struct FramePlan {
-    /// 活动区窗口内容（已按宽度折行的逻辑行，直接渲染）。
-    window: Vec<Line<'static>>,
-    /// 窗口内每行对应的工具卡片 id（鼠标点击展开；消息行为 None）。
-    row_hits: Vec<Option<HitTarget>>,
-    /// 转录区屏幕矩形（鼠标 hit-test）。
-    transcript_rect: Rect,
-    overflow: Vec<Line<'static>>,
-    committed_after: usize,
-}
-
 impl Renderer {
     /// 初始化终端（§29-30：raw mode + alternate screen（fullscreen）+ bracketed
     /// paste + mouse capture + hide cursor）。P2：主题由配置注入（`[ui] theme`）。
@@ -138,6 +143,7 @@ impl Renderer {
             last_transcript_rect: None,
             last_row_hits: Vec::new(),
             hits_valid: false,
+            last_scrollbar_rect: None,
         })
     }
 
@@ -152,6 +158,10 @@ impl Renderer {
         }
         let index = (row - rect.y) as usize;
         self.last_row_hits.get(index).cloned().flatten()
+    }
+    /// §24：最近一帧 scrollbar 矩形（鼠标点击/拖拽 hit-test；app 层优先判断）。
+    pub fn scrollbar_rect(&self) -> Option<Rect> {
+        self.last_scrollbar_rect
     }
 
     /// 距上次 draw 是否已过帧间隔（§16.1：16 ms 合并）。
@@ -178,8 +188,10 @@ impl Renderer {
                 window,
                 row_hits,
                 transcript_rect,
+                scrollbar_rect,
                 overflow: frame_overflow,
                 committed_after,
+                ..
             } = render_frame(
                 frame,
                 view,
@@ -196,6 +208,9 @@ impl Renderer {
                 window,
                 row_hits,
                 transcript_rect,
+                scrollbar_rect,
+                window_start: 0,
+                total_rows: 0,
                 overflow: Vec::new(),
                 committed_after,
             });
@@ -205,6 +220,7 @@ impl Renderer {
             self.last_transcript_rect = Some(plan.transcript_rect);
             self.last_row_hits = plan.row_hits;
             self.hits_valid = true;
+            self.last_scrollbar_rect = plan.scrollbar_rect;
         }
         // §16.1：闭合且不再变化的行提交到 scrollback（活动区上方；仅 inline）。
         // fullscreen：alternate screen 内直接绘制整个终端，无 scrollback。
@@ -304,6 +320,14 @@ fn render_frame(
     idx += 1;
     let footer_area = chunks[idx];
 
+    // §24：fullscreen 在转录区右侧预留 1 列 scrollbar（inline 兼容模式不预留）。
+    let scrollbar_enabled = mode == terminal::ViewMode::Fullscreen && trans_area.width >= 2;
+    let transcript_width = if scrollbar_enabled {
+        trans_area.width - 1
+    } else {
+        trans_area.width
+    };
+
     if let Some(pa) = plan_area {
         draw_plan(frame, pa, view, theme);
     }
@@ -312,7 +336,7 @@ fn render_frame(
     let plan = plan_window(
         view,
         theme,
-        trans_area.width,
+        transcript_width,
         trans_area.height,
         *committed,
         reset_committed,
@@ -322,6 +346,20 @@ fn render_frame(
     let overflow = plan.overflow;
     // 窗口已按宽度折行，无需再次 wrap。
     frame.render_widget(Paragraph::new(plan.window), trans_area);
+
+    // §24：全屏历史垂直 scrollbar（1 列；比例按 visual 行数）。
+    let scrollbar_rect = if scrollbar_enabled {
+        let rect = Rect::new(
+            trans_area.x + trans_area.width - 1,
+            trans_area.y,
+            1,
+            trans_area.height,
+        );
+        draw_scrollbar(frame, rect, theme, plan.window_start, plan.total_rows);
+        Some(rect)
+    } else {
+        None
+    };
 
     // 命令补全菜单浮层（覆盖在转录区上方，§16.2 之外的小浮层）。
     if let Some(menu) = &view.menu {
@@ -379,12 +417,14 @@ fn render_frame(
     FramePlan {
         window: Vec::new(),
         row_hits: plan.row_hits,
+        scrollbar_rect,
         transcript_rect: trans_area,
+        window_start: plan.window_start,
+        total_rows: plan.total_rows,
         overflow,
         committed_after: *committed,
     }
 }
-
 /// 转录窗口规划（TUI v2 §3-4、§57）：
 /// - Follow：窗口 = 尾部 `area_h` 行；跟随模式下窗口之上的闭合行交给调用方
 ///   提交到 scrollback（overflow，仅 inline）；
@@ -466,12 +506,15 @@ fn plan_window(
         row_hits,
         // plan_window 不感知屏幕坐标；transcript_rect 由 render_frame 覆盖。
         transcript_rect: Rect::default(),
+        // §24：scrollbar 矩形由 render_frame 计算（需要屏幕坐标）。
+        scrollbar_rect: None,
+        window_start,
+        total_rows: heights.iter().sum(),
         overflow,
         committed_after,
     }
 }
 
-/// [`wrap_lines`] 的 hit 伴随版本：折行时卡片 id 跟随所属逻辑行。
 fn wrap_lines_with_hits(
     lines: Vec<Line<'static>>,
     hits: Vec<Option<HitTarget>>,
@@ -1157,6 +1200,13 @@ fn draw_footer(
             ));
         }
     }
+    // BUG-005：运行中排队的消息在 footer 可见（避免用户以为提交丢失/未生效）。
+    if view.pending_queue_len > 0 {
+        spans.push(Span::styled(
+            format!(" · 已排队 {} 条消息", view.pending_queue_len),
+            Style::default().fg(theme.warning),
+        ));
+    }
     // 整改 D：footer 固定顺序 workspace · model · state · ctx · tokens · 提示。
     // 上下文用量条（§对比：gemini-cli ContextUsageDisplay；projected/usable）。
     if let Some((projected, usable)) = view.context_usage
@@ -1204,6 +1254,41 @@ fn draw_footer(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// §24：全屏历史垂直 scrollbar——1 列，thumb 比例按 visual 行数（不是 entry 数）。
+/// 内容不超一屏时画空轨道（布局稳定，不随内容增长跳变）。
+fn draw_scrollbar(
+    frame: &mut ratatui::Frame,
+    rect: Rect,
+    theme: theme::Theme,
+    window_start: usize,
+    total_rows: usize,
+) {
+    let area_h = rect.height.max(1) as usize;
+    let mut glyphs: Vec<&'static str> = vec!["│"; area_h];
+    if total_rows > area_h {
+        let thumb_h =
+            (((area_h as u64 * area_h as u64) / total_rows.max(1) as u64).max(1)) as usize;
+        let max_start = total_rows - area_h;
+        let top = if max_start == 0 {
+            0
+        } else {
+            ((window_start as u64 * (area_h - thumb_h) as u64) / max_start as u64) as usize
+        };
+        for y in top..(top + thumb_h).min(area_h) {
+            glyphs[y] = "▐";
+        }
+    }
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(area_h);
+    for g in glyphs {
+        let style = if g == "▐" {
+            Style::default().fg(theme.info)
+        } else {
+            Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
+        };
+        lines.push(Line::styled(g, style));
+    }
+    frame.render_widget(Paragraph::new(lines), rect);
+}
 /// 输入区（§16.2：硬件 cursor 放在真实输入位置，优先保证中文 IME）。
 ///
 /// 支持多行（Alt+Enter）；行数与光标位置按 display width 折行计算。
@@ -1213,13 +1298,23 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: t
         Span::raw(view.input.clone()),
     ]);
     let wrapped = wrap_lines(vec![line], area.width as usize);
-    let rows = wrapped.len().max(1);
+    let rows = wrapped.len().max(1) as u16;
     let (cursor_row, cursor_col) = input_cursor_cell(&view.input, view.input_cursor, area.width);
-    let scroll_rows = cursor_row.saturating_sub(rows as u16 - 1);
+    // BUG-008：滚动基准必须是可见区域高度（area.height），而不是全部折行行数
+    // （rows）——否则长输入（>8 行）时光标会被放到输入区之外、不可见。
+    let scroll_rows = input_scroll_offset(cursor_row, rows, area.height);
     frame.render_widget(Paragraph::new(wrapped).scroll((scroll_rows, 0)), area);
     let y = area.y + (cursor_row - scroll_rows);
     let x = area.x + cursor_col;
     frame.set_cursor_position((x, y));
+}
+
+/// BUG-008：输入区内部滚动的可见基准——保证光标行落在 `area` 内。
+/// `total_rows` 是输入全部折行行数（可能大于区域高度，内部滚动）。
+fn input_scroll_offset(cursor_row: u16, total_rows: u16, area_height: u16) -> u16 {
+    let area_height = area_height.max(1);
+    let max_scroll = total_rows.saturating_sub(area_height);
+    cursor_row.saturating_sub(area_height - 1).min(max_scroll)
 }
 
 /// 输入区所需行数（≤4 行；长输入内部滚动跟随光标）。
@@ -1771,6 +1866,22 @@ mod tests {
         assert_eq!(fmt_tokens(2_000_000), "2.0M");
     }
 
+    /// BUG-008：长输入（折行数 > 输入区高度）时光标行必须留在输入区内。
+    #[test]
+    fn input_scroll_keeps_cursor_inside_visible_area() {
+        // 10 行输入、4 行区域：光标在最后一行（row 9）→ 滚动 6 行，
+        // 光标 y 落在区域第 4 行（area.y + 3），而不是区域外。
+        let offset = input_scroll_offset(9, 10, 4);
+        assert_eq!(offset, 6);
+        assert!(9 - offset < 4, "光标必须落在 4 行区域内");
+        // 光标在顶部时不滚动。
+        assert_eq!(input_scroll_offset(0, 10, 4), 0);
+        assert_eq!(input_scroll_offset(2, 10, 4), 0);
+        // 输入行数小于区域高度：不滚动。
+        assert_eq!(input_scroll_offset(2, 3, 8), 0);
+        // 极端：区域高度 0 不 panic（clamp 到 1）。
+        assert_eq!(input_scroll_offset(5, 10, 0), 5);
+    }
     #[test]
     fn activity_height_scales_with_terminal_rows() {
         // 小终端：2/5 屏不足下限 → 12 行。

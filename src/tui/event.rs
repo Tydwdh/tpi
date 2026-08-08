@@ -20,6 +20,8 @@ pub enum UiEvent {
     ClickTool(String),
     /// 鼠标点击命中折叠的 reasoning 行（Renderer hit-test 后；EntryId §4.1）。
     ClickReasoning(crate::tui::scroll::EntryId),
+    /// 点击/拖拽垂直 scrollbar（§24）：参数是点击行在转录区内的偏移（0-based）。
+    ScrollbarClick(u16),
     /// bracketed paste 文本。
     Paste(String),
     /// Agent 运行时事件（模型增量/工具生命周期/上下文用量）。

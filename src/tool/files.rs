@@ -97,7 +97,7 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
             let mut text = window.text;
             let mut truncated = window.truncated;
             if text.len() > DEFAULT_READ_MAX_BYTES {
-                text.truncate(DEFAULT_READ_MAX_BYTES);
+                crate::util::truncate_to_char_boundary(&mut text, DEFAULT_READ_MAX_BYTES);
                 truncated = true;
             }
             let revision_header = edit::format_revision_header(&window.revision);
@@ -437,4 +437,66 @@ pub fn display_path(workspace_root: &Utf8PathBuf, path: &Utf8PathBuf) -> String 
     path.strip_prefix(workspace_root)
         .map(|relative| relative.to_string())
         .unwrap_or_else(|_| path.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::outcome::ToolStatus;
+    use tokio_util::sync::CancellationToken;
+
+    /// BUG-001 回归：读取超过 32 KiB 且截断点落在多字节字符中间的中文文件
+    /// 不得 panic（此前 `String::truncate` 按裸字节截断）。
+    #[test]
+    fn read_large_cjk_file_truncates_at_char_boundary_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("big_zh.rs")).unwrap();
+        // 单行 20k 个“中”（3 字节/字）：60000 字节 + \n，远超 32 KiB 预算；
+        // 32 KiB 边界（32768 % 3 = 2）必然落在一个中文字符中间。
+        let mut content = String::new();
+        content.push_str(&"中".repeat(20_000));
+        content.push('\n');
+        content.push_str("fn main() {}\n");
+        std::fs::write(path.as_std_path(), &content).unwrap();
+
+        let ctx = ToolContext {
+            workspace_root: workspace,
+            cancel: CancellationToken::new(),
+            artifacts_root: dir.path().join("artifacts"),
+            session_id: "test-session".into(),
+            call_id: crate::ids::ToolCallId::new_v7(),
+            output_tx: None,
+            scan_snapshots: Default::default(),
+            shell_path: None,
+            snapshot_store: Default::default(),
+            current_plan: Default::default(),
+            interactive: false,
+        };
+        let outcome = read(
+            ReadArgs {
+                path: path.to_string(),
+                start_line: 1,
+                line_count: 200,
+            },
+            &ctx,
+        );
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        let output = &outcome.model_payload.output;
+        assert!(
+            std::str::from_utf8(output.as_bytes()).is_ok(),
+            "read 输出必须是合法 UTF-8"
+        );
+        assert!(
+            !output.contains('\u{FFFD}'),
+            "截断不得产生 replacement char"
+        );
+        // 正文（去掉头部信息后）不得超过 32 KiB 预算。
+        let body = output.split("\n\n").last().unwrap_or("");
+        assert!(
+            body.len() <= 32 * 1024,
+            "正文超出预算: {} bytes",
+            body.len()
+        );
+    }
 }

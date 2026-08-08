@@ -1,4 +1,4 @@
-//! P1 修复回归测试（fix.md 外部审查报告，第二批）。
+﻿//! P1 修复回归测试（fix.md 外部审查报告，第二批）。
 //!
 //! - P1-1：取消后 session 已提交的 assistant 内容必须同步进 outcome.messages；
 //! - P1-2：max_tool_calls 超限必须是独立的 MaxToolCalls reason，不是 Error。
@@ -223,6 +223,7 @@ async fn p1_3_watchdog_fires_warn_before_deadline() {
     let (handle, _) = tpi::agent::limits::spawn_watchdog_with_wall(
         std::time::Duration::from_secs(2),
         cancel.clone(),
+        || {},
         move || {
             let _ = warn_tx.send(());
         },

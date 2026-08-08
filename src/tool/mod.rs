@@ -165,9 +165,9 @@ pub enum ValidatedArgs {
 
 /// 工具流式输出事件（bash 实时输出 → UI；tool 层不依赖 agent 层）。
 ///
-/// 进程层读帧时同步发送（UnboundedSender 不阻塞执行路径）；
-/// agent 桥接转发为 [`crate::agent::RuntimeEvent::ToolOutputDelta`]。
-#[derive(Debug, Clone)]
+/// BUG-012：此前 unbounded channel 会在 UI 消费慢时无限堆积；现在是有界
+/// channel + try_send，满时丢弃（实时输出是 lossy telemetry，§12：不允许为
+/// UI streaming 建无限队列；工具自身输出仍有界：24 KiB tail + artifact）。
 pub struct ToolStreamEvent {
     /// 工具调用的内部 id（与 ToolStarted 事件一致，UI 按此匹配卡片）。
     pub call_id: crate::ids::ToolCallId,
@@ -176,7 +176,10 @@ pub struct ToolStreamEvent {
     pub text: String,
 }
 
+/// 工具流式输出通道容量（有界；满时丢弃新帧，见 [`ToolStreamEvent`]）。
+pub const TOOL_STREAM_CAPACITY: usize = 256;
 /// 工具执行上下文。
+#[derive(Clone)]
 pub struct ToolContext {
     pub workspace_root: Utf8PathBuf,
     pub cancel: CancellationToken,
@@ -187,7 +190,7 @@ pub struct ToolContext {
     /// 当前工具调用的内部 id（流式输出事件按此匹配 UI 卡片）。
     pub call_id: crate::ids::ToolCallId,
     /// 流式输出通道（bash 实时输出；None = 无 UI 订阅）。
-    pub output_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolStreamEvent>>,
+    pub output_tx: Option<tokio::sync::mpsc::Sender<ToolStreamEvent>>,
     /// list/search 分页 snapshot（session 作用域；cursor 翻页不重新扫描，§8.4）。
     pub scan_snapshots:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, search::ScanSnapshot>>>,
@@ -334,7 +337,6 @@ pub fn path_rejected_outcome(tool: &str, error: PathResolveError) -> ToolOutcome
 /// 执行一个已校验的工具调用（§8.2：预期失败返回 ToolOutcome，不返回 Err）。
 ///
 /// `plan` 是写工具（edit/write）的提交计划：agent loop 在持久化 `ToolStarted`
-/// 前生成（§10.7 第 1 条：temp/backup 标识先于副作用）。
 pub async fn execute(
     tool: BuiltinTool,
     args: ValidatedArgs,
@@ -343,37 +345,64 @@ pub async fn execute(
 ) -> ToolOutcome {
     let start = std::time::Instant::now();
     let outcome = match (tool, args) {
-        (BuiltinTool::Read, ValidatedArgs::Read(args)) => files::read(args, ctx),
-        (BuiltinTool::List, ValidatedArgs::List(args)) => search::list(args, ctx),
-        (BuiltinTool::Search, ValidatedArgs::Search(args)) => search::search(args, ctx),
-        (BuiltinTool::Edit, ValidatedArgs::Edit(args)) => files::edit(args, ctx, plan),
-        (BuiltinTool::Write, ValidatedArgs::Write(args)) => files::write(args, ctx, plan),
+        // 异步工具（网络/进程）留在 async 上下文。
         (BuiltinTool::Bash, ValidatedArgs::Bash(args)) => command::bash(args, ctx).await,
-        // §13：update_plan 是原生同步控制操作，不进入普通调度队列。
-        (BuiltinTool::UpdatePlan, ValidatedArgs::UpdatePlan(args)) => plan::update_plan(args, ctx),
         (BuiltinTool::WebSearch, ValidatedArgs::WebSearch(args)) => {
             web::web_search(args, ctx).await
         }
         (BuiltinTool::WebFetch, ValidatedArgs::WebFetch(args)) => web::web_fetch(args, ctx).await,
+        // §11/BUG-009：同步工具（文件 IO/正则扫描）挪到 blocking 池，避免大目录扫描、
+        // 大文件读取、网络盘遍历阻塞 Tokio worker——并行 4 个工具时可能占满全部
+        // worker，导致 TUI 事件循环（ui_rx/ticker/键盘）明显卡顿。
         (tool, args) => {
-            // 内部不变量：ValidatedArgs 由同工具解析产生；异常组合按失败上报。
-            tracing::error!(
-                tool = ?tool,
-                args = ?args,
-                "execute: tool 与已解析参数不匹配（内部不变量破坏）",
-            );
-            ToolOutcome::failed(
-                "internal",
-                ModelPayload {
-                    status: ToolStatus::Failed,
-                    program: None,
-                    exit_code: None,
-                    duration_ms: 0,
-                    output: "status: failed\ntool: internal\nerror: args_mismatch\n\n内部错误：工具与参数不匹配。".into(),
-                    effect: None,
-                    artifact: None,
-                },
-            )
+            let ctx = ctx.clone();
+            let plan = plan.cloned();
+            tokio::task::spawn_blocking(move || match (tool, args) {
+                (BuiltinTool::Read, ValidatedArgs::Read(args)) => files::read(args, &ctx),
+                (BuiltinTool::List, ValidatedArgs::List(args)) => search::list(args, &ctx),
+                (BuiltinTool::Search, ValidatedArgs::Search(args)) => search::search(args, &ctx),
+                (BuiltinTool::Edit, ValidatedArgs::Edit(args)) => files::edit(args, &ctx, plan.as_ref()),
+                (BuiltinTool::Write, ValidatedArgs::Write(args)) => files::write(args, &ctx, plan.as_ref()),
+                // §13：update_plan 是原生同步控制操作。
+                (BuiltinTool::UpdatePlan, ValidatedArgs::UpdatePlan(args)) => plan::update_plan(args, &ctx),
+                (tool, args) => {
+                    // 内部不变量：ValidatedArgs 由同工具解析产生；异常组合按失败上报。
+                    tracing::error!(
+                        tool = ?tool,
+                        args = ?args,
+                        "execute: tool 与已解析参数不匹配（内部不变量破坏）",
+                    );
+                    ToolOutcome::failed(
+                        "internal",
+                        ModelPayload {
+                            status: ToolStatus::Failed,
+                            program: None,
+                            exit_code: None,
+                            duration_ms: 0,
+                            output: "status: failed\\ntool: internal\\nerror: args_mismatch\\n\\n内部错误：工具与参数不匹配。".into(),
+                            effect: None,
+                            artifact: None,
+                        },
+                    )
+                }
+            })
+            .await
+            .unwrap_or_else(|error| {
+                // spawn_blocking panic/取消：按基础设施失败上报，不崩溃进程。
+                tracing::error!(tool = ?tool, error = %error, "execute: blocking tool failed");
+                ToolOutcome::failed(
+                    "internal",
+                    ModelPayload {
+                        status: ToolStatus::Failed,
+                        program: None,
+                        exit_code: None,
+                        duration_ms: 0,
+                        output: "status: failed\\ntool: internal\\nerror: tool_panicked\\n\\n内部错误：工具执行线程异常退出。".into(),
+                        effect: None,
+                        artifact: None,
+                    },
+                )
+            })
         }
     };
     outcome.with_timing(start.elapsed().as_millis() as u64)
@@ -404,3 +433,44 @@ pub fn requires_write_ahead(tool: BuiltinTool) -> bool {
 
 /// update_plan 是否计入工具调用预算（§13：计入）。
 pub const UPDATE_PLAN_COUNTS_TO_BUDGET: bool = true;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    /// BUG-009：同步工具（read）经 spawn_blocking 执行后仍返回正确结果。
+    #[tokio::test]
+    async fn execute_runs_sync_tools_through_blocking_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("a.txt")).unwrap();
+        std::fs::write(path.as_std_path(), "hello 世界\n").unwrap();
+        let ctx = ToolContext {
+            workspace_root: workspace,
+            cancel: CancellationToken::new(),
+            artifacts_root: dir.path().join("artifacts"),
+            session_id: "test-session".into(),
+            call_id: crate::ids::ToolCallId::new_v7(),
+            output_tx: None,
+            scan_snapshots: Default::default(),
+            shell_path: None,
+            snapshot_store: Default::default(),
+            current_plan: Default::default(),
+            interactive: false,
+        };
+        let outcome = execute(
+            BuiltinTool::Read,
+            ValidatedArgs::Read(files::ReadArgs {
+                path: path.to_string(),
+                start_line: 1,
+                line_count: 200,
+            }),
+            &ctx,
+            None,
+        )
+        .await;
+        assert_eq!(outcome.status, outcome::ToolStatus::Succeeded);
+        assert!(outcome.model_text().contains("hello 世界"));
+    }
+}

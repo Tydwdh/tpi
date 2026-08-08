@@ -24,6 +24,7 @@ use crate::provider::openai_compat::OpenAiCompatClient;
 use crate::provider::{ChatMessage, Provider};
 use crate::session::{self, SessionEvent, SessionLog};
 use crate::tui::effect::UiEffect;
+use crate::tui::event::UiEvent;
 use crate::tui::state::UiState;
 use crate::tui::{Renderer, model::LineKind, model::StatusLine, model::ViewModel};
 use ratatui::crossterm::event::Event;
@@ -125,6 +126,10 @@ pub async fn run(
             current_cancel.clone(),
         )
         .await?;
+        // §16：wall-time 自动取消不是用户取消，-p 也要明确提示（stderr）。
+        if outcome.reason == crate::session::CompletionReason::WallTimeExceeded {
+            eprintln!("警告：run 达到 wall-time 预算被自动取消（非用户取消）");
+        }
         // §18.3：`-p` 模式 stdout 只输出最终答案。
         if !outcome.assistant_text.is_empty() {
             println!("{}", outcome.assistant_text);
@@ -182,11 +187,14 @@ pub async fn run_prompt_once<P: Provider>(
         false,
         false,
     )
-    .await
-    .map_err(|failure| failure.to_string())?;
+    .await;
     *crate::util::lock_mutex(&current_cancel, "current_cancel") = None;
+    let outcome = outcome.map_err(|failure| failure.to_string())?;
     if outcome.reason == crate::session::CompletionReason::Error {
-        return Err("run 以 Error 结束（长度限制/内容过滤/协议错误，见 session 记录）".into());
+        return Err(format!(
+            "run 以 Error 结束（长度限制/内容过滤/协议错误）；session 记录: {}",
+            session.path().display()
+        ));
     }
     Ok(outcome)
 }
@@ -232,11 +240,16 @@ async fn interactive_loop<P: Provider>(
     // §26-27：UiState 是 UI 单一事实源；交互循环只做
     // event → reducer → effects → draw（T3）。
     let mut ui_state = UiState::new(view);
+    // BUG-006：--continue/--resume 启动时把已加载的 history 重建到屏幕，
+    // 避免“模型有历史、屏幕空白/显示旧内容”的不一致。
+    if !history.is_empty() {
+        ui_state.view.load_history(history);
+    }
     // 排队语义（§12 稳定化任务书）：运行中输入先存 ui_state.pending_message，
     // 当前 run 完成后由主循环作为下一条消息提交——不是 run 内的
     // boundary steering。
     if !initial_prompt.is_empty() {
-        ui_state.pending_message = Some(initial_prompt.to_string());
+        ui_state.push_pending(initial_prompt.to_string());
     }
     renderer
         .draw(&mut ui_state.view)
@@ -273,60 +286,46 @@ async fn interactive_loop<P: Provider>(
     });
 
     loop {
-        // 处理键盘事件（空闲时阻塞等待，不空转）。
+        // BUG-003：存在排队输入（初始 prompt / run 期间提交的消息 / /sessions 选择）
+        // 时必须立即消费，不能先阻塞等待键盘事件——否则 `tpi "prompt"` 与
+        // “run 结束后自动执行下一条”都要再按一次键才生效。
         let mut need_draw = false;
-        tokio::select! {
-            event = key_rx.recv() => {
-                match event {
-                    Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                        need_draw = true;
-                        let effects = crate::tui::reducer::update(&mut ui_state, UiEvent::Key(key));
-                        for effect in effects {
-                            execute_ui_effect(effect, &mut ui_state, current_cancel.clone());
-                        }
-                    }
-                    Some(Event::Paste(text)) => {
-                        need_draw = true;
-                        crate::tui::reducer::update(&mut ui_state, UiEvent::Paste(text));
-                    }
-                    // 鼠标：滚轮翻页、点击工具卡片展开（空闲态）；
-                    // hit-test 依赖 Renderer，在 app 层解析后送语义化事件。
-                    Some(Event::Mouse(mouse)) => {
-                        use ratatui::crossterm::event::MouseEventKind;
-                        let event = match mouse.kind {
-                            MouseEventKind::ScrollUp => Some(UiEvent::MouseScrollUp),
-                            MouseEventKind::ScrollDown => Some(UiEvent::MouseScrollDown),
-                            MouseEventKind::Down(_) => {
-                                if ui_state.view.overlay.is_some() {
-                                    // Overlay 打开时点击外部不动作。
-                                    None
-                                } else if let Some(target) =
-                                    renderer.hit_target(mouse.column, mouse.row)
-                                {
-                                    match target {
-                                        crate::tui::HitTarget::Tool(id) => {
-                                            Some(UiEvent::ClickTool(id))
-                                        }
-                                        crate::tui::HitTarget::Reasoning(id) => {
-                                            Some(UiEvent::ClickReasoning(id))
-                                        }
-                                    }
-                                } else {
-                                    None
+        if !ui_state.has_pending_work() {
+            // 处理键盘事件（空闲时阻塞等待，不空转）。
+            tokio::select! {
+                event = key_rx.recv() => {
+                    match event {
+                        Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                            need_draw = true;
+                            let effects = crate::tui::reducer::update(&mut ui_state, UiEvent::Key(key));
+                            let mut quit = false;
+                            for effect in effects {
+                                if execute_ui_effect(effect, &mut ui_state, current_cancel.clone()) {
+                                    quit = true;
                                 }
                             }
-                            _ => None,
-                        };
-                        if let Some(event) = event {
-                            need_draw = true;
-                            crate::tui::reducer::update(&mut ui_state, event);
+                            if quit {
+                                // BUG-004：空闲 Ctrl-C 请求退出（走循环后的正常终端 restore）。
+                                break;
+                            }
                         }
+                        Some(Event::Paste(text)) => {
+                            need_draw = true;
+                            crate::tui::reducer::update(&mut ui_state, UiEvent::Paste(text));
+                        }
+                        // 鼠标：滚轮翻页、点击工具卡片展开（空闲态）；
+                        Some(Event::Mouse(mouse)) => {
+                            if let Some(event) = mouse_ui_event(&ui_state, &renderer, mouse) {
+                                need_draw = true;
+                                crate::tui::reducer::update(&mut ui_state, event);
+                            }
+                        }
+                        Some(Event::Resize(_, _)) => {
+                            renderer.autoresize().map_err(|e| e.to_string())?;
+                            need_draw = true;
+                        }
+                        _ => {}
                     }
-                    Some(Event::Resize(_, _)) => {
-                        renderer.autoresize().map_err(|e| e.to_string())?;
-                        need_draw = true;
-                    }
-                    _ => {}
                 }
             }
         }
@@ -351,6 +350,8 @@ async fn interactive_loop<P: Provider>(
                     Ok((new_session, new_history)) => {
                         *session = new_session;
                         *history = new_history;
+                        // BUG-006：屏幕必须重建为新 session 的对话（不能残留旧屏幕）。
+                        ui_state.view.load_history(history);
                         ui_state.view.push_line(
                             LineKind::System,
                             format!("已恢复 session {id}（对话历史已加载）"),
@@ -371,7 +372,7 @@ async fn interactive_loop<P: Provider>(
         }
 
         // 有提交的消息：运行。
-        if let Some(message) = ui_state.pending_message.take() {
+        if let Some(message) = ui_state.pop_pending() {
             match message.as_str() {
                 "/quit" | "/exit" => break,
                 "/settings" => {
@@ -537,6 +538,8 @@ workspace: {}
                 "/new" => {
                     *session = None;
                     history.clear();
+                    // BUG-006：屏幕投影必须与已清空的上下文同步（否则显示旧 session）。
+                    ui_state.view.reset_for_new_session();
                     push_system_line(
                         &mut ui_state.view,
                         &mut renderer,
@@ -583,20 +586,26 @@ workspace: {}
                     continue;
                 }
                 "/diff" => {
+                    // §19：diff 是查看型内容，走 Modal 不污染 transcript。
                     let diff = match session.as_ref() {
                         Some(log) => last_edit_diff(log),
                         None => "尚无 session".to_string(),
                     };
-                    push_system_line(&mut ui_state.view, &mut renderer, diff)?;
+                    ui_state.view.open_modal("/diff", diff);
+                    renderer
+                        .draw(&mut ui_state.view)
+                        .map_err(|e| e.to_string())?;
                     continue;
                 }
                 "/doctor" => {
-                    // P2：TUI 内环境检查（与 `tpi doctor` 同一份报告）。
-                    push_system_line(
-                        &mut ui_state.view,
-                        &mut renderer,
+                    // §19：环境检查报告走 Modal（此前 push 进 transcript 污染聊天历史）。
+                    ui_state.view.open_modal(
+                        "/doctor",
                         crate::doctor::render_report(&config.workspace_root),
-                    )?;
+                    );
+                    renderer
+                        .draw(&mut ui_state.view)
+                        .map_err(|e| e.to_string())?;
                     continue;
                 }
                 "/compact" => {
@@ -669,12 +678,61 @@ workspace: {}
     Ok(())
 }
 
+/// 把 crossterm 鼠标事件解析为语义化 UiEvent（§24 scrollbar 点击/拖拽 +
+/// 工具/reasoning hit-test；reducer 不依赖终端坐标）。
+fn mouse_ui_event(
+    ui_state: &UiState,
+    renderer: &Renderer,
+    mouse: ratatui::crossterm::event::MouseEvent,
+) -> Option<UiEvent> {
+    use ratatui::crossterm::event::MouseEventKind;
+    let scrollbar_click = |mouse: &ratatui::crossterm::event::MouseEvent| -> Option<UiEvent> {
+        let rect = renderer.scrollbar_rect()?;
+        if mouse.column < rect.x
+            || mouse.column >= rect.x + rect.width
+            || mouse.row < rect.y
+            || mouse.row >= rect.y + rect.height
+        {
+            return None;
+        }
+        Some(UiEvent::ScrollbarClick(mouse.row - rect.y))
+    };
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Some(UiEvent::MouseScrollUp),
+        MouseEventKind::ScrollDown => Some(UiEvent::MouseScrollDown),
+        MouseEventKind::Down(_) => {
+            if ui_state.view.overlay.is_some() {
+                // Overlay 打开时点击外部不动作。
+                None
+            } else if let Some(event) = scrollbar_click(&mouse) {
+                Some(event)
+            } else if let Some(target) = renderer.hit_target(mouse.column, mouse.row) {
+                match target {
+                    crate::tui::HitTarget::Tool(id) => Some(UiEvent::ClickTool(id)),
+                    crate::tui::HitTarget::Reasoning(id) => Some(UiEvent::ClickReasoning(id)),
+                }
+            } else {
+                None
+            }
+        }
+        MouseEventKind::Drag(_) => {
+            // §24：拖拽 scrollbar thumb 持续跳转；其他位置不动作。
+            if ui_state.view.overlay.is_none() {
+                scrollbar_click(&mouse)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
 /// 执行 reducer 返回的跨边界效果（§27：app 层执行 effect）。
+/// 返回 true 表示请求退出主循环（BUG-004：空闲 Ctrl-C）。
 fn execute_ui_effect(
     effect: UiEffect,
     ui_state: &mut UiState,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
-) {
+) -> bool {
     match effect {
         UiEffect::CancelRun => {
             if let Some(cancel) = crate::util::lock_mutex(&current_cancel, "current_cancel").clone()
@@ -683,10 +741,13 @@ fn execute_ui_effect(
             }
             ui_state
                 .view
-                .push_line(LineKind::System, "已发送取消（Esc）；保留 session");
+                .push_line(LineKind::System, "已发送取消（Ctrl-C/Esc）；保留 session");
+            false
         }
-        // Quit / ResumeSession 由交互主循环处理（/quit 与 /sessions 菜单）。
-        UiEffect::Quit | UiEffect::ResumeSession(_) => {}
+        // BUG-004：空闲 Ctrl-C 产生 Quit → app 层 break 主循环走正常退出（含终端 restore）。
+        UiEffect::Quit => true,
+        // ResumeSession 由交互主循环处理（/sessions 菜单）。
+        UiEffect::ResumeSession(_) => false,
     }
 }
 
@@ -763,7 +824,7 @@ async fn run_interactive<P: Provider>(
                                     cancel.cancel();
                                     ui_state.view.push_line(
                                         LineKind::System,
-                                        "已发送取消（Esc）；保留 session",
+                                        "已发送取消（Ctrl-C/Esc）；保留 session",
                                     );
                                 }
                                 UiEffect::Quit | UiEffect::ResumeSession(_) => {
@@ -777,34 +838,8 @@ async fn run_interactive<P: Provider>(
                         crate::tui::reducer::update(ui_state, UiEvent::Paste(text));
                         renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }
-                    // 鼠标：滚轮翻页；点击工具卡片展开/折叠（hit-test 在 app 层）。
                     Some(Event::Mouse(mouse)) => {
-                        use ratatui::crossterm::event::MouseEventKind;
-                        let event = match mouse.kind {
-                            MouseEventKind::ScrollUp => Some(UiEvent::MouseScrollUp),
-                            MouseEventKind::ScrollDown => Some(UiEvent::MouseScrollDown),
-                            MouseEventKind::Down(_) => {
-                                if ui_state.view.overlay.is_some() {
-                                    // Overlay 打开时点击外部不动作。
-                                    None
-                                } else if let Some(target) =
-                                    renderer.hit_target(mouse.column, mouse.row)
-                                {
-                                    match target {
-                                        crate::tui::HitTarget::Tool(id) => {
-                                            Some(UiEvent::ClickTool(id))
-                                        }
-                                        crate::tui::HitTarget::Reasoning(id) => {
-                                            Some(UiEvent::ClickReasoning(id))
-                                        }
-                                    }
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => None,
-                        };
-                        if let Some(event) = event {
+                        if let Some(event) = mouse_ui_event(ui_state, renderer, mouse) {
                             crate::tui::reducer::update(ui_state, event);
                             renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                         }
@@ -836,6 +871,13 @@ async fn run_interactive<P: Provider>(
             ui_state.view.push_line(
                 LineKind::System,
                 "上下文仍超出模型窗口（压缩后仍无法容纳）。请 /new 开启新会话，或检查配置中的 context_window。",
+            );
+        }
+        crate::session::CompletionReason::WallTimeExceeded => {
+            // §16：watchdog 自动取消≠用户取消，明确提示。
+            ui_state.view.push_line(
+                LineKind::System,
+                "run 达到 wall-time 预算被自动取消（非用户取消）；已保留已提交内容".to_string(),
             );
         }
         _ => {}
@@ -908,13 +950,16 @@ fn spawn_ctrl_c_handler(current_cancel: Arc<Mutex<Option<CancellationToken>>>) {
 /// 退出前恢复终端（inline TUI 打开过 raw mode；process::exit 不触发 Drop）。
 fn restore_terminal_on_exit() {
     use std::io::Write;
-    let _ = ratatui::crossterm::terminal::disable_raw_mode();
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::cursor::Show,
+        ratatui::crossterm::event::DisableMouseCapture,
+        ratatui::crossterm::event::DisableBracketedPaste,
+        ratatui::crossterm::terminal::LeaveAlternateScreen,
         ratatui::crossterm::style::ResetColor,
     );
     let _ = std::io::stdout().flush();
+    let _ = ratatui::crossterm::terminal::disable_raw_mode();
 }
 
 /// §31：panic hook——先尽力恢复终端，再走默认 panic 输出。
@@ -1032,13 +1077,34 @@ fn list_sessions(
 }
 
 /// P2：从 session 文件提取首条用户消息摘要（≤40 字符，单行）。
+/// UX/性能：只流式读文件头部（≤500 行），不解析整个 session——
+/// 长会话下 `/sessions` 列表保持轻量（此前 read_events 解析全部事件）。
 fn first_user_preview(path: &std::path::Path) -> String {
-    use crate::session::read_events;
-    let Ok(events) = read_events(path) else {
+    use std::io::BufRead;
+    const MAX_LINES: usize = 500;
+    let Ok(file) = std::fs::File::open(path) else {
         return String::new();
     };
-    for event in events {
-        if let SessionEvent::UserSubmitted { content } = event {
+    let mut reader = std::io::BufReader::new(file);
+    let mut lines_read = 0usize;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        lines_read += 1;
+        if lines_read > MAX_LINES {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(envelope) = serde_json::from_str::<crate::session::Envelope>(&line) else {
+            continue;
+        };
+        if let SessionEvent::UserSubmitted { content } = envelope.to_session_event() {
             let one_line = content.lines().next().unwrap_or_default();
             let truncated: String = one_line.chars().take(40).collect();
             return if one_line.chars().count() > 40 {
@@ -1050,7 +1116,6 @@ fn first_user_preview(path: &std::path::Path) -> String {
     }
     String::new()
 }
-
 /// P1-13：事件数 = JSONL 行数（每行一个事件，§14.2）；只数行不 serde 解析，
 /// session 增多时 `/sessions` 列表仍保持轻量（此前对每个文件解析全部事件）。
 fn count_jsonl_lines(path: &std::path::Path) -> usize {
@@ -1213,9 +1278,53 @@ mod tests {
             UiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         );
         assert_eq!(
-            state.pending_message.as_deref(),
+            state.pop_pending().as_deref(),
             Some("/settings"),
             "Enter 提交的必须是补全后的命令"
         );
     }
+}
+
+/// UX：首条用户消息预览只读文件头部——超过 500 行才出现的 UserSubmitted 不读取
+/// （长会话 `/sessions` 列表保持轻量，不解析整个 session）。
+#[test]
+fn first_user_preview_is_bounded_to_file_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.jsonl");
+    let mut content = String::new();
+    // 600 个非用户事件（合法 envelope 行），UserSubmitted 在第 600 行之后。
+    for i in 0..600 {
+        let envelope = serde_json::json!({
+            "schema": 1,
+            "seq": i + 1,
+            "event_id": format!("event-{i}"),
+            "timestamp": "2026-01-01T00:00:00Z",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "type": "run_started",
+            "payload": {"model": {"name": "m", "provider": "p"}, "limits": {"max_turns": 1, "max_tool_calls": 1}}
+        });
+        content.push_str(&serde_json::to_string(&envelope).unwrap());
+        content.push('\n');
+    }
+    content.push_str(
+        &serde_json::to_string(&serde_json::json!({
+            "schema": 1,
+            "seq": 601,
+            "event_id": "event-600",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "type": "user_submitted",
+            "payload": {"content": "太晚的消息"}
+        }))
+        .unwrap(),
+    );
+    content.push('\n');
+    std::fs::write(&path, content).unwrap();
+    assert_eq!(
+        first_user_preview(&path),
+        "",
+        "超过头部预算的 UserSubmitted 不应被读取（保持 /sessions 轻量）"
+    );
 }

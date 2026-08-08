@@ -179,6 +179,7 @@ async fn watchdog_cancels_at_wall_deadline() {
         std::time::Duration::from_millis(200),
         cancel.clone(),
         || {},
+        || {},
     );
     let end = watchdog.await.unwrap();
     assert_eq!(end, limits::BudgetEnd::WallTimeExceeded);

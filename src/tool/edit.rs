@@ -1007,11 +1007,7 @@ mod tests {
     fn read_window_returns_utf8_chinese() {
         let dir = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("zh.rs")).unwrap();
-        std::fs::write(
-            path.as_std_path(),
-            "// 第一行\n// 第二行\nfn main() {}\n",
-        )
-        .unwrap();
+        std::fs::write(path.as_std_path(), "// 第一行\n// 第二行\nfn main() {}\n").unwrap();
         let window = read_window(&path, 1, 3).unwrap();
         assert_eq!(window.text, "// 第一行\n// 第二行\nfn main() {}");
         assert_eq!(window.total_lines, 3);

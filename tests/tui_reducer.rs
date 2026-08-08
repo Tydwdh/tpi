@@ -36,7 +36,10 @@ fn typing_and_enter_produces_pending_message() {
         "输入投影必须同步（§25 双状态消除）"
     );
     reducer::update(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.pending_message.as_deref(), Some("你好 world"));
+    assert_eq!(
+        s.pending_messages.front().map(String::as_str),
+        Some("你好 world")
+    );
     assert!(s.editor.text().is_empty(), "提交后清空编辑区");
 }
 
@@ -76,7 +79,7 @@ fn event_sequence_is_replayable() {
     assert_eq!(s1.view.anim_tick, s2.view.anim_tick);
     assert_eq!(s1.view.context_usage, s2.view.context_usage);
     assert_eq!(s1.view.transcript.len(), s2.view.transcript.len());
-    assert_eq!(s1.pending_message, s2.pending_message);
+    assert_eq!(s1.pending_messages, s2.pending_messages);
 }
 
 #[test]
@@ -139,7 +142,10 @@ fn menu_enter_submits_completed_command() {
     reducer::update(&mut s, key(KeyCode::Tab));
     reducer::update(&mut s, key(KeyCode::Tab));
     reducer::update(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.pending_message.as_deref(), Some("/help"));
+    assert_eq!(
+        s.pending_messages.front().map(String::as_str),
+        Some("/help")
+    );
 }
 
 #[test]
@@ -258,7 +264,10 @@ fn shift_enter_and_ctrl_j_insert_newline_but_plain_enter_submits() {
     assert_eq!(s.editor.text(), "a\nb\nc");
     // 普通 Enter 提交（§23：Enter = 提交）。
     reducer::update(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.pending_message.as_deref(), Some("a\nb\nc"));
+    assert_eq!(
+        s.pending_messages.front().map(String::as_str),
+        Some("a\nb\nc")
+    );
 }
 
 #[test]
@@ -267,8 +276,11 @@ fn up_down_moves_within_multiline_then_falls_back_to_history() {
     // 先提交一条历史。
     reducer::update(&mut s, UiEvent::Paste("历史命令".into()));
     reducer::update(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.pending_message.as_deref(), Some("历史命令"));
-    s.pending_message = None;
+    assert_eq!(
+        s.pending_messages.front().map(String::as_str),
+        Some("历史命令")
+    );
+    s.pending_messages.clear();
     // 多行输入。
     reducer::update(&mut s, UiEvent::Paste("第一行\n第二行".into()));
     s.editor.home();
@@ -372,4 +384,198 @@ fn alt_up_down_jumps_between_user_turns() {
         panic!();
     };
     assert_eq!(anchor.entry_id.0, 3);
+}
+
+/// BUG-004：Ctrl-C 在运行中必须产生 CancelRun（Windows raw mode 下
+/// tokio 的 ctrl_c() 信号不会触发，此前按键被 reducer 直接忽略）。
+#[test]
+fn ctrl_c_running_cancels_run() {
+    let mut s = state();
+    s.running = true;
+    let effects = reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+    );
+    assert!(
+        effects.contains(&UiEffect::CancelRun),
+        "运行中 Ctrl-C 必须取消 run: {effects:?}"
+    );
+}
+
+/// BUG-004：空闲 Ctrl-C 必须产生 Quit（此前该按键被忽略，Windows 上无法退出）。
+#[test]
+fn ctrl_c_idle_quits() {
+    let mut s = state();
+    let effects = reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+    );
+    assert!(
+        effects.contains(&UiEffect::Quit),
+        "空闲 Ctrl-C 必须退出: {effects:?}"
+    );
+}
+
+/// BUG-004：Ctrl-C 与 Esc 同层——Overlay 打开时先关闭 Overlay，不产生 Quit/CancelRun。
+#[test]
+fn ctrl_c_priority_overlay_first() {
+    let mut s = state();
+    s.running = true;
+    s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
+    s.view
+        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err");
+    reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
+    assert!(s.view.overlay.is_some());
+    let effects = reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+    );
+    assert!(s.view.overlay.is_none(), "Ctrl-C 应关闭 Overlay");
+    assert!(
+        effects.is_empty(),
+        "关闭 Overlay 不得附带取消/退出: {effects:?}"
+    );
+}
+
+/// BUG-005：运行中连续提交两条消息必须按顺序排队，不能覆盖丢失第一条。
+#[test]
+fn second_submit_while_running_queues_not_overwrites() {
+    let mut s = state();
+    // 模拟运行中提交第一条。
+    for ch in "第一条".chars() {
+        reducer::update(
+            &mut s,
+            UiEvent::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+        );
+    }
+    reducer::update(&mut s, key(KeyCode::Enter));
+    // 再提交第二条（不经过 run 边界）。
+    for ch in "第二条".chars() {
+        reducer::update(
+            &mut s,
+            UiEvent::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+        );
+    }
+    reducer::update(&mut s, key(KeyCode::Enter));
+
+    assert_eq!(s.pending_messages.len(), 2, "两条消息都必须排队");
+    assert_eq!(s.pop_pending().as_deref(), Some("第一条"), "FIFO 顺序");
+    assert_eq!(s.pop_pending().as_deref(), Some("第二条"));
+}
+
+/// BUG-005：has_pending_work 供 app 主循环判断是否可跳过键盘阻塞（BUG-003）。
+#[test]
+fn has_pending_work_reflects_queue_and_session() {
+    let mut s = state();
+    assert!(!s.has_pending_work());
+    s.push_pending("hello".into());
+    assert!(s.has_pending_work());
+    assert_eq!(s.pop_pending().as_deref(), Some("hello"));
+    assert!(!s.has_pending_work());
+    s.pending_session = Some("id".into());
+    assert!(s.has_pending_work());
+}
+
+/// BUG-013：Modal 打开时 ↑/↓ 滚动 Modal（提示与实际行为一致）。
+#[test]
+fn arrows_scroll_modal_when_open() {
+    let mut s = state();
+    s.view.open_modal("/help", "line1\nline2\nline3");
+    assert_eq!(s.view.modal.as_ref().unwrap().scroll, 0);
+    reducer::update(&mut s, key(KeyCode::Down));
+    reducer::update(&mut s, key(KeyCode::Down));
+    assert_eq!(s.view.modal.as_ref().unwrap().scroll, 2);
+    reducer::update(&mut s, key(KeyCode::Up));
+    assert_eq!(s.view.modal.as_ref().unwrap().scroll, 1);
+    // 滚动到顶不 panic。
+    for _ in 0..5 {
+        reducer::update(&mut s, key(KeyCode::Up));
+    }
+    assert_eq!(s.view.modal.as_ref().unwrap().scroll, 0);
+}
+
+/// BUG-014：搜索打开时 Paste 进入搜索框而不是 composer。
+#[test]
+fn paste_goes_into_search_when_search_open() {
+    let mut s = state();
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+    );
+    assert!(s.view.search.is_some());
+    reducer::update(&mut s, UiEvent::Paste("error[E0308]".into()));
+    assert_eq!(
+        s.view.search.as_ref().unwrap().query,
+        "error[E0308]",
+        "粘贴必须进入搜索框"
+    );
+    assert!(s.editor.text().is_empty(), "composer 不得被污染");
+    // 搜索关闭后 Paste 回到 composer。
+    reducer::update(&mut s, key(KeyCode::Esc));
+    reducer::update(&mut s, UiEvent::Paste("正常输入".into()));
+    assert_eq!(s.editor.text(), "正常输入");
+}
+
+/// BUG-005：footer 排队计数与队列同步（push 后可见、pop 后递减）。
+#[test]
+fn pending_queue_len_tracks_queue_for_footer() {
+    let mut s = state();
+    s.push_pending("A".into());
+    s.push_pending("B".into());
+    assert_eq!(s.view.pending_queue_len, 2, "footer 必须显示排队数");
+    assert_eq!(s.pop_pending().as_deref(), Some("A"));
+    assert_eq!(s.view.pending_queue_len, 1);
+    assert_eq!(s.pop_pending().as_deref(), Some("B"));
+    assert_eq!(s.view.pending_queue_len, 0);
+}
+
+/// §24：scrollbar 点击 → 按比例锁定到绝对位置（0 = 顶部，1 = 底部）。
+#[test]
+fn scrollbar_click_jumps_to_ratio() {
+    let mut s = state();
+    for i in 0..50 {
+        s.view.push_line(LineKind::Assistant, format!("line {i}"));
+    }
+    // 模拟布局后的视口高度（如 22 行）。
+    s.view.transcript_rows = 22;
+    // 点底部 → 锁定到内容末尾（Follow 语义等价：到底部）。
+    reducer::update(&mut s, UiEvent::ScrollbarClick(21));
+    let ScrollMode::Locked(anchor) = s.view.scroll_mode else {
+        panic!("点击后必须 Locked");
+    };
+    // 底部锚点 = 最后一个 entry 的某行。
+    assert!(
+        anchor.entry_id.0 > 0,
+        "点底部应锁定到历史末尾附近: {anchor:?}"
+    );
+    // 点顶部 → 锁定到第一个 entry。
+    reducer::update(&mut s, UiEvent::ScrollbarClick(0));
+    let ScrollMode::Locked(anchor) = s.view.scroll_mode else {
+        panic!();
+    };
+    assert_eq!(
+        anchor.entry_id.0, 1,
+        "点顶部应锁定到第一条 entry（首条 id=1）"
+    );
+}
+
+/// §25：Ctrl+Home 跳到历史最顶部。
+#[test]
+fn ctrl_home_jumps_to_top() {
+    let mut s = state();
+    for i in 0..10 {
+        s.view.push_line(LineKind::Assistant, format!("line {i}"));
+    }
+    s.view.follow_tail();
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL)),
+    );
+    let ScrollMode::Locked(anchor) = s.view.scroll_mode else {
+        panic!("Ctrl+Home 后必须 Locked");
+    };
+    assert_eq!(
+        anchor.entry_id.0, 1,
+        "Ctrl+Home 应跳到第一条 entry（首条 id=1）"
+    );
 }

@@ -1,4 +1,4 @@
-//! Agent 状态机与执行循环（文档 §6）。
+﻿//! Agent 状态机与执行循环（文档 §6）。
 //!
 //! §6.2 一轮的精确算法：接收用户消息 → append UserSubmitted → 构建 context →
 //! 发起一次 provider request → 消费规范化 stream → 原子提交 assistant message →
@@ -187,15 +187,31 @@ pub async fn run<P: Provider>(
     let mut progress = crate::agent::scheduler::ProgressTracker::default();
     // §12.4：wall-clock watchdog（实时主动取消）。
     // P1-3：接近预算时向 TUI 发送 BudgetWarning（此前只写日志）。
+    // §16：取消来源（用户 vs wall-time）——watchdog 到期前写入 WALL_TIME，
+    // 否则 UI/session 会把系统超时显示成用户取消。
+    let cancel_cause = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+        crate::agent::limits::CANCEL_CAUSE_USER,
+    ));
     let warn_ui = ui.clone();
-    let (watchdog, _wall) =
-        crate::agent::limits::spawn_watchdog(&config.limits, cancel.clone(), move || {
+
+    let cause_for_watchdog = cancel_cause.clone();
+    let (watchdog, _wall) = crate::agent::limits::spawn_watchdog(
+        &config.limits,
+        cancel.clone(),
+        move || {
+            // §16：硬限制到期前标记来源，run 结束时据此记录 WallTimeExceeded。
+            cause_for_watchdog.store(
+                crate::agent::limits::CANCEL_CAUSE_WALL_TIME,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        },
+        move || {
             tracing::info!("run approaching wall-time budget");
             let _ = warn_ui.try_send(RuntimeEvent::BudgetWarning);
-        });
+        },
+    );
     // §15.4：同一阈值区间内 compaction 失败后不反复调用模型。
     let mut compaction_failed = false;
-
     let final_reason: CompletionReason = 'run_loop: loop {
         if turn >= config.limits.max_model_turns {
             session
@@ -343,15 +359,19 @@ pub async fn run<P: Provider>(
                                     content: content.clone(),
                                     tool_calls: Vec::new(),
                                 });
+                            // §16：区分取消来源——watchdog 超时不是用户取消。
                             }
+                            let cause = cancel_cause.load(std::sync::atomic::Ordering::SeqCst);
+                            let cancel_reason =
+                                crate::agent::limits::cancel_reason_for_cause(cause);
                             session
                                 .append_event(&SessionEvent::RunCompleted {
-                                    reason: CompletionReason::Cancelled,
+                                    reason: cancel_reason,
                                     usage: usage_total,
                                 })
                                 .and_then(|_| session.sync_data())
                                 .map_err(|e| RunFailure::Session(e.to_string()))?;
-                            break 'run_loop CompletionReason::Cancelled;
+                            break 'run_loop cancel_reason;
                         }
                         Err(e) => {
                             // 错误详情记录到日志（§19.2：provider 错误可诊断）。
@@ -652,8 +672,10 @@ error: invalid_arguments
         // 并行执行（§12.2 第 3 条：同 wave 无冲突 calls）。
         // 无进展判定在构造 future 前同步完成（futures 不借用 progress/session）。
         // 实时输出通道：工具执行中 bash 增量 → 本 task 转发 → ui_tx。
+        // BUG-012：有界通道（§12/§13）——UI 消费慢时工具侧 try_send 丢弃新帧，
+        // 不阻塞进程读循环、不无限堆积。
         let (output_tx, mut output_rx) =
-            tokio::sync::mpsc::unbounded_channel::<tool::ToolStreamEvent>();
+            tokio::sync::mpsc::channel::<tool::ToolStreamEvent>(tool::TOOL_STREAM_CAPACITY);
         let ui_for_stream = ui.clone();
         let stream_forwarder = tokio::spawn(async move {
             while let Some(event) = output_rx.recv().await {

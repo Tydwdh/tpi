@@ -285,7 +285,8 @@ async fn bash_streams_live_output_through_output_tx() {
     let mut ctx = test_tool_context(&workspace);
     ctx.artifacts_root = config.artifacts_root.clone();
     ctx.call_id = tpi::ids::ToolCallId::new_v7();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tpi::tool::ToolStreamEvent>();
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<tpi::tool::ToolStreamEvent>(tpi::tool::TOOL_STREAM_CAPACITY);
     ctx.output_tx = Some(tx);
 
     let args = BashArgs {
@@ -323,4 +324,30 @@ async fn bash_streams_live_output_through_output_tx() {
         received.contains("s-20"),
         "流事件应包含最后一行: {received}"
     );
+}
+
+/// BUG-012：有界流通道 + try_send——UI 不消费时 bash 不得阻塞/无限堆积，
+/// 必须正常完成并返回（实时输出是 lossy telemetry）。
+#[tokio::test]
+async fn bash_does_not_block_when_stream_channel_full() {
+    point_host_at_real_tpi();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut ctx = test_tool_context(&workspace);
+    ctx.artifacts_root = config.artifacts_root.clone();
+    ctx.call_id = tpi::ids::ToolCallId::new_v7();
+    // 容量 1 且无人消费：bash 输出大量行时 try_send 必须丢弃而非阻塞。
+    let (tx, _rx) = tokio::sync::mpsc::channel::<tpi::tool::ToolStreamEvent>(1);
+    ctx.output_tx = Some(tx);
+
+    let args = BashArgs {
+        command: "for i in $(seq 1 200); do echo line-$i; done".into(),
+        cwd: ".".into(),
+        timeout_ms: 30_000,
+    };
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), bash(args, &ctx))
+        .await
+        .expect("bash 在满通道下必须完成，不得挂死");
+    assert_eq!(outcome.status, ToolStatus::Succeeded);
 }

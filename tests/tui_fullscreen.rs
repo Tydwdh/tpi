@@ -123,3 +123,61 @@ fn fullscreen_pending_below_hint_renders() {
     let all: String = row_texts(&buf).join("\n");
     assert!(all.contains("条新内容"), "scroll lock 提示应可见: {all:?}");
 }
+
+/// §24：全屏历史必须有垂直 scrollbar——右侧 1 列，thumb 按 visual 行数比例。
+#[test]
+fn fullscreen_shows_scrollbar_at_right_edge() {
+    let mut view = busy_view(50); // 远超一屏，thumb 可见
+    let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
+    let w = buf.area().width as usize;
+    // footer(1) + input(1) → 转录区 22 行（0..22）。
+    let trans_rows = 22usize;
+    let mut found_track = false;
+    let mut found_thumb = false;
+    for y in 0..trans_rows {
+        let sym = buf[((w - 1) as u16, y as u16)].symbol();
+        if sym == "│" {
+            found_track = true;
+        } else if sym == "▐" {
+            found_thumb = true;
+        }
+    }
+    assert!(found_track, "scrollbar 轨道必须渲染在右缘");
+    assert!(
+        found_thumb,
+        "内容超一屏时 thumb 必须渲染（比例按 visual 行数）"
+    );
+}
+
+/// §24：内容不足一屏时 scrollbar 仍保留轨道（布局稳定，不随内容增长跳变）。
+#[test]
+fn fullscreen_scrollbar_track_is_stable_when_short() {
+    let mut view = busy_view(5); // 不足一屏
+    let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
+    let w = buf.area().width as usize;
+    let trans_rows = 22usize;
+    let mut track_rows = 0;
+    for y in 0..trans_rows {
+        if buf[((w - 1) as u16, y as u16)].symbol() == "│" {
+            track_rows += 1;
+        }
+    }
+    assert!(track_rows > 0, "内容不足一屏时仍应画轨道（布局稳定）");
+}
+
+/// §27/§31 stress：2000 条 transcript（上限）在 fullscreen 下渲染不 panic、
+/// 不超时，且 Follow/Locked 两种模式都稳定。
+#[test]
+fn long_transcript_2000_entries_renders_stably() {
+    let mut view = ViewModel::default();
+    for i in 0..2000 {
+        view.push_line(LineKind::Assistant, format!("line {i} 中文内容"));
+    }
+    assert!(view.transcript.len() <= 2000, "transcript 必须受上限约束");
+    let buf = draw_to_test_backend_mode(&mut view, 120, 40, ViewMode::Fullscreen);
+    assert_eq!(buf.area().width, 120);
+    // Locked 模式（历史浏览）下同样渲染稳定。
+    view.scroll_up(50);
+    let buf2 = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
+    assert_eq!(buf2.area().width, 80);
+}

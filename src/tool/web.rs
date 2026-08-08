@@ -18,7 +18,20 @@ use serde::Deserialize;
 use crate::tool::ToolContext;
 use crate::tool::outcome::{ArtifactRef, ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 
-/// web_fetch 正文预算（§8.4：正文 48 KiB）。
+/// 把抓取正文按 `FETCH_BODY_BUDGET` 有界化。
+///
+/// BUG-002：此前 `String::truncate` 按裸字节截断，多字节字符边界处 panic；
+/// 现在统一走 `util::truncate_to_char_boundary`（合法 UTF-8，绝不 panic）。
+/// 返回 (截断后正文, 是否截断)。
+fn bounded_body(text: &str) -> (String, bool) {
+    let truncated = text.len() > FETCH_BODY_BUDGET;
+    if !truncated {
+        return (text.to_string(), false);
+    }
+    let mut body = text.to_string();
+    crate::util::truncate_to_char_boundary(&mut body, FETCH_BODY_BUDGET);
+    (body, true)
+}
 pub const FETCH_BODY_BUDGET: usize = 48 * 1024;
 /// HTML 原始体积上限（转换前）。
 pub const FETCH_RAW_LIMIT: usize = 2 * 1024 * 1024;
@@ -910,12 +923,8 @@ pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
 
     let text = convert_response_body(&bytes, &content_type);
 
-    // 有界正文（§8.4：48 KiB）。
-    let truncated = text.len() > FETCH_BODY_BUDGET;
-    let mut body = text.clone();
-    if truncated {
-        body.truncate(FETCH_BODY_BUDGET);
-    }
+    // 有界正文（§8.4：48 KiB；BUG-002：UTF-8 安全截断，不 panic）。
+    let (body, truncated) = bounded_body(&text);
 
     // artifact 记录完整正文。
     let mut artifact = None;
@@ -1283,5 +1292,33 @@ mod tests {
         assert_eq!(bing_freshness("pd_1m"), Some(r#"interval="30""#));
         assert_eq!(bing_freshness("pd_1y"), Some(r#"interval="365""#));
         assert_eq!(bing_freshness("nonsense"), None);
+    }
+    /// BUG-002 回归：超过 48 KiB 且截断点落在多字节字符中间的正文
+    /// 必须被 UTF-8 安全截断（不 panic、不产生 replacement char）。
+    #[test]
+    fn bounded_body_truncates_cjk_at_char_boundary_without_panic() {
+        // 20k 个“中”（3 字节/字）= 60000 字节 > 48 KiB；边界落在字符中间。
+        let text = "中".repeat(20_000);
+        let (body, truncated) = bounded_body(&text);
+        assert!(truncated, "必须标记截断");
+        assert!(
+            body.len() <= FETCH_BODY_BUDGET,
+            "正文超预算: {}",
+            body.len()
+        );
+        assert!(
+            std::str::from_utf8(body.as_bytes()).is_ok(),
+            "截断后必须是合法 UTF-8"
+        );
+        assert!(!body.contains('\u{FFFD}'), "不得产生 replacement char");
+        assert!(body.ends_with('中'), "应保留可读尾部");
+    }
+
+    /// BUG-002：预算内正文原样返回。
+    #[test]
+    fn bounded_body_short_text_is_unchanged() {
+        let (body, truncated) = bounded_body("你好 world");
+        assert!(!truncated);
+        assert_eq!(body, "你好 world");
     }
 }

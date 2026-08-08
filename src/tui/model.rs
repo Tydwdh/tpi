@@ -326,6 +326,8 @@ pub struct ViewModel {
     pub entry_heights: HashMap<EntryId, usize>,
     /// 最近一次布局的转录区高度（PageUp/PageDown 按 viewport-2 移动，§10）。
     pub transcript_rows: u16,
+    /// 排队中的待提交消息数（footer 提示；由 UiState 同步）。
+    pub pending_queue_len: usize,
     /// 思考内容是否展开（Alt+T 切换，§16.2：thinking 可折叠）。
     pub reasoning_visible: bool,
     /// 本会话累计 token 用量（AgentOutcome.usage 累积，§16.2：无 pricing 时显示 usage）。
@@ -367,6 +369,7 @@ impl Default for ViewModel {
             layout_top: None,
             entry_heights: HashMap::new(),
             transcript_rows: 0,
+            pending_queue_len: 0,
             reasoning_visible: false,
             input_tokens: 0,
             output_tokens: 0,
@@ -402,6 +405,55 @@ impl ViewModel {
         id
     }
 
+    /// BUG-006：/new 后清空全部会话投影（transcript/live/plan/usage/滚动/浮层），
+    /// 保证屏幕不再显示旧 session 内容（模型上下文已清空，屏幕必须同步）。
+    /// 保留 next_entry_id / next_version（单调递增即可，不需要复用）。
+    pub fn reset_for_new_session(&mut self) {
+        self.transcript.clear();
+        self.live = LiveTurnState::default();
+        self.plan = None;
+        self.status = StatusLine::Idle;
+        self.turn = 0;
+        self.scroll_mode = ScrollMode::Follow;
+        self.transcript_scroll = 0;
+        self.pending_below = 0;
+        self.layout_top = None;
+        self.entry_heights.clear();
+        self.transcript_rows = 0;
+        self.input_tokens = 0;
+        self.output_tokens = 0;
+        self.context_usage = None;
+        self.menu = None;
+        self.overlay = None;
+        self.modal = None;
+        self.search = None;
+    }
+
+    /// BUG-006：会话切换/恢复后把模型上下文（history）重建到屏幕，
+    /// 避免“屏幕是 session A、模型在 session B”的状态不一致。
+    /// User/Assistant 按原文重建；工具结果以单行摘要呈现（不伪造卡片）。
+    pub fn load_history(&mut self, history: &[crate::provider::ChatMessage]) {
+        self.reset_for_new_session();
+        for message in history {
+            match message {
+                crate::provider::ChatMessage::User(text) => {
+                    self.push_line(LineKind::User, text.clone());
+                }
+                crate::provider::ChatMessage::Assistant { content, .. } => {
+                    if !content.is_empty() {
+                        self.push_line(LineKind::Assistant, content.clone());
+                    }
+                }
+                crate::provider::ChatMessage::Tool { name, content, .. } => {
+                    let first = content.lines().next().unwrap_or_default();
+                    self.push_line(LineKind::Tool, format!("{name}: {first}"));
+                }
+                crate::provider::ChatMessage::System(text) => {
+                    self.push_line(LineKind::System, text.clone());
+                }
+            }
+        }
+    }
     /// 追加转录行。
     pub fn push_line(&mut self, kind: LineKind, text: impl Into<String>) {
         let version = self.alloc_version();
@@ -521,6 +573,38 @@ impl ViewModel {
     }
 
     /// 恢复 follow-tail（End/Ctrl+End，§3.1）：回到底部并清空新消息计数。
+
+    /// §24：跳转到转录的绝对比例位置（scrollbar 点击/拖拽）。
+    /// ratio ∈ [0,1] 对应视口顶部在内容中的位置（0 = 顶部，1 = 底部）。
+    pub fn scroll_to_ratio(&mut self, ratio: f64) {
+        let mut ids: Vec<EntryId> = self.transcript.iter().map(Entry::id).collect();
+        // 与 plan_window 一致：live 区是最后一个 group（哨兵 id）。
+        if self.live.reasoning.is_some()
+            || self.live.assistant.is_some()
+            || !self.live.tools.is_empty()
+        {
+            ids.push(EntryId(u64::MAX));
+        }
+        let heights = self.current_heights(&ids);
+        let total: usize = heights.iter().sum();
+        let area = self.transcript_rows as usize;
+        if total <= area || area == 0 {
+            self.follow_tail();
+            return;
+        }
+        let max_start = total - area;
+        let ratio = ratio.clamp(0.0, 1.0);
+        let target = (ratio * max_start as f64).round() as usize;
+        let (entry, row) = crate::tui::scroll::locate_row(&ids, &heights, target);
+        self.lock_to(entry, row);
+    }
+
+    /// §25：Ctrl+Home 跳到历史最顶部（第一条 entry）。
+    pub fn jump_to_top(&mut self) {
+        if let Some(first) = self.transcript.iter().map(Entry::id).next() {
+            self.lock_to(first, 0);
+        }
+    }
     pub fn follow_tail(&mut self) {
         self.scroll_mode = ScrollMode::Follow;
         self.transcript_scroll = 0;
@@ -1483,6 +1567,65 @@ mod p2_card_nav_tests {
                 .as_deref(),
             Some("call-2"),
             "反向"
+        );
+    }
+
+    /// BUG-006：/new 后屏幕投影必须全部清空（模型上下文已清空）。
+    #[test]
+    fn reset_for_new_session_clears_all_projection() {
+        let mut view = ViewModel::default();
+        view.push_line(LineKind::User, "旧会话问题");
+        view.push_line(LineKind::Assistant, "旧会话回答");
+        view.push_stream_delta(LineKind::Assistant, "流式中");
+        view.plan = Some(crate::tool::plan::Plan {
+            explanation: Some("旧计划".into()),
+            items: Vec::new(),
+        });
+        view.input_tokens = 123;
+        view.output_tokens = 456;
+        view.context_usage = Some((10, 100));
+        view.open_modal("/old", "旧 modal");
+        view.lock_to(crate::tui::scroll::EntryId(1), 0);
+        view.reset_for_new_session();
+        assert!(view.transcript.is_empty(), "transcript 必须清空");
+        assert!(view.live.assistant.is_none() && view.live.reasoning.is_none());
+        assert!(view.plan.is_none(), "旧计划必须清空");
+        assert_eq!(view.input_tokens, 0);
+        assert_eq!(view.output_tokens, 0);
+        assert!(view.context_usage.is_none());
+        assert!(view.modal.is_none());
+        assert_eq!(view.scroll_mode, ScrollMode::Follow, "滚动必须回到底部");
+    }
+    /// BUG-006：恢复 session 后必须把 history 重建到屏幕（User/Assistant/工具摘要）。
+    #[test]
+    fn load_history_rebuilds_transcript_from_context() {
+        let mut view = ViewModel::default();
+        view.push_line(LineKind::User, "旧内容"); // 先有旧屏幕
+        let history = vec![
+            crate::provider::ChatMessage::User("新会话问题".into()),
+            crate::provider::ChatMessage::Assistant {
+                content: "新会话回答".into(),
+                tool_calls: Vec::new(),
+            },
+            crate::provider::ChatMessage::Tool {
+                tool_call_id: "call-1".into(),
+                name: "bash".into(),
+                content: "status: failed\\nerror: x".into(),
+            },
+        ];
+        view.load_history(&history);
+        assert_eq!(view.transcript.len(), 3, "旧屏幕被替换为重建历史");
+        let kinds: Vec<LineKind> = view
+            .transcript
+            .iter()
+            .map(|e| match e {
+                Entry::Message { line, .. } => line.kind,
+                Entry::Tool { .. } => LineKind::Tool,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![LineKind::User, LineKind::Assistant, LineKind::Tool]
         );
     }
 }

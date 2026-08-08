@@ -1,0 +1,177 @@
+# TPI UX / 人体工学审计
+
+> 第一轮（2026-08-08）。只讨论输入、历史、滚动、快捷键、Tool、Reasoning、Modal、Status、视觉层级、长时间使用人体工学。
+> 判断标准：功能一天用几次？几次按键？能否预测？失败后是否知道发生了什么？是否打断阅读位置？是否破坏输入？是否污染长期 transcript？是否需要记忆奇怪快捷键？
+
+---
+
+## 1. 输入（Composer）
+
+### 现状（好）
+- Editor 是输入唯一事实源，`view.input` 只是投影（T6 已收敛）。
+- 中文 IME：编辑器维护 Unicode 字符边界，`backspace/delete/←/→` 按 char 移动，不 panic。
+- 多行：Shift+Enter / Alt+Enter / Ctrl+J；logical line 导航 + preferred column；Home/End 按 logical line。
+- 历史：↑/↓ 到边界后进入 prompt history（去重、上限 100）。
+- Ctrl+A/E/U/W/K 行级编辑；Alt+←/→ 词移动（中文按连续段）。
+- 粘贴走 bracketed paste。
+
+### 问题
+1. **光标越界（P1，BUG-008）**：输入超过 8 行后光标被渲染到输入区外，长时间编辑大段文本时完全不可见。
+2. **菜单/搜索期间 Paste 语义不一致（P3，BUG-014）**：搜索打开时 Paste 进 composer 而不是 search query。
+3. **输入区高度策略**：`input_area_rows` 上限 8，但长输入时无视觉提示“内部滚动中”，用户可能不知道上方还有内容（建议滚动到光标时 footer 或输入区显示 `(N 行)`）。
+4. **提交反馈**：Enter 提交后没有任何排队提示；运行中提交的消息要等 run 结束才执行——**已实现**（第二轮）：footer 显示“已排队 N 条消息”。
+5. **Pending 单槽覆盖（P0，BUG-005）**：运行中第二条消息覆盖第一条。
+
+### 建议（本轮只修 1/2/5，其余记录）
+- 修光标越界；Paste 路由进 search；pending 改队列 + 排队提示。
+
+---
+
+## 2. 历史 / 会话
+
+- `/sessions` 列表：按修改时间倒序、事件数、首条用户消息预览、Enter 恢复——信息够用。
+- `/new` 与恢复后**屏幕不重置**（P0，BUG-006）：用户看到旧 session 内容但模型已切换，是最大的“不可预测”来源。
+- 恢复后没有重建历史对话到屏幕：用户无法确认“我恢复的是哪段对话”。
+- 建议：/new 清屏并显示分隔；恢复 session 时把 history 重建到 transcript（至少 User/Assistant 消息 + 工具摘要行）。
+
+---
+
+## 3. 滚动
+
+### 现状（好）
+- Follow / Locked(EntryId + row) 双模式；Locked 期间新内容不移动视口，只计数 `pending_below`，footer 有提示。
+- PageUp/PageDown、滚轮（3 行）、Ctrl+End 恢复跟随、Alt+Up/Down 跳 User turn、Ctrl+F 搜索跳转。
+- resize 后锚点保持语义位置（有测试）。
+
+### 问题
+1. **滚轮步长固定 3 行**，长对话中滚得很慢（PageUp 8 行也偏小）。可接受，但建议滚轮 5-6 行。
+2. **没有可视 scrollbar**（任务 §24 建议）——**已实现**（第二轮）：全屏转录区右侧 1 列轨道 + thumb（比例按 visual 行数），支持点击轨道/拖拽 thumb 跳转；配合滚轮/PgUp/PgDn/Ctrl+End/Ctrl+Home。
+3. **Locked 到底部后仍保持 Locked**，此时按 Ctrl+End 才回 Follow；用户可能不知道“已经在底部”。footer 的 pending 提示有帮助，可加“(已到底部, End 跟随)”状态。
+4. **搜索命中不显示当前位置在文本中的上下文**，只显示 n/m；可接受。
+
+---
+
+## 4. 快捷键
+
+### 现状
+- 核心：Shift+Enter 换行、↑/↓ 历史、Tab 补全、Alt+T 思考折叠、Alt+E 最近工具、Alt+O 最近失败工具、Alt+[/] 切换工具、Ctrl+F 搜索、PgUp/PgDn、Ctrl+End 回底部、Esc 取消。
+- `/help` Modal 列出命令与快捷键，不污染 transcript（好）。
+
+### 问题
+1. **Ctrl-C 在交互模式失效（P0，BUG-004）**：最常见取消/退出方式必须修。
+2. **Esc 语义分层清晰**（overlay > modal > menu > run 取消），但 idle 时 Esc 无操作，用户可能期待 Esc 清空输入；建议记录（低优先级）。
+3. **Alt+Up/Down 无 User 消息时静默**，无反馈（P3）。
+4. **快捷键记忆成本**：Alt+E / Alt+O / Alt+[/] 区分“最近工具”和“最近失败工具”，稍显重叠；可保留（有 Alt+O 快捷看错误，价值高）。
+5. Modal 内 ↑/↓ 无效但提示可用（P3，BUG-013）。
+
+---
+
+## 5. Tool 卡片
+
+### 现状（好）
+- 单行卡片：icon + name + target + duration/exit；运行中 spinner；失败保留 ≤4 行关键 tail；成功不展开。
+- 完整输出走 Overlay（点击/Alt+E），不重写 scrollback、不污染 transcript。
+- 命令压缩显示、有界 8 KiB；bash 实时输出运行中可见（尾部 3 行）。
+- `@artifact` 引用保持模型可读完整输出。
+
+### 问题
+1. **失败命令 stderr 可能完全消失（P1，BUG-007）**：stdout 占满 24 KiB 预算时失败原因不可见——对 Coding Agent 是最大人体工学问题。
+2. 成功工具也保留完整输出（可展开），但 UI 折叠态不占空间（好）。
+3. 运行中实时输出只显示最后 3 行，没有“更多”提示；可接受（Overlay 可看）。
+4. Tool 卡片失败 tail 用 error 色 DIM，可读性一般；建议失败 tail 不用 DIM（P3）。
+
+---
+
+## 6. Reasoning
+
+- 默认折叠为 `◇ Thinking · Enter 查看`（一行），Alt+T 全局展开/折叠；点击行开 Overlay 看原文。
+- 流式 reasoning 在 live 区，finalize 后进 transcript 作为独立条目（但默认折叠渲染成一行）。
+- **好**：reasoning 不进 session/durable facts，不污染上下文。
+- **问题**：折叠行仍占一条 Entry（高度 1），大量 reasoning 时 transcript 条目数增长；有 `reasoning_flood_collapses_to_one_line` 测试。可接受。
+- 建议：长会话中 reasoning 超过 N 条时自动折叠更彻底（记录）。
+
+---
+
+## 7. Modal / Overlay
+
+- Modal：/help /settings /session /sessions /thinking 等不进 transcript（好，符合 §19）。
+- Overlay：工具详情/reasoning 原文覆盖显示，不重写 scrollback（好）。
+- **问题**：
+  1. Modal 内 ↑/↓ 无效（P3，BUG-013）。
+  2. Overlay 打开时点击外部无操作（有意为之）；但用户可能想点击外部关闭——保持现状（Esc 关闭是标准）。
+  3. Modal 尺寸 `min(88, width)-4`，窄终端下 Modal 比屏幕宽（`max(40)` 兜底）；极窄终端（<44 列）会溢出。P3。
+
+---
+
+## 8. Status / 信息层级
+
+### 现状
+- 最高优先级信息：Agent 正在干什么（Running tool/turn）、是否失败（tool card/tail/error 色）、下一步（plan 区域）。
+- Footer：workspace/model/usage/context 用量条/状态；plan 独立紧凑区域（≤7 items）。
+- 系统消息用 System 行（分隔线、run 失败提示等），数量少。
+
+### 问题
+1. **状态栏没有“已排队消息”提示**（见输入 §1.4）。
+2. **ContextOverflow / MaxTurns 等结束原因只在 run 结束后的 System 行出现一次**，无持久状态；用户回到历史后看不到当前 run 的结果。可接受。
+3. 大量成功工具调用时 transcript 全是卡片行；卡片已单行化，可接受。
+4. footer 的用量条信息密度适中；但 token 数值对多数用户无决策价值（context 用量条更有用）。
+
+---
+
+## 9. 长时间使用人体工学
+
+### 好
+- 16ms 帧合并 + synchronized update；空闲不重绘（CPU 友好）。
+- 2000 entry 上限防无限增长；消息/卡片输出有界。
+- 键盘独立线程：运行中也能翻页/折叠/输入。
+- Scroll Lock 锚点稳定，历史不漂移。
+
+### 问题
+1. **长会话 Ctrl+F 搜索后 Esc 关闭不跳回底部**（有意设计），但用户可能忘记自己处于 Locked；footer pending 提示帮助有限，建议状态栏在 Locked 时显示“历史浏览中”。
+2. **无跨 session 记忆**（范围外，README 已声明）。
+3. 每帧全量 rebuild wrapped 行：2000 entries 时 CPU 尚可，若实测卡顿再做增量（BUG-009 记录）。
+4. 长会话下 `/sessions` 列表读取事件预览会解析整个文件（`first_user_preview` 调 `read_events`），session 文件很大时会慢；建议只解析前几行（P2，未列入 BUG_AUDIT 主表，记录此处）。
+
+---
+
+## 10. 结论（本轮 UX 修复优先级）
+1. Ctrl-C 可用（BUG-004）
+2. pending 立即执行 + 不丢消息 + 排队提示（BUG-003/005）
+3. /new 与 session 恢复的屏幕/上下文一致性（BUG-006）
+4. 输入光标不出界（BUG-008）
+5. 失败命令 stderr 不消失（BUG-007）
+6. 小 polish：Modal 滚动、Paste 进搜索、-p 错误到 stderr（BUG-013/014/015）
+---
+
+## 11. 修复状态（第一轮 2026-08-08）
+
+- BUG-004 Ctrl-C：已修（reducer → CancelRun/Quit；Windows raw mode 下按键路径可用）。
+- BUG-003/005 pending：已修（主循环跳过键盘阻塞 + 有界 FIFO 队列，连发消息不丢失）。
+- BUG-006 /new 与 session 恢复：已修（view 重置/按 history 重建，屏幕与上下文一致）。
+- BUG-008 输入光标越界：已修（滚动基准改为可见区域高度）。
+- BUG-007 失败命令 stderr 消失：已修（stderr 最小预算 4 KiB 优先）。
+- BUG-013 Modal ↑/↓、BUG-014 搜索 Paste、BUG-011 终端恢复、BUG-010 -p cancel 清理：已修。
+- 未修（记录）：无（BUG-015 已修：-p Error 附带 session 路径）。
+
+## 12. 第二轮修复状态（2026-08-08 续）
+- BUG-009 工具层同步 fs：已修（同步工具经 spawn_blocking 执行 + 回归测试）。
+- BUG-012 流通道背压：已修（有界 TOOL_STREAM_CAPACITY=256 + try_send 丢帧 + 满通道不阻塞测试）。
+- 24 全屏 scrollbar：已实现（轨道+thumb、点击/拖拽、Ctrl+Home）。
+- 排队提示：已实现（footer 已排队 N 条消息）。
+
+## 13. 第三轮修复状态（2026-08-08 续）
+- 16 取消来源：已修（wall-time 超时记录 WallTimeExceeded，UI/-p 明确提示非用户取消）。
+- 19 transcript 污染：已修（/doctor、/diff 走 Modal）。
+- BUG-015：已修（-p Error 消息附带 session 文件路径）。
+
+## 14. 第四轮状态（2026-08-08 续）
+- /sessions 预览性能：已修（first_user_preview 只流式读文件头部 ≤500 行，不再解析整个 session；长会话列表保持轻量）。
+- 26/27/31 覆盖：新增随机尺寸渲染 proptest（width 40~220 × height 10~70，Follow/Locked）+ 2000 条 transcript 压力渲染测试。
+- 验收：`tpi -p` 真实 provider 已通过；交互 TUI（raw mode / alternate screen / 鼠标拖拽 / Ctrl-C 信号路径）仍需真实终端人工验收（本环境无可用 PTY，winpty 无法管道驱动）。
+
+## 15. 交互验收完成（2026-08-08）
+- 通过 node-pty（Windows ConPTY）真实终端语义驱动 tpi：9 个场景全部通过
+  （basic run、Ctrl-C 运行中/空闲、滚动键、多工具 read+bash(cargo test)、
+  排队消息自动执行、resize、/new 切换、鼠标滚轮后输入存活、/quit 干净退出）。
+- 验收脚本：`scripts/interactive_acceptance.js`（仓库外 npm i node-pty 后运行）。
+- Alt+E overlay 与 bracketed paste 由真实终端产生，ConPTY 无法模拟，由单元测试覆盖。
