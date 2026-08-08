@@ -944,6 +944,9 @@ fn render_markdown(text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
     let mut item_count: u64 = 1;
     let mut item_pending = false;
     let mut quote_depth: usize = 0;
+    // 标题层级（§16.2 增强）：Start(Heading) 时记录，End(Heading) flush 后
+    // 对整行应用标题样式（h1-h3 分色，h4+ 归一）。
+    let mut heading_level: Option<u8> = None;
 
     for event in parser {
         match event {
@@ -1005,6 +1008,10 @@ fn render_markdown(text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
                 Tag::Emphasis => style_stack.push(Modifier::ITALIC),
                 Tag::Strong => style_stack.push(Modifier::BOLD),
                 Tag::Strikethrough => style_stack.push(Modifier::CROSSED_OUT),
+                Tag::Heading { level, .. } => {
+                    heading_level = Some(level as u8);
+                    flush_line(&mut out, &mut current);
+                }
                 Tag::CodeBlock(_) => {
                     flush_line(&mut out, &mut current);
                     in_code_block = true;
@@ -1024,6 +1031,21 @@ fn render_markdown(text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
             Event::End(end) => match end {
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                     style_stack.pop();
+                }
+                TagEnd::Heading(_) => {
+                    // 把当前行内容应用标题样式（§16.2 增强：h1-h3 分色 BOLD）。
+                    if let Some(level) = heading_level.take()
+                        && !current.is_empty()
+                    {
+                        let style = heading_style(level, theme);
+                        let spans: Vec<Span<'static>> = std::mem::take(&mut current)
+                            .into_iter()
+                            .map(|span| Span::styled(span.content, style))
+                            .collect();
+                        out.push(Line::from(spans));
+                    } else {
+                        flush_line(&mut out, &mut current);
+                    }
                 }
                 TagEnd::Link => {
                     style_stack.pop();
@@ -1062,6 +1084,18 @@ fn flush_line(out: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>) {
     if !current.is_empty() {
         out.push(Line::from(std::mem::take(current)));
     }
+}
+
+/// 标题样式（§16.2 增强）：h1=primary 加粗，h2=accent 加粗，h3=info 加粗，
+/// h4+ 归一为 text 加粗（避免过多颜色噪声；正文与标题层级清晰区分）。
+fn heading_style(level: u8, theme: theme::Theme) -> Style {
+    let color = match level {
+        1 => theme.primary,
+        2 => theme.accent,
+        3 => theme.info,
+        _ => theme.text,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
 /// 工具名语义色（§16.2 增强）：bash=info（执行）、edit/write=success（写文件）、
@@ -2121,6 +2155,42 @@ mod tests {
         assert!(
             text.contains("链接 (https://example.com)"),
             "链接应附 URL: {text:?}"
+        );
+    }
+
+    /// §16.2 增强：markdown 标题分级渲染（h1-h3 分色 + BOLD，h4+ 归一）。
+    #[test]
+    fn markdown_headings_render_with_level_styles() {
+        let theme = theme::Theme::omp();
+        let lines = render_markdown("# 大标题\n\n## 副标题\n\n### 小节\n\n#### 四级\n", theme);
+        assert_eq!(lines.len(), 4, "四个标题各一行: {lines:?}");
+        // h1 → primary + BOLD。
+        let h1 = &lines[0];
+        assert!(h1.spans.iter().all(|s| s.content == "大标题"));
+        let h1_style = &h1.spans[0].style;
+        assert_eq!(h1_style.fg, Some(theme.primary));
+        assert!(
+            h1_style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        // h2 → accent + BOLD。
+        let h2 = &lines[1];
+        assert_eq!(h2.spans[0].style.fg, Some(theme.accent));
+        assert!(
+            h2.spans[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        // h4 → text + BOLD（归一）。
+        let h4 = &lines[3];
+        assert_eq!(h4.spans[0].style.fg, Some(theme.text));
+        assert!(
+            h4.spans[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
         );
     }
 
