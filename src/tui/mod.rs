@@ -1367,20 +1367,44 @@ fn tool_card_lines(
         None
     };
     if let Some(body) = show_body {
-        let body_lines: Vec<&str> = body.split('\n').collect();
-        let shown: Vec<&str> = if card.expanded {
-            body_lines
-        } else {
-            // 整改 A3：折叠态实时输出只保留最后 3 行。
-            body_lines.iter().rev().take(3).copied().collect::<Vec<_>>()
-        };
-        for s in shown {
-            let style = if card.expanded {
-                Style::default().fg(theme.text)
-            } else {
-                Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
+        // §16.2 增强：edit/write 输出含 `diff:` 段——diff 段红绿着色
+        // （opencode 式），其余行按默认样式。
+        let diff_idx = find_diff_start(body);
+        if card.expanded && diff_idx.is_some() {
+            // 展开态：diff 段用 render_diff_lines 着色。
+            let (prefix, diff_part) = match diff_idx {
+                Some(idx) => (&body[..idx], &body[idx..]),
+                None => (body, ""),
             };
-            lines.push(Line::styled(format!("│ {s}"), style));
+            for s in prefix.lines() {
+                lines.push(Line::styled(
+                    format!("│ {s}"),
+                    Style::default().fg(theme.text),
+                ));
+            }
+            let diff_lines = render_diff_lines(diff_part, theme);
+            for l in diff_lines {
+                // 保留工具卡片的 │ 前缀 + 原 diff 行着色（Line.style 应用到整行）。
+                let mut spans = vec![Span::styled("│ ", Style::default().fg(theme.muted))];
+                spans.extend(l.spans.iter().cloned());
+                lines.push(Line::from(spans).style(l.style));
+            }
+        } else {
+            let body_lines: Vec<&str> = body.split('\n').collect();
+            let shown: Vec<&str> = if card.expanded {
+                body_lines
+            } else {
+                // 整改 A3：折叠态实时输出只保留最后 3 行。
+                body_lines.iter().rev().take(3).copied().collect::<Vec<_>>()
+            };
+            for s in shown {
+                let style = if card.expanded {
+                    Style::default().fg(theme.text)
+                } else {
+                    Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
+                };
+                lines.push(Line::styled(format!("│ {s}"), style));
+            }
         }
         if card.output_truncated && card.expanded {
             lines.push(Line::styled(
@@ -1403,6 +1427,39 @@ fn tool_card_lines(
         }
     }
     lines
+}
+
+/// 渲染 unified diff 文本为红绿着色行（§16.2 增强：opencode 式 diff 展示）。
+///
+/// 按行首判定：`+` → success（绿）、`-` → error（红）、`@@` 统计 → primary、
+/// 其余上下文 → text（muted）。输入是 edit/write 工具输出的 `diff:` 段。
+fn render_diff_lines(diff_text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
+    diff_text
+        .lines()
+        .map(|line| {
+            let style = if line.starts_with("+++") || line.starts_with("---") {
+                // 文件头行：muted BOLD（标识文件，非增删内容）。
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD)
+            } else if let Some(_) = line.strip_prefix('+') {
+                Style::default().fg(theme.success)
+            } else if let Some(_) = line.strip_prefix('-') {
+                Style::default().fg(theme.error)
+            } else if line.starts_with("@@") {
+                Style::default().fg(theme.primary)
+            } else {
+                Style::default().fg(theme.muted)
+            };
+            Line::styled(line.to_string(), style)
+        })
+        .collect()
+}
+
+/// 定位 diff 段的起始（`\ndiff:\n` 之后的内容起点）。
+/// edit/write 工具输出含 `diff:` 段；返回该段起始字节偏移。
+fn find_diff_start(body: &str) -> Option<usize> {
+    body.find("\ndiff:\n").map(|idx| idx + "\ndiff:\n".len())
 }
 
 /// 按 display width 截断（超宽加 …），保证主行不溢出。
@@ -1801,11 +1858,28 @@ fn draw_modal(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: t
             .add_modifier(Modifier::BOLD),
     ));
     content.push(Line::default());
+    // §16.2 增强：/diff Modal 的 diff 行红绿着色；其他 Modal 保持纯文本
+    // （避免 settings/help 里以 +/- 开头的行被误着色）。
+    let diff_colored = modal.title == "/diff";
     for line in modal.body.lines() {
-        content.push(Line::styled(
-            line.to_string(),
-            Style::default().fg(theme.text),
-        ));
+        let styled: Line<'static> =
+            if diff_colored && line.starts_with('+') && !line.starts_with("+++") {
+                Line::styled(line.to_string(), Style::default().fg(theme.success))
+            } else if diff_colored && line.starts_with('-') && !line.starts_with("---") {
+                Line::styled(line.to_string(), Style::default().fg(theme.error))
+            } else if diff_colored && line.starts_with("@@") {
+                Line::styled(line.to_string(), Style::default().fg(theme.primary))
+            } else if diff_colored && (line.starts_with("+++") || line.starts_with("---")) {
+                Line::styled(
+                    line.to_string(),
+                    Style::default()
+                        .fg(theme.muted)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Line::styled(line.to_string(), Style::default().fg(theme.text))
+            };
+        content.push(styled);
     }
     let wrapped = wrap_lines(content, inner_w);
     let total = wrapped.len();
@@ -2392,6 +2466,34 @@ mod tests {
                 .contains(ratatui::style::Modifier::BOLD)),
             "表头必须加粗"
         );
+    }
+
+    /// §16.2 增强：unified diff 行红绿着色（+ 绿 / - 红 / @@ 主色）。
+    #[test]
+    fn diff_lines_render_with_add_remove_colors() {
+        let theme = theme::Theme::omp();
+        let diff = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,4 @@\n fn main() {\n-    let x = 1;\n+    let x = 2;\n }";
+        let lines = render_diff_lines(diff, theme);
+        // 行数 = diff 行数（7 行：--- +++ @@ 上下文 - + 上下文）。
+        assert_eq!(lines.len(), 7, "每行一个 Line: {lines:?}");
+        // - 行 → error 色。
+        let minus = lines
+            .iter()
+            .find(|l| l.spans[0].content.starts_with("-    let x = 1;"))
+            .expect("找到 - 行");
+        assert_eq!(minus.style.fg, Some(theme.error));
+        // + 行 → success 色。
+        let plus = lines
+            .iter()
+            .find(|l| l.spans[0].content.starts_with("+    let x = 2;"))
+            .expect("找到 + 行");
+        assert_eq!(plus.style.fg, Some(theme.success));
+        // @@ 行 → primary 色。
+        let hunk = lines
+            .iter()
+            .find(|l| l.spans[0].content.starts_with("@@"))
+            .expect("找到 @@ 行");
+        assert_eq!(hunk.style.fg, Some(theme.primary));
     }
 
     #[test]
