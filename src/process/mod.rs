@@ -174,7 +174,10 @@ pub async fn run_in_host(
             }
             read = read_frame(&mut stdout) => {
                 match read {
-                    Ok(Some((MSG_OUTPUT, payload))) if payload.len() >= 5 => {
+                    // payload = [stream][bytes]?子进程输出 1-3 字节的小块时
+                    // 框长度为 2-4（正常有效）。此前要求 >= 5
+                    // 会把这些小输出丢帧并刷“unknown process-host message kind=1”告警。
+                    Ok(Some((MSG_OUTPUT, payload))) if payload.len() >= 1 => {
                         let stream = payload[0];
                         let bytes = &payload[1..];
                         if let Some(sink) = stream_sink {
@@ -386,4 +389,24 @@ impl Drop for Job {
     }
     #[cfg(not(windows))]
     fn drop(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// 回归：read_frame 必须能解析小于 5 字节 payload 的 MSG_OUTPUT 帧
+    /// （子进程输出 1-3 字节时框长度 2-4；此前被当“unknown message”丢帧）。
+    #[tokio::test]
+    async fn read_frame_parses_tiny_output_frames() {
+        // len=2 LE + kind=MSG_OUTPUT + payload=[0(stream), b'x']
+        let wire = [2u8, 0, 0, 0, MSG_OUTPUT, 0, b'x'];
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&wire).await.unwrap();
+        drop(tx);
+        let frame = read_frame(&mut rx).await.unwrap().expect("frame");
+        assert_eq!(frame.0, MSG_OUTPUT, "小帧 kind 必须保持 MSG_OUTPUT");
+        assert_eq!(frame.1, vec![0, b'x'], "小帧 payload 不得丢失");
+    }
 }

@@ -247,3 +247,7 @@
 ## 迭代记录（2026-08-08 续 12）
 - ALTJUMP-HINT-001（P3，UX 审计遗留）：无 User 消息时 Alt+Up/Down 静默。已修：ViewModel.transient_hint + footer 渲染 + 下一次交互清除；Alt+Up/Down 失败时设置提示。回归：alt_up_down_shows_hint_when_no_user_message / footer_shows_transient_hint。
 - 交互验收（真实 ConPTY）：9/9 通过（node-pty 驱动，覆盖第 15/16 轮改动后基本流、Ctrl-C、滚动、多工具、排队、resize、/new、滚轮）。
+## 迭代记录（2026-08-08 续 13，真实日志驱动）
+- PROCESS-FRAME-001（P1 数据丢失）：process-host 读取端要求 MSG_OUTPUT payload >= 5；子进程输出 1-3 字节小块时帧长 2-4，被判为“unknown message”丢弃——小输出可完全丢失，且日志反复出现 “unknown process-host message kind=1”。已修：放宽到 >= 1（[stream][bytes]，bytes 可空）。回归：read_frame_parses_tiny_output_frames。
+- PROVIDER-CANCEL-LOG-001（P3 日志误导）：用户取消请求时 send 失败分支仍打 WARN“请求发送失败，重试 error=cancelled”并 sleep 重试（日志多次出现）。已修：error == "cancelled" 直接返回 ProviderError::Cancelled。
+- 会话日志分析：最新会话（贪吃蛇任务）整体流程健康（14+ 工具调用、edit 修复编译错误、build+冒烟通过）；结尾因 provider “error decoding response body” 中断（外部端点问题），用户输入“继续”后新请求 21s 无响应被取消（0 token）——属 provider 侧不稳定，TPI 已按 §7.3 策略不重试已收到事件的流。

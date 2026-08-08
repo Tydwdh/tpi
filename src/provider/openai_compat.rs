@@ -219,6 +219,11 @@ impl Provider for OpenAiCompatClient {
             let response = match self.send_once(&url, &body, &cancel).await {
                 Ok(response) => response,
                 Err(error) => {
+                    // 用户取消：不是输输失败，直接以 Cancelled 返回，
+                    // 不得记录“重试”告警也不重发请求。
+                    if error == "cancelled" {
+                        return Err(ProviderError::Cancelled);
+                    }
                     // 传输层失败（连接被拒/中断）：未收到任何事件，可安全重试。
                     if attempt == MAX_RETRIES {
                         return Err(classify_error(error, attempt));

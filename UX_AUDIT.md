@@ -247,3 +247,7 @@
 ## 31. 迭代第17轮（2026-08-08）
 - Alt+Up/Alt+Down 静默无反馈（P3，UX 审计第 4 节遗留）：transcript 没有 User 消息时按 Alt+Up/Down 无任何反应，用户不知道是“没消息可跳”还是按键失效。已修：新增 transient_hint——无 User 消息时 footer 显示“没有用户消息可跳转”，下一次键盘/鼠标/粘贴操作后消失。回归 alt_up_down_shows_hint_when_no_user_message / footer_shows_transient_hint。
 - 真实终端验收：node-pty（ConPTY）驱动 tpi.exe 交互验收 9/9 通过（含第 15/16 轮改动后的回归）。
+## 32. 迭代第18轮（2026-08-08，真实日志分析驱动）
+- 分析最新会话日志（Desktop\test 贪吃蛇任务）与 tpi.log 后发现两个真实 bug：
+  1. process-host 输出小帧被丢（P1 数据丢失 + 刷屏告警）：子进程输出 1-3 字节的小块（如 printf 短输出）时帧长 2-4，读取端却要求 payload >= 5，把小帧当“unknown process-host message kind=1”丢弃——真实输出可能完全丢失且日志反复告警。已修：MSG_OUTPUT 帧放宽到 >= 1。回归 read_frame_parses_tiny_output_frames。
+  2. 用户取消被记录为“重试”告警（P3 日志误导）：Ctrl-C 取消请求时 send 失败分支仍打 WARN“请求发送失败，重试 error=cancelled”并等待重试。已修：error == "cancelled" 立即返回 ProviderError::Cancelled，不告警不重发。
