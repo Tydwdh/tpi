@@ -412,7 +412,7 @@ fn run_init() -> Result<(), String> {
         tpi::auth::auth_set(&provider, token)?;
     }
     let content = format!(
-        "[model.primary]\nprovider = \"{provider}\"\nname = \"{name}\"\nbase_url = \"{base_url}\"\nmax_output_tokens = {max_output}\ncontext_window = {context_window}\n# api_key_env = \"{api_key_env}\"   # 环境变量显式覆盖（§18.4）\n"
+        "[model.primary]\nprovider = \"{provider}\"\nname = \"{name}\"\nbase_url = \"{base_url}\"\nmax_output_tokens = {max_output}\ncontext_window = {context_window}\n# api_key_env = \"{api_key_env}\"   # 环境变量显式覆盖（§18.4）\n# price_input = 0.0       # 每百万输入 token 美元（§16.2 花费展示，可选）\n# price_output = 0.0      # 每百万输出 token 美元\n"
     );
     std::fs::write(&config_path, content)
         .map_err(|e| format!("写入 {} 失败: {e}", config_path.display()))?;

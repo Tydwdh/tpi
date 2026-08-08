@@ -341,6 +341,13 @@ pub struct ViewModel {
     /// 本会话累计 token 用量（AgentOutcome.usage 累积，§16.2：无 pricing 时显示 usage）。
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// 缓存命中的输入 token（§16.2：`⇄` 展示）。
+    pub cache_read_tokens: u64,
+    /// 本会话累计花费（美元；§16.2：config 配置单价后显示）。
+    pub cost_usd: f64,
+    /// 输入/输出单价（每百万 token，美元；None = 不显示花费）。
+    pub price_input: Option<f64>,
+    pub price_output: Option<f64>,
     /// 动画帧计数（spinner；由 app 的 ticker 推进，§16.1：动画时钟独立）。
     pub anim_tick: u64,
     /// 命令补全菜单（None = 关闭）。
@@ -384,6 +391,10 @@ impl Default for ViewModel {
             hover_hit: None,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cost_usd: 0.0,
+            price_input: None,
+            price_output: None,
             anim_tick: 0,
             menu: None,
             context_usage: None,
@@ -433,6 +444,8 @@ impl ViewModel {
         self.transcript_rows = 0;
         self.input_tokens = 0;
         self.output_tokens = 0;
+        self.cache_read_tokens = 0;
+        self.cost_usd = 0.0;
         self.context_usage = None;
         self.menu = None;
         self.overlay = None;
@@ -1076,6 +1089,14 @@ impl ViewModel {
     pub fn add_usage(&mut self, usage: &Usage) {
         self.input_tokens += usage.input_tokens;
         self.output_tokens += usage.output_tokens;
+        self.cache_read_tokens += usage.cache_read_tokens;
+        // §16.2：配置单价后按输入/输出 token 累计花费（每百万 token 美元）。
+        if let Some(pi) = self.price_input {
+            self.cost_usd += (usage.input_tokens as f64 / 1_000_000.0) * pi;
+        }
+        if let Some(po) = self.price_output {
+            self.cost_usd += (usage.output_tokens as f64 / 1_000_000.0) * po;
+        }
     }
 
     /// 依据当前输入重建命令补全菜单（保留选中项；无匹配则关闭）。
@@ -1380,13 +1401,48 @@ mod tests {
         view.add_usage(&Usage {
             input_tokens: 100,
             output_tokens: 50,
+            cache_read_tokens: 10,
         });
         view.add_usage(&Usage {
             input_tokens: 200,
             output_tokens: 60,
+            cache_read_tokens: 20,
         });
         assert_eq!(view.input_tokens, 300);
         assert_eq!(view.output_tokens, 110);
+        assert_eq!(view.cache_read_tokens, 30, "缓存命中 token 必须累积");
+    }
+
+    /// §16.2：配置单价后按 token 累计花费（每百万 token 美元）。
+    #[test]
+    fn usage_accumulates_cost_with_pricing() {
+        let mut view = ViewModel {
+            price_input: Some(1.0),  // $1/1M input
+            price_output: Some(2.0), // $2/1M output
+            ..Default::default()
+        };
+        // 1M input tokens + 1M output tokens → 1.0 + 2.0 = 3.0。
+        view.add_usage(&Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_tokens: 100,
+        });
+        assert!(
+            (view.cost_usd - 3.0).abs() < 1e-9,
+            "cost = {:.4}",
+            view.cost_usd
+        );
+        // 缓存命中不影响花费（只展示命中量）。
+        assert_eq!(view.cache_read_tokens, 100);
+
+        // 无 pricing → cost 恒 0（不显示花费）。
+        let mut view2 = ViewModel::default();
+        view2.add_usage(&Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_tokens: 0,
+        });
+        assert_eq!(view2.cost_usd, 0.0, "未配置单价不计算花费");
     }
 
     #[test]

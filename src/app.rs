@@ -242,6 +242,10 @@ async fn interactive_loop<P: Provider>(
             .file_name()
             .map(|s| s.to_string())
             .unwrap_or_default(),
+        // §16.2：模型单价（config [model.primary] price_input/price_output）注入，
+        // add_usage 按 token 累计花费显示。
+        price_input: config.model.price_input,
+        price_output: config.model.price_output,
         ..Default::default()
     };
     view.push_line(
@@ -464,7 +468,8 @@ shell: {shell}
 web_search: DuckDuckGo（免费，无需 API key）
 自动打开浏览器: {}
 保留 token: {}
-允许访问 workspace 外路径: {}",
+允许访问 workspace 外路径: {}
+模型单价: {}/百万输入 · {}/百万输出（未配置则不在 footer 显示花费）",
                             config.source,
                             config.workspace_root,
                             config.sessions_root.display(),
@@ -480,6 +485,8 @@ web_search: DuckDuckGo（免费，无需 API key）
                             } else {
                                 "否（严格沙箱）"
                             },
+                            fmt_price(config.model.price_input),
+                            fmt_price(config.model.price_output),
                         ),
                     );
                     renderer
@@ -1267,6 +1274,14 @@ fn count_jsonl_lines(path: &std::path::Path) -> usize {
         .lines()
         .filter(|line| line.as_ref().is_ok_and(|l| !l.trim().is_empty()))
         .count()
+}
+
+/// 模型单价格式化（§16.2）：None → "未配置"；有值 → "$X"。
+fn fmt_price(price: Option<f64>) -> String {
+    match price {
+        Some(p) => format!("${p}"),
+        None => "未配置".into(),
+    }
 }
 
 /// 会话列表展示用的时间格式（HH:MM:SS 或 MM-DD HH:MM）。

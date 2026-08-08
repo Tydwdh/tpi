@@ -69,6 +69,11 @@ pub struct PrimaryModelFile {
     pub context_window: Option<u64>,
     /// 从环境变量读取 API key 的变量名（默认 TPI_API_KEY）。
     pub api_key_env: Option<String>,
+    /// 输入/输出单价（每百万 token，美元；§16.2 花费展示，可选）。
+    #[serde(default)]
+    pub price_input: Option<f64>,
+    #[serde(default)]
+    pub price_output: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -129,6 +134,9 @@ pub struct ModelConfig {
     pub max_output_tokens: Option<u32>,
     pub context_window: Option<u64>,
     pub api_key_env: String,
+    /// 输入/输出单价（每百万 token，美元；None = 不显示花费）。
+    pub price_input: Option<f64>,
+    pub price_output: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +224,8 @@ pub fn load(workspace_root: &Utf8PathBuf, cli_model: Option<&str>) -> Result<Con
             max_output_tokens: primary.max_output_tokens,
             context_window: primary.context_window,
             api_key_env: primary.api_key_env.unwrap_or_else(|| "TPI_API_KEY".into()),
+            price_input: primary.price_input,
+            price_output: primary.price_output,
         },
         limits: LimitsConfig {
             max_model_turns: merged

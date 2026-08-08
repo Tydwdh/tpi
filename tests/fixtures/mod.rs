@@ -21,6 +21,8 @@ pub fn test_config(workspace_root: &Utf8PathBuf) -> Config {
             max_output_tokens: None,
             context_window: None,
             api_key_env: "TPI_TEST_API_KEY".into(),
+            price_input: None,
+            price_output: None,
         },
         limits: LimitsConfig::default(),
         workspace_root: workspace_root.clone(),

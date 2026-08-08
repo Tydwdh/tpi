@@ -1727,6 +1727,20 @@ fn draw_footer(
             muted,
         ));
     }
+    // §16.2：缓存命中的输入 token（⇄ 标记；减少真实计费输入的直观反馈）。
+    if view.cache_read_tokens > 0 {
+        spans.push(Span::styled(
+            format!(" · ⇄{}", fmt_tokens(view.cache_read_tokens)),
+            Style::default().fg(theme.success),
+        ));
+    }
+    // §16.2：配置单价后显示本会话花费。
+    if view.cost_usd > 0.0 {
+        spans.push(Span::styled(
+            format!(" · ${:.4}", view.cost_usd),
+            Style::default().fg(theme.warning),
+        ));
+    }
     // 过渡提示（如“没有用户消息可跳转”）：下一次键盘/鼠标操作后消失。
     if let Some(hint) = &view.transient_hint {
         spans.push(Span::styled(

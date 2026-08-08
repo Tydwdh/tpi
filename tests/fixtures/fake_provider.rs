@@ -60,6 +60,7 @@ impl FakeResponse {
         self.usage = Usage {
             input_tokens: input,
             output_tokens: output,
+            cache_read_tokens: 0,
         };
         self
     }

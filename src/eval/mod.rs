@@ -843,6 +843,7 @@ mod tests {
             usage: Usage {
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 0,
             },
         });
 

@@ -84,6 +84,9 @@ pub enum CompletionReason {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// 缓存命中（prompt cache read）的输入 token（§16.2：缓存命中/花费展示）。
+    #[serde(default)]
+    pub cache_read_tokens: u64,
 }
 
 /// 写工具执行前的 recovery metadata（§10.7/§14.2 write-ahead）。

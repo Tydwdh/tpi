@@ -178,6 +178,15 @@ struct SseUsage {
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+    /// OpenAI-compatible：`prompt_tokens_details.cached_tokens`（缓存命中）。
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 /// 流中 tool call 的组装状态。
@@ -561,6 +570,12 @@ async fn consume_stream(
             usage = Usage {
                 input_tokens: usage_value.prompt_tokens.unwrap_or(0),
                 output_tokens: usage_value.completion_tokens.unwrap_or(0),
+                // §16.2：缓存命中 token（OpenAI-compatible prompt_tokens_details）。
+                cache_read_tokens: usage_value
+                    .prompt_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.cached_tokens)
+                    .unwrap_or(0),
             };
         }
     }
@@ -793,4 +808,33 @@ fn retry_after_respected_when_larger() {
     assert_eq!(backoff_delay(0, Some(server_longer)), server_longer);
     let server_shorter = Duration::from_millis(10);
     assert_eq!(backoff_delay(0, Some(server_shorter)), local);
+}
+
+/// §16.2：缓存命中 token 解析——prompt_tokens_details.cached_tokens。
+#[test]
+fn sse_usage_parses_cached_tokens() {
+    let raw = r#"{"prompt_tokens": 100, "completion_tokens": 50, "prompt_tokens_details": {"cached_tokens": 40}}"#;
+    let usage: SseUsage = serde_json::from_str(raw).unwrap();
+    assert_eq!(usage.prompt_tokens, Some(100));
+    assert_eq!(usage.completion_tokens, Some(50));
+    assert_eq!(
+        usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens),
+        Some(40),
+        "缓存命中 token 必须解析"
+    );
+
+    // 无 details 字段（部分 provider）不报错。
+    let raw2 = r#"{"prompt_tokens": 10, "completion_tokens": 5}"#;
+    let usage2: SseUsage = serde_json::from_str(raw2).unwrap();
+    assert_eq!(
+        usage2
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens),
+        None,
+        "缺 details 时为 None"
+    );
 }
