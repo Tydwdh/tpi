@@ -68,6 +68,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("diff", "查看本轮全部文件 diff"),
     ("doctor", "环境检查（config/模型/API key/Git Bash）"),
     ("compact", "手动压缩上下文"),
+    ("retry", "重试上一次失败/中断的 turn"),
     ("quit", "退出 TPI"),
 ];
 

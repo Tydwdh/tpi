@@ -15,6 +15,9 @@ pub struct UiState {
     pub pending_messages: VecDeque<String>,
     /// /sessions 菜单 Enter 选中的 session id（app 执行恢复）。
     pub pending_session: Option<String>,
+    /// 待重试的上一次失败 turn（`/retry`；app 消费时以空 user_message 发起 run，
+    /// 不重复记录 UserSubmitted，也不追加 User 消息）。
+    pub pending_retry: Option<String>,
     /// 是否正在 run（Esc 取消语义、spinner 状态）。
     pub running: bool,
     /// P1-10：手动 /compact 请求（下一次 run 开始时在完整边界压缩一次）。
@@ -31,15 +34,28 @@ impl UiState {
             editor: Editor::new(),
             pending_messages: VecDeque::new(),
             pending_session: None,
+            pending_retry: None,
             running: false,
             force_compaction: false,
         }
     }
 
+    /// 请求重试上一次失败 turn（`/retry`）。
+    pub fn push_retry(&mut self, target: String) {
+        self.pending_retry = Some(target);
+    }
+
+    /// 取出待重试的消息（消费一次）。
+    pub fn take_pending_retry(&mut self) -> Option<String> {
+        self.pending_retry.take()
+    }
+
     /// 是否存在待消费的排队输入（app 主循环据此决定是否可跳过键盘阻塞等待；
     /// BUG-003：`tpi "prompt"` 与 run 结束后排队的消息必须无需按键即可执行）。
     pub fn has_pending_work(&self) -> bool {
-        !self.pending_messages.is_empty() || self.pending_session.is_some()
+        !self.pending_messages.is_empty()
+            || self.pending_session.is_some()
+            || self.pending_retry.is_some()
     }
 
     /// 入队一条待提交消息（Enter 提交）。超上限时丢弃最旧并写入系统行提示

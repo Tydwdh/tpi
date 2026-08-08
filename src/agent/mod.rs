@@ -162,12 +162,17 @@ pub async fn run<P: Provider>(
     let run_started = std::time::Instant::now();
 
     // 1. 用户提交（durable boundary）。
-    session
-        .append_event(&SessionEvent::UserSubmitted {
-            content: user_message.clone(),
-        })
-        .and_then(|_| session.sync_data())
-        .map_err(|e| RunFailure::Session(e.to_string()))?;
+    // 空 user_message = retry 语义（`/retry`）：复用已有 history（上次失败的 turn
+    // 不重复记录 UserSubmitted，也不追加新 User 消息）；仍记录 RunStarted 作为新 attempt。
+    // app 层已拦截空输入，正常对话不会传空消息。
+    if !user_message.is_empty() {
+        session
+            .append_event(&SessionEvent::UserSubmitted {
+                content: user_message.clone(),
+            })
+            .and_then(|_| session.sync_data())
+            .map_err(|e| RunFailure::Session(e.to_string()))?;
+    }
     session
         .append_event(&SessionEvent::RunStarted {
             model: ModelRef {
@@ -183,7 +188,9 @@ pub async fn run<P: Provider>(
         .map_err(|e| RunFailure::Session(e.to_string()))?;
 
     let mut messages: Vec<ChatMessage> = history.to_vec();
-    messages.push(ChatMessage::User(user_message.clone()));
+    if !user_message.is_empty() {
+        messages.push(ChatMessage::User(user_message.clone()));
+    }
     // P1-10：手动 /compact——在第一个完整边界无条件执行一次压缩。
     // 失败（历史不足/不显著）不中断 run，只记录日志。
     if force_compaction

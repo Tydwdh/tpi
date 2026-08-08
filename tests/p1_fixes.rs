@@ -838,3 +838,85 @@ async fn tool_delta_restart_is_capped() {
         .count();
     assert_eq!(interrupted, 2, "首次 + restart 各记录一次中断: {events:?}");
 }
+
+/// §4.3 `/retry`：空 user_message = retry 语义。
+/// 验证：不追加 UserSubmitted 事件、不追加 User 消息（复用 history）、仍正常完成。
+#[tokio::test]
+async fn retry_with_empty_user_message_does_not_repeat_submission() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = FakeProvider::new(vec![FakeResponse::text("第二次成功了")]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    // 模拟第一次失败 turn 已存在：history 已有 User（retry 复用）。
+    let history = vec![ChatMessage::User("修这个 bug".into())];
+    let (tx, mut rx) = mpsc::channel(16);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        &history,
+        String::new(), // retry：空 user_message
+        tx,
+        CancellationToken::new(),
+        false,
+        false,
+    )
+    .await
+    .expect("retry run 必须正常结束");
+
+    drain.abort();
+    assert_eq!(outcome.reason, CompletionReason::Stop);
+
+    // retry 不得追加 UserSubmitted 事件。
+    let events = tpi::session::read_events(session.path()).unwrap();
+    let user_submitted = events
+        .iter()
+        .filter(|e| matches!(e, SessionEvent::UserSubmitted { .. }))
+        .count();
+    assert_eq!(
+        user_submitted, 0,
+        "retry 不得重复记录 UserSubmitted（重试 ModelTurn 而非重发 User 消息）: {events:?}"
+    );
+    // RunStarted 记录新 attempt。
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::RunStarted { .. })),
+        "retry 必须记录 RunStarted（新 attempt）"
+    );
+
+    // outcome.messages 不得追加新的 User 消息（复用 history 的 User）。
+    let user_count = outcome
+        .messages
+        .iter()
+        .filter(|m| matches!(m, ChatMessage::User(_)))
+        .count();
+    assert_eq!(
+        user_count, 1,
+        "retry 不得追加新 User 消息: {:?}",
+        outcome.messages
+    );
+}
+
+/// UiState：push_retry/take_pending_retry 语义（`/retry` 入队→消费）。
+#[test]
+fn retry_pending_round_trips_through_state() {
+    let mut ui = tpi::tui::state::UiState::new(Default::default());
+    assert!(ui.take_pending_retry().is_none(), "初始无 retry");
+    ui.push_retry("修这个 bug".into());
+    assert!(ui.has_pending_work(), "retry 请求也是待消费工作");
+    assert_eq!(
+        ui.take_pending_retry().as_deref(),
+        Some("修这个 bug"),
+        "retry 目标必须可取出"
+    );
+    assert!(ui.take_pending_retry().is_none(), "取出后清空");
+}

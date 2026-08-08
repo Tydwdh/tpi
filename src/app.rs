@@ -296,6 +296,10 @@ async fn interactive_loop<P: Provider>(
         }
     });
 
+    // `/retry` 目标：上一次因 provider 失败而中断的 turn 的用户消息。
+    // 成功完成后清空；失败/中断后保留，供用户一键重试（§4.3）。
+    let mut last_failed_message: Option<String> = None;
+
     loop {
         // BUG-003：存在排队输入（初始 prompt / run 期间提交的消息 / /sessions 选择）
         // 时必须立即消费，不能先阻塞等待键盘事件——否则 `tpi "prompt"` 与
@@ -380,6 +384,55 @@ async fn interactive_loop<P: Provider>(
             renderer
                 .draw(&mut ui_state.view)
                 .map_err(|e| e.to_string())?;
+        }
+
+        // `/retry`：重试上一次失败 turn（空 user_message → agent 不重复 UserSubmitted）。
+        if let Some(retry_target) = ui_state.take_pending_retry() {
+            let _ = retry_target; // 仅展示用；run 以空 user_message 发起
+            if session.is_none() {
+                *session = Some(create_session(
+                    &config.sessions_root,
+                    &config.workspace_root,
+                )?);
+            }
+            let Some(mut session_log) = session.take() else {
+                tracing::error!("run 循环：session 槽位为空（内部不变量破坏）");
+                return Err("内部错误：session 未初始化".into());
+            };
+            // retry：user_message 传空（§4.3：不重复记录 UserSubmitted，复用 history）。
+            let outcome = match run_interactive(
+                provider,
+                &mut session_log,
+                config,
+                history,
+                String::new(),
+                &mut ui_state,
+                &mut renderer,
+                &mut key_rx,
+                current_cancel.clone(),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    ui_state.view.status = crate::tui::model::StatusLine::Idle;
+                    ui_state.view.turn = 0;
+                    ui_state.view.push_line(
+                        LineKind::System,
+                        format!("run 失败，session 已保留：{error}"),
+                    );
+                    renderer
+                        .draw(&mut ui_state.view)
+                        .map_err(|e| e.to_string())?;
+                    *session = Some(session_log);
+                    continue;
+                }
+            };
+            ui_state.view.add_usage(&outcome.usage);
+            merge_outcome_history(history, &outcome);
+            *session = Some(session_log);
+            ui_state.view.push_line(LineKind::System, "─".repeat(40));
+            continue;
         }
 
         // 有提交的消息：运行。
@@ -639,6 +692,29 @@ workspace: {}
                     )?;
                     continue;
                 }
+                "/retry" => {
+                    // §4.3：重试上一次失败/中断的 ModelTurn——不是重发 User 消息。
+                    // 目标消息入 pending_retry，主循环以空 user_message 发起 run，
+                    // 不重复记录 UserSubmitted，也不追加 User 消息（不污染对话）。
+                    match last_failed_message.clone() {
+                        Some(target) => {
+                            ui_state.push_retry(target.clone());
+                            push_system_line(
+                                &mut ui_state.view,
+                                &mut renderer,
+                                format!("⟳ 重试上一次 turn（{target}）"),
+                            )?;
+                        }
+                        None => {
+                            push_system_line(
+                                &mut ui_state.view,
+                                &mut renderer,
+                                "没有可重试的 turn（上一次 run 成功或尚无 run）".to_string(),
+                            )?;
+                        }
+                    }
+                    continue;
+                }
                 _ => {}
             }
             ui_state.view.push_line(LineKind::User, message.clone());
@@ -662,7 +738,7 @@ workspace: {}
                 &mut session_log,
                 config,
                 history,
-                message,
+                message.clone(),
                 &mut ui_state,
                 &mut renderer,
                 &mut key_rx,
@@ -683,6 +759,8 @@ workspace: {}
                     renderer
                         .draw(&mut ui_state.view)
                         .map_err(|e| e.to_string())?;
+                    // 记录失败 turn 供 /retry（§4.3）。
+                    last_failed_message = Some(message.clone());
                     *session = Some(session_log);
                     continue;
                 }
@@ -691,6 +769,16 @@ workspace: {}
             // P0-1：outcome.messages 是完整 context（含旧历史），必须 replace。
             merge_outcome_history(history, &outcome);
             *session = Some(session_log);
+            // 成功（或正常中断）后清空 retry 目标；ProviderInterrupted 是失败类，
+            // 保留以便用户 /retry。
+            match outcome.reason {
+                crate::session::CompletionReason::ProviderInterrupted
+                | crate::session::CompletionReason::ProviderUnavailable
+                | crate::session::CompletionReason::Error => {
+                    last_failed_message = Some(message.clone());
+                }
+                _ => last_failed_message = None,
+            }
             ui_state.view.push_line(LineKind::System, "─".repeat(40));
         }
     }
