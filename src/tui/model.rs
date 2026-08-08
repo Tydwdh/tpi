@@ -1052,16 +1052,26 @@ impl ViewModel {
         for entry in &self.transcript {
             let entry_id = entry.id();
             let text = match entry {
-                Entry::Message { line, .. } => line.text.clone(),
+                Entry::Message { line, .. } => {
+                    // ③ Canonical Semantic Text：与 renderer hit 坐标系一致——
+                    // 用渲染后纯文本（markdown 去样式），而非原始 markdown。
+                    canonical_semantic_text(line.kind, &line.text)
+                }
                 Entry::Tool { card, .. } => card_semantic_text(card),
             };
             candidates.push((entry_id, text));
         }
         if let Some(msg) = &self.live.assistant {
-            candidates.push((msg.entry_id, msg.text.clone()));
+            candidates.push((
+                msg.entry_id,
+                canonical_semantic_text(LineKind::Assistant, &msg.text),
+            ));
         }
         if let Some(msg) = &self.live.reasoning {
-            candidates.push((msg.entry_id, msg.text.clone()));
+            candidates.push((
+                msg.entry_id,
+                canonical_semantic_text(LineKind::Reasoning, &msg.text),
+            ));
         }
         let mut parts: Vec<String> = Vec::new();
         for (entry_id, text) in candidates {
@@ -1334,6 +1344,30 @@ fn bound_tail(tail: &str) -> String {
     let suffix: String = tail.chars().rev().take(MAX_CHARS).collect();
     out.extend(suffix.chars().rev());
     out
+}
+
+/// ③ Canonical Semantic Text：消息的「用户看到的纯文本」（markdown 渲染后
+/// 去样式）。renderer 的 hit-test 与 ViewModel::selected_text 必须基于同一份
+/// 文本，否则鼠标 offset 与复制内容分叉（一个用 rendered、一个用 raw）。
+fn canonical_semantic_text(kind: LineKind, raw: &str) -> String {
+    match kind {
+        // markdown 渲染的正文：User/Assistant 走同一 renderer。
+        LineKind::User | LineKind::Assistant => {
+            let rendered = crate::tui::render_markdown(raw, crate::tui::theme::Theme::omp());
+            rendered
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        // Reasoning/System/Tool：纯文本，无 markdown 转换。
+        _ => raw.to_string(),
+    }
 }
 
 /// 工具卡片的语义文本（§PointerHit：copy 从内容提取，不反推渲染结果）。
