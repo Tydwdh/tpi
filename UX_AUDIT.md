@@ -233,3 +233,6 @@
 ## 26. 迭代第12轮（2026-08-08）
 - Windows 控制台 UTF-8（真 bug，中文系统）：启动时未切换控制台代码页，GBK/936 控制台（cmd/PowerShell 旧 conhost）会把 UTF-8 输出（-p 答案、TUI、错误信息）显示成乱码。已修：main() 启动即 SetConsoleCP/SetConsoleOutputCP(65001)；doctor 新增 console 检查项。输入（config init/auth 中文）也随输入 CP 切换受益。
 - 光标投影不同步（真 bug）：Home/End/Ctrl+A/Ctrl+E 只移动 editor 光标，未调用 sync_input()，view.input_cursor 停留在旧位置——按完键硬件光标不跟着走，直到下一次输入才纠正。已修：四处分支补 sync_input。回归 home_end_sync_input_cursor_projection。
+## 27. 迭代第13轮（2026-08-08）
+- 搜索打开时键盘翻页失效（真 bug，行为不一致）：Ctrl+F 搜索打开时，鼠标滚轮能滚动 transcript，但 PgUp/PgDn/Ctrl+Home/Ctrl+End 被搜索键路由吞掉，键盘无法浏览上下文。已修：搜索模式路由 PgUp/PgDn 滚动、Ctrl+Home 顶部、Ctrl+End 回最新（搜索保持打开）。回归 search_mode_keeps_transcript_navigation_keys。
+- 滚轮步长 3 → 5 行（第 3 节建议落地）：长对话滚轮浏览更快；Modal/Overlay 内部滚轮同步 5 行。测试同步更新。

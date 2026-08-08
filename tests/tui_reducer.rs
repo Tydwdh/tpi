@@ -738,8 +738,8 @@ fn page_and_wheel_scroll_modal_when_open() {
     reducer::update(&mut s, UiEvent::MouseScrollDown);
     assert_eq!(
         s.view.modal.as_ref().unwrap().scroll,
-        13,
-        "wheel must scroll the Modal"
+        15,
+        "wheel must scroll the Modal (step 5)"
     );
     reducer::update(&mut s, UiEvent::MouseScrollUp);
     assert_eq!(s.view.modal.as_ref().unwrap().scroll, 10);
@@ -828,6 +828,40 @@ fn home_end_sync_input_cursor_projection() {
         s.view.input_cursor, 3,
         "Ctrl+E must sync the cursor projection"
     );
+}
+
+#[test]
+fn search_mode_keeps_transcript_navigation_keys() {
+    let mut s = state();
+    for i in 0..60 {
+        s.view.push_line(LineKind::Assistant, format!("line {i}"));
+    }
+    // Ctrl+F opens search.
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+    );
+    assert!(s.view.search.is_some(), "Ctrl+F opens search");
+    // PgUp must still scroll the transcript (consistent with the mouse wheel).
+    reducer::update(&mut s, key(KeyCode::PageUp));
+    assert!(
+        s.view.scroll_mode != ScrollMode::Follow,
+        "PgUp while search is open must scroll the transcript"
+    );
+    // Ctrl+End returns to Follow while keeping search open.
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL)),
+    );
+    assert_eq!(
+        s.view.scroll_mode,
+        ScrollMode::Follow,
+        "Ctrl+End restores Follow"
+    );
+    assert!(s.view.search.is_some(), "Ctrl+End must not close search");
+    // PgDown at Follow is a no-op (already at the bottom).
+    reducer::update(&mut s, key(KeyCode::PageDown));
+    assert_eq!(s.view.scroll_mode, ScrollMode::Follow);
 }
 
 /// /sessions 是“菜单 + Modal 指令”组合：Enter 仍应恢复选中 session（例外路径）。

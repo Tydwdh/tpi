@@ -233,3 +233,6 @@
 ## 迭代记录（2026-08-08 续 7）
 - WIN-UTF8-001（P2，Windows 中文系统）：启动未设控制台代码页 → GBK/936 下 UTF-8 输出乱码（-p/TUI/错误信息），config init/auth 中文输入同样受影响。已修：main() 启动 SetConsoleCP/SetConsoleOutputCP(65001) + doctor console 检查。
 - CURSOR-SYNC-001（P2）：Home/End/Ctrl+A/Ctrl+E 未同步 view.input_cursor，硬件光标停在旧位置直到下次输入。已修：四处补 sync_input。回归：home_end_sync_input_cursor_projection。
+## 迭代记录（2026-08-08 续 8）
+- SEARCH-KEY-001（P2，行为不一致）：Ctrl+F 搜索打开时 PgUp/PgDn/Ctrl+Home/Ctrl+End 被 handle_search_key 吞掉，而鼠标滚轮可滚动 transcript——键盘无法浏览上下文。已修：搜索模式放行 PgUp/PgDn/Ctrl+Home/Ctrl+End。回归：search_mode_keeps_transcript_navigation_keys。
+- WHEEL-STEP-001（P3，人体工学建议落地）：滚轮步长 3 → 5 行（Modal/Overlay 内部同步）；event.rs 文档同步。

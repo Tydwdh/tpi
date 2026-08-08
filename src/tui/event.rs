@@ -12,9 +12,9 @@ use ratatui::crossterm::event::KeyEvent;
 pub enum UiEvent {
     /// 键盘按键（仅 `KeyEventKind::Press`）。
     Key(KeyEvent),
-    /// 滚轮向上（3 行）。
+    /// 滚轮向上（5 行）。
     MouseScrollUp,
-    /// 滚轮向下（3 行）。
+    /// 滚轮向下（5 行）。
     MouseScrollDown,
     /// 鼠标点击命中工具卡片（Renderer hit-test 后）。
     ClickTool(String),

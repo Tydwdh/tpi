@@ -60,6 +60,20 @@ fn handle_search_key(
         KeyCode::F(3) => {
             state.view.search_jump(true);
         }
+        KeyCode::PageUp => {
+            // 搜索打开时 PgUp/PgDn 仍可滚动 transcript（与鼠标滚轮一致），
+            // 不得被搜索路由吞掉。
+            state.view.scroll_up(8);
+        }
+        KeyCode::PageDown => {
+            state.view.scroll_down(8);
+        }
+        KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.view.jump_to_top();
+        }
+        KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.view.follow_tail();
+        }
         KeyCode::Esc => {
             state.view.search = None;
         }
@@ -457,21 +471,21 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
         UiEvent::Key(key) => handle_key(state, key),
         UiEvent::MouseScrollUp => {
             if let Some(modal) = &mut state.view.modal {
-                modal.scroll = modal.scroll.saturating_sub(3);
+                modal.scroll = modal.scroll.saturating_sub(5);
             } else if let Some(overlay) = &mut state.view.overlay {
-                overlay.scroll = overlay.scroll.saturating_sub(3);
+                overlay.scroll = overlay.scroll.saturating_sub(5);
             } else {
-                state.view.scroll_up(3);
+                state.view.scroll_up(5);
             }
             Vec::new()
         }
         UiEvent::MouseScrollDown => {
             if let Some(modal) = &mut state.view.modal {
-                modal.scroll = modal.scroll.saturating_add(3);
+                modal.scroll = modal.scroll.saturating_add(5);
             } else if let Some(overlay) = &mut state.view.overlay {
-                overlay.scroll = overlay.scroll.saturating_add(3);
+                overlay.scroll = overlay.scroll.saturating_add(5);
             } else {
-                state.view.scroll_down(3);
+                state.view.scroll_down(5);
             }
             Vec::new()
         }
