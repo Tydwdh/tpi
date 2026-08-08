@@ -274,6 +274,7 @@ pub async fn run<P: Provider>(
             let system_prompt = system_prompt_text(
                 config,
                 crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+                None,
             );
             let projected = crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
             if crate::context::should_compact(projected, usable) && !compaction_failed {
@@ -284,6 +285,7 @@ pub async fn run<P: Provider>(
                         let system_prompt = system_prompt_text(
                             config,
                             crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+                            None,
                         );
                         let after =
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
@@ -308,6 +310,7 @@ pub async fn run<P: Provider>(
                         let system_prompt = system_prompt_text(
                             config,
                             crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+                            None,
                         );
                         let after =
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
@@ -338,22 +341,21 @@ pub async fn run<P: Provider>(
         let mut saw_tool_calls = false;
 
         let response = 'attempt: loop {
-            // 构建 request：续写 attempt 在 messages 尾部注入 recovery instruction
-            //（harness control metadata：不进 session、不进对话投影）。
-            let request_messages = if stream_recoveries == 0 {
-                messages.clone()
+            // 续写 attempt 的 recovery instruction 是 harness control metadata：
+            // 作为 ephemeral system instruction 注入 build_context（不进 session、
+            // 不进对话投影），而不是伪装成 User 消息。
+            let ephemeral_system = if stream_recoveries == 0 {
+                None
             } else {
-                let mut recovery = messages.clone();
-                let instruction = STREAM_RECOVERY_INSTRUCTION.replace("{partial}", &content);
-                recovery.push(ChatMessage::User(instruction));
-                recovery
+                Some(STREAM_RECOVERY_INSTRUCTION.replace("{partial}", &content))
             };
             let request = ModelRequest {
                 model: config.model.name.clone(),
                 messages: build_context(
                     config,
-                    &request_messages,
+                    &messages,
                     crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+                    ephemeral_system.as_deref(),
                 ),
                 tools: tool_defs.clone(),
                 max_output_tokens: config.model.max_output_tokens,
@@ -370,9 +372,10 @@ pub async fn run<P: Provider>(
                 let system_prompt = system_prompt_text(
                     config,
                     crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+                    ephemeral_system.as_deref(),
                 );
                 let projected =
-                    crate::context::estimate_request(&system_prompt, &request_messages, &tool_defs);
+                    crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                 let _ = ui
                     .send(RuntimeEvent::ContextUsage { projected, usable })
                     .await;
@@ -1289,7 +1292,14 @@ fn backup_cleanup_allowed(status: ToolStatus) -> bool {
 }
 
 /// 拼接 system prompt 文本（P0-9 提取：预算估算与请求构造共用同一来源）。
-fn system_prompt_text(config: &Config, plan: Option<&crate::tool::plan::Plan>) -> String {
+///
+/// `ephemeral_system` 是 harness control metadata（如续写 recovery instruction）：
+/// 只在本次 request 出现，不进 session、不进对话投影，也不伪装成 User 消息。
+fn system_prompt_text(
+    config: &Config,
+    plan: Option<&crate::tool::plan::Plan>,
+    ephemeral_system: Option<&str>,
+) -> String {
     let mut system = DEFAULT_SYSTEM_PROMPT.to_string();
     if let Some(extra) = &config.system_prompt_extra {
         system.push_str("\n\n");
@@ -1300,6 +1310,10 @@ fn system_prompt_text(config: &Config, plan: Option<&crate::tool::plan::Plan>) -
         system.push_str("\n\n");
         system.push_str(&snapshot);
     }
+    if let Some(ephemeral) = ephemeral_system {
+        system.push_str("\n\n");
+        system.push_str(ephemeral);
+    }
     system
 }
 
@@ -1307,13 +1321,21 @@ fn system_prompt_text(config: &Config, plan: Option<&crate::tool::plan::Plan>) -
 ///
 /// §13：每次 model request 的 runtime snapshot 都包含规范化计划（compaction 或
 /// 长对话不会让模型只靠记忆遵循 Todo）。
+///
+/// `ephemeral_system`：本次 request 的 harness control metadata（§4.3 续写指令），
+/// 以 system 指令注入，不进入对话投影。
 fn build_context(
     config: &Config,
     messages: &[ChatMessage],
     plan: Option<&crate::tool::plan::Plan>,
+    ephemeral_system: Option<&str>,
 ) -> Vec<ChatMessage> {
     let mut out = Vec::with_capacity(messages.len() + 2);
-    out.push(ChatMessage::System(system_prompt_text(config, plan)));
+    out.push(ChatMessage::System(system_prompt_text(
+        config,
+        plan,
+        ephemeral_system,
+    )));
     out.extend_from_slice(messages);
     out
 }

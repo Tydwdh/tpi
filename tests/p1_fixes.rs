@@ -502,12 +502,19 @@ impl Provider for RecoverThenSucceedProvider {
     ) -> Result<ProviderResponse, ProviderError> {
         self.calls += 1;
         if self.calls >= 2 {
-            // 第二次调用（续写）：必须看到 recovery instruction。
+            // 第二次调用（续写）：recovery instruction 是 harness control metadata，
+            // 必须作为 ephemeral system instruction 注入，而不是伪装成 User 消息。
             assert!(
                 request.messages.iter().any(|m| {
+                    matches!(m, ChatMessage::System(text) if text.contains("transport failure"))
+                }),
+                "续写 request 必须把 recovery instruction 作为 ephemeral system instruction 注入"
+            );
+            assert!(
+                !request.messages.iter().any(|m| {
                     matches!(m, ChatMessage::User(text) if text.contains("transport failure"))
                 }),
-                "续写 request 必须注入 recovery instruction（harness metadata）"
+                "recovery instruction 不得伪装成 User 消息"
             );
             events
                 .send(ProviderEvent::TextDelta("因为 target_exists 分支".into()))
