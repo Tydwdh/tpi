@@ -218,3 +218,8 @@
 ## 迭代记录（2026-08-08 续 3）
 - PROVIDER-RETRY-001（新，P1）：SSE 中途断开且已收到事件时，consume_stream 仍标记 retryable=true → 重发请求会重复已到达的文本/工具调用（与 §7.3 注释自相矛盾）。已修：`retryable = sse_transport_error_retryable(received_any)`（收到事件即不可重试）。
   回归：单测 `sse_transport_error_retryable_only_before_any_event` + 集成测试 `sse_midstream_error_after_events_does_not_retry`（部分 SSE 后 RST，断言连接数=1 不重试）。
+
+## 迭代记录（2026-08-08 续 4）
+- MENU-BG-001（P2，反馈复核补漏）：命令补全菜单浮层未 Clear，未选中行透出 transcript 背景文字（与“思考悬浮窗背景干扰”同族）。已修：draw_menu 渲染前 Clear 覆盖区。回归：menu_clears_background_before_rendering。
+- CURSOR-SEARCH-001（P2，反馈复核补漏）：Ctrl+F 搜索打开时 composer 硬件光标仍显示/闪烁（should_show_input_cursor 只覆盖 modal/overlay）。已修：搜索打开即隐藏输入光标。回归：cursor_hidden_during_run_when_input_empty（新增搜索字节级断言）。
+- OVERLAY-TITLE-001（P3）：思考（reasoning）悬浮窗边框标题硬编码 “Tool details”，信息错误。已修：按 overlay 类型显示 “思考（reasoning）”。回归：reasoning_overlay_uses_thinking_border_title。

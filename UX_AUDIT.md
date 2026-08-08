@@ -216,3 +216,10 @@
 ## 22. 迭代第8轮（2026-08-08）
 - 长菜单可视窗口（/sessions 多会话）：选中项始终可见，窗口外项隐藏并显示 …（此前只渲染前 9 行，选中项超出可视区时用户看不到选择）。回归 long_menu_window_follows_selection。
 - ConPTY 交互验收 9/9（第 4 次全量回归）。
+
+## 23. 迭代第9轮（2026-08-08）
+- 用户反馈 4 项修复后的同族补漏（同一批“悬浮窗/光标”问题复核）：
+  1. 命令补全菜单同样悬浮在 transcript 上方，但 draw_menu 未 Clear —— 未选中行会透出背景文字（与“思考悬浮窗被背景文字干扰”完全同族）。补 Clear + 回归 menu_clears_background_before_rendering。
+  2. Ctrl+F 搜索打开时，输入光标仍显示在 composer（打字进搜索框、光标却在输入框，视觉误导）。should_show_input_cursor 增加 search 条件，搜索打开即隐藏；字节级回归（\x1b[?25l）追加进 cursor_hidden_during_run_when_input_empty。
+  3. 思考（reasoning）悬浮窗边框标题此前硬编码 “Tool details” —— 现按 overlay 类型显示 “思考（reasoning）”。回归 reasoning_overlay_uses_thinking_border_title。
+- 全量测试通过（145 lib + 全部集成套件）。

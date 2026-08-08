@@ -1,4 +1,4 @@
-﻿//! TUI 渲染层（文档 §16）。
+//! TUI 渲染层（文档 §16）。
 //!
 //! 只有 renderer 可以调用 Crossterm/Ratatui 或写 stdout；Agent、provider、tool
 //! 和日志模块只能发送事件（§16.1、§3.2 不变量 11）。
@@ -1356,6 +1356,7 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: t
         &view.status,
         view.input.is_empty(),
         view.modal.is_some() || view.overlay.is_some(),
+        view.search.is_some(),
     ) {
         frame.set_cursor_position((x, y));
     }
@@ -1367,8 +1368,9 @@ fn should_show_input_cursor(
     status: &StatusLine,
     input_empty: bool,
     overlay_or_modal_open: bool,
+    search_open: bool,
 ) -> bool {
-    (matches!(status, StatusLine::Idle) || !input_empty) && !overlay_or_modal_open
+    (matches!(status, StatusLine::Idle) || !input_empty) && !overlay_or_modal_open && !search_open
 }
 
 /// BUG-008：输入区内部滚动的可见基准——保证光标行落在 `area` 内。
@@ -1558,10 +1560,16 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
     let end = (start + inner_h).min(wrapped.len());
     let window = wrapped[start..end].to_vec();
 
+    // Border title follows overlay type: tool details vs thinking (reasoning) window.
+    let border_title = if overlay.tool_id.is_some() {
+        " Tool details "
+    } else {
+        " 思考（reasoning） "
+    };
     let block = ratatui::widgets::Block::default()
         .borders(ratatui::widgets::Borders::ALL)
         .border_style(Style::default().fg(theme.primary))
-        .title(" Tool details ");
+        .title(border_title);
     // 先清空 Overlay 覆盖区域，否则底层 transcript 文字会透过内容间隙显示（用户反馈“思考悬浮窗被其他文字干扰背景”）。
     frame.render_widget(ratatui::widgets::Clear, rect);
     frame.render_widget(
@@ -1621,6 +1629,8 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
     if bottom_ellipsis {
         lines.push(Line::styled("…", Style::default().fg(theme.muted)));
     }
+    // Menu also floats over the transcript: clear the area first so unselected rows do not bleed background text.
+    frame.render_widget(ratatui::widgets::Clear, rect);
     frame.render_widget(Paragraph::new(Text::from(lines)), rect);
 }
 
@@ -2134,18 +2144,96 @@ fn overlay_clears_background_before_rendering() {
     );
 }
 
+/// Menu also floats over the transcript: unselected rows must not bleed background text.
+#[test]
+fn menu_clears_background_before_rendering() {
+    let mut view = ViewModel::default();
+    for _ in 0..40 {
+        view.push_line(LineKind::Assistant, "背景文字X".repeat(20));
+    }
+    view.input = "/".to_string();
+    view.refresh_command_menu();
+    let buf = draw_to_test_backend(&mut view, 80, 24);
+    // Locate a menu row by its item label (the menu is drawn over the transcript).
+    let mut menu_row = None;
+    let mut row_text = String::new();
+    for y in 0..24u16 {
+        row_text.clear();
+        for x in 0..80u16 {
+            row_text.push_str(buf[(x, y)].symbol());
+        }
+        if row_text.contains("/help") {
+            menu_row = Some(y);
+            break;
+        }
+    }
+    let row = menu_row.expect("menu row with /help must be rendered");
+    // Trailing cells of a menu row (beyond the item text) must be cleared to blank.
+    assert_eq!(
+        buf[(47, row)].symbol(),
+        " ",
+        "menu row must clear background text (col 47 leaked: {:?})",
+        buf[(47, row)].symbol()
+    );
+}
+
+/// Reasoning overlay must show its own border title, not "Tool details".
+#[test]
+fn reasoning_overlay_uses_thinking_border_title() {
+    let mut view = ViewModel::default();
+    for _ in 0..40 {
+        view.push_line(LineKind::Assistant, "背景文字X".repeat(4));
+    }
+    view.overlay = Some(crate::tui::model::OverlayState::for_reasoning(
+        "let me think",
+    ));
+    let buf = draw_to_test_backend(&mut view, 80, 24);
+    // Find the overlay top border row (Block title is drawn there).
+    let mut border_row = None;
+    for y in 0..buf.area().height {
+        let mut row = String::new();
+        for x in 0..buf.area().width {
+            row.push_str(buf[(x, y)].symbol());
+        }
+        if row.contains('┌') {
+            border_row = Some(row);
+            break;
+        }
+    }
+    let row = border_row.expect("overlay top border must be rendered");
+    assert!(
+        row.contains('思') && row.contains('考') && row.contains("reasoning") && row.contains('）'),
+        "reasoning overlay border must show the thinking title, got: {row:?}"
+    );
+    assert!(
+        !row.contains("Tool details"),
+        "reasoning overlay must not show the Tool details border title, got: {row:?}"
+    );
+}
 /// 修复：模型输出（Running + 空输入）期间隐藏光标，避免一直闪烁；空闲时显示。
 #[test]
 fn cursor_hidden_during_run_when_input_empty() {
-    // 产品规则：空闲恒显示；运行中仅输入非空时显示；Modal/Overlay 打开时隐藏。
-    assert!(should_show_input_cursor(&StatusLine::Idle, true, false));
-    assert!(should_show_input_cursor(&StatusLine::Idle, false, false));
+    // Product rule: idle always shows; running shows only when input is non-empty;
+    // hidden while a Modal/Overlay is open or while search (Ctrl+F) is open.
+    assert!(should_show_input_cursor(
+        &StatusLine::Idle,
+        true,
+        false,
+        false
+    ));
+    assert!(should_show_input_cursor(
+        &StatusLine::Idle,
+        false,
+        false,
+        false
+    ));
     assert!(!should_show_input_cursor(
         &StatusLine::Running {
             turn: 1,
             tool: "x".into()
         },
         true,
+        false,
         false
     ));
     assert!(should_show_input_cursor(
@@ -2154,11 +2242,12 @@ fn cursor_hidden_during_run_when_input_empty() {
             tool: "x".into()
         },
         false,
+        false,
         false
     ));
     assert!(
-        !should_show_input_cursor(&StatusLine::Idle, true, true),
-        "Modal/Overlay 打开时隐藏输入光标"
+        !should_show_input_cursor(&StatusLine::Idle, true, true, false),
+        "cursor must hide while Modal/Overlay is open"
     );
     assert!(!should_show_input_cursor(
         &StatusLine::Running {
@@ -2166,24 +2255,48 @@ fn cursor_hidden_during_run_when_input_empty() {
             tool: "x".into()
         },
         false,
+        true,
+        false
+    ));
+    assert!(
+        !should_show_input_cursor(&StatusLine::Idle, true, false, true),
+        "cursor must hide while search is open (typing goes to the search box)"
+    );
+    assert!(!should_show_input_cursor(
+        &StatusLine::Running {
+            turn: 1,
+            tool: "x".into()
+        },
+        false,
+        false,
         true
     ));
 
-    // 字节级：运行中 + 空输入的帧必须发出隐藏序列（绘制期间不得 set_cursor_position）。
+    // Byte level: running + empty input must emit the hide sequence.
     let mut view = ViewModel::default();
     view.status = StatusLine::Running {
         turn: 1,
-        tool: "模型生成中".into(),
+        tool: "generating".into(),
     };
     view.input = String::new();
     let s = String::from_utf8_lossy(&draw_captured_bytes(&mut view)).into_owned();
-    assert!(s.contains("\x1b[?25l"), "运行中必须隐藏光标: {s:?}");
+    assert!(s.contains("\x1b[?25l"), "running must hide cursor: {s:?}");
 
-    // 空闲帧必须显示光标。
+    // Idle frame must show cursor.
     let mut view2 = ViewModel::default();
     view2.status = StatusLine::Idle;
     let s2 = String::from_utf8_lossy(&draw_captured_bytes(&mut view2)).into_owned();
-    assert!(s2.contains("\x1b[?25h"), "空闲必须显示光标: {s2:?}");
+    assert!(s2.contains("\x1b[?25h"), "idle must show cursor: {s2:?}");
+
+    // Search open (Ctrl+F): typing goes into the search box, composer cursor must hide.
+    let mut view3 = ViewModel::default();
+    view3.status = StatusLine::Idle;
+    view3.open_search();
+    let s3 = String::from_utf8_lossy(&draw_captured_bytes(&mut view3)).into_owned();
+    assert!(
+        s3.contains("\x1b[?25l"),
+        "search open must hide cursor: {s3:?}"
+    );
 }
 
 /// §14 高亮：搜索命中条目整段带下划线，未命中条目不带。
