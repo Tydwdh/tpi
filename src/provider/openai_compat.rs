@@ -20,6 +20,10 @@ use tokio_util::sync::CancellationToken;
 
 /// 最大尝试次数（含首次请求；§7.3：指数退避，最多 4 次）。
 const MAX_ATTEMPTS: u32 = 4;
+/// 重试等待总预算（§7.3：只计「重试等待」的累计，不计单次请求耗时——
+/// 防止服务端持续 Retry-After 时无限重试；单次请求本身由 connect_timeout
+/// 和 cancel 约束，SSE 流读取无总超时）。
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 /// 首次退避基准（第 0 次重试）；每次尝试翻倍：500ms → 1s → 2s。
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
@@ -49,12 +53,14 @@ impl OpenAiCompatClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
-            // 请求超时（§7.3）：连接建立/首字节/整体各设上限，防止网络 hang
-            // 导致单次 send 无限阻塞——此前无超时，一次慢请求可耗尽整个重试
-            // 预算（日志：`connection failed: attempt 0`，实际已卡 3 分钟）。
+            // 连接超时（§7.3）：TCP 连接建立上限，防网络 hang 无限阻塞
+            // （此前无超时，连接卡住会耗尽重试预算）。
+            // 注意：**不设置整体 timeout**——SSE 流可能长时间保持打开
+            // （模型长 thinking / tool 间无 token），reqwest 的 `.timeout()`
+            // 是整请求总超时，会误杀长流（`error decoding response body`）。
+            // 流读取空闲由 consume_stream 的 cancel 处理。
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(60))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         }
@@ -234,10 +240,12 @@ impl Provider for OpenAiCompatClient {
         // （consume_stream）的传输错误在未收到任何事件时同样可安全重试（网络抖动/
         // 连接中途断开），收到事件后失败则不可重试（避免事件重复/乱序）。
         //
-        // 退避策略（§7.3）：指数退避 + jitter；最多 `MAX_ATTEMPTS` 次尝试；
-        // 服务端 `Retry-After` 大于本地退避时尊重服务端。
-        // 每次请求有 timeout=60s，总墙钟上限由 MAX_ATTEMPTS×timeout 隐式约束。
+        // 退避策略（§7.3）：指数退避 + jitter；最多 `MAX_ATTEMPTS` 次尝试，
+        // 且「重试等待」累计不超过 `MAX_RETRY_WAIT`（防服务端持续 Retry-After
+        // 时无限重试）。单次请求耗时不计入预算（由 connect_timeout / cancel
+        // 约束；SSE 流读取无总超时）。
         let mut attempt: u32 = 0;
+        let mut retry_wait = Duration::ZERO;
         loop {
             let response = match self.send_once(&url, &body, &cancel).await {
                 Ok(response) => response,
@@ -248,10 +256,7 @@ impl Provider for OpenAiCompatClient {
                         return Err(ProviderError::Cancelled);
                     }
                     // 传输层失败（连接被拒/中断）：未收到任何事件，可安全重试。
-                    // 上限只由 MAX_ATTEMPTS 决定（每次请求已有 timeout=60s，
-                    // 总墙钟上限由 4 次×60s 隐式约束）——不能把「本次请求耗时」
-                    // 计入预算，否则一次慢请求（如连接 hang）会吞掉全部重试。
-                    if attempt + 1 >= MAX_ATTEMPTS {
+                    if attempt + 1 >= MAX_ATTEMPTS || retry_wait >= MAX_RETRY_WAIT {
                         return Err(classify_error(error, attempt));
                     }
                     let delay = backoff_delay(attempt, None);
@@ -264,6 +269,7 @@ impl Provider for OpenAiCompatClient {
                     if !wait_or_cancelled(&cancel, delay).await {
                         return Err(ProviderError::Cancelled);
                     }
+                    retry_wait += delay;
                     attempt += 1;
                     continue;
                 }
@@ -282,7 +288,7 @@ impl Provider for OpenAiCompatClient {
                             if !retryable || matches!(error, ProviderError::Cancelled) {
                                 return Err(error);
                             }
-                            if attempt + 1 >= MAX_ATTEMPTS {
+                            if attempt + 1 >= MAX_ATTEMPTS || retry_wait >= MAX_RETRY_WAIT {
                                 return Err(error);
                             }
                             // 未收到任何事件：传输层失败，短暂等待后重发请求。
@@ -296,6 +302,7 @@ impl Provider for OpenAiCompatClient {
                             if !wait_or_cancelled(&cancel, delay).await {
                                 return Err(ProviderError::Cancelled);
                             }
+                            retry_wait += delay;
                             attempt += 1;
                         }
                     }
@@ -309,7 +316,7 @@ impl Provider for OpenAiCompatClient {
                         );
                         trace::log("retryable", fields);
                     }
-                    if attempt + 1 >= MAX_ATTEMPTS {
+                    if attempt + 1 >= MAX_ATTEMPTS || retry_wait >= MAX_RETRY_WAIT {
                         return Err(ProviderError::RateLimited(format!(
                             "attempt {attempt}: retry budget exhausted"
                         )));
@@ -323,6 +330,7 @@ impl Provider for OpenAiCompatClient {
                     if !wait_or_cancelled(&cancel, delay).await {
                         return Err(ProviderError::Cancelled);
                     }
+                    retry_wait += delay;
                     attempt += 1;
                 }
             }
@@ -506,21 +514,29 @@ async fn consume_stream(
                 };
             }
         };
-        received_any = true;
+        // §7.3/§15：`received_any` 表示「已收到语义内容」（text/reasoning/tool/
+        // finish_reason）。只有收到语义内容后断流才不可重试（避免重复内容）；
+        // 空 chunk / usage-only chunk（如流开头的 usage 包）不算——它们不会导致
+        // 重复，收到后断流仍应可重试（否则长响应在开头被 usage chunk 标记为
+        // 不可重试，网络抖动直接 ProviderUnavailable）。
+        let mut chunk_had_semantic = false;
         for choice in &chunk.choices {
             if let Some(content) = &choice.delta.content
                 && !content.is_empty()
             {
+                chunk_had_semantic = true;
                 let _ = events.send(ProviderEvent::TextDelta(content.clone())).await;
             }
             if let Some(reasoning) = &choice.delta.reasoning_content
                 && !reasoning.is_empty()
             {
+                chunk_had_semantic = true;
                 let _ = events
                     .send(ProviderEvent::ReasoningDelta(reasoning.clone()))
                     .await;
             }
             for call in &choice.delta.tool_calls {
+                chunk_had_semantic = true;
                 let index = call.index.unwrap_or(0) as usize;
                 if pending.len() <= index {
                     pending.resize_with(index + 1, || PendingToolCall {
@@ -569,8 +585,12 @@ async fn consume_stream(
                 }
             }
             if let Some(reason) = &choice.finish_reason {
+                chunk_had_semantic = true;
                 finish_reason = Some(parse_finish_reason(reason));
             }
+        }
+        if chunk_had_semantic {
+            received_any = true;
         }
         if let Some(usage_value) = &chunk.usage {
             usage = Usage {
