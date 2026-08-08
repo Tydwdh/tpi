@@ -390,10 +390,10 @@ fn alt_up_down_jumps_between_user_turns() {
     assert_eq!(anchor.entry_id.0, 3);
 }
 
-/// BUG-004：Ctrl-C 在运行中必须产生 CancelRun（Windows raw mode 下
-/// tokio 的 ctrl_c() 信号不会触发，此前按键被 reducer 直接忽略）。
+/// §用户诉求：Ctrl-C 只用于复制——运行中到达应用的 Ctrl-C 静默忽略，
+/// 不取消 run（取消统一用 Esc）。
 #[test]
-fn ctrl_c_running_cancels_run() {
+fn ctrl_c_running_is_ignored_for_copy() {
     let mut s = state();
     s.running = true;
     let effects = reducer::update(
@@ -401,28 +401,30 @@ fn ctrl_c_running_cancels_run() {
         UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
     );
     assert!(
-        effects.contains(&UiEffect::CancelRun),
-        "运行中 Ctrl-C 必须取消 run: {effects:?}"
+        !effects.contains(&UiEffect::CancelRun),
+        "运行中 Ctrl-C 不得取消 run（只用于复制）: {effects:?}"
     );
+    // 也不得输入 'c' 到 composer。
+    assert!(s.view.input.is_empty(), "Ctrl-C 不得写入输入框");
 }
 
-/// BUG-004：空闲 Ctrl-C 必须产生 Quit（此前该按键被忽略，Windows 上无法退出）。
+/// §用户诉求：空闲 Ctrl-C 静默忽略（不退出；退出用 /quit）。
 #[test]
-fn ctrl_c_idle_quits() {
+fn ctrl_c_idle_is_ignored() {
     let mut s = state();
     let effects = reducer::update(
         &mut s,
         UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
     );
     assert!(
-        effects.contains(&UiEffect::Quit),
-        "空闲 Ctrl-C 必须退出: {effects:?}"
+        !effects.contains(&UiEffect::Quit),
+        "空闲 Ctrl-C 不得退出（只用于复制）: {effects:?}"
     );
 }
 
-/// BUG-004：Ctrl-C 与 Esc 同层——Overlay 打开时先关闭 Overlay，不产生 Quit/CancelRun。
+/// §用户诉求：Ctrl-C 静默忽略——不关闭 Overlay（Esc 负责关闭弹层）。
 #[test]
-fn ctrl_c_priority_overlay_first() {
+fn ctrl_c_does_not_close_overlay() {
     let mut s = state();
     s.running = true;
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
@@ -434,11 +436,11 @@ fn ctrl_c_priority_overlay_first() {
         &mut s,
         UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
     );
-    assert!(s.view.overlay.is_none(), "Ctrl-C 应关闭 Overlay");
     assert!(
-        effects.is_empty(),
-        "关闭 Overlay 不得附带取消/退出: {effects:?}"
+        s.view.overlay.is_some(),
+        "Ctrl-C 不关闭 Overlay（Esc 负责）"
     );
+    assert!(effects.is_empty(), "Ctrl-C 静默忽略: {effects:?}");
 }
 
 /// BUG-005：运行中连续提交两条消息必须按顺序排队，不能覆盖丢失第一条。
@@ -606,9 +608,9 @@ fn submit_clears_input_projection() {
     );
 }
 
-/// Ctrl-C 在搜索打开时先关闭搜索，不误退出/误取消；再按一次才退出。
+/// §用户诉求：Ctrl-C 只用于复制——搜索打开时也静默忽略（Esc 负责关闭搜索）。
 #[test]
-fn ctrl_c_closes_search_instead_of_quitting_or_cancelling() {
+fn ctrl_c_ignored_while_search_open() {
     let mut s = state();
     reducer::update(
         &mut s,
@@ -619,17 +621,15 @@ fn ctrl_c_closes_search_instead_of_quitting_or_cancelling() {
         &mut s,
         UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
     );
-    assert!(s.view.search.is_none(), "Ctrl-C 必须先关闭搜索");
-    assert!(
-        effects.is_empty(),
-        "关闭搜索不得产生 Quit/CancelRun: {effects:?}"
-    );
-    // 搜索已关、空闲：再按 Ctrl-C → 退出。
+    // §用户诉求：Ctrl-C 只复制——不关闭搜索（Esc 负责关闭），静默忽略。
+    assert!(s.view.search.is_some(), "Ctrl-C 不关闭搜索（Esc 负责）");
+    assert!(effects.is_empty(), "Ctrl-C 静默忽略: {effects:?}");
+    // 搜索已开、空闲：Ctrl-C 也不退出。
     let effects2 = reducer::update(
         &mut s,
         UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
     );
-    assert!(effects2.contains(&UiEffect::Quit));
+    assert!(!effects2.contains(&UiEffect::Quit), "Ctrl-C 不得退出");
 }
 
 /// 弹层打开时普通按键不得写入 composer（关弹层后输入框不应出现乱码）。

@@ -95,32 +95,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
     // 过渡提示下一次键盘操作清除（同一个键可重新设置）。
     state.view.transient_hint = None;
 
-    // BUG-004：Ctrl-C 必须在 raw mode 下作为按键处理（Windows 下 crossterm raw
-    // mode 清除 ENABLE_PROCESSED_INPUT，Ctrl-C 不会产生 CTRL_C_EVENT，tokio 的
-    // ctrl_c() 信号 handler 不会触发；此前 reducer 直接忽略该按键 → 取消失效）。
-    // 语义与 Esc 同层：Overlay > Modal > Menu > 运行中取消；空闲时退出。
-    // （`ctrl_c()` handler 保留，作为 -p 模式/非 raw 场景的兜底。）
-    let is_ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
-    if is_ctrl_c {
-        if state.view.overlay.is_some() {
-            state.view.close_overlay();
-        } else if state.view.modal.is_some() {
-            state.view.close_modal();
-        } else if state.view.menu.is_some() {
-            state.view.menu = None;
-        } else if state.view.search.is_some() {
-            // Ctrl-C 在搜索打开时先关闭搜索（避免误退出/误取消，与 Esc 语义一致）。
-            state.view.search = None;
-        } else if state.running {
-            // §6.2：Ctrl-C 打断当前 run（等价 Esc，保留 session）。
-            effects.push(UiEffect::CancelRun);
-        } else {
-            // 空闲 Ctrl-C：退出 TUI（与 ctrl_c handler 的语义一致）。
-            effects.push(UiEffect::Quit);
-        }
-        return effects;
-    }
+    // Ctrl+C 语义（§用户诉求）：只用于复制——Windows Terminal 选中文本后
+    // Ctrl+C 由终端优先复制（不传给应用）；未选中时到达应用的 Ctrl+C 静默忽略，
+    // 不取消/退出（取消统一用 Esc）。
+    // 注意：raw mode 下 crossterm 把 Ctrl+C 读成 KeyEvent；若不做任何处理，
+    // 它会落到 `Char('c')` 分支变成输入 'c'，因此必须显式忽略。
 
     // 弹层（Modal/Overlay）打开时：只响应导航/关闭/菜单键，普通按键不得写入 composer
     // （否则用户打字全进后台输入框，关弹层后输入框出现乱码）。
@@ -333,7 +312,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             }
         }
         KeyCode::Char(c) => {
-            // Ctrl-C 已在 handle_key 顶部处理（BUG-004）；此处不再忽略。
+            // Ctrl+C：只复制（§用户诉求）。Windows Terminal 选中文本后由终端
+            // 复制；未选中时到达应用的 Ctrl+C 静默忽略，避免输入 'c'。
+            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
+                return effects;
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'u' {
                 state.editor.clear();
                 state.sync_input();

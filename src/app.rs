@@ -3,7 +3,7 @@
 //! 活动 run 中的输入路由（§6.2）：
 //! - 普通 Enter：输入排队（pending_message），**当前 run 完成后**作为下一条
 //!   消息提交（§12 稳定化任务书：不是 run 内的 boundary steering）；
-//! - Ctrl-C：取消当前 run，保留 session；空闲时退出。
+//! - Esc：取消当前 run，保留 session（Ctrl-C 只用于复制，见 reducer）。
 //!
 //! M5：Ratatui inline renderer——只有 renderer 写 stdout（§3.2 不变量 11、
 //! §16.1），16 ms 帧合并，synchronized update。
@@ -250,7 +250,7 @@ async fn interactive_loop<P: Provider>(
     };
     view.push_line(
         LineKind::System,
-        "TPI：/help 查看命令与快捷键 · Ctrl-C 取消当前 run",
+        "TPI：/help 查看命令与快捷键 · Esc 取消当前 run",
     );
     // §26-27：UiState 是 UI 单一事实源；交互循环只做
     // event → reducer → effects → draw（T3）。
@@ -549,7 +549,7 @@ web_search: DuckDuckGo（免费，无需 API key）
                         Alt+[/] 切换工具 · Ctrl+F 搜索 · Ctrl+U 清空 ·
                         Ctrl+A/E 行首/行尾 · PgUp/PgDn 翻页 · 滚轮/滚动条滚动 ·
                         Ctrl+Home 顶部 · Ctrl+End 最新 · Modal ↑/↓ 滚动 ·
-                        点击工具卡片展开 · Ctrl-C 取消 run",
+                        点击工具卡片展开 · Esc 取消 run",
                     );
                     renderer
                         .draw(&mut ui_state.view)
@@ -866,7 +866,7 @@ fn execute_ui_effect(
             }
             ui_state
                 .view
-                .push_line(LineKind::System, "已发送取消（Ctrl-C/Esc）；保留 session");
+                .push_line(LineKind::System, "已发送取消（Esc）；保留 session");
             false
         }
         // BUG-004：空闲 Ctrl-C 产生 Quit → app 层 break 主循环走正常退出（含终端 restore）。
@@ -949,7 +949,7 @@ async fn run_interactive<P: Provider>(
                                     cancel.cancel();
                                     ui_state.view.push_line(
                                         LineKind::System,
-                                        "已发送取消（Ctrl-C/Esc）；保留 session",
+                                        "已发送取消（Esc）；保留 session",
                                     );
                                 }
                                 UiEffect::Quit | UiEffect::ResumeSession(_) => {
