@@ -2028,7 +2028,6 @@ mod p2_card_nav_tests {
     #[test]
     fn streaming_selection_survives_finalize() {
         use crate::tui::interaction::TextPosition;
-        use crate::tui::scroll::EntryId;
         let mut view = ViewModel::default();
         view.push_stream_delta(LineKind::Assistant, "streaming content");
         // streaming 期间选中（entry_id 已分配）。
