@@ -335,6 +335,9 @@ pub struct ViewModel {
     /// 鼠标点击命中的目标（工具卡片/reasoning 行；§24 高亮反馈）。
     /// Overlay 打开期间该行高亮；关闭 Overlay 后清除。
     pub active_hit: Option<crate::tui::HitTarget>,
+    /// 鼠标悬浮命中的目标（§24 hover 高亮）：光标停在可点击行上时
+    /// 该行显示 hover 反馈（反转/下划线），移开即清除。
+    pub hover_hit: Option<crate::tui::HitTarget>,
     /// 本会话累计 token 用量（AgentOutcome.usage 累积，§16.2：无 pricing 时显示 usage）。
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -378,6 +381,7 @@ impl Default for ViewModel {
             pending_queue_len: 0,
             reasoning_visible: false,
             active_hit: None,
+            hover_hit: None,
             input_tokens: 0,
             output_tokens: 0,
             anim_tick: 0,
@@ -435,6 +439,7 @@ impl ViewModel {
         self.modal = None;
         self.search = None;
         self.active_hit = None;
+        self.hover_hit = None;
     }
 
     /// BUG-006：会话切换/恢复后把模型上下文（history）重建到屏幕，
@@ -950,6 +955,12 @@ impl ViewModel {
     pub fn close_overlay(&mut self) {
         self.overlay = None;
         self.active_hit = None;
+    }
+
+    /// 更新鼠标悬浮目标（§24 hover 高亮）：命中可点击行 → 记录；
+    /// 移开/不可点 → 清除。
+    pub fn set_hover_hit(&mut self, hit: Option<crate::tui::HitTarget>) {
+        self.hover_hit = hit;
     }
 
     /// 关闭 Modal（Esc；优先级低于 Overlay，§49）。
@@ -1708,5 +1719,24 @@ mod p2_card_nav_tests {
         view.close_overlay();
         assert!(view.active_hit.is_none(), "关闭 Overlay 清除高亮");
         assert!(view.overlay.is_none());
+    }
+
+    /// §24：鼠标悬浮设置/清除 hover_hit（hover 高亮）。
+    #[test]
+    fn hover_hit_sets_and_clears() {
+        let mut view = ViewModel::default();
+        assert!(view.hover_hit.is_none(), "初始无 hover");
+        view.set_hover_hit(Some(crate::tui::HitTarget::Tool("c1".into())));
+        assert!(
+            matches!(&view.hover_hit, Some(crate::tui::HitTarget::Tool(id)) if id == "c1"),
+            "悬浮到工具卡片行必须记录: {:?}",
+            view.hover_hit
+        );
+        view.set_hover_hit(None);
+        assert!(view.hover_hit.is_none(), "移开鼠标清除 hover");
+        // 新会话也清除。
+        view.set_hover_hit(Some(crate::tui::HitTarget::Reasoning(EntryId(1))));
+        view.reset_for_new_session();
+        assert!(view.hover_hit.is_none());
     }
 }

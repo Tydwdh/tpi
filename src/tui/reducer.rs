@@ -535,6 +535,13 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             }
             Vec::new()
         }
+        // §24 hover：reducer 不依赖终端坐标，MouseMoved 由 app 层解析为
+        // hit 目标后传入（未命中为 None）。
+        UiEvent::MouseMoved { .. } => {
+            // app 层已通过 Renderer.hit_target 更新 view.hover_hit；
+            // 此处仅标记重绘由 app 处理。
+            Vec::new()
+        }
         UiEvent::ClickTool(id) => {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new(); // 弹层打开时鼠标点击不得打开后台 overlay

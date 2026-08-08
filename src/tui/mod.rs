@@ -90,8 +90,8 @@ pub enum HitTarget {
 struct FramePlan {
     /// 活动区窗口内容（已按宽度折行的逻辑行，直接渲染）。
     window: Vec<Line<'static>>,
-    /// 窗口内每行对应的工具卡片 id（鼠标点击展开；消息行为 None）。
-    row_hits: Vec<Option<HitTarget>>,
+    /// 窗口内每行对应的可点击目标 + 列上限（鼠标点击展开；消息行为 None）。
+    row_hits: Vec<Option<(HitTarget, u16)>>,
     /// 转录区屏幕矩形（鼠标 hit-test）。
     transcript_rect: Rect,
     /// scrollbar 屏幕矩形（fullscreen 1 列；§24）。
@@ -120,8 +120,9 @@ pub struct Renderer {
     cache_width: u16,
     /// 最近一帧的转录区矩形（鼠标 hit-test 用）。
     last_transcript_rect: Option<Rect>,
-    /// 最近一帧窗口内每行对应的工具卡片 id（鼠标点击展开用）。
-    last_row_hits: Vec<Option<HitTarget>>,
+    /// 最近一帧窗口内每行对应的可点击目标 + 可点击列上限
+    /// （鼠标点击展开用；主行限制在图标+工具名区域，避免整行误触）。
+    last_row_hits: Vec<Option<(HitTarget, u16)>>,
     /// 已提交到 scrollback 的行数（折叠/展开状态变化时 hit 失效，置空）。
     hits_valid: bool,
     /// 最近一帧 scrollbar 矩形（§24 鼠标点击/拖拽 hit-test）。
@@ -151,6 +152,7 @@ impl Renderer {
     }
 
     /// 鼠标点击 hit-test：命中工具卡片/reasoning 行返回目标（Overlay 用）。
+    /// 列必须落在该行的可点击范围内（§24：主行限图标+工具名区域，避免误触）。
     pub fn hit_target(&self, column: u16, row: u16) -> Option<HitTarget> {
         if !self.hits_valid {
             return None;
@@ -160,7 +162,15 @@ impl Renderer {
             return None;
         }
         let index = (row - rect.y) as usize;
-        self.last_row_hits.get(index).cloned().flatten()
+        let Some((target, end_col)) = self.last_row_hits.get(index).cloned().flatten() else {
+            return None;
+        };
+        // 列必须是可点击区域内（含 0..=end_col；end_col==0 表示该行不可点）。
+        let col = column.saturating_sub(rect.x);
+        if end_col == 0 || col > end_col {
+            return None;
+        }
+        Some(target)
     }
     /// §24：最近一帧 scrollbar 矩形（鼠标点击/拖拽 hit-test；app 层优先判断）。
     pub fn scrollbar_rect(&self) -> Option<Rect> {
@@ -474,7 +484,7 @@ fn plan_window(
 
     // 按全局行切片：逐 entry 取窗口内的行。
     let mut window: Vec<Line<'static>> = Vec::new();
-    let mut row_hits: Vec<Option<HitTarget>> = Vec::new();
+    let mut row_hits: Vec<Option<HitRange>> = Vec::new();
     let mut cursor = 0usize;
     for (_, wrapped, wrapped_hits) in &wrapped_by_entry {
         let start = cursor;
@@ -525,20 +535,20 @@ fn plan_window(
 
 fn wrap_lines_with_hits(
     lines: Vec<Line<'static>>,
-    hits: Vec<Option<HitTarget>>,
+    hits: Vec<Option<HitRange>>,
     width: usize,
-) -> (Vec<Line<'static>>, Vec<Option<HitTarget>>) {
+) -> (Vec<Line<'static>>, Vec<Option<HitRange>>) {
     let width = width.max(1);
     let mut out: Vec<Line<'static>> = Vec::new();
-    let mut out_hits: Vec<Option<HitTarget>> = Vec::new();
+    let mut out_hits: Vec<Option<HitRange>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
     let mut cur_w = 0usize;
-    let mut cur_hit: Option<HitTarget> = None;
+    let mut cur_hit: Option<HitRange> = None;
     let flush = |out: &mut Vec<Line<'static>>,
-                 out_hits: &mut Vec<Option<HitTarget>>,
+                 out_hits: &mut Vec<Option<HitRange>>,
                  cur: &mut Vec<Span<'static>>,
                  cur_w: &mut usize,
-                 cur_hit: &mut Option<HitTarget>| {
+                 cur_hit: &mut Option<HitRange>| {
         if !cur.is_empty() {
             out.push(Line::from(std::mem::take(cur)));
             out_hits.push(cur_hit.clone());
@@ -639,21 +649,33 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// 可点击目标 + 可点击列上限（§24）：`end_col` 为该行可点击的最大列
+/// （0 表示该行不可点击）。主行（工具图标+工具名）记录实际宽度；
+/// 正文/tail 行不可点（避免整行误触）。
+pub type HitRange = (HitTarget, u16);
+
 /// 按 entry 分组的渲染结果：(EntryId, 逻辑行, 逐行 hits)。
 /// hits 与 lines 等长，工具卡片的行对应卡片 id（鼠标点击展开）。
-type EntryGroup = (EntryId, Vec<Line<'static>>, Vec<Option<HitTarget>>);
+type EntryGroup = (EntryId, Vec<Line<'static>>, Vec<Option<HitRange>>);
 
 /// entry 是否命中当前 active_hit（§24 点击高亮）：hits 中任意一行与
 /// active_hit 相等即为命中（工具卡片所有行共享同一 hit）。
 fn entry_matches_active_hit(
     _entry_id: &EntryId,
-    hits: &[Option<HitTarget>],
+    hits: &[Option<HitRange>],
     active: &Option<HitTarget>,
 ) -> bool {
     match active {
-        Some(target) => hits.iter().any(|h| h.as_ref() == Some(target)),
+        Some(target) => hits
+            .iter()
+            .any(|h| h.as_ref().map(|(t, _)| t) == Some(target)),
         None => false,
     }
+}
+
+/// 构建一个"整行可点"的 hit（reasoning 折叠行）。
+fn full_line_hit(target: HitTarget, width: u16) -> Option<HitRange> {
+    Some((target, width))
 }
 
 /// 把转录条目渲染为逻辑行（Message 按类型着色/加 rail；Tool 渲染为卡片）。
@@ -667,11 +689,11 @@ fn build_transcript_text(
 ) -> Vec<EntryGroup> {
     let mut groups: Vec<EntryGroup> = Vec::with_capacity(view.transcript.len());
     let mut out: Vec<Line<'static>> = Vec::new();
-    let mut hits: Vec<Option<HitTarget>> = Vec::new();
+    let mut hits: Vec<Option<HitRange>> = Vec::new();
     let push_hit = |lines: &mut Vec<Line<'static>>,
-                    hits: &mut Vec<Option<HitTarget>>,
+                    hits: &mut Vec<Option<HitRange>>,
                     line: Line<'static>,
-                    hit: Option<HitTarget>| {
+                    hit: Option<HitRange>| {
         lines.push(line);
         hits.push(hit);
     };
@@ -750,7 +772,7 @@ fn build_transcript_text(
                                         .fg(theme.muted)
                                         .add_modifier(Modifier::ITALIC),
                                 ),
-                                Some(HitTarget::Reasoning(entry_id)),
+                                None,
                             );
                         }
                     } else {
@@ -763,7 +785,7 @@ fn build_transcript_text(
                                     .fg(theme.muted)
                                     .add_modifier(Modifier::ITALIC),
                             ),
-                            Some(HitTarget::Reasoning(entry_id)),
+                            full_line_hit(HitTarget::Reasoning(entry_id), width as u16),
                         );
                     }
                 }
@@ -805,13 +827,17 @@ fn build_transcript_text(
             },
             Entry::Tool { card, .. } => {
                 let card_id = card.id.clone();
-                for line in tool_card_lines(card, view.anim_tick, theme, width) {
-                    push_hit(
-                        &mut out,
-                        &mut hits,
-                        line,
-                        Some(HitTarget::Tool(card_id.clone())),
-                    );
+                let card_lines = tool_card_lines(card, view.anim_tick, theme, width);
+                for (i, line) in card_lines.into_iter().enumerate() {
+                    // §24：只有主行（index 0）可点击，范围 = 图标+工具名+target
+                    // 的 display 宽度；正文/tail 行不可点（避免整行误触）。
+                    let hit = if i == 0 {
+                        let w = line.width() as u16;
+                        Some((HitTarget::Tool(card_id.clone()), w))
+                    } else {
+                        None
+                    };
+                    push_hit(&mut out, &mut hits, line, hit);
                 }
             }
         }
@@ -856,6 +882,25 @@ fn build_transcript_text(
                 })
                 .collect();
             out = highlighted;
+        } else if entry_matches_active_hit(&entry_id, &hits, &view.hover_hit) {
+            // §24 hover：鼠标停在可点击行上 → 反转色提示"可点击"。
+            let hovered = std::mem::take(&mut out)
+                .into_iter()
+                .map(|line| {
+                    Line::from(
+                        line.spans
+                            .into_iter()
+                            .map(|span| {
+                                Span::styled(
+                                    span.content,
+                                    span.style.add_modifier(Modifier::REVERSED),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            out = hovered;
         }
         groups.push((
             entry_id,
@@ -877,7 +922,7 @@ fn build_live_group(
     cache: &mut HashMap<u64, Vec<Line<'static>>>,
     width: usize,
     out: &mut Vec<Line<'static>>,
-    hits: &mut Vec<Option<HitTarget>>,
+    hits: &mut Vec<Option<HitRange>>,
     groups: &mut Vec<EntryGroup>,
 ) {
     let live = &view.live;
@@ -952,9 +997,16 @@ fn build_live_group(
     for call_id in &live.tool_order {
         if let Some(card) = live.tools.get(call_id) {
             let card_id = card.id.clone();
-            for line in tool_card_lines(card, view.anim_tick, theme, width) {
+            let card_lines = tool_card_lines(card, view.anim_tick, theme, width);
+            for (i, line) in card_lines.into_iter().enumerate() {
+                // §24：只有主行可点击（图标+工具名区域），正文行不可点。
+                let hit = if i == 0 {
+                    Some((HitTarget::Tool(card_id.clone()), line.width() as u16))
+                } else {
+                    None
+                };
                 out.push(line);
-                hits.push(Some(HitTarget::Tool(card_id.clone())));
+                hits.push(hit);
             }
         }
     }
@@ -2289,6 +2341,39 @@ mod tests {
             "Locked 时新输出不得移动视口"
         );
         assert!(view.pending_below >= 1, "Locked 时新内容必须计数");
+    }
+
+    /// §24：工具卡片只有主行可点击（end_col>0），正文行不可点（None）。
+    #[test]
+    fn tool_card_only_main_row_is_clickable() {
+        let mut view = ViewModel::default();
+        view.begin_tool("c1", "bash", Some("cmd".into()), None);
+        view.finish_tool(
+            "c1",
+            "bash",
+            crate::tool::outcome::ToolStatus::Failed,
+            10,
+            Some(1),
+            "第一行\n第二行\n第三行\n第四行",
+        );
+        let mut cache = HashMap::new();
+        let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+        // row_hits 与 window 等长；主行(index 0)应有 Tool hit 且 end_col>0，
+        // 正文/tail 行(index>0)应为 None（不可点，避免整行误触）。
+        assert!(plan.window.len() >= 2, "卡片含主行+正文: {:?}", plan.window);
+        let main = plan.row_hits[0].as_ref();
+        assert!(
+            matches!(main, Some((HitTarget::Tool(id), end)) if id == "c1" && *end > 0),
+            "主行必须可点击且限定列宽: {:?}",
+            plan.row_hits[0]
+        );
+        for hit in plan.row_hits.iter().skip(1) {
+            assert!(
+                hit.is_none(),
+                "卡片正文/tail 行不得可点击（避免误触）: {:?}",
+                hit
+            );
+        }
     }
 
     #[test]
