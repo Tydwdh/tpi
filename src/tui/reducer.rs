@@ -154,8 +154,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 match kind {
                     MenuKind::Session => {
                         // 会话恢复由 app 执行（需要重建 SessionLog/history）。
+                        // /sessions = Modal + 菜单一个整体：选中后一并关闭，
+                        // 不得把“会话列表”留在恢复后的屏幕上。
                         state.pending_session = Some(label);
                         state.view.menu = None;
+                        state.view.modal = None;
                         return effects;
                     }
                     _ => state.view.complete_menu_command(),
@@ -194,6 +197,13 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.view.close_overlay();
             } else if state.view.modal.is_some() {
                 state.view.close_modal();
+                // /sessions 浏览器 = Modal + Session 菜单一个整体：Esc 一次关闭两者。
+                if matches!(
+                    state.view.menu.as_ref().map(|m| m.kind),
+                    Some(MenuKind::Session)
+                ) {
+                    state.view.menu = None;
+                }
             } else if state.view.menu.is_some() {
                 state.view.menu = None;
             } else if state.running {

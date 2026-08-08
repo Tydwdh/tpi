@@ -242,3 +242,5 @@
 ## 迭代记录（2026-08-08 续 10）
 - SLASH-ENTER-QUIT-001（P2，误触退出）：命令菜单默认选中第一项且 Enter 补全+提交；第一项是 quit → “/”+回车直接退出。已修：SLASH_COMMANDS 重排（help 第一、quit 最后）。回归：slash_enter_defaults_to_help_not_quit。
 - ESC-CLEAR-001（P3，人体工学记录项落地）：idle 且输入非空时 Esc 现在清空输入（此前无操作；运行中取消、弹层/菜单关闭语义不变）。回归：esc_idle_clears_input。
+## 迭代记录（2026-08-08 续 11）
+- SESSIONS-MODAL-001（P2）：/sessions 的 Modal+菜单组合在 Enter 恢复后 Modal 残留盖住新会话；Esc 也要按两次才能完全关闭。已修：Session 菜单 Enter 关闭 modal；Esc 遇 Session 菜单一并关闭。回归：esc_closes_sessions_browser_in_one_press + sessions_menu_enter_still_works_with_modal_open 断言扩展。

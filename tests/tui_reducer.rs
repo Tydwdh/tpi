@@ -933,4 +933,25 @@ fn sessions_menu_enter_still_works_with_modal_open() {
     });
     reducer::update(&mut s, key(KeyCode::Enter));
     assert_eq!(s.pending_session.as_deref(), Some("sess-1"));
+    assert!(
+        s.view.menu.is_none() && s.view.modal.is_none(),
+        "selecting a session must close both the menu and the /sessions modal"
+    );
+}
+
+/// /sessions 浏览器（Modal + Session 菜单）一次 Esc 全部关闭。
+#[test]
+fn esc_closes_sessions_browser_in_one_press() {
+    let mut s = state();
+    s.view.open_modal("/sessions", "list");
+    s.view.menu = Some(tpi::tui::model::MenuView {
+        items: vec![("sess-1".into(), "label".into())],
+        selected: 0,
+        kind: tpi::tui::model::MenuKind::Session,
+    });
+    reducer::update(&mut s, key(KeyCode::Esc));
+    assert!(
+        s.view.modal.is_none() && s.view.menu.is_none(),
+        "one Esc must dismiss the whole /sessions browser"
+    );
 }

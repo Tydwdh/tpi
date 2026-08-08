@@ -242,3 +242,5 @@
 ## 29. 迭代第15轮（2026-08-08）
 - 斜杠菜单默认项陷阱（P2，真 bug）：命令补全菜单第一项是 /quit，输入 “/” + 回车（默认选中第一项并提交）会直接退出 TPI——探索菜单时误触即退出。已修：SLASH_COMMANDS 重排，help 第一、quit 最后；“/”+回车默认 /help。回归 slash_enter_defaults_to_help_not_quit。
 - 空闲 Esc 清空输入（P3，第 4 节记录项落地）：idle 且输入非空时 Esc 清空当前输入（运行中 Esc 仍取消、弹层/菜单优先语义不变）。回归 esc_idle_clears_input。
+## 30. 迭代第16轮（2026-08-08）
+- /sessions 恢复后残留弹层（真 bug）：/sessions 同时打开 Modal（提示）+ Session 菜单；Enter 选中恢复时只关菜单，Modal“会话列表”仍盖在新加载的会话上，必须再按一次 Esc。已修：选中会话时一并关闭 Modal；Esc 也一次关闭整个 /sessions 浏览器（Modal + Session 菜单）。回归 sessions_menu_enter_still_works_with_modal_open（断言扩展）/ esc_closes_sessions_browser_in_one_press。
