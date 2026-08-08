@@ -870,15 +870,29 @@ fn build_transcript_text(
                 let card_id = card.id.clone();
                 let card_lines = tool_card_lines(card, view.anim_tick, theme, width);
                 for (i, line) in card_lines.into_iter().enumerate() {
-                    // §24：只有主行（index 0）可点击，范围 = 图标+工具名+target
-                    // 的 display 宽度；正文/tail 行不可点（避免整行误触）。
+                    // §24：主行可点击范围 = 图标+工具名+target 宽度（先算，避免 move 后借用）。
                     let hit = if i == 0 {
                         let w = line.width() as u16;
                         Some((HitTarget::Tool(card_id.clone()), w))
                     } else {
                         None
                     };
-                    push_hit(&mut out, &mut hits, line, hit);
+                    // §用户诉求：卡片背景色（surface），形成 opencode 式卡片感
+                    // （与 transcript 区分）。diff 行保留红绿背景（本身高亮）。
+                    let is_diff_line = i > 0 && card.diff.is_some();
+                    let styled_line = if is_diff_line {
+                        line // diff 行保留自身红绿背景
+                    } else {
+                        Line::from(
+                            line.spans
+                                .into_iter()
+                                .map(|span| {
+                                    Span::styled(span.content, span.style.bg(theme.surface))
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    };
+                    push_hit(&mut out, &mut hits, styled_line, hit);
                 }
             }
         }
@@ -1046,7 +1060,19 @@ fn build_live_group(
                 } else {
                     None
                 };
-                out.push(line);
+                // §用户诉求：卡片背景（surface）；diff 行保留红绿。
+                let is_diff_line = i > 0 && card.diff.is_some();
+                let styled = if is_diff_line {
+                    line
+                } else {
+                    Line::from(
+                        line.spans
+                            .into_iter()
+                            .map(|span| Span::styled(span.content, span.style.bg(theme.surface)))
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                out.push(styled);
                 hits.push(hit);
             }
         }
@@ -1508,15 +1534,36 @@ fn tool_card_lines(
     }
     let mut lines = vec![Line::from(spans)];
 
-    // §用户诉求：edit/write 的独立 diff 字段 → 无论展开与否都默认显示红绿
-    // diff（opencode 式：每次写入后直接可见）。不受折叠状态影响。
+    // §用户诉求：edit/write 的独立 diff 字段 → 默认显示红绿 diff，但限制
+    // 长度（折叠态前 N 行 + 提示，点击展开看完整；opencode 式）。
     if let Some(diff_text) = &card.diff {
+        const DIFF_COLLAPSED_LINES: usize = 12;
         let diff_lines = render_diff_lines(diff_text, theme);
-        for l in diff_lines {
+        let total = diff_lines.len();
+        let shown: Vec<&Line<'static>> = if card.expanded {
+            diff_lines.iter().collect()
+        } else {
+            diff_lines.iter().take(DIFF_COLLAPSED_LINES).collect()
+        };
+        for l in &shown {
             // 保留工具卡片的 │ 前缀 + diff 行红绿背景（Line.style 应用整行）。
             let mut spans = vec![Span::styled("│ ", Style::default().fg(theme.muted))];
             spans.extend(l.spans.iter().cloned());
             lines.push(Line::from(spans).style(l.style));
+        }
+        if total > shown.len() {
+            // 折叠提示：未展开时显示剩余行数。
+            let hint = if card.expanded {
+                "点击卡片折叠".to_string()
+            } else {
+                format!("… 点击展开剩余 {} 行", total - shown.len())
+            };
+            lines.push(Line::styled(
+                format!("│ {hint}"),
+                Style::default()
+                    .fg(theme.info)
+                    .add_modifier(Modifier::ITALIC),
+            ));
         }
     }
 
@@ -2748,6 +2795,56 @@ mod tests {
             .find(|l| l.spans.iter().any(|s| s.content.contains("let x = 2")))
             .expect("找到 + 行");
         assert_eq!(plus.style.bg, Some(theme.success), "新增行绿底");
+    }
+
+    /// §用户诉求：diff 自动展开但限长——未展开时只显示前 N 行 + 折叠提示，
+    /// 展开时显示全部。
+    #[test]
+    fn tool_card_diff_limits_length_when_collapsed() {
+        let theme = theme::Theme::omp();
+        // 30 行 diff。
+        let mut diff = String::new();
+        for i in 0..30 {
+            diff.push_str(&format!("+line {i}\n"));
+        }
+        let mk = |expanded: bool| ToolCard {
+            id: "c1".into(),
+            name: "edit".into(),
+            target: None,
+            command: None,
+            state: ToolCardState::Done {
+                status: crate::tool::outcome::ToolStatus::Succeeded,
+                duration_ms: 10,
+                exit_code: Some(0),
+            },
+            output: None,
+            diff: Some(diff.clone()),
+            output_truncated: false,
+            expanded,
+            tail: None,
+        };
+        // 未展开：只显示 12 行 + 提示。
+        let collapsed = tool_card_lines(&mk(false), 0, theme, 100);
+        let diff_line_count = collapsed
+            .iter()
+            .filter(|l| l.spans.iter().any(|s| s.content.contains("line ")))
+            .count();
+        assert!(
+            diff_line_count <= 12,
+            "折叠态 diff 最多 12 行: {diff_line_count}"
+        );
+        let text: String = collapsed
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("点击展开"), "折叠态显示展开提示: {text}");
+        // 展开：显示全部 30 行。
+        let expanded = tool_card_lines(&mk(true), 0, theme, 100);
+        let expanded_count = expanded
+            .iter()
+            .filter(|l| l.spans.iter().any(|s| s.content.contains("line ")))
+            .count();
+        assert_eq!(expanded_count, 30, "展开态显示全部 diff");
     }
 
     #[test]

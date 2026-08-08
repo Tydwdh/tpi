@@ -540,7 +540,8 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new(); // 弹层打开时鼠标点击不得打开后台 overlay
             }
-            state.view.open_tool_overlay(id);
+            // §用户诉求：点击工具卡片展开/收缩（diff 折叠态显示，展开看完整）。
+            state.view.toggle_expand(id);
             Vec::new()
         }
         UiEvent::ClickReasoning(id) => {

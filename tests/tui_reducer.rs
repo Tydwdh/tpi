@@ -90,7 +90,7 @@ fn esc_priority_overlay_over_menu_over_cancel() {
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
         .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
-    reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
+    s.view.open_tool_overlay("c1");
     assert!(s.view.overlay.is_some());
     let effects = reducer::update(&mut s, key(KeyCode::Esc));
     assert!(s.view.overlay.is_none());
@@ -431,7 +431,7 @@ fn ctrl_c_does_not_close_overlay() {
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
         .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
-    reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
+    s.view.open_tool_overlay("c1");
     assert!(s.view.overlay.is_some());
     let effects = reducer::update(
         &mut s,
@@ -678,7 +678,7 @@ fn overlay_blocks_composer_typing() {
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
         .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
-    reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
+    s.view.open_tool_overlay("c1");
     assert!(s.view.overlay.is_some());
     reducer::update(
         &mut s,
@@ -707,7 +707,7 @@ fn paste_blocked_while_modal_or_overlay_open() {
     s2.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s2.view
         .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
-    reducer::update(&mut s2, UiEvent::ClickTool("c1".into()));
+    s2.view.open_tool_overlay("c1");
     assert!(s2.view.overlay.is_some());
     reducer::update(&mut s2, UiEvent::Paste("junk".into()));
     assert!(
@@ -768,14 +768,17 @@ fn clicks_blocked_while_modal_open() {
         "scrollbar click must not scroll transcript while Modal is open"
     );
     assert_eq!(s.view.transcript_scroll, scroll_before);
-    // ClickTool must not open an overlay behind the modal.
+    // ClickTool must not expand a card behind the modal.
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
         .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
     reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
     assert!(
-        s.view.overlay.is_none(),
-        "tool click must not open an overlay behind Modal"
+        !matches!(
+            &s.view.transcript[0],
+            tpi::tui::model::Entry::Tool { card, .. } if card.expanded
+        ),
+        "tool click must not expand a card behind Modal"
     );
 }
 
@@ -788,7 +791,7 @@ fn clicks_blocked_while_overlay_open() {
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
         .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
-    reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
+    s.view.open_tool_overlay("c1");
     assert!(s.view.overlay.is_some());
     let scroll_before = s.view.transcript_scroll;
     reducer::update(&mut s, UiEvent::ScrollbarClick(5));
