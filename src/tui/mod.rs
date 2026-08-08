@@ -934,7 +934,7 @@ fn cached_markdown(
 fn render_markdown(text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-    let parser = Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH);
+    let parser = Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES);
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Modifier> = Vec::new();
@@ -947,10 +947,18 @@ fn render_markdown(text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
     // 标题层级（§16.2 增强）：Start(Heading) 时记录，End(Heading) flush 后
     // 对整行应用标题样式（h1-h3 分色，h4+ 归一）。
     let mut heading_level: Option<u8> = None;
+    // 表格状态（§16.2 增强）：收集到完整表格后在 End(Table) 一次性渲染
+    //（带边框 + 列宽对齐；流式下表格到达时才渲染，无逐 cell 闪烁）。
+    let mut table: Option<TableState> = None;
 
     for event in parser {
         match event {
             Event::Text(t) => {
+                if table.is_some() {
+                    // 表格内：文本进当前 cell（不参与普通 current 渲染）。
+                    table_push_text(&mut table, &t);
+                    continue;
+                }
                 if in_code_block {
                     flush_line(&mut out, &mut current);
                     let content = t.trim_end_matches('\n');
@@ -994,6 +1002,11 @@ fn render_markdown(text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
                 }
             }
             Event::Code(t) => {
+                if table.is_some() {
+                    // 表格内行内代码：以纯文本进 cell（表格统一文本渲染）。
+                    table_push_text(&mut table, &t);
+                    continue;
+                }
                 current.push(Span::styled(
                     t.to_string(),
                     Style::default().fg(theme.primary).bg(theme.surface_subtle),
@@ -1026,6 +1039,24 @@ fn render_markdown(text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
                     style_stack.push(Modifier::UNDERLINED);
                 }
                 Tag::BlockQuote(_) => quote_depth += 1,
+                Tag::Table(_) => {
+                    // 表格开始：flush 当前行，初始化表格收集状态。
+                    flush_line(&mut out, &mut current);
+                    table = Some(TableState::new());
+                }
+                Tag::TableHead => {
+                    // 表头行即第一行（与数据行同一收集机制）。
+                }
+                Tag::TableRow => {
+                    if let Some(t) = &mut table {
+                        t.current_row = Vec::new();
+                    }
+                }
+                Tag::TableCell => {
+                    if let Some(t) = &mut table {
+                        t.current_cell = Some(String::new());
+                    }
+                }
                 _ => {}
             },
             Event::End(end) => match end {
@@ -1070,6 +1101,39 @@ fn render_markdown(text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
                     quote_depth = quote_depth.saturating_sub(1);
                     flush_line(&mut out, &mut current);
                 }
+                TagEnd::TableCell => {
+                    // 完成当前 cell：取走内容，push 进当前行。
+                    if let Some(t) = &mut table {
+                        if let Some(cell) = t.current_cell.take() {
+                            t.current_row.push(cell.trim().to_string());
+                        } else {
+                            t.current_row.push(String::new());
+                        }
+                    }
+                }
+                TagEnd::TableRow => {
+                    if let Some(t) = &mut table {
+                        if !t.current_row.is_empty() {
+                            t.rows.push(std::mem::take(&mut t.current_row));
+                        }
+                    }
+                }
+                TagEnd::TableHead => {
+                    // 表头没有 TableRow 包裹（pulldown 语义：TableHead 直接含
+                    // TableCell）；cell 已收集进 current_row，作为第一行入 rows。
+                    if let Some(t) = &mut table
+                        && !t.current_row.is_empty()
+                    {
+                        t.rows.push(std::mem::take(&mut t.current_row));
+                    }
+                }
+                TagEnd::Table => {
+                    // 表格结束：一次性渲染。
+                    if let Some(t) = table.take() {
+                        out.extend(render_table(&t, theme));
+                    }
+                    flush_line(&mut out, &mut current);
+                }
                 TagEnd::Paragraph => flush_line(&mut out, &mut current),
                 _ => {}
             },
@@ -1084,6 +1148,107 @@ fn flush_line(out: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>) {
     if !current.is_empty() {
         out.push(Line::from(std::mem::take(current)));
     }
+}
+
+/// 表格收集状态（§16.2 增强）：`rows[0]` 是表头行，其余为数据行。
+struct TableState {
+    rows: Vec<Vec<String>>,
+    /// 当前正在收集的 cell（每个 cell 的 Text 事件拼接）。
+    current_cell: Option<String>,
+    /// 当前行（已收集完的 cells）。
+    current_row: Vec<String>,
+}
+
+impl TableState {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            current_cell: None,
+            current_row: Vec::new(),
+        }
+    }
+}
+
+/// 表格文本追加（cell 内可能含空格拼接；简单拼接 Text 事件）。
+fn table_push_text(table: &mut Option<TableState>, text: &str) {
+    if let Some(t) = table
+        && let Some(cell) = &mut t.current_cell
+    {
+        cell.push_str(text);
+    }
+}
+
+/// 收集完毕的表格 → 带边框的对齐行（§16.2 增强）。
+///
+/// 列宽按 display-width 计算（CJK 按 2 列）；边框用 `│ ─ ┼` 简洁风格：
+/// ```text
+/// ┌────┬────┐
+/// │ a  │ b  │
+/// ├────┼────┤
+/// │ c  │ d  │
+/// └────┴────┘
+/// ```
+fn render_table(table: &TableState, theme: theme::Theme) -> Vec<Line<'static>> {
+    let rows = &table.rows;
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if cols == 0 {
+        return Vec::new();
+    }
+    // 每列最大宽度（表头与数据）。
+    let mut widths = vec![0usize; cols];
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            let w = unicode_width::UnicodeWidthStr::width(cell.as_str());
+            if w > widths[i] {
+                widths[i] = w;
+            }
+        }
+    }
+    let border = Style::default().fg(theme.muted);
+    let header_style = Style::default().fg(theme.text).add_modifier(Modifier::BOLD);
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    // 分隔线辅助。
+    let row_line = |left: &str, mid: &str, right: &str| -> Line<'static> {
+        let mut s = String::from(left);
+        for (i, w) in widths.iter().enumerate() {
+            s.push_str(&"─".repeat(w + 2));
+            s.push_str(if i + 1 < cols { mid } else { right });
+        }
+        Line::styled(s, border)
+    };
+
+    out.push(row_line("┌", "┬", "┐"));
+    for (ri, row) in rows.iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled("│ ", border));
+        for (i, cell) in row.iter().enumerate() {
+            let pad =
+                widths[i].saturating_sub(unicode_width::UnicodeWidthStr::width(cell.as_str()));
+            let styled = if ri == 0 {
+                Span::styled(format!("{cell}{}", " ".repeat(pad)), header_style)
+            } else {
+                Span::styled(
+                    format!("{cell}{}", " ".repeat(pad)),
+                    Style::default().fg(theme.text),
+                )
+            };
+            spans.push(styled);
+            spans.push(Span::styled(
+                if i + 1 < cols { " │ " } else { " │" },
+                border,
+            ));
+        }
+        out.push(Line::from(spans));
+        if ri == 0 {
+            out.push(row_line("├", "┼", "┤"));
+        }
+    }
+    out.push(row_line("└", "┴", "┘"));
+    out
 }
 
 /// 标题样式（§16.2 增强）：h1=primary 加粗，h2=accent 加粗，h3=info 加粗，
@@ -2191,6 +2356,41 @@ mod tests {
                 .style
                 .add_modifier
                 .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    /// §16.2 增强：markdown 表格渲染——带边框、表头加粗、列宽对齐。
+    #[test]
+    fn markdown_table_renders_with_borders_and_header() {
+        let theme = theme::Theme::omp();
+        let md = "| 名称 | 数量 |\n| --- | ---: |\n| 苹果 | 3 |\n| 香蕉 | 10 |";
+        let lines = render_markdown(md, theme);
+        // 期望：顶边框 + 表头 + 分隔 + 2 数据行 + 底边框 = 6 行。
+        assert!(lines.len() >= 6, "表格应渲染多行: {lines:?}");
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            text.contains("名称") && text.contains("数量"),
+            "表头可见: {text}"
+        );
+        assert!(
+            text.contains("苹果") && text.contains("香蕉"),
+            "数据行可见: {text}"
+        );
+        assert!(text.contains('│'), "带竖边框: {text}");
+        // 表头行加粗。
+        let header_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content == "名称"))
+            .expect("找到表头行");
+        assert!(
+            header_line.spans.iter().any(|s| s
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)),
+            "表头必须加粗"
         );
     }
 
