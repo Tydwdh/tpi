@@ -3837,3 +3837,69 @@ fn wrap_with_semantic_produces_exact_mapping() {
         .collect();
     assert_eq!(joined, long, "语义拼接必须等于原文（不丢字）");
 }
+
+/// 端到端：任意字符可选中（非整行）。
+/// 用 plan_window 的 semantic_rows 模拟 hit_text 的列→offset 映射，再走
+/// ViewModel::selected_text 的 char 级提取。选中中间 3 个字符 → 精确返回。
+#[test]
+fn arbitrary_char_selection_is_char_precise() {
+    use crate::tui::interaction::{TextPosition, cell_to_char, chars_to_cells};
+    use crate::tui::model::LineKind;
+    use crate::tui::scroll::EntryId;
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::Assistant, "hello world");
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
+    let (entry_id, char_start, text, decor) = plan.semantic_rows[0]
+        .as_ref()
+        .expect("第一行必须有语义映射");
+    assert_eq!(text, "hello world");
+    // 模拟 hit_text：视觉 cell 列 → 语义 offset。
+    // 屏幕列 = rect.x + decor + 目标字符前的 cell 宽度。
+    let to_offset = |screen_col: usize| -> usize {
+        let semantic_col = screen_col.saturating_sub(*decor);
+        cell_to_char(text, semantic_col) + *char_start
+    };
+    // 屏幕列指向 "world" 的开头（decor + "hello " = 7 + 6 = 13 cell 列）。
+    let w_col = *decor + chars_to_cells("hello ", 6);
+    let w_offset = to_offset(w_col);
+    assert_eq!(w_offset, 6, "w 的 offset 应为 6");
+    // 选中 "wor"（offset 6..9）。
+    view.selection_start(TextPosition {
+        entry_id: *entry_id,
+        offset: w_offset,
+    });
+    view.selection_update(TextPosition {
+        entry_id: *entry_id,
+        offset: w_offset + 3,
+    });
+    view.selection_end();
+    assert_eq!(view.selected_text(), "wor", "必须精确选中 3 个字符，非整行");
+    // CJK：选中 2 个汉字。
+    view.push_line(LineKind::Assistant, "你好世界");
+    let mut cache2 = HashMap::new();
+    let plan2 = plan_window(
+        &mut view,
+        theme::Theme::omp(),
+        80,
+        10,
+        0,
+        false,
+        &mut cache2,
+    );
+    let (_, _, text2, _) = plan2.semantic_rows[1]
+        .as_ref()
+        .expect("第二行必须有语义映射");
+    let (e2, _, _, _) = plan2.semantic_rows[1].as_ref().unwrap();
+    assert_eq!(text2, "你好世界");
+    view.selection_start(TextPosition {
+        entry_id: *e2,
+        offset: 1,
+    });
+    view.selection_update(TextPosition {
+        entry_id: *e2,
+        offset: 3,
+    });
+    view.selection_end();
+    assert_eq!(view.selected_text(), "好世", "CJK 按 char 精确选中");
+}
