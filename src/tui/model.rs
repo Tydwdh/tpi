@@ -572,7 +572,11 @@ impl ViewModel {
                 return;
             }
         };
-        let msg = slot.as_mut().expect("上方已初始化");
+        let Some(msg) = slot.as_mut() else {
+            // Defensive only: the matching branch above initializes this slot.
+            debug_assert!(false, "streaming slot must be initialized");
+            return;
+        };
         // P1-9：单条消息有界（超出丢弃中段并标记，防膨胀）。
         if msg.text.len() < MAX_MESSAGE_CHARS {
             let room = MAX_MESSAGE_CHARS - msg.text.len();
