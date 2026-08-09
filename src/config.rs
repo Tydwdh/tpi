@@ -6,6 +6,9 @@
 use camino::Utf8PathBuf;
 use serde::Deserialize;
 
+const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_INSTRUCTION_BYTES: usize = 1024 * 1024;
+
 /// 配置根目录（~/.tpi，§14.1）。
 pub fn tpi_home() -> std::path::PathBuf {
     std::env::var_os("TPI_HOME")
@@ -276,6 +279,19 @@ pub(crate) fn load_from_home(
         return Err("shell.path 不能为空".into());
     }
 
+    let safety_reserve_tokens = merged.context.safety_reserve_tokens.unwrap_or(8192);
+    if let Some(context_window) = primary.context_window
+        && crate::context::usable_input(
+            context_window,
+            u64::from(primary.max_output_tokens.unwrap_or(0)),
+            safety_reserve_tokens,
+        ) == 0
+    {
+        return Err(
+            "context_window 必须大于 max_output_tokens 与 safety_reserve_tokens 之和".into(),
+        );
+    }
+
     Ok(Config {
         model: ModelConfig {
             provider: primary.provider,
@@ -293,7 +309,7 @@ pub(crate) fn load_from_home(
         sessions_root: home.join("sessions"),
         artifacts_root: home.join("artifacts"),
         shell_path,
-        safety_reserve_tokens: merged.context.safety_reserve_tokens.unwrap_or(8192),
+        safety_reserve_tokens,
         auto_open_browser: false,
         web_summary_model: "none".into(),
         system_prompt_extra,
@@ -313,8 +329,8 @@ fn read_config(path: &std::path::Path) -> Result<ConfigFile, String> {
     if !path.exists() {
         return Ok(ConfigFile::default());
     }
-    let text =
-        std::fs::read_to_string(path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+    let text = crate::util::read_utf8_file_bounded(path, MAX_CONFIG_BYTES)
+        .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
     toml::from_str(&text).map_err(|e| format!("解析 {} 失败: {e}", path.display()))
 }
 
@@ -433,7 +449,7 @@ fn read_system_md(path: &std::path::Path) -> Result<Option<String>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    let content = std::fs::read_to_string(path)
+    let content = crate::util::read_utf8_file_bounded(path, MAX_INSTRUCTION_BYTES)
         .map_err(|error| format!("读取指令文件 {} 失败: {error}", path.display()))?;
     Ok((!content.trim().is_empty()).then_some(content))
 }
@@ -585,6 +601,37 @@ mod tests {
             load_from_home(&workspace, None, &home)
                 .unwrap_err()
                 .contains("max_parallel_tools")
+        );
+
+        write_config(
+            "[model.primary]\nprovider = \"p\"\nname = \"m\"\nbase_url = \"https://example.invalid\"\nmax_output_tokens = 500\ncontext_window = 1000\n\n[context]\nsafety_reserve_tokens = 500\n",
+        );
+        assert!(
+            load_from_home(&workspace, None, &home)
+                .unwrap_err()
+                .contains("safety_reserve_tokens")
+        );
+    }
+
+    #[test]
+    fn config_and_instruction_files_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let oversized_config = dir.path().join("config.toml");
+        std::fs::File::create(&oversized_config)
+            .unwrap()
+            .set_len((MAX_CONFIG_BYTES + 1) as u64)
+            .unwrap();
+        assert!(read_config(&oversized_config).unwrap_err().contains("上限"));
+
+        let oversized_rules = dir.path().join("SYSTEM.md");
+        std::fs::File::create(&oversized_rules)
+            .unwrap()
+            .set_len((MAX_INSTRUCTION_BYTES + 1) as u64)
+            .unwrap();
+        assert!(
+            read_system_md(&oversized_rules)
+                .unwrap_err()
+                .contains("上限")
         );
     }
 

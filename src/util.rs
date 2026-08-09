@@ -5,6 +5,22 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+/// 一次有界逐行读取的结果。`bytes` 不包含行尾 LF；CRLF 的 CR 保留为
+/// JSON/文本解析器可接受的尾部空白。`consumed_bytes` 包含实际消费的行尾。
+pub struct BoundedLine {
+    pub bytes: Vec<u8>,
+    pub terminated: bool,
+    pub consumed_bytes: u64,
+}
+
+/// 有界逐行读取状态。超长行会被完整丢弃到下一个行边界，调用者可安全继续，
+/// 不会把同一物理行的剩余部分误当成下一行。
+pub enum BoundedLineRead {
+    Eof,
+    Line(BoundedLine),
+    TooLong,
+}
+
 /// 获取互斥锁；遇 poison（持锁线程 panic 后遗留）时记录告警并恢复，
 /// 不 panic、不丢弃数据（`PoisonError::into_inner` 取回内部数据）。
 ///
@@ -35,6 +51,113 @@ pub fn truncate_to_char_boundary(text: &mut String, max_bytes: usize) {
     text.truncate(end);
 }
 
+/// 读取不超过 `max_bytes` 的整个文件，并抵御 metadata 检查后的增长竞态。
+pub fn read_file_bounded(path: &std::path::Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > max_bytes as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("文件超过 {max_bytes} 字节上限"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(max_bytes.min(8192));
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("文件超过 {max_bytes} 字节上限"),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// UTF-8 文本文件的有界读取；大小和编码错误都在同一底层边界处理。
+pub fn read_utf8_file_bounded(path: &std::path::Path, max_bytes: usize) -> std::io::Result<String> {
+    String::from_utf8(read_file_bounded(path, max_bytes)?).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("文件不是有效 UTF-8: {error}"),
+        )
+    })
+}
+
+/// 从 `BufRead` 读取一个物理行，最多保留 `max_bytes` 字节。
+///
+/// 超限后继续消费到 LF/EOF，但不继续分配；这既限制内存，也保持后续行边界。
+pub fn read_line_bounded<R: std::io::BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<BoundedLineRead> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(8192));
+    let mut consumed_bytes = 0u64;
+    let mut saw_input = false;
+    let mut too_long = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if !saw_input {
+                Ok(BoundedLineRead::Eof)
+            } else if too_long {
+                Ok(BoundedLineRead::TooLong)
+            } else {
+                Ok(BoundedLineRead::Line(BoundedLine {
+                    bytes,
+                    terminated: false,
+                    consumed_bytes,
+                }))
+            };
+        }
+        saw_input = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index.saturating_add(1));
+        let payload = newline.map_or(consumed, |index| index);
+        if !too_long {
+            match bytes.len().checked_add(payload) {
+                Some(total) if total <= max_bytes => bytes.extend_from_slice(&available[..payload]),
+                _ => {
+                    too_long = true;
+                    bytes.clear();
+                }
+            }
+        }
+        consumed_bytes = consumed_bytes
+            .checked_add(u64::try_from(consumed).unwrap_or(u64::MAX))
+            .ok_or_else(|| std::io::Error::other("行偏移溢出"))?;
+        reader.consume(consumed);
+        if newline.is_some() {
+            return if too_long {
+                Ok(BoundedLineRead::TooLong)
+            } else {
+                Ok(BoundedLineRead::Line(BoundedLine {
+                    bytes,
+                    terminated: true,
+                    consumed_bytes,
+                }))
+            };
+        }
+    }
+}
+
+/// 判断路径自身是否是符号链接或 Windows reparse point（junction 等）。
+/// 对可能递归或执行破坏性操作的调用方，这比 `Path::is_dir/is_file` 的跟随式
+/// 判断更安全。
+#[cfg(windows)]
+pub fn is_symlink_or_reparse(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    let metadata = std::fs::symlink_metadata(path)?;
+    Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+#[cfg(not(windows))]
+pub fn is_symlink_or_reparse(path: &std::path::Path) -> std::io::Result<bool> {
+    Ok(std::fs::symlink_metadata(path)?.file_type().is_symlink())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +186,33 @@ mod tests {
         assert!(s.is_char_boundary(s.len()));
         assert!(std::str::from_utf8(s.as_bytes()).is_ok());
         assert!(s.len() <= 8);
+    }
+
+    #[test]
+    fn bounded_line_discards_whole_oversized_line_and_resumes_at_next_line() {
+        let input = b"123456\nnext\n";
+        let mut reader = std::io::BufReader::with_capacity(2, &input[..]);
+        assert!(matches!(
+            read_line_bounded(&mut reader, 3).unwrap(),
+            BoundedLineRead::TooLong
+        ));
+        let BoundedLineRead::Line(line) = read_line_bounded(&mut reader, 4).unwrap() else {
+            panic!("second line must remain readable");
+        };
+        assert_eq!(line.bytes, b"next");
+        assert!(line.terminated);
+        assert_eq!(line.consumed_bytes, 5);
+    }
+
+    #[test]
+    fn bounded_file_rechecks_actual_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large");
+        std::fs::write(&path, b"12345").unwrap();
+        assert_eq!(read_file_bounded(&path, 5).unwrap(), b"12345");
+        assert_eq!(
+            read_file_bounded(&path, 4).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 }

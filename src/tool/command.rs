@@ -166,6 +166,7 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
         launcher: Some("git-bash"),
         cancel: ctx.cancel.clone(),
         timeout,
+        output_budget: crate::process::OUTPUT_BUDGET,
         artifact: Some(&mut artifact),
         stream_sink: stream_sink
             .as_ref()

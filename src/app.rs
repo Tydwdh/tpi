@@ -1295,31 +1295,37 @@ fn list_sessions(
 /// UX/性能：只流式读文件头部（≤500 行），不解析整个 session——
 /// 长会话下 `/sessions` 列表保持轻量（此前 read_events 解析全部事件）。
 fn first_user_preview(path: &std::path::Path) -> String {
-    use std::io::BufRead;
     const MAX_LINES: usize = 500;
+    const MAX_PREVIEW_EVENT_BYTES: usize = 1024 * 1024;
     let Ok(file) = std::fs::File::open(path) else {
         return String::new();
     };
     let mut reader = std::io::BufReader::new(file);
     let mut lines_read = 0usize;
-    let mut line = String::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        lines_read += 1;
+        let line = match crate::util::read_line_bounded(&mut reader, MAX_PREVIEW_EVENT_BYTES) {
+            Ok(crate::util::BoundedLineRead::Eof) | Err(_) => break,
+            Ok(crate::util::BoundedLineRead::TooLong) => {
+                lines_read = lines_read.saturating_add(1);
+                if lines_read >= MAX_LINES {
+                    break;
+                }
+                continue;
+            }
+            Ok(crate::util::BoundedLineRead::Line(line)) => line.bytes,
+        };
+        lines_read = lines_read.saturating_add(1);
         if lines_read > MAX_LINES {
             break;
         }
-        if line.trim().is_empty() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let Ok(envelope) = serde_json::from_str::<crate::session::Envelope>(&line) else {
+        let Ok(envelope) = serde_json::from_slice::<crate::session::Envelope>(&line) else {
             continue;
         };
-        if let SessionEvent::UserSubmitted { content } = envelope.to_session_event() {
+        if let crate::session::EventBody::UserSubmitted { payload } = envelope.body {
+            let content = payload.content;
             let one_line = content.lines().next().unwrap_or_default();
             let truncated: String = one_line.chars().take(40).collect();
             return if one_line.chars().count() > 40 {
@@ -1574,4 +1580,29 @@ fn first_user_preview_is_bounded_to_file_head() {
         "",
         "超过头部预算的 UserSubmitted 不应被读取（保持 /sessions 轻量）"
     );
+}
+
+#[test]
+fn first_user_preview_skips_a_whole_oversized_line_without_losing_alignment() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    file.write_all(b"\n").unwrap();
+    let envelope = serde_json::json!({
+        "schema": 1,
+        "seq": 1,
+        "event_id": "00000000-0000-7000-8000-000000000001",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "session_id": "00000000-0000-7000-8000-000000000002",
+        "run_id": "00000000-0000-7000-8000-000000000003",
+        "type": "user_submitted",
+        "payload": {"content": "仍可读取"}
+    });
+    writeln!(file, "{}", serde_json::to_string(&envelope).unwrap()).unwrap();
+    drop(file);
+
+    assert_eq!(first_user_preview(&path), "仍可读取");
 }

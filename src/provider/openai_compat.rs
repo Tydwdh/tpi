@@ -160,6 +160,8 @@ struct SseChunk {
 #[derive(Deserialize)]
 struct SseChoice {
     #[serde(default)]
+    index: Option<u32>,
+    #[serde(default)]
     delta: SseDelta,
     #[serde(default)]
     finish_reason: Option<String>,
@@ -215,7 +217,84 @@ struct PendingToolCall {
     provider_id: Option<String>,
     name: String,
     arguments: String,
+    announced: bool,
 }
+
+/// 在第三方 SSE parser 之前执行的原始帧预算。parser 会跨网络 chunk 累积到
+/// 空行；若只在 parser 产出 Event 后检查，永不结束的超长帧仍可耗尽内存。
+#[derive(Default)]
+struct SseFrameGuard {
+    frame_bytes: usize,
+    recent: [u8; 4],
+    recent_len: usize,
+}
+
+impl SseFrameGuard {
+    fn inspect(&mut self, chunk: &[u8]) -> Result<(), BoundedSseStreamError> {
+        self.inspect_with_limit(chunk, MAX_SSE_EVENT_BYTES)
+    }
+
+    fn inspect_with_limit(
+        &mut self,
+        chunk: &[u8],
+        max_frame_bytes: usize,
+    ) -> Result<(), BoundedSseStreamError> {
+        for byte in chunk {
+            self.frame_bytes = self
+                .frame_bytes
+                .checked_add(1)
+                .ok_or(BoundedSseStreamError::FrameTooLarge)?;
+            if self.recent_len < self.recent.len() {
+                self.recent[self.recent_len] = *byte;
+                self.recent_len += 1;
+            } else {
+                self.recent.copy_within(1.., 0);
+                self.recent[3] = *byte;
+            }
+
+            let recent = &self.recent[..self.recent_len];
+            let delimiter_len = if recent.ends_with(b"\r\n\r\n") {
+                Some(4)
+            } else if recent.ends_with(b"\n\n") || recent.ends_with(b"\r\r") {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(delimiter_len) = delimiter_len {
+                if self.frame_bytes.saturating_sub(delimiter_len) > max_frame_bytes {
+                    return Err(BoundedSseStreamError::FrameTooLarge);
+                }
+                self.frame_bytes = 0;
+                self.recent_len = 0;
+            } else if self.frame_bytes > max_frame_bytes.saturating_add(3) {
+                return Err(BoundedSseStreamError::FrameTooLarge);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum BoundedSseStreamError {
+    Transport(reqwest::Error),
+    FrameTooLarge,
+}
+
+impl std::fmt::Display for BoundedSseStreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => error.fmt(formatter),
+            Self::FrameTooLarge => {
+                write!(
+                    formatter,
+                    "SSE frame exceeds {MAX_SSE_EVENT_BYTES} byte limit"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BoundedSseStreamError {}
 
 impl Provider for OpenAiCompatClient {
     fn model_name(&self) -> &str {
@@ -511,7 +590,12 @@ async fn consume_stream(
     events: tokio::sync::mpsc::Sender<ProviderEvent>,
     cancel: CancellationToken,
 ) -> ConsumeResult {
-    let mut stream = response.bytes_stream().eventsource();
+    let mut frame_guard = SseFrameGuard::default();
+    let guarded_stream = response.bytes_stream().map(move |result| match result {
+        Ok(chunk) => frame_guard.inspect(&chunk).map(|()| chunk),
+        Err(error) => Err(BoundedSseStreamError::Transport(error)),
+    });
+    let mut stream = guarded_stream.eventsource();
     let mut pending: Vec<PendingToolCall> = Vec::new();
     let mut finish_reason: Option<FinishReason> = None;
     let mut usage = Usage::default();
@@ -560,8 +644,10 @@ async fn consume_stream(
             trace::log("sse_event", fields);
         }
         if event.event == "error" {
+            let mut message = event.data;
+            crate::util::truncate_to_char_boundary(&mut message, MAX_ERROR_BODY_BYTES);
             return ConsumeResult::Failed {
-                error: ProviderError::Protocol(event.data),
+                error: ProviderError::Protocol(format!("provider error event: {message}")),
                 retryable: false,
             };
         }
@@ -582,6 +668,20 @@ async fn consume_stream(
                 };
             }
         };
+        if finish_reason.is_some() && !chunk.choices.is_empty() {
+            return ConsumeResult::Failed {
+                error: ProviderError::Protocol("choice received after finish_reason".into()),
+                retryable: false,
+            };
+        }
+        if chunk.choices.len() > 1 {
+            return ConsumeResult::Failed {
+                error: ProviderError::Protocol(
+                    "multiple completion choices are not supported".into(),
+                ),
+                retryable: false,
+            };
+        }
         // §7.3/§15：`received_any` 表示「已收到语义内容」（text/reasoning/tool/
         // finish_reason）。只有收到语义内容后断流才不可重试（避免重复内容）；
         // 空 chunk / usage-only chunk（如流开头的 usage 包）不算——它们不会导致
@@ -589,6 +689,12 @@ async fn consume_stream(
         // 不可重试，网络抖动直接 ProviderUnavailable）。
         let mut chunk_had_semantic = false;
         for choice in &chunk.choices {
+            if choice.index.unwrap_or(0) != 0 {
+                return ConsumeResult::Failed {
+                    error: ProviderError::Protocol("unexpected completion choice index".into()),
+                    retryable: false,
+                };
+            }
             if let Some(content) = &choice.delta.content
                 && !content.is_empty()
             {
@@ -657,6 +763,7 @@ async fn consume_stream(
                         provider_id: None,
                         name: String::new(),
                         arguments: String::new(),
+                        announced: false,
                     });
                 }
                 let slot = &mut pending[index];
@@ -670,7 +777,19 @@ async fn consume_stream(
                             retryable: false,
                         };
                     }
-                    slot.provider_id = Some(id.clone());
+                    if slot
+                        .provider_id
+                        .as_ref()
+                        .is_some_and(|existing| existing != id)
+                    {
+                        return ConsumeResult::Failed {
+                            error: ProviderError::Protocol(
+                                "tool call id changed while streaming".into(),
+                            ),
+                            retryable: false,
+                        };
+                    }
+                    slot.provider_id.get_or_insert_with(|| id.clone());
                 }
                 if let Some(name) = &call.function.as_ref().and_then(|f| f.name.as_ref()) {
                     if name.is_empty()
@@ -682,19 +801,35 @@ async fn consume_stream(
                             retryable: false,
                         };
                     }
-                    slot.name = name.to_string();
+                    if !slot.name.is_empty() && slot.name != name.as_str() {
+                        return ConsumeResult::Failed {
+                            error: ProviderError::Protocol(
+                                "tool call name changed while streaming".into(),
+                            ),
+                            retryable: false,
+                        };
+                    }
+                    if slot.name.is_empty() {
+                        slot.name = name.to_string();
+                    }
+                }
+                if !slot.announced
+                    && !slot.name.is_empty()
+                    && let Some(provider_id) = &slot.provider_id
+                {
+                    slot.announced = true;
                     if trace::enabled() {
                         let mut fields = serde_json::Map::new();
                         fields.insert("index".into(), json!(index));
-                        fields.insert("name".into(), json!(name));
-                        fields.insert("provider_id".into(), json!(slot.provider_id));
+                        fields.insert("name".into(), json!(slot.name));
+                        fields.insert("provider_id".into(), json!(provider_id));
                         trace::log("tool_call_started", fields);
                     }
                     if events
                         .send(ProviderEvent::ToolCallStarted {
                             index: index as u32,
-                            id: slot.provider_id.clone().unwrap_or_default(),
-                            name: name.to_string(),
+                            id: provider_id.clone(),
+                            name: slot.name.clone(),
                         })
                         .await
                         .is_err()
@@ -803,10 +938,13 @@ async fn consume_stream(
                 ));
             }
             let arguments = call.arguments;
-            if !arguments.trim().is_empty() {
-                serde_json::from_str::<serde_json::Value>(&arguments)
-                    .map_err(|_| ProviderError::Protocol("incomplete tool arguments".into()))?;
+            if arguments.trim().is_empty() {
+                return Err(ProviderError::Protocol(
+                    "tool call is missing JSON arguments".into(),
+                ));
             }
+            serde_json::from_str::<serde_json::Value>(&arguments)
+                .map_err(|_| ProviderError::Protocol("incomplete tool arguments".into()))?;
             let provider_id = call.provider_id.ok_or_else(|| {
                 ProviderError::Protocol(format!("tool call {} is missing id", call.name))
             })?;
@@ -884,6 +1022,26 @@ mod tests {
             FinishReason::ContentFilter
         );
         assert_eq!(parse_finish_reason("weird"), FinishReason::Error);
+    }
+
+    #[test]
+    fn raw_sse_frame_guard_handles_split_delimiters_and_rejects_oversize() {
+        let mut guard = SseFrameGuard::default();
+        guard.inspect_with_limit(b"data: 1\r\n\r", 16).unwrap();
+        guard.inspect_with_limit(b"\n", 16).unwrap();
+        assert_eq!(
+            guard.frame_bytes, 0,
+            "split CRLF delimiter must reset budget"
+        );
+        guard.inspect_with_limit(b"data: 2\n\n", 16).unwrap();
+        assert_eq!(guard.frame_bytes, 0, "LF delimiter must reset budget");
+
+        let mut oversized = SseFrameGuard::default();
+        assert!(
+            oversized
+                .inspect_with_limit(b"123456789012\n\n", 8)
+                .is_err()
+        );
     }
 
     #[test]

@@ -7,12 +7,14 @@ use keyring::{Entry, Error};
 
 /// keyring service 名。
 const SERVICE: &str = "tpi";
+const MAX_PROVIDER_BYTES: usize = 256;
+pub const MAX_TOKEN_BYTES: usize = 64 * 1024;
 
 /// 写入凭据（§18.4：Windows Credential Manager）。
 pub fn auth_set(provider: &str, token: &str) -> Result<(), String> {
     validate_provider(provider)?;
-    if token.is_empty() {
-        return Err("token 为空".into());
+    if token.is_empty() || token.len() > MAX_TOKEN_BYTES {
+        return Err(format!("token 必须在 1..={MAX_TOKEN_BYTES} 字节范围内"));
     }
     let entry =
         Entry::new(SERVICE, provider).map_err(|e| format!("创建 keyring entry 失败: {e}"))?;
@@ -51,6 +53,9 @@ fn validate_provider(provider: &str) -> Result<(), String> {
     }
     if provider.chars().any(char::is_control) {
         return Err("provider 不能包含控制字符".into());
+    }
+    if provider.len() > MAX_PROVIDER_BYTES {
+        return Err(format!("provider 最多 {MAX_PROVIDER_BYTES} 字节"));
     }
     Ok(())
 }

@@ -553,6 +553,63 @@ async fn malformed_streamed_arguments_is_protocol_error() {
     );
 }
 
+async fn expect_protocol_error(fixture: &'static str) -> ProviderError {
+    let (base_url, _body_handle) = mock_sse_server(fixture).await;
+    let mut client = OpenAiCompatClient::new(base_url, "m".into(), "k".into(), None, None, None);
+    let request = ModelRequest {
+        model: "m".into(),
+        messages: vec![ChatMessage::User("hi".into())],
+        tools: Vec::new(),
+        max_output_tokens: None,
+        reasoning: None,
+        context_window: None,
+    };
+    let (tx, _rx) = mpsc::channel(16);
+    client
+        .stream(request, tx, CancellationToken::new())
+        .await
+        .expect_err("fixture must be rejected")
+}
+
+#[tokio::test]
+async fn streamed_tool_identity_cannot_change_mid_call() {
+    let changed_id = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_b\",\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    assert!(matches!(
+        expect_protocol_error(changed_id).await,
+        ProviderError::Protocol(_)
+    ));
+
+    let changed_name = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"list\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    assert!(matches!(
+        expect_protocol_error(changed_name).await,
+        ProviderError::Protocol(_)
+    ));
+}
+
+#[tokio::test]
+async fn empty_tool_arguments_and_multiple_choices_are_protocol_errors() {
+    let empty_arguments = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    assert!(matches!(
+        expect_protocol_error(empty_arguments).await,
+        ProviderError::Protocol(_)
+    ));
+
+    let multiple_choices = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}},{\"index\":1,\"delta\":{\"content\":\"b\"}}]}\n\ndata: [DONE]\n\n";
+    assert!(matches!(
+        expect_protocol_error(multiple_choices).await,
+        ProviderError::Protocol(_)
+    ));
+}
+
+#[tokio::test]
+async fn semantic_choice_after_finish_is_protocol_error() {
+    let fixture = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"}}]}\n\ndata: [DONE]\n\n";
+    assert!(matches!(
+        expect_protocol_error(fixture).await,
+        ProviderError::Protocol(_)
+    ));
+}
+
 /// 测试 client 不带超时重试（本地 mock 失败时快速失败）。
 #[tokio::test]
 async fn retry_respects_cancel_during_backoff() {

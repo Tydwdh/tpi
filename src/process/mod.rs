@@ -62,15 +62,16 @@ fn terminal_without_start(ended_by: EndReason, launcher: Option<&'static str>) -
 
 /// 模型侧输出预算（§8.4：run/bash 24 KiB，保留错误相关 tail）。
 pub const OUTPUT_BUDGET: usize = 24 * 1024;
+const MAX_OUTPUT_BUDGET: usize = 16 * 1024 * 1024;
 
-fn append_bounded(buffer: &mut Vec<u8>, bytes: &[u8]) {
-    if bytes.len() >= OUTPUT_BUDGET {
+fn append_bounded(buffer: &mut Vec<u8>, bytes: &[u8], budget: usize) {
+    if bytes.len() >= budget {
         buffer.clear();
-        buffer.extend_from_slice(&bytes[bytes.len() - OUTPUT_BUDGET..]);
+        buffer.extend_from_slice(&bytes[bytes.len() - budget..]);
     } else {
         let total = buffer.len() + bytes.len();
-        if total > OUTPUT_BUDGET {
-            buffer.drain(..total - OUTPUT_BUDGET);
+        if total > budget {
+            buffer.drain(..total - budget);
         }
         buffer.extend_from_slice(bytes);
     }
@@ -96,6 +97,8 @@ pub struct HostRunRequest<'a> {
     pub launcher: Option<&'static str>,
     pub cancel: CancellationToken,
     pub timeout: std::time::Duration,
+    /// stdout/stderr 各自保留的 tail 预算；完整输出仍可选写入 artifact。
+    pub output_budget: usize,
     pub artifact: Option<&'a mut crate::session::artifact::ArtifactWriter>,
     pub stream_sink: Option<&'a StreamSink>,
 }
@@ -107,9 +110,15 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
         launcher,
         cancel,
         timeout,
+        output_budget,
         mut artifact,
         stream_sink,
     } = request;
+    if output_budget == 0 || output_budget > MAX_OUTPUT_BUDGET {
+        return Err(format!(
+            "process output budget must be in 1..={MAX_OUTPUT_BUDGET}"
+        ));
+    }
     if cancel.is_cancelled() {
         return Ok(terminal_without_start(EndReason::Cancelled, launcher));
     }
@@ -254,12 +263,12 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
                             output.stdout_total = output
                                 .stdout_total
                                 .saturating_add(bytes.len() as u64);
-                            append_bounded(&mut output.stdout, bytes);
+                            append_bounded(&mut output.stdout, bytes, output_budget);
                         } else {
                             output.stderr_total = output
                                 .stderr_total
                                 .saturating_add(bytes.len() as u64);
-                            append_bounded(&mut output.stderr, bytes);
+                            append_bounded(&mut output.stderr, bytes, output_budget);
                         }
                     }
                     Ok(Some((MSG_EXIT, payload))) if payload.len() == 4 => {

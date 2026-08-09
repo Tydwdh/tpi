@@ -24,6 +24,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tpi::app::{self, SessionTarget};
 use tpi::config;
 
+const MAX_INTERACTIVE_INPUT_BYTES: usize = 16 * 1024;
+
 #[derive(Parser, Debug)]
 #[command(name = "tpi", version, about = "TPI: 个人终端 Coding Agent")]
 struct Cli {
@@ -190,6 +192,24 @@ fn with_input_echo<T>(echo: bool, f: impl FnOnce() -> T) -> T {
     {
         let _ = echo;
         f()
+    }
+}
+
+fn read_stdin_line_bounded(max_bytes: usize) -> std::io::Result<String> {
+    let stdin = std::io::stdin();
+    let mut lock = stdin.lock();
+    match tpi::util::read_line_bounded(&mut lock, max_bytes)? {
+        tpi::util::BoundedLineRead::Eof => Ok(String::new()),
+        tpi::util::BoundedLineRead::TooLong => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("输入超过 {max_bytes} 字节上限"),
+        )),
+        tpi::util::BoundedLineRead::Line(line) => String::from_utf8(line.bytes).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("输入不是有效 UTF-8: {error}"),
+            )
+        }),
     }
 }
 
@@ -420,7 +440,9 @@ fn walk_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> 
             let ft = entry
                 .file_type()
                 .map_err(|e| format!("读取 {} 类型失败: {e}", path.display()))?;
-            if is_reparse_point(&path)? {
+            if tpi::util::is_symlink_or_reparse(&path)
+                .map_err(|e| format!("读取 {} 元数据失败: {e}", path.display()))?
+            {
                 if !ft.is_dir() {
                     files.push(path);
                 }
@@ -434,22 +456,6 @@ fn walk_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> 
         }
     }
     Ok(files)
-}
-
-#[cfg(windows)]
-fn is_reparse_point(path: &std::path::Path) -> Result<bool, String> {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("读取 {} 元数据失败: {e}", path.display()))?;
-    Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(path: &std::path::Path) -> Result<bool, String> {
-    std::fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .map_err(|e| format!("读取 {} 元数据失败: {e}", path.display()))
 }
 
 /// 断言：prnune 遍历不得跟随符号链目录（防止删除 TPI 目录外的文件）。
@@ -490,9 +496,7 @@ fn run_init() -> Result<(), String> {
     if config_path.exists() {
         print!("{} 已存在，覆盖？(y/N) ", config_path.display());
         std::io::stdout().flush().ok();
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
+        let answer = read_stdin_line_bounded(MAX_INTERACTIVE_INPUT_BYTES)
             .map_err(|e| format!("读取输入失败: {e}"))?;
         if !answer.trim().eq_ignore_ascii_case("y") {
             return Err("已取消（保留现有配置）".into());
@@ -501,9 +505,7 @@ fn run_init() -> Result<(), String> {
     let prompt = |label: &str, default: &str| -> Result<String, String> {
         print!("{label} [{default}]: ");
         std::io::stdout().flush().ok();
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
+        let answer = read_stdin_line_bounded(MAX_INTERACTIVE_INPUT_BYTES)
             .map_err(|e| format!("读取输入失败: {e}"))?;
         let answer = answer.trim();
         Ok(if answer.is_empty() {
@@ -529,16 +531,15 @@ fn run_init() -> Result<(), String> {
     )?;
     print!("写入 API key 到凭据管理器？(y/N) ");
     std::io::stdout().flush().ok();
-    let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
+    let answer = read_stdin_line_bounded(MAX_INTERACTIVE_INPUT_BYTES)
         .map_err(|e| format!("读取输入失败: {e}"))?;
     let token = if answer.trim().eq_ignore_ascii_case("y") {
         print!("输入 token（粘贴后回车，输入不回显）: ");
         std::io::stdout().flush().ok();
-        let mut token = String::new();
-        let read = with_input_echo(false, || std::io::stdin().read_line(&mut token));
-        read.map_err(|e| format!("读取输入失败: {e}"))?;
+        let token = with_input_echo(false, || {
+            read_stdin_line_bounded(tpi::auth::MAX_TOKEN_BYTES)
+        })
+        .map_err(|e| format!("读取输入失败: {e}"))?;
         let token = token.trim_end_matches(['\r', '\n']);
         if token.is_empty() {
             return Err("token 为空".into());
@@ -623,9 +624,10 @@ fn run(cli: Cli) -> Result<(), String> {
                 print!("输入 token（粘贴后回车，输入不回显）: ");
                 std::io::stdout().flush().map_err(|e| e.to_string())?;
                 // P1-14：隐藏回显（此前 token 明文显示在终端）。
-                let mut token = String::new();
-                let read = with_input_echo(false, || std::io::stdin().read_line(&mut token));
-                read.map_err(|e| format!("读取输入失败: {e}"))?;
+                let token = with_input_echo(false, || {
+                    read_stdin_line_bounded(tpi::auth::MAX_TOKEN_BYTES)
+                })
+                .map_err(|e| format!("读取输入失败: {e}"))?;
                 let token = token.trim_end_matches(['\r', '\n']);
                 if token.is_empty() {
                     return Err("token 为空".into());

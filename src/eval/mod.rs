@@ -32,6 +32,13 @@ pub const EVALS_DIR: &str = "evals";
 pub const RESULTS_DIR: &str = "evals/results";
 /// 评测 session 根目录（相对 ~/.tpi）。
 pub const SESSIONS_DIR: &str = "evals/sessions";
+const MAX_EVAL_TASK_BYTES: usize = 1024 * 1024;
+const MAX_EXPECTED_BYTES: usize = 1024 * 1024;
+const MAX_VERIFY_FILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EVAL_TASKS: usize = 10_000;
+const MAX_VERIFY_STEPS: usize = 1_000;
+const MAX_EVAL_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+const MAX_VERIFY_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// 验收断言（expected.toml 的 `[[verify]]`）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -105,6 +112,14 @@ pub fn discover(evals_root: &Path) -> Result<Vec<TaskEntry>, String> {
     if !evals_root.is_dir() {
         return Err(format!("evals 根目录不存在: {}", evals_root.display()));
     }
+    if crate::util::is_symlink_or_reparse(evals_root)
+        .map_err(|error| format!("检查 evals 根目录失败: {error}"))?
+    {
+        return Err("evals 根目录不能是符号链接或 reparse point".into());
+    }
+    let canonical_root = evals_root
+        .canonicalize()
+        .map_err(|error| format!("解析 evals 根目录失败: {error}"))?;
     let mut tasks = Vec::new();
     for entry in std::fs::read_dir(evals_root).map_err(|e| format!("读取 evals 失败: {e}"))? {
         let entry = entry.map_err(|e| format!("读取 evals 失败: {e}"))?;
@@ -112,6 +127,18 @@ pub fn discover(evals_root: &Path) -> Result<Vec<TaskEntry>, String> {
             continue;
         }
         let dir = entry.path();
+        if crate::util::is_symlink_or_reparse(&dir)
+            .map_err(|error| format!("检查 {} 失败: {error}", dir.display()))?
+        {
+            return Err(format!(
+                "评测任务目录不能是符号链接或 reparse point: {}",
+                dir.display()
+            ));
+        }
+        let id = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| format!("评测任务目录名不是有效 Unicode: {}", dir.display()))?;
         let task_md_path = dir.join("task.md");
         let expected_path = dir.join("expected.toml");
         let repo_dir = dir.join("repo");
@@ -126,33 +153,62 @@ pub fn discover(evals_root: &Path) -> Result<Vec<TaskEntry>, String> {
                 dir.display()
             ));
         }
-        let task_md = std::fs::read_to_string(&task_md_path)
+        for path in [&task_md_path, &expected_path, &repo_dir] {
+            if crate::util::is_symlink_or_reparse(path)
+                .map_err(|error| format!("检查 {} 失败: {error}", path.display()))?
+            {
+                return Err(format!(
+                    "评测任务组件不能是符号链接或 reparse point: {}",
+                    path.display()
+                ));
+            }
+        }
+        let canonical_dir = dir
+            .canonicalize()
+            .map_err(|error| format!("解析任务目录失败: {error}"))?;
+        let canonical_repo = repo_dir
+            .canonicalize()
+            .map_err(|error| format!("解析评测 repo 失败: {error}"))?;
+        if !canonical_dir.starts_with(&canonical_root)
+            || !canonical_repo.starts_with(&canonical_dir)
+        {
+            return Err(format!(
+                "评测 repo 必须位于任务目录内: {}",
+                repo_dir.display()
+            ));
+        }
+        let task_md = crate::util::read_utf8_file_bounded(&task_md_path, MAX_EVAL_TASK_BYTES)
             .map_err(|e| format!("读取 {} 失败: {e}", task_md_path.display()))?;
-        let raw = std::fs::read_to_string(&expected_path)
+        let raw = crate::util::read_utf8_file_bounded(&expected_path, MAX_EXPECTED_BYTES)
             .map_err(|e| format!("读取 {} 失败: {e}", expected_path.display()))?;
         let expected: Expected = toml::from_str(&raw)
             .map_err(|e| format!("解析 {} 失败: {e}", expected_path.display()))?;
-        if expected.name != entry.file_name().to_string_lossy() {
+        if expected.name != id {
             return Err(format!(
                 "{}: expected.toml 的 name 必须等于目录名（{}）",
                 expected_path.display(),
-                entry.file_name().to_string_lossy()
+                id
             ));
         }
         if task_md.trim().is_empty() {
             return Err(format!("{}: task.md 不能为空", task_md_path.display()));
         }
-        if expected.timeout_sec == 0 {
+        if expected.timeout_sec == 0 || expected.timeout_sec > MAX_EVAL_TIMEOUT_SECS {
             return Err(format!(
-                "{}: timeout_sec 必须大于 0",
-                expected_path.display()
+                "{}: timeout_sec 必须在 1..={MAX_EVAL_TIMEOUT_SECS} 范围内",
+                expected_path.display(),
             ));
         }
-        if expected.verify.is_empty() {
+        if expected.verify.is_empty() || expected.verify.len() > MAX_VERIFY_STEPS {
             return Err(format!(
-                "{}: 至少需要一条 [[verify]]",
-                expected_path.display()
+                "{}: 至少需要一条 [[verify]]，且最多 {MAX_VERIFY_STEPS} 条",
+                expected_path.display(),
             ));
+        }
+        if let Some(base_commit) = expected.base_commit.as_deref() {
+            validate_git_revision(base_commit).map_err(|error| {
+                format!("{}: base_commit 无效: {error}", expected_path.display())
+            })?;
         }
         for step in &expected.verify {
             match step {
@@ -165,12 +221,15 @@ pub fn discover(evals_root: &Path) -> Result<Vec<TaskEntry>, String> {
             }
         }
         tasks.push(TaskEntry {
-            id: entry.file_name().to_string_lossy().into_owned(),
+            id,
             dir,
             repo_dir,
             task_md,
             expected,
         });
+        if tasks.len() > MAX_EVAL_TASKS {
+            return Err(format!("评测任务数量超过 {MAX_EVAL_TASKS} 上限"));
+        }
     }
     tasks.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(tasks)
@@ -207,8 +266,23 @@ pub fn reset_repo(repo_dir: &Path, base_commit: Option<&str>) -> Result<(), Stri
         Ok(())
     };
     let target = base_commit.unwrap_or("HEAD");
+    validate_git_revision(target)?;
     git(&["reset", "--hard", target])?;
     git(&["clean", "-fdx"])?;
+    Ok(())
+}
+
+fn validate_git_revision(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.starts_with('-')
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(
+            "Git revision 必须是 1..=256 字节、不能以 '-' 开头或包含空白边界/控制字符".into(),
+        );
+    }
     Ok(())
 }
 
@@ -287,28 +361,19 @@ struct EvalStats {
     compaction_count: u32,
 }
 
-/// 读取 session JSONL 为 (timestamp_ms, SessionEvent) 列表（跳过损坏行）。
+/// 读取并严格验证 session JSONL，再生成 (timestamp_ms, SessionEvent) 列表。
+/// session 协议知识只由持久层维护；eval 不再自行跳过坏行后生成误导性指标。
 fn read_events_with_ts(path: &Path) -> Result<Vec<(i128, SessionEvent)>, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("读取 session 失败: {e}"))?;
+    let envelopes = crate::session::read_envelopes(path)
+        .map_err(|error| format!("读取 session 失败: {error}"))?;
     let mut events = Vec::new();
-    for (index, line) in raw.lines().enumerate() {
-        let envelope: crate::session::Envelope = match serde_json::from_str(line) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                tracing::warn!(
-                    line = index + 1,
-                    error = %error,
-                    "eval: 跳过损坏的 session 事件行",
-                );
-                continue;
-            }
-        };
+    for envelope in envelopes {
         let ts = time::OffsetDateTime::parse(
             &envelope.timestamp,
             &time::format_description::well_known::Rfc3339,
         )
         .map(|dt| dt.unix_timestamp_nanos() / 1_000_000)
-        .unwrap_or(0);
+        .map_err(|error| format!("session timestamp 无效: {error}"))?;
         events.push((ts, envelope.to_session_event()));
     }
     Ok(events)
@@ -367,15 +432,15 @@ fn stats_from_events(events: &[(i128, SessionEvent)]) -> EvalStats {
             }
             SessionEvent::CompactionCommitted { .. } => stats.compaction_count += 1,
             SessionEvent::RunCompleted { usage, .. } => {
-                stats.input_tokens += usage.input_tokens;
-                stats.output_tokens += usage.output_tokens;
+                stats.input_tokens = stats.input_tokens.saturating_add(usage.input_tokens);
+                stats.output_tokens = stats.output_tokens.saturating_add(usage.output_tokens);
             }
             SessionEvent::PlanReplaced { .. } => {}
         }
     }
 
     if let (Some(start), Some(first)) = (start_ts, first_edit_ts) {
-        stats.first_edit_time_ms = Some((first - start).max(0) as u64);
+        stats.first_edit_time_ms = Some(u64::try_from((first - start).max(0)).unwrap_or(u64::MAX));
     }
     stats
 }
@@ -537,6 +602,40 @@ fn locate_bash(configured: Option<&Utf8PathBuf>) -> Option<String> {
     None
 }
 
+async fn run_verify_bash(
+    shell: &str,
+    command: &str,
+    repo_dir: &Path,
+) -> Result<crate::process::HostRunOutput, String> {
+    let cwd = repo_dir
+        .to_str()
+        .ok_or_else(|| "eval repo 路径不是有效 Unicode".to_string())?;
+    let args = crate::tool::command::RunArgs {
+        program: shell.to_string(),
+        args: vec![
+            "--noprofile".into(),
+            "--norc".into(),
+            "-c".into(),
+            format!("set -o pipefail\n{command}"),
+        ],
+        cwd: cwd.to_string(),
+        timeout_ms: 60_000,
+        env: Default::default(),
+    };
+    let resolved_program = PathBuf::from(shell);
+    crate::process::run_in_host(crate::process::HostRunRequest {
+        args: &args,
+        resolved_program: &resolved_program,
+        launcher: Some("git-bash"),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout: std::time::Duration::from_secs(60),
+        output_budget: MAX_VERIFY_OUTPUT_BYTES,
+        artifact: None,
+        stream_sink: None,
+    })
+    .await
+}
+
 /// 执行验收断言（bash 步骤在 repo 根运行，timeout 60s/步）。
 async fn run_verify(
     steps: &[VerifyStep],
@@ -554,49 +653,32 @@ async fn run_verify(
                 expect_stderr_contains,
             } => {
                 let shell = bash.clone().unwrap_or_else(|| "bash".to_string());
-                let run = async {
-                    let mut command_line = tokio::process::Command::new(&shell);
-                    command_line
-                        .args(["-lc", command])
-                        .current_dir(repo_dir)
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .kill_on_drop(true);
-                    let child = command_line.spawn();
-                    match child {
-                        Ok(child) => {
-                            let output = child.wait_with_output().await;
-                            match output {
-                                Ok(output) => (
-                                    output.status.code(),
-                                    None,
-                                    String::from_utf8_lossy(&output.stdout).into_owned(),
-                                    String::from_utf8_lossy(&output.stderr).into_owned(),
-                                ),
-                                Err(e) => (
-                                    None,
-                                    Some(format!("执行失败: {e}")),
-                                    String::new(),
-                                    String::new(),
-                                ),
-                            }
-                        }
-                        Err(e) => (
-                            None,
-                            Some(format!("启动失败: {e}")),
-                            String::new(),
-                            String::new(),
-                        ),
+                match run_verify_bash(&shell, command, repo_dir).await {
+                    Err(error) => VerifyResult::new(step, false, Some(error)),
+                    Ok(output) if output.ended_by == crate::process::EndReason::TimedOut => {
+                        VerifyResult::new(step, false, Some("超时（>60s）".into()))
                     }
-                };
-                match tokio::time::timeout(std::time::Duration::from_secs(60), run).await {
-                    Err(_) => VerifyResult::new(step, false, Some("超时（>60s）".into())),
-                    Ok((None, Some(err), _, _)) => VerifyResult::new(step, false, Some(err)),
-                    Ok((Some(code), _, stdout, stderr)) => {
+                    Ok(output) if output.ended_by == crate::process::EndReason::Cancelled => {
+                        VerifyResult::new(step, false, Some("验收命令被取消".into()))
+                    }
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
                         let expected = expect_exit.unwrap_or(0);
                         let mut failures: Vec<String> = Vec::new();
-                        if code != expected {
-                            failures.push(format!("exit code {code} != {expected}"));
+                        if output.exit_code != Some(expected) {
+                            failures
+                                .push(format!("exit code {:?} != {expected}", output.exit_code));
+                        }
+                        if output.stdout_total > output.stdout.len() as u64 {
+                            failures.push(format!(
+                                "stdout 超过 {MAX_VERIFY_OUTPUT_BYTES} 字节验收上限"
+                            ));
+                        }
+                        if output.stderr_total > output.stderr.len() as u64 {
+                            failures.push(format!(
+                                "stderr 超过 {MAX_VERIFY_OUTPUT_BYTES} 字节验收上限"
+                            ));
                         }
                         for needle in expect_stdout_contains {
                             if !stdout.contains(needle) {
@@ -614,7 +696,6 @@ async fn run_verify(
                             VerifyResult::new(step, false, Some(failures.join("；")))
                         }
                     }
-                    Ok(_) => VerifyResult::new(step, false, Some("未知错误".into())),
                 }
             }
             VerifyStep::FileExists { path } => match resolve_verify_path(repo_dir, path) {
@@ -624,15 +705,21 @@ async fn run_verify(
             },
             VerifyStep::FileContains { path, contains } => {
                 match resolve_verify_path(repo_dir, path) {
-                    Ok(full) => match std::fs::read_to_string(&full) {
-                        Ok(text) if text.contains(contains) => VerifyResult::new(step, true, None),
-                        Ok(_) => VerifyResult::new(
-                            step,
-                            false,
-                            Some(format!("文件缺少内容: {contains:?}")),
-                        ),
-                        Err(e) => VerifyResult::new(step, false, Some(format!("读取失败: {e}"))),
-                    },
+                    Ok(full) => {
+                        match crate::util::read_utf8_file_bounded(&full, MAX_VERIFY_FILE_BYTES) {
+                            Ok(text) if text.contains(contains) => {
+                                VerifyResult::new(step, true, None)
+                            }
+                            Ok(_) => VerifyResult::new(
+                                step,
+                                false,
+                                Some(format!("文件缺少内容: {contains:?}")),
+                            ),
+                            Err(e) => {
+                                VerifyResult::new(step, false, Some(format!("读取失败: {e}")))
+                            }
+                        }
+                    }
                     Err(error) => VerifyResult::new(step, false, Some(error)),
                 }
             }

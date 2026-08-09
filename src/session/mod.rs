@@ -383,6 +383,10 @@ impl Envelope {
 
 /// envelope schema 版本（§14.2：migration 是纯函数）。
 pub const SCHEMA_VERSION: u32 = 1;
+/// 单条 durable event 的序列化上限。Provider、工具和编辑器各自有更窄的
+/// 输入上限；session 在事实源边界统一兜底，防止异常调用者或损坏文件耗尽内存。
+pub const MAX_SESSION_EVENT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_SESSION_EVENTS: usize = 1_000_000;
 
 /// 由事件恢复为 session 事件（envelope 反序列化结果）。
 impl Envelope {
@@ -480,6 +484,12 @@ impl SessionLog {
         let workspace_id = workspace_id_for(workspace_root);
         let dir = sessions_root.join(&workspace_id);
         std::fs::create_dir_all(&dir)?;
+        if crate::util::is_symlink_or_reparse(&dir)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "session workspace 目录不能是符号链接或 reparse point",
+            ));
+        }
         let path = dir.join(format!("{session_id}.jsonl"));
         let lock_file = open_and_lock_session(&path)?;
         let file = OpenOptions::new()
@@ -515,6 +525,15 @@ impl SessionLog {
         let path = sessions_root
             .join(&workspace_id)
             .join(format!("{session_id}.jsonl"));
+        if crate::util::is_symlink_or_reparse(
+            path.parent()
+                .ok_or_else(|| std::io::Error::other("session 路径缺少父目录"))?,
+        )? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "session workspace 目录不能是符号链接或 reparse point",
+            ));
+        }
         let metadata = std::fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
             return Err(std::io::Error::new(
@@ -590,10 +609,15 @@ impl SessionLog {
         self.protocol
             .validate(&envelope.body, envelope.seq)
             .map_err(std::io::Error::other)?;
-        let line = serde_json::to_string(&envelope)
+        let mut bytes = serde_json::to_vec(&envelope)
             .map_err(|e| std::io::Error::other(format!("serialize event: {e}")))?;
+        if bytes.len() > MAX_SESSION_EVENT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("session event 超过 {MAX_SESSION_EVENT_BYTES} 字节上限"),
+            ));
+        }
         let original_len = self.file.metadata()?.len();
-        let mut bytes = line.into_bytes();
         bytes.push(b'\n');
         if let Err(write_error) = self.file.write_all(&bytes) {
             if let Err(rollback_error) = self.file.set_len(original_len) {
@@ -845,7 +869,7 @@ pub fn read_events_and_max_seq(path: &Path) -> std::io::Result<(Vec<SessionEvent
 
 /// 读取并验证完整 envelope 序列。只容忍“文件末尾没有换行且 JSON 不完整”这一种
 /// 崩溃形态；中间损坏、已换行的坏记录、schema/session/seq 异常都必须报错。
-fn read_envelopes(path: &Path) -> std::io::Result<Vec<Envelope>> {
+pub(crate) fn read_envelopes(path: &Path) -> std::io::Result<Vec<Envelope>> {
     Ok(read_envelopes_state(path)?.envelopes)
 }
 
@@ -935,7 +959,16 @@ impl SessionProtocolState {
 
 /// 读取 envelope，并返回下一次追加前需要在独占锁内完成的尾部修复。
 fn read_envelopes_state(path: &Path) -> std::io::Result<EnvelopeRead> {
-    let raw = std::fs::read(path)?;
+    read_envelopes_state_with_limits(path, MAX_SESSION_EVENT_BYTES, MAX_SESSION_EVENTS)
+}
+
+fn read_envelopes_state_with_limits(
+    path: &Path,
+    max_event_bytes: usize,
+    max_events: usize,
+) -> std::io::Result<EnvelopeRead> {
+    let file = File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
     let expected_from_name = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -947,34 +980,48 @@ fn read_envelopes_state(path: &Path) -> std::io::Result<EnvelopeRead> {
     let mut protocol = SessionProtocolState::default();
     let mut envelopes = Vec::new();
     let mut tail_repair = TailRepair::None;
-    let mut offset = 0usize;
+    let mut offset = 0u64;
+    let mut line_number = 0usize;
 
-    for (index, chunk) in raw.split_inclusive(|byte| *byte == b'\n').enumerate() {
+    loop {
         let line_start = offset;
-        offset = offset.saturating_add(chunk.len());
-        let has_newline = chunk.ends_with(b"\n");
-        let bytes = if has_newline {
-            &chunk[..chunk.len() - 1]
-        } else {
-            chunk
+        let line = match crate::util::read_line_bounded(&mut reader, max_event_bytes)? {
+            crate::util::BoundedLineRead::Eof => break,
+            crate::util::BoundedLineRead::TooLong => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "session 第 {} 行超过 {} 字节上限",
+                        line_number.saturating_add(1),
+                        max_event_bytes
+                    ),
+                ));
+            }
+            crate::util::BoundedLineRead::Line(line) => line,
         };
+        line_number = line_number.saturating_add(1);
+        offset = offset
+            .checked_add(line.consumed_bytes)
+            .ok_or_else(|| std::io::Error::other("session 文件偏移溢出"))?;
+        let has_newline = line.terminated;
+        let bytes = line.bytes;
         if bytes.iter().all(u8::is_ascii_whitespace) {
             if !has_newline {
-                tail_repair = TailRepair::Truncate(line_start as u64);
+                tail_repair = TailRepair::Truncate(line_start);
             }
             continue;
         }
-        let envelope = match serde_json::from_slice::<Envelope>(bytes) {
+        let envelope = match serde_json::from_slice::<Envelope>(&bytes) {
             Ok(envelope) => envelope,
-            Err(error) if !has_newline && offset == raw.len() => {
-                tracing::warn!(line = index + 1, %error, "dropping incomplete trailing session line");
-                tail_repair = TailRepair::Truncate(line_start as u64);
+            Err(error) if !has_newline => {
+                tracing::warn!(line = line_number, %error, "dropping incomplete trailing session line");
+                tail_repair = TailRepair::Truncate(line_start);
                 break;
             }
             Err(error) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("session 第 {} 行损坏: {error}", index + 1),
+                    format!("session 第 {line_number} 行损坏: {error}"),
                 ));
             }
         };
@@ -983,9 +1030,7 @@ fn read_envelopes_state(path: &Path) -> std::io::Result<EnvelopeRead> {
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "session 第 {} 行 schema={}，当前仅支持 {}",
-                    index + 1,
-                    envelope.schema,
-                    SCHEMA_VERSION
+                    line_number, envelope.schema, SCHEMA_VERSION
                 ),
             ));
         }
@@ -993,7 +1038,7 @@ fn read_envelopes_state(path: &Path) -> std::io::Result<EnvelopeRead> {
         if envelope.session_id != session_id {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("session 第 {} 行 session_id 不一致", index + 1),
+                format!("session 第 {line_number} 行 session_id 不一致"),
             ));
         }
         if envelope.seq <= previous_seq {
@@ -1001,16 +1046,14 @@ fn read_envelopes_state(path: &Path) -> std::io::Result<EnvelopeRead> {
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "session 第 {} 行 seq={} 未严格递增（前一条 {}）",
-                    index + 1,
-                    envelope.seq,
-                    previous_seq
+                    line_number, envelope.seq, previous_seq
                 ),
             ));
         }
         if !event_ids.insert(envelope.event_id) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("session 第 {} 行 event_id 重复", index + 1),
+                format!("session 第 {line_number} 行 event_id 重复"),
             ));
         }
         if time::OffsetDateTime::parse(
@@ -1021,18 +1064,24 @@ fn read_envelopes_state(path: &Path) -> std::io::Result<EnvelopeRead> {
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("session 第 {} 行 timestamp 无效", index + 1),
+                format!("session 第 {line_number} 行 timestamp 无效"),
             ));
         }
         if let Err(error) = protocol.validate(&envelope.body, envelope.seq) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("session 第 {} 行 {error}", index + 1),
+                format!("session 第 {line_number} 行 {error}"),
             ));
         }
         protocol.apply(&envelope.body);
         previous_seq = envelope.seq;
         envelopes.push(envelope);
+        if envelopes.len() > max_events {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("session 事件数超过 {max_events} 上限"),
+            ));
+        }
         if !has_newline {
             tail_repair = TailRepair::AppendNewline;
         }
@@ -1139,6 +1188,18 @@ mod tests {
         assert_eq!(seq, 3, "修复残片后必须连续续写");
         drop(reopened);
         assert_eq!(read_events(&path).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn session_reader_rejects_an_oversized_physical_event_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, format!("{}\n", "x".repeat(33))).unwrap();
+        let error = read_envelopes_state_with_limits(&path, 32, 10)
+            .err()
+            .expect("oversized line must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("超过 32 字节上限"), "{error}");
     }
 
     #[test]

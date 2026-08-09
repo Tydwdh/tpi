@@ -9,6 +9,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// 单个 artifact 的落盘上限。模型读取另有更窄窗口；这里防止长时间刷屏命令
+/// 无限占用磁盘。超限写入失败，调用方的 Job Object 会终止进程树，Drop 删除残片。
+pub const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
 /// artifact 记录（§14.3）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRecord {
@@ -48,7 +52,7 @@ impl ArtifactWriter {
         let dir = artifacts_root.join(session_id);
         std::fs::create_dir_all(&dir)?;
         let dir_meta = std::fs::symlink_metadata(&dir)?;
-        if !dir_meta.is_dir() || dir_meta.file_type().is_symlink() {
+        if !dir_meta.is_dir() || crate::util::is_symlink_or_reparse(&dir)? {
             return Err(std::io::Error::other(
                 "artifact session path is not a regular directory",
             ));
@@ -81,11 +85,9 @@ impl ArtifactWriter {
 
     /// 追加一段输出。
     pub fn write(&mut self, _stream: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let next = checked_artifact_len(self.written, bytes.len(), MAX_ARTIFACT_BYTES)?;
         self.file.write_all(bytes)?;
-        self.written = self
-            .written
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| std::io::Error::other("artifact 长度溢出"))?;
+        self.written = next;
         Ok(())
     }
 
@@ -101,6 +103,21 @@ impl ArtifactWriter {
         self.finished = true;
         Ok(self.record.clone())
     }
+}
+
+fn checked_artifact_len(current: u64, additional: usize, limit: u64) -> std::io::Result<u64> {
+    let additional =
+        u64::try_from(additional).map_err(|_| std::io::Error::other("artifact 长度溢出"))?;
+    let next = current
+        .checked_add(additional)
+        .ok_or_else(|| std::io::Error::other("artifact 长度溢出"))?;
+    if next > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("artifact 超过 {limit} 字节上限"),
+        ));
+    }
+    Ok(next)
 }
 
 impl Drop for ArtifactWriter {
@@ -145,7 +162,10 @@ pub fn find(
     }
     let path = artifacts_root.join(session_id).join(format!("{id}.out"));
     let meta = std::fs::symlink_metadata(&path).ok()?;
-    if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+    if !meta.file_type().is_file()
+        || meta.file_type().is_symlink()
+        || crate::util::is_symlink_or_reparse(&path).ok()?
+    {
         return None;
     }
     Some(ArtifactRecord {
@@ -248,6 +268,16 @@ mod tests {
             writer.record.internal_path.clone()
         };
         assert!(!path.exists(), "未完成 artifact 不得遗留孤儿文件");
+    }
+
+    #[test]
+    fn artifact_length_limit_is_checked_before_writing() {
+        assert_eq!(checked_artifact_len(3, 2, 5).unwrap(), 5);
+        assert_eq!(
+            checked_artifact_len(5, 1, 5).unwrap_err().kind(),
+            std::io::ErrorKind::FileTooLarge
+        );
+        assert!(checked_artifact_len(u64::MAX, 1, u64::MAX).is_err());
     }
 
     #[test]

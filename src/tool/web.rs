@@ -249,7 +249,7 @@ async fn fetch_following_safe_redirects(
             .map_err(|error| format!("invalid_redirect: {error}"))?;
         current = validate_url(next, policy)?;
     }
-    unreachable!("bounded redirect loop always returns")
+    Err("too_many_redirects: redirect state exhausted unexpectedly".to_string())
 }
 
 async fn read_bounded_bytes(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
