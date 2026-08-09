@@ -64,6 +64,10 @@ pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
     });
 
     // 3. Git Bash（bash 是唯一命令执行通道）。
+    // §PointerHit 10：优先用配置的 shell.path（locate_git_bash 第一优先级）。
+    let configured_shell = crate::config::load(workspace_root, None)
+        .ok()
+        .and_then(|config| config.shell_path.clone());
     let ctx = crate::tool::ToolContext {
         workspace_root: workspace_root.clone(),
         allow_outside_workspace: true,
@@ -75,7 +79,7 @@ pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
         scan_snapshots: std::sync::Arc::new(
             std::sync::Mutex::new(std::collections::HashMap::new()),
         ),
-        shell_path: None,
+        shell_path: configured_shell.clone(),
         snapshot_store: std::sync::Arc::new(std::sync::Mutex::new(
             crate::tool::edit::SnapshotStore::new(64, 8),
         )),
@@ -87,7 +91,14 @@ pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
         name: "git_bash",
         ok: bash.is_some(),
         detail: match bash {
-            Some(path) => path.to_string(),
+            Some(path) => {
+                let source = if configured_shell.is_some() {
+                    "（配置的 shell.path）"
+                } else {
+                    "（自动探测）"
+                };
+                format!("{path} {source}")
+            }
             None => "未找到 Git Bash（运行 scripts/install-bash.ps1 或配置 shell.path）".into(),
         },
     });

@@ -928,10 +928,14 @@ fn execute_ui_effect(
         UiEffect::CopySelection => {
             let text = ui_state.view.selected_text();
             if !text.is_empty() {
-                crate::clipboard::set_text(&text);
-                // §PointerHit：复制反馈用 footer hint，不污染 transcript。
-                ui_state.view.transient_hint =
-                    Some(format!("已复制 {} 行到剪贴板", text.lines().count()));
+                // §PointerHit 11：剪贴板失败如实提示，不伪装"已复制"。
+                if crate::clipboard::set_text(&text) {
+                    ui_state.view.transient_hint =
+                        Some(format!("已复制 {} 行到剪贴板", text.lines().count()));
+                } else {
+                    ui_state.view.transient_hint =
+                        Some("复制失败：剪贴板不可用（可能被占用或平台不支持）".into());
+                }
             }
             // 复制后清除选区（高亮消失）。
             ui_state.view.selection_clear();
@@ -1018,15 +1022,19 @@ async fn run_interactive<P: Provider>(
                                     ui_state.view.transient_hint =
                                         Some("已发送取消（Esc）；保留 session".into());
                                 }
-                                // §PointerHit：Ctrl+C 有选区时复制（run 中也可复制）。
+                                // §PointerHit 11：Ctrl+C 有选区时复制（run 中也可复制）。
                                 UiEffect::CopySelection => {
                                     let text = ui_state.view.selected_text();
                                     if !text.is_empty() {
-                                        crate::clipboard::set_text(&text);
-                                        ui_state.view.transient_hint = Some(format!(
-                                            "已复制 {} 行到剪贴板",
-                                            text.lines().count()
-                                        ));
+                                        if crate::clipboard::set_text(&text) {
+                                            ui_state.view.transient_hint = Some(format!(
+                                                "已复制 {} 行到剪贴板",
+                                                text.lines().count()
+                                            ));
+                                        } else {
+                                            ui_state.view.transient_hint =
+                                                Some("复制失败：剪贴板不可用".into());
+                                        }
                                     }
                                     ui_state.view.selection_clear();
                                 }

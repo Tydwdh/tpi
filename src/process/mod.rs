@@ -98,7 +98,9 @@ pub async fn run_in_host(
         .arg("__process-host")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        // §PointerHit 12：host 诊断不 inherit（TUI 下会污染终端）——
+        // 改 piped 由下方 pump 转发到 tracing 日志（§19.2）。
+        .stderr(std::process::Stdio::piped())
         .creation_flags(create_no_window_flag())
         .spawn()
         .map_err(|e| format!("spawn process-host: {e}"))?;
@@ -119,6 +121,17 @@ pub async fn run_in_host(
         .stdout
         .take()
         .ok_or_else(|| "process-host stdout unavailable".to_string())?;
+
+    // host 自身的诊断输出（非 target 的 stderr）转发到 tracing 日志，不写终端。
+    if let Some(host_stderr) = host.stderr.take() {
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = tokio::io::BufReader::new(host_stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(line = %line, "process-host stderr");
+            }
+        });
+    }
 
     // 发送 Start spec（framed：len + kind + payload）。
     let spec = serde_json::json!({
