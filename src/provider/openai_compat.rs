@@ -98,10 +98,7 @@ impl OpenAiCompatClient {
         body.insert("stream".into(), json!(true));
         // §PointerHit 9：请求流式 usage——很多 OpenAI 兼容服务需显式
         // stream_options.include_usage 才返回 usage，否则 token/成本/评测为 0。
-        body.insert(
-            "stream_options".into(),
-            json!({ "include_usage": true }),
-        );
+        body.insert("stream_options".into(), json!({ "include_usage": true }));
         serde_json::Value::Object(body)
     }
 }
