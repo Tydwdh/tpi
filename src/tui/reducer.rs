@@ -552,8 +552,14 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new();
             }
-            // §用户诉求：点击 thinking 行展开/收缩（像 diff 一样）。
-            state.view.toggle_reasoning_expanded(id);
+            // §PointerHit：live reasoning 折叠行点击 → 切换全局展开；
+            // 历史 reasoning → 按条目展开（与 diff 一致）。
+            let in_transcript = state.view.transcript.iter().any(|entry| entry.id() == id);
+            if in_transcript {
+                state.view.toggle_reasoning_expanded(id);
+            } else {
+                state.view.reasoning_visible = !state.view.reasoning_visible;
+            }
             Vec::new()
         }
         UiEvent::ScrollbarClick(row) => {

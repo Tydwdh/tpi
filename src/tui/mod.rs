@@ -1331,7 +1331,9 @@ fn build_live_group(
                     .fg(theme.muted)
                     .add_modifier(Modifier::ITALIC),
             ));
-            hits.push(None);
+            // §PointerHit：live reasoning 折叠行可点击（与历史一致），
+            // 打开 reasoning overlay（msg.entry_id 是稳定 id）。
+            hits.push(Some((HitTarget::Reasoning(msg.entry_id), 0)));
             semantic.push(SemanticLine {
                 text: String::new(),
                 decor_cells: 0,
@@ -2122,21 +2124,7 @@ fn tool_card_lines(
     };
     // metadata（固定右侧区域）：duration [· exit code]。
     // PM：成功卡的 `exit 0` 是噪声且占宽度，只在非成功时显示退出码。
-    let mut meta = String::new();
-    if let ToolCardState::Done {
-        status,
-        duration_ms,
-        exit_code,
-        ..
-    } = &card.state
-    {
-        meta.push_str(&fmt_duration(*duration_ms));
-        if *status != crate::tool::outcome::ToolStatus::Succeeded
-            && let Some(code) = exit_code
-        {
-            meta.push_str(&format!(" · exit {code}"));
-        }
-    }
+    let meta = tool_card_meta(card);
     let meta_w = unicode_width::UnicodeWidthStr::width(meta.as_str());
     let icon_w = 2; // "✓ " 等 icon + 空格
     // 预算分配（保证主行单行，§16.2/整改 A2）：
@@ -2182,9 +2170,42 @@ fn tool_card_lines(
     // - 已展开：显示全部内容。
     const COLLAPSED_LINES: usize = 10;
 
-    // 确定「内容行」：diff 优先，否则 output。统一折叠。
+    // §PointerHit：失败卡片折叠态显示错误 tail（不是 output 开头）；
+    // 运行中卡片折叠态显示实时尾部（最新进度）。
+    let is_failed = matches!(
+        &card.state,
+        ToolCardState::Done { status, .. } if *status != crate::tool::outcome::ToolStatus::Succeeded
+    );
+    let is_running = matches!(&card.state, ToolCardState::Running);
+
+    // 确定「内容行」：diff 优先；失败无 diff 用 tail；否则 output。
     let content_lines: Vec<Line<'static>> = if let Some(diff_text) = &card.diff {
         render_diff_lines(diff_text, theme)
+    } else if let Some(tail) = card.tail.as_deref() {
+        if is_failed {
+            // 失败：红色关键 tail（错误诊断优先）。
+            tail.lines()
+                .map(|s| {
+                    Line::styled(
+                        s.to_string(),
+                        Style::default().fg(theme.error).add_modifier(Modifier::DIM),
+                    )
+                })
+                .collect()
+        } else if let Some(body) = card.output.as_deref() {
+            body.lines()
+                .map(|s| Line::styled(s.to_string(), Style::default().fg(theme.text)))
+                .collect()
+        } else {
+            tail.lines()
+                .map(|s| {
+                    Line::styled(
+                        s.to_string(),
+                        Style::default().fg(theme.error).add_modifier(Modifier::DIM),
+                    )
+                })
+                .collect()
+        }
     } else if let Some(body) = card.output.as_deref() {
         let diff_idx = find_diff_start(body);
         // 输出里含 `diff:` 段 → diff 部分着色，其余普通。
@@ -2218,6 +2239,9 @@ fn tool_card_lines(
     let overflow = total > COLLAPSED_LINES;
     let shown = if card.expanded || !overflow {
         content_lines.as_slice()
+    } else if is_running || is_failed {
+        // §PointerHit：运行中显示实时尾部（最新进度）；失败显示错误尾部。
+        &content_lines[content_lines.len().saturating_sub(COLLAPSED_LINES)..]
     } else {
         &content_lines[..COLLAPSED_LINES]
     };
@@ -2253,7 +2277,11 @@ fn tool_card_lines(
     lines
 }
 
-/// 工具卡片主行的语义文本（复制源）：`name target`（去 icon 前缀与 meta 尾部）。
+/// 工具卡片主行的语义文本（复制源）：`name target  meta`。
+///
+/// §PointerHit 修复：主行视觉 = `icon name target meta`，语义 = name+target+meta
+/// （meta 并入语义而非丢弃），因此 decor = 仅 icon 宽度，语义与视觉 offset
+/// 连续对应——不会出现「meta 被当前缀 decor 导致点击/选中错位」。
 fn card_semantic_header(card: &ToolCard) -> String {
     let mut out = card.name.clone();
     if let Some(target) = &card.target
@@ -2262,7 +2290,33 @@ fn card_semantic_header(card: &ToolCard) -> String {
         out.push(' ');
         out.push_str(target);
     }
+    // 与 tool_card_lines 的 meta 一致（duration · exit code）。
+    let meta = tool_card_meta(card);
+    if !meta.is_empty() {
+        out.push(' ');
+        out.push_str(&meta);
+    }
     out
+}
+
+/// 工具卡片主行的 metadata 文本（`duration · exit code`；与渲染一致）。
+fn tool_card_meta(card: &ToolCard) -> String {
+    let mut meta = String::new();
+    if let ToolCardState::Done {
+        status,
+        duration_ms,
+        exit_code,
+        ..
+    } = &card.state
+    {
+        meta.push_str(&fmt_duration(*duration_ms));
+        if *status != crate::tool::outcome::ToolStatus::Succeeded
+            && let Some(code) = exit_code
+        {
+            meta.push_str(&format!(" · exit {code}"));
+        }
+    }
+    meta
 }
 
 /// 工具卡片内容行的语义文本（复制源）：diff 优先，否则 output/tail 对应行。

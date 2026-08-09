@@ -185,7 +185,10 @@ impl Editor {
 
     /// P2（编辑器增强）：删除光标到行尾。
     pub fn delete_to_end(&mut self) {
-        self.text.truncate(self.cursor);
+        // §PointerHit：多行输入时删到当前逻辑行尾（Ctrl+K 语义），
+        // 不是删到整个输入末尾。
+        let (_, end) = self.logical_line_bounds();
+        self.text.drain(self.cursor..end);
     }
 
     /// P2（编辑器增强）：按“词”向左移动（跳过词间空白，停在词首）。
@@ -451,6 +454,18 @@ mod p2_word_edit_tests {
         e.delete_to_end();
         assert_eq!(e.text, "ab");
         assert_eq!(e.cursor, 2);
+    }
+
+    /// §PointerHit：多行输入 Ctrl+K 只删到当前行尾，保留后续行。
+    #[test]
+    fn delete_to_end_stops_at_line_end_in_multiline() {
+        let mut e = Editor::new();
+        e.set_text("line1 rest\nline2\nline3".to_string());
+        // 光标在第一行 "rest" 中间（逻辑行尾 = 第一个 \n 前 = 索引 9）。
+        e.cursor = 6;
+        e.delete_to_end();
+        assert_eq!(e.text, "line1 \nline2\nline3", "只删当前行后半段");
+        assert_eq!(e.cursor, 6);
     }
 
     #[test]

@@ -911,6 +911,11 @@ impl ViewModel {
     /// 切换某张卡片展开/折叠（显示完整输出正文）。
     pub fn toggle_expand(&mut self, id: impl Into<String>) {
         let id = id.into();
+        // §PointerHit：运行中的工具在 live.tools，先查它。
+        if let Some(tool) = self.live.tools.get_mut(&id) {
+            tool.card.expanded = !tool.card.expanded;
+            return;
+        }
         for entry in self.transcript.iter_mut().rev() {
             if let Entry::Tool { card, .. } = entry
                 && card.id == id
@@ -933,6 +938,13 @@ impl ViewModel {
 
     /// 打开最近一张工具卡片的详情 Overlay（Alt+E）。
     pub fn open_last_tool_overlay(&mut self) {
+        // §PointerHit：运行中的工具优先（最新）。
+        if let Some(tool) = self.live.tool_order.last()
+            && let Some(tool) = self.live.tools.get(tool)
+        {
+            self.overlay = Some(OverlayState::for_tool(&tool.card));
+            return;
+        }
         for entry in self.transcript.iter().rev() {
             if let Entry::Tool { card, .. } = entry {
                 self.overlay = Some(OverlayState::for_tool(card));
@@ -943,6 +955,7 @@ impl ViewModel {
 
     /// P2：打开最近一张失败/被拒/取消的工具卡片 Overlay（Alt+O）。
     pub fn open_failed_tool_overlay(&mut self) {
+        // §PointerHit：运行中不算失败；查 transcript。
         for entry in self.transcript.iter().rev() {
             if let Entry::Tool { card, .. } = entry {
                 let failed = matches!(
@@ -980,8 +993,14 @@ impl ViewModel {
     }
 
     /// 按 id 打开工具卡片详情 Overlay（鼠标点击）。
+    /// §PointerHit：运行中的工具在 live.tools，优先查它。
     pub fn open_tool_overlay(&mut self, id: impl Into<String>) {
         let id = id.into();
+        if let Some(tool) = self.live.tools.get(&id) {
+            self.overlay = Some(OverlayState::for_tool(&tool.card));
+            self.active_hit = Some(crate::tui::HitTarget::Tool(id));
+            return;
+        }
         for entry in self.transcript.iter().rev() {
             if let Entry::Tool { card, .. } = entry
                 && card.id == id
