@@ -1217,12 +1217,22 @@ fn resume_session(
     }
     let recovery =
         session::recovery::recover(&path).map_err(|e| format!("恢复 session 失败: {e}"))?;
-    // P0-3：从文件重建（带真实 seq 的 replay 投影，与 runtime 语义对齐）；
-    // recovery.events 用于中断工具的恢复信息。
-    let mut history = session::replay_messages(&path).map_err(|e| format!("重建历史失败: {e}"))?;
-    history.extend(agent::interrupted_as_messages(&recovery.interrupted));
-    let log = SessionLog::open(sessions_root, workspace_root.as_std_path(), session_id)
+    // §PointerHit 3：先打开 log，把合成的 interrupted tool 结果**持久化**
+    //（写 ToolCompleted），再重建 history——replay 自然含它们，位置正确、
+    // 不再每次 resume 重复合成。
+    let mut log = SessionLog::open(sessions_root, workspace_root.as_std_path(), session_id)
         .map_err(|e| format!("打开 session 失败: {e}"))?;
+    for (call_id, _provider_id, outcome) in &recovery.interrupted {
+        // call_id 是原 ToolRequested 的 id（recovery 记录）；解析失败时新生成
+        //（理论上不会——它来自真实 call，仅防御）。
+        let call_id = uuid::Uuid::parse_str(call_id)
+            .map(|u| crate::ids::ToolCallId(u))
+            .unwrap_or_else(|_| crate::ids::ToolCallId::new_v7());
+        log.complete_tool(call_id, outcome)
+            .map_err(|e| format!("持久化中断工具结果失败: {e}"))?;
+    }
+    log.sync_data().map_err(|e| format!("同步 session 失败: {e}"))?;
+    let history = session::replay_messages(&path).map_err(|e| format!("重建历史失败: {e}"))?;
     Ok((Some(log), history))
 }
 

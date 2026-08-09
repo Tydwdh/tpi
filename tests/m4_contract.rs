@@ -32,6 +32,7 @@ fn waves_parallelize_reads_and_serialize_writes() {
         }),
         access,
         action_key: format!("k{index}"),
+        plan: None,
     };
     let file_read = |index: usize, path: &str, mode: tpi::agent::scheduler::AccessMode| {
         mk(
@@ -85,6 +86,7 @@ fn bash_serializes_all_following_tools() {
         }),
         access: ToolAccess::WorkspaceUnknown,
         action_key: format!("b{index}"),
+        plan: None,
     };
     let file_read = |index: usize, path: &str| PreparedCall {
         source_index: index,
@@ -101,6 +103,7 @@ fn bash_serializes_all_following_tools() {
             mode: tpi::agent::scheduler::AccessMode::Read,
         }]),
         action_key: format!("r{index}"),
+        plan: None,
     };
 
     // bash → read → bash → edit：每个 bash 独占 wave，后续调用不得并入。
@@ -145,6 +148,7 @@ fn file_write(index: usize, path: &str) -> PreparedCall {
             mode: tpi::agent::scheduler::AccessMode::Write,
         }]),
         action_key: format!("w{index}"),
+        plan: None,
     }
 }
 

@@ -1,4 +1,4 @@
-//! M1 Walking Skeleton 端到端验收（§21 M1）。
+﻿//! M1 Walking Skeleton 端到端验收（§21 M1）。
 //!
 //! fake provider 驱动 TPI 读取 fixture、修改一处代码、运行一次失败检查、
 //! 再次修正并通过；验证 finish=stop 只有一次请求、session 持久化完整、
@@ -241,7 +241,7 @@ async fn recovery_never_replays_write_tools() {
         vec!["user_submitted", "tool_requested", "tool_started"]
     );
     assert_eq!(recovery.interrupted.len(), 1);
-    let (provider_id, outcome) = &recovery.interrupted[0];
+    let (_, provider_id, outcome) = &recovery.interrupted[0];
     assert_eq!(provider_id, &call.provider_id);
     assert_eq!(outcome.status, ToolStatus::Interrupted);
     assert_eq!(

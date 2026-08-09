@@ -1,4 +1,4 @@
-//! Phase F（任务书 §36）：crash 恢复矩阵——agent 级恢复测试。
+﻿//! Phase F（任务书 §36）：crash 恢复矩阵——agent 级恢复测试。
 //!
 //! 覆盖：crash after ToolRequested / after ToolStarted（副作用前）/
 //! after 副作用 before ToolCompleted。验收：恢复后不自动重放未知副作用、
@@ -74,7 +74,7 @@ fn crash_after_tool_requested_recovers_with_clear_effect() {
 
     let recovery = recover(&path).unwrap();
     assert_eq!(recovery.interrupted.len(), 1, "必须合成 1 条 Interrupted");
-    let (provider_id, outcome) = &recovery.interrupted[0];
+    let (_, provider_id, outcome) = &recovery.interrupted[0];
     assert_eq!(provider_id, "call_read_1");
     assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Interrupted);
     assert_eq!(outcome.model_payload.effect, Some(Effect::NotApplied));
@@ -161,7 +161,7 @@ fn crash_after_write_ahead_before_effect_is_not_applied() {
     );
     let recovery = recover(&path).unwrap();
     assert_eq!(recovery.interrupted.len(), 1);
-    let (_, outcome) = &recovery.interrupted[0];
+    let (_, _, outcome) = &recovery.interrupted[0];
     assert_eq!(outcome.model_payload.effect, Some(Effect::NotApplied));
     assert!(
         outcome.model_payload.output.contains("未自动重跑"),
@@ -224,7 +224,7 @@ fn crash_after_effect_before_completed_is_committed() {
 
     let recovery = recover(&path).unwrap();
     assert_eq!(recovery.interrupted.len(), 1);
-    let (_, outcome) = &recovery.interrupted[0];
+    let (_, _, outcome) = &recovery.interrupted[0];
     assert_eq!(outcome.model_payload.effect, Some(Effect::Committed));
     assert!(
         outcome.model_payload.output.contains("未自动重跑"),

@@ -792,6 +792,35 @@ async fn execute_batch(
     let mut rejected: HashMap<usize, StoredToolOutcome> = HashMap::new();
     for (index, call) in calls.iter().enumerate() {
         if *tool_calls_total >= config.limits.max_tool_calls {
+            // §PointerHit 2：预算超限时，为剩余 tool calls 合成标准化拒绝结果
+            // 并持久化——否则 assistant.tool_calls 有 call 但无对应 tool result，
+            // 下一轮/resume 的 history 是非法消息序列（provider 可能拒绝）。
+            for skipped in &calls[index..] {
+                if let Some(tool) = BuiltinTool::from_name(&skipped.name) {
+                    let outcome = ToolOutcome::failed(
+                        tool.name(),
+                        crate::tool::outcome::ModelPayload {
+                            status: ToolStatus::Rejected,
+                            program: None,
+                            exit_code: None,
+                            duration_ms: 0,
+                            output: "status: rejected
+tool: {tool}
+error: tool_budget_exceeded
+
+工具调用预算（max_tool_calls）已耗尽，本批剩余调用未执行。"
+                                .replace("{tool}", tool.name()),
+                            effect: None,
+                            artifact: None,
+                        },
+                    )
+                    .into_stored();
+                    session
+                        .append_event(&SessionEvent::ToolRequested { call: skipped.clone() })
+                        .and_then(|_| session.complete_tool(skipped.call_id, &outcome))
+                        .map_err(|e| RunFailure::Session(e.to_string()))?;
+                }
+            }
             return Ok(BatchEnd::BudgetExceeded);
         }
         *tool_calls_total += 1;
@@ -815,12 +844,20 @@ async fn execute_batch(
                     &config.workspace_root,
                     config.allow_outside_workspace,
                 );
+                // §10.7：写工具预检时生成一次提交计划；write-ahead 与执行复用。
+                let plan = write_tool_plan(
+                    tool,
+                    call,
+                    &config.workspace_root,
+                    config.allow_outside_workspace,
+                );
                 prepared.push(PreparedCall {
                     source_index: index,
                     tool,
                     args,
                     access,
                     action_key: action_key(tool, &call.arguments),
+                    plan,
                 });
             }
             Err(message) => {
@@ -870,16 +907,11 @@ error: invalid_arguments
         // write-ahead（§14.2）：wave 内写工具先持久化 ToolStarted。
         for call in &wave {
             let source = &calls[call.source_index];
-            let plan = write_tool_plan(
-                call.tool,
-                source,
-                &config.workspace_root,
-                config.allow_outside_workspace,
-            );
+            // §10.7：复用预检阶段生成的同一 plan（temp/backup 路径一致）。
             let recovery = recovery_metadata(
                 call.tool,
                 source,
-                plan.as_ref(),
+                call.plan.as_ref(),
                 &config.workspace_root,
                 config.allow_outside_workspace,
             );
@@ -961,14 +993,9 @@ error: invalid_arguments
                     .await;
             }
 
-            let plan = write_tool_plan(
-                tool,
-                &calls[source_index],
-                &config.workspace_root,
-                config.allow_outside_workspace,
-            );
             // §10.7 第 6 步：backup 保留到 ToolCompleted 持久化之后；
-            // 记录清理路径（成功后删除），崩溃恢复窗口依赖 backup 存在。
+            // 记录清理路径（成功后删除）。复用预检阶段生成的同一 plan。
+            let plan = call.plan.clone();
             if let Some(backup) = plan.as_ref().and_then(|p| p.backup_path.as_ref()) {
                 backup_cleanup.insert(source_index, backup.clone());
             }
@@ -1493,10 +1520,12 @@ impl BuiltinTool {
 }
 
 /// 恢复一个中断 session 后继续：把 Interrupted outcome 注入历史（§4.3）。
-pub fn interrupted_as_messages(interrupted: &[(String, StoredToolOutcome)]) -> Vec<ChatMessage> {
+pub fn interrupted_as_messages(
+    interrupted: &[(String, String, StoredToolOutcome)],
+) -> Vec<ChatMessage> {
     interrupted
         .iter()
-        .map(|(provider_id, outcome)| ChatMessage::Tool {
+        .map(|(_call_id, provider_id, outcome)| ChatMessage::Tool {
             tool_call_id: provider_id.clone(),
             name: outcome.session_metadata.tool.clone(),
             content: outcome.model_payload.output.clone(),

@@ -1,4 +1,4 @@
-//! M3 竞态与恢复契约测试（§10.4/§10.7、§20.2 场景 18/19）。
+﻿//! M3 竞态与恢复契约测试（§10.4/§10.7、§20.2 场景 18/19）。
 //!
 //! - §20.2 场景 18：写工具在副作用前已持久化 recovery metadata；分别在 replace 前、
 //!   replace 后、ToolCompleted 前崩溃都能恢复/诊断；
@@ -79,7 +79,7 @@ async fn crash_before_replace_recovers_as_not_applied() {
     let recovery = tpi::session::recovery::recover(session.path()).unwrap();
     assert_eq!(recovery.interrupted.len(), 1);
     assert_eq!(
-        recovery.interrupted[0].1.model_payload.effect,
+        recovery.interrupted[0].2.model_payload.effect,
         Some(Effect::NotApplied),
         "replace 前崩溃：target == expected → not_applied"
     );
@@ -116,7 +116,7 @@ async fn crash_after_replace_recovers_as_committed() {
     let recovery = tpi::session::recovery::recover(session.path()).unwrap();
     assert_eq!(recovery.interrupted.len(), 1);
     assert_eq!(
-        recovery.interrupted[0].1.model_payload.effect,
+        recovery.interrupted[0].2.model_payload.effect,
         Some(Effect::Committed),
         "replace 后崩溃：target == temp digest → committed"
     );

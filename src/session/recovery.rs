@@ -17,7 +17,9 @@ pub struct RecoveryOutcome {
     /// 原始完整事件（不含合成的 Interrupted）。
     pub events: Vec<SessionEvent>,
     /// 合成的 Interrupted 结果（按 call 顺序；provider_id, outcome）。
-    pub interrupted: Vec<(String, StoredToolOutcome)>,
+    /// 已请求但未完成的 call（恢复期间合成 Tool 结果）。
+    /// 每项 = (call_id, provider_id, outcome)。
+    pub interrupted: Vec<(String, String, StoredToolOutcome)>,
 }
 
 /// 已请求但未完成的 call（恢复期间的跟踪条目）。
@@ -66,7 +68,8 @@ pub fn recover(path: &Path) -> std::io::Result<RecoveryOutcome> {
         .map(|entry| {
             let effect = classify_effect(&entry.tool_name, entry.recovery.as_ref());
             let outcome = interrupted_outcome(&entry.tool_name, &entry.provider_id, effect);
-            (entry.provider_id, outcome)
+            // §PointerHit：保留 call_id 供 resume 持久化合成结果（避免重复合成）。
+            (entry.call_id, entry.provider_id, outcome)
         })
         .collect();
 

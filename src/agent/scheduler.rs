@@ -134,6 +134,10 @@ pub struct PreparedCall {
     pub access: ToolAccess,
     /// §12.3：ActionKey = hash(tool_name + canonical_json(args))。
     pub action_key: String,
+    /// §10.7：写工具（edit/write）的提交计划（temp/backup 路径）。
+    /// 预检阶段生成一次，write-ahead 持久化与真正执行**必须复用同一 plan**，
+    /// 否则 recovery metadata 指向的路径与实际执行不一致，崩溃恢复判定失效。
+    pub plan: Option<crate::tool::edit::CommitPlan>,
 }
 
 /// 构建 execution waves（§12.2 第 3-4 条）。
