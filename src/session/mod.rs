@@ -15,6 +15,7 @@ use crate::tool::outcome::StoredToolOutcome;
 use serde::{Deserialize, Serialize};
 
 pub mod artifact;
+pub mod conversation;
 pub mod recovery;
 
 /// 模型引用（§7.2 模型角色；M1 只有 primary）。

@@ -19,9 +19,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent;
 use crate::config::Config;
-use crate::ids::{RunId, SessionId};
+use crate::ids::SessionId;
 use crate::provider::openai_compat::OpenAiCompatClient;
 use crate::provider::{ChatMessage, Provider};
+use crate::session::conversation::Conversation;
 use crate::session::{self, SessionEvent, SessionLog};
 use crate::tui::effect::UiEffect;
 use crate::tui::state::UiState;
@@ -95,15 +96,15 @@ pub async fn run(
     let current_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
     spawn_ctrl_c_handler(current_cancel.clone());
 
-    let (mut session, history) = match session_target {
-        SessionTarget::New => (None, Vec::new()),
+    let mut conversation = match session_target {
+        SessionTarget::New => Conversation::new(),
         SessionTarget::Continue => {
             let session_id = latest_session_id(&sessions_root, &workspace_root)?;
-            resume_session(&sessions_root, &workspace_root, session_id)?
+            Conversation::resume(&sessions_root, &workspace_root, session_id)?
         }
         SessionTarget::Resume(id) => {
             let session_id = parse_session_id(&id)?;
-            resume_session(&sessions_root, &workspace_root, session_id)?
+            Conversation::resume(&sessions_root, &workspace_root, session_id)?
         }
     };
 
@@ -112,19 +113,20 @@ pub async fn run(
             return Err("非交互模式需要提供 prompt：tpi -p \"...\"".into());
         }
         let message = prompt.to_string();
-        let mut session = match session {
-            Some(session) => session,
-            None => create_session(&sessions_root, &workspace_root)?,
+        conversation.ensure_started(&sessions_root, &workspace_root)?;
+        let outcome = {
+            let (session, history) = conversation.parts_for_run()?;
+            run_prompt_once(
+                &mut provider,
+                session,
+                &config,
+                history,
+                message,
+                current_cancel.clone(),
+            )
+            .await?
         };
-        let outcome = run_prompt_once(
-            &mut provider,
-            &mut session,
-            &config,
-            &history,
-            message,
-            current_cancel.clone(),
-        )
-        .await?;
+        conversation.accept_context(outcome.messages.clone());
         // §16：wall-time 自动取消不是用户取消，-p 也要明确提示（stderr）。
         if outcome.reason == crate::session::CompletionReason::WallTimeExceeded {
             eprintln!("警告：run 达到 wall-time 预算被自动取消（非用户取消）");
@@ -140,26 +142,14 @@ pub async fn run(
         return Ok(());
     }
 
-    let mut history = history;
     interactive_loop(
         &mut provider,
-        &mut session,
+        &mut conversation,
         &config,
-        &mut history,
         prompt,
         current_cancel.clone(),
     )
     .await
-}
-
-/// 把一次 run 的 outcome 合并进调用方持有的对话历史（P0-1：唯一合并入口）。
-///
-/// `AgentOutcome.messages` 的语义是**完整 context**（agent 从调用方传入的
-/// history 复制构造并逐步追加，compaction 后还可能重建），因此调用方必须
-/// **replace** 而不是 extend——extend 会让旧历史每轮整体重复（token 膨胀、
-/// 模型看到重复 user/tool 信息）。interactive 与 -p 模式共用本入口。
-pub fn merge_outcome_history(history: &mut Vec<ChatMessage>, outcome: &agent::AgentOutcome) {
-    *history = outcome.messages.clone();
 }
 
 /// 非交互单次 run（输出经 stdout，仅最终答案）。
@@ -215,9 +205,8 @@ pub async fn run_prompt_once<P: Provider>(
 /// 输入事件立即标 dirty，动画时钟只在 run 中推进（§16.1）。
 async fn interactive_loop<P: Provider>(
     provider: &mut P,
-    session: &mut Option<SessionLog>,
+    conversation: &mut Conversation,
     config: &Config,
-    history: &mut Vec<ChatMessage>,
     initial_prompt: &str,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 ) -> Result<(), String> {
@@ -256,8 +245,8 @@ async fn interactive_loop<P: Provider>(
     let mut ui_state = UiState::new(view);
     // BUG-006：--continue/--resume 启动时把已加载的 history 重建到屏幕，
     // 避免“模型有历史、屏幕空白/显示旧内容”的不一致。
-    if !history.is_empty() {
-        ui_state.view.load_history(history);
+    if !conversation.history().is_empty() {
+        ui_state.view.load_history(conversation.history());
     }
     // 排队语义（§12 稳定化任务书）：运行中输入先存 ui_state.pending_message，
     // 当前 run 完成后由主循环作为下一条消息提交——不是 run 内的
@@ -378,23 +367,24 @@ async fn interactive_loop<P: Provider>(
         // 会话恢复选择（/sessions 菜单 Enter）。
         if let Some(session_id) = ui_state.pending_session.take() {
             match parse_session_id(&session_id) {
-                Ok(id) => match resume_session(&config.sessions_root, &config.workspace_root, id) {
-                    Ok((new_session, new_history)) => {
-                        *session = new_session;
-                        *history = new_history;
-                        // BUG-006：屏幕必须重建为新 session 的对话（不能残留旧屏幕）。
-                        ui_state.view.load_history(history);
-                        ui_state.view.push_line(
-                            LineKind::System,
-                            format!("已恢复 session {id}（对话历史已加载）"),
-                        );
+                Ok(id) => {
+                    match Conversation::resume(&config.sessions_root, &config.workspace_root, id) {
+                        Ok(new_conversation) => {
+                            *conversation = new_conversation;
+                            // BUG-006：屏幕必须重建为新 session 的对话（不能残留旧屏幕）。
+                            ui_state.view.load_history(conversation.history());
+                            ui_state.view.push_line(
+                                LineKind::System,
+                                format!("已恢复 session {id}（对话历史已加载）"),
+                            );
+                        }
+                        Err(error) => {
+                            ui_state
+                                .view
+                                .push_line(LineKind::System, format!("恢复失败: {error}"));
+                        }
                     }
-                    Err(error) => {
-                        ui_state
-                            .view
-                            .push_line(LineKind::System, format!("恢复失败: {error}"));
-                    }
-                },
+                }
                 Err(error) => ui_state.view.push_line(LineKind::System, error),
             }
             ui_state.view.menu = None;
@@ -406,32 +396,27 @@ async fn interactive_loop<P: Provider>(
         // `/retry`：重试上一次失败 turn（空 user_message → agent 不重复 UserSubmitted）。
         if let Some(retry_target) = ui_state.take_pending_retry() {
             let _ = retry_target; // 仅展示用；run 以空 user_message 发起
-            if session.is_none() {
-                *session = Some(create_session(
-                    &config.sessions_root,
-                    &config.workspace_root,
-                )?);
-            }
-            let Some(mut session_log) = session.take() else {
-                tracing::error!("run 循环：session 槽位为空（内部不变量破坏）");
-                return Err("内部错误：session 未初始化".into());
-            };
+            conversation.ensure_started(&config.sessions_root, &config.workspace_root)?;
             // retry：user_message 传空（§4.3：不重复记录 UserSubmitted，复用 history）。
-            let outcome = match run_interactive(
-                provider,
-                &mut session_log,
-                config,
-                history,
-                String::new(),
-                &mut ui_state,
-                &mut renderer,
-                &mut key_rx,
-                current_cancel.clone(),
-            )
-            .await
-            {
+            let run_result = {
+                let (session_log, history) = conversation.parts_for_run()?;
+                run_interactive(
+                    provider,
+                    session_log,
+                    config,
+                    history,
+                    String::new(),
+                    &mut ui_state,
+                    &mut renderer,
+                    &mut key_rx,
+                    current_cancel.clone(),
+                )
+                .await
+            };
+            let outcome = match run_result {
                 Ok(outcome) => outcome,
                 Err(error) => {
+                    conversation.refresh_from_log()?;
                     ui_state.view.status = crate::tui::model::StatusLine::Idle;
                     ui_state.view.turn = 0;
                     ui_state.view.push_line(
@@ -441,13 +426,11 @@ async fn interactive_loop<P: Provider>(
                     renderer
                         .draw(&mut ui_state.view)
                         .map_err(|e| e.to_string())?;
-                    *session = Some(session_log);
                     continue;
                 }
             };
             ui_state.view.add_usage(&outcome.usage);
-            merge_outcome_history(history, &outcome);
-            *session = Some(session_log);
+            conversation.accept_context(outcome.messages.clone());
             ui_state.view.push_line(LineKind::System, "─".repeat(40));
             continue;
         }
@@ -562,7 +545,7 @@ web_search: DuckDuckGo（免费，无需 API key）
                     continue;
                 }
                 "/session" => {
-                    let info = match session.as_ref() {
+                    let info = match conversation.log() {
                         Some(log) => format!(
                             "session: {}
 workspace: {}
@@ -630,8 +613,7 @@ workspace: {}
                     continue;
                 }
                 "/new" => {
-                    *session = None;
-                    history.clear();
+                    conversation.reset();
                     // BUG-006：屏幕投影必须与已清空的上下文同步（否则显示旧 session）。
                     ui_state.view.reset_for_new_session();
                     push_system_line(
@@ -681,7 +663,7 @@ workspace: {}
                 }
                 "/diff" => {
                     // §19：diff 是查看型内容，走 Modal 不污染 transcript。
-                    let diff = match session.as_ref() {
+                    let diff = match conversation.log() {
                         Some(log) => last_edit_diff(log),
                         None => "尚无 session".to_string(),
                     };
@@ -742,32 +724,28 @@ workspace: {}
                 .draw(&mut ui_state.view)
                 .map_err(|e| e.to_string())?;
 
-            if session.is_none() {
-                *session = Some(create_session(
-                    &config.sessions_root,
-                    &config.workspace_root,
-                )?);
-            }
-            // 上面已确保 Some；take 为空说明内部状态被破坏——按错误上报。
-            let Some(mut session_log) = session.take() else {
-                tracing::error!("run 循环：session 槽位为空（内部不变量破坏）");
-                return Err("内部错误：session 未初始化".into());
+            conversation.ensure_started(&config.sessions_root, &config.workspace_root)?;
+            let run_result = {
+                let (session_log, history) = conversation.parts_for_run()?;
+                run_interactive(
+                    provider,
+                    session_log,
+                    config,
+                    history,
+                    message.clone(),
+                    &mut ui_state,
+                    &mut renderer,
+                    &mut key_rx,
+                    current_cancel.clone(),
+                )
+                .await
             };
-            let outcome = match run_interactive(
-                provider,
-                &mut session_log,
-                config,
-                history,
-                message.clone(),
-                &mut ui_state,
-                &mut renderer,
-                &mut key_rx,
-                current_cancel.clone(),
-            )
-            .await
-            {
+            let outcome = match run_result {
                 Ok(outcome) => outcome,
                 Err(error) => {
+                    // 失败点可能位于 Assistant/Tool durable commit 之后；只追加 User
+                    // 会构造残缺 context。始终从 session 事实源重建。
+                    conversation.refresh_from_log()?;
                     // 交互模式：run 失败（provider/工具基础设施）不得杀死整个 TUI。
                     // 显示实际错误并保留 session，用户可以继续对话。
                     ui_state.view.status = crate::tui::model::StatusLine::Idle;
@@ -781,19 +759,12 @@ workspace: {}
                         .map_err(|e| e.to_string())?;
                     // 记录失败 turn 供 /retry（§4.3）。
                     last_failed_message = Some(message.clone());
-                    // §修复：失败时把 User 消息写入 history——否则 /retry 复用
-                    // history 时模型丢失本次任务（context 不包含这条 User）。
-                    if !message.is_empty() {
-                        history.push(ChatMessage::User(message.clone()));
-                    }
-                    *session = Some(session_log);
                     continue;
                 }
             };
             ui_state.view.add_usage(&outcome.usage);
             // P0-1：outcome.messages 是完整 context（含旧历史），必须 replace。
-            merge_outcome_history(history, &outcome);
-            *session = Some(session_log);
+            conversation.accept_context(outcome.messages.clone());
             // 成功（或正常中断）后清空 retry 目标；ProviderInterrupted 是失败类，
             // 保留以便用户 /retry。
             match outcome.reason {
@@ -1213,46 +1184,6 @@ fn install_terminal_panic_hook() {
             default(info);
         }));
     });
-}
-
-fn create_session(
-    sessions_root: &std::path::Path,
-    workspace_root: &Utf8PathBuf,
-) -> Result<SessionLog, String> {
-    SessionLog::create(sessions_root, workspace_root.as_std_path(), RunId::new_v7())
-        .map_err(|e| format!("创建 session 失败: {e}"))
-}
-
-/// 恢复既有 session：读取事件 + 注入 Interrupted 结果（§4.3）。
-fn resume_session(
-    sessions_root: &std::path::Path,
-    workspace_root: &Utf8PathBuf,
-    session_id: SessionId,
-) -> Result<(Option<SessionLog>, Vec<ChatMessage>), String> {
-    let path = agent::session_path(sessions_root, workspace_root, session_id);
-    if !path.exists() {
-        return Err(format!("session 不存在: {session_id}"));
-    }
-    let recovery =
-        session::recovery::recover(&path).map_err(|e| format!("恢复 session 失败: {e}"))?;
-    // §PointerHit 3：先打开 log，把合成的 interrupted tool 结果**持久化**
-    //（写 ToolCompleted），再重建 history——replay 自然含它们，位置正确、
-    // 不再每次 resume 重复合成。
-    let mut log = SessionLog::open(sessions_root, workspace_root.as_std_path(), session_id)
-        .map_err(|e| format!("打开 session 失败: {e}"))?;
-    for (call_id, _provider_id, outcome) in &recovery.interrupted {
-        // call_id 是原 ToolRequested 的 id（recovery 记录）；解析失败时新生成
-        //（理论上不会——它来自真实 call，仅防御）。
-        let call_id = uuid::Uuid::parse_str(call_id)
-            .map(crate::ids::ToolCallId)
-            .unwrap_or_else(|_| crate::ids::ToolCallId::new_v7());
-        log.complete_tool(call_id, outcome)
-            .map_err(|e| format!("持久化中断工具结果失败: {e}"))?;
-    }
-    log.sync_data()
-        .map_err(|e| format!("同步 session 失败: {e}"))?;
-    let history = session::replay_messages(&path).map_err(|e| format!("重建历史失败: {e}"))?;
-    Ok((Some(log), history))
 }
 
 /// 把 session 事件重建为对话消息（§15.1：session log 是事实源，上下文是投影）。

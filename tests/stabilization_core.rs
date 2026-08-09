@@ -3,8 +3,8 @@
 //! - P0-1：interactive 层每轮 `history.extend(outcome.messages)`，而
 //!   `AgentOutcome.messages` 是 agent 从调用方 history 复制构造的**完整 context**
 //!   → 历史每轮整体重复（token 膨胀、模型看到重复消息）。
-//!   修复契约：outcome.messages = 完整 context，调用方必须 replace
-//!   （`app::merge_outcome_history` 为唯一合并入口）。
+//!   修复契约：outcome.messages = 完整 context，由 `Conversation` 整体接纳，
+//!   app 不再分别持有 SessionLog 与 history。
 //!
 //! 本文件同时承载 Phase 1 后续的 replay / runtime-resume 等价测试。
 
@@ -33,27 +33,27 @@ async fn p0_1_history_never_duplicates_across_turns() {
         FakeResponse::text("A2"),
         FakeResponse::text("A3"),
     ]);
-    let mut session = SessionLog::create(
-        &config.sessions_root,
-        workspace.as_std_path(),
-        RunId::new_v7(),
-    )
-    .expect("create session");
     let current_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+    let mut conversation = tpi::session::conversation::Conversation::new();
+    conversation
+        .ensure_started(&config.sessions_root, &workspace)
+        .expect("create session");
 
-    let mut history: Vec<ChatMessage> = Vec::new();
     for i in 1..=3 {
-        let outcome = app::run_prompt_once(
-            &mut provider,
-            &mut session,
-            &config,
-            &history,
-            format!("U{i}"),
-            current_cancel.clone(),
-        )
-        .await
-        .expect("run should succeed");
-        app::merge_outcome_history(&mut history, &outcome);
+        let outcome = {
+            let (session, history) = conversation.parts_for_run().unwrap();
+            app::run_prompt_once(
+                &mut provider,
+                session,
+                &config,
+                history,
+                format!("U{i}"),
+                current_cancel.clone(),
+            )
+            .await
+            .expect("run should succeed")
+        };
+        conversation.accept_context(outcome.messages);
     }
 
     let expected: Vec<ChatMessage> = vec![
@@ -74,7 +74,8 @@ async fn p0_1_history_never_duplicates_across_turns() {
         },
     ];
     assert_eq!(
-        history, expected,
+        conversation.history(),
+        expected,
         "history 必须精确为 U1A1U2A2U3A3，不得重复"
     );
 }
@@ -615,36 +616,37 @@ async fn ten_turns_context_grows_linearly() {
             .map(|i| FakeResponse::text(&format!("A{i}")))
             .collect(),
     );
-    let mut session = SessionLog::create(
-        &config.sessions_root,
-        workspace.as_std_path(),
-        RunId::new_v7(),
-    )
-    .expect("create session");
     let current_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+    let mut conversation = tpi::session::conversation::Conversation::new();
+    conversation
+        .ensure_started(&config.sessions_root, &workspace)
+        .expect("create session");
 
-    let mut history: Vec<ChatMessage> = Vec::new();
     for i in 1..=10 {
-        let outcome = app::run_prompt_once(
-            &mut provider,
-            &mut session,
-            &config,
-            &history,
-            format!("U{i}"),
-            current_cancel.clone(),
-        )
-        .await
-        .expect("run should succeed");
-        app::merge_outcome_history(&mut history, &outcome);
+        let outcome = {
+            let (session, history) = conversation.parts_for_run().unwrap();
+            app::run_prompt_once(
+                &mut provider,
+                session,
+                &config,
+                history,
+                format!("U{i}"),
+                current_cancel.clone(),
+            )
+            .await
+            .expect("run should succeed")
+        };
+        conversation.accept_context(outcome.messages);
         // 线性增长：第 i 轮后恰好 2i 条消息，无重复、无丢失。
         assert_eq!(
-            history.len(),
+            conversation.history().len(),
             2 * i,
             "第 {i} 轮后 history 必须精确 2{i} 条: {:?}",
-            history
+            conversation.history()
         );
     }
     // 最终序列精确：U1 A1 U2 A2 ... U10 A10。
+    let history = conversation.history();
     for i in 1..=10 {
         let user = &history[2 * (i - 1)];
         let assistant = &history[2 * (i - 1) + 1];
