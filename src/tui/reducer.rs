@@ -156,7 +156,10 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 // §PointerHit：运行中提交立即在 footer 提示（不写 transcript，
                 // 避免消费时重复显示；实际 User 消息在消费时入 transcript）。
                 if state.running {
-                    state.view.transient_hint = Some(format!("已排队：{text}"));
+                    state.view.transient_hint = Some(format!(
+                        "已排队：{}",
+                        crate::tui::text::truncate_middle_utf8(&text, 160, "…")
+                    ));
                 }
                 state.push_pending(text);
             }
@@ -481,7 +484,7 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
 pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
     match event {
         UiEvent::Tick => {
-            state.view.anim_tick += 1;
+            state.view.anim_tick = state.view.anim_tick.wrapping_add(1);
             Vec::new()
         }
         UiEvent::Paste(text) => {
@@ -499,12 +502,22 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
                     .as_ref()
                     .map(|s| s.query.clone())
                     .unwrap_or_default();
-                query.push_str(&text);
+                let room = (4 * 1024usize).saturating_sub(query.len());
+                let keep = crate::tui::text::floor_char_boundary(&text, room.min(text.len()));
+                query.push_str(&text[..keep]);
                 state.view.update_search_query(&query);
             } else {
+                let truncated = state.editor.text().len().saturating_add(text.len())
+                    > crate::tui::editor::MAX_INPUT_BYTES;
                 state.editor.insert_str(&text);
                 state.sync_input();
                 refresh_menus(state);
+                if truncated {
+                    state.view.transient_hint = Some(format!(
+                        "输入已截断到 {} KiB",
+                        crate::tui::editor::MAX_INPUT_BYTES / 1024
+                    ));
+                }
             }
             Vec::new()
         }

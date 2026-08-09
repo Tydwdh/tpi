@@ -24,6 +24,7 @@ pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// 模型可见项数预算。
 pub const MAX_RESULTS: usize = 1_000;
 pub const PAGE_SIZE: usize = 200;
+const MAX_RESULT_PATH_CHARS: usize = 2_048;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct ListArgs {
@@ -120,7 +121,18 @@ pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
     let mut stop_reason = StopReason::Complete;
 
     'scan: for entry in WalkBuilder::new(&root, Some(args.depth)) {
+        if ctx.cancel.is_cancelled() {
+            stop_reason = StopReason::Cancelled;
+            break;
+        }
+        if started.elapsed() > SCAN_DEADLINE {
+            stop_reason = StopReason::Deadline;
+            break;
+        }
         let Ok(entry) = entry else { continue };
+        if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         if entry.depth() == 0 {
             continue; // root 本身
@@ -129,30 +141,24 @@ pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
             continue;
         }
         if meta.is_dir() {
-            items.push(format!("{}/", relative(&root, entry.path())));
+            items.push(format!(
+                "{}/",
+                truncate_line(&relative(&root, entry.path()), MAX_RESULT_PATH_CHARS)
+            ));
         } else {
-            scanned_files += 1;
-            scanned_bytes += meta.len();
-            if meta.len() > MAX_FILE_BYTES {
+            scanned_files = scanned_files.saturating_add(1);
+            scanned_bytes = scanned_bytes.saturating_add(meta.len());
+            if scanned_files >= MAX_SCAN_FILES || scanned_bytes >= MAX_SCAN_BYTES {
+                stop_reason = StopReason::ScanLimit;
+                break 'scan;
+            }
+            if meta.len() > MAX_FILE_BYTES || is_binary_file(entry.path()) {
                 continue;
             }
-            items.push(relative(&root, entry.path()));
-        }
-        if scanned_files >= MAX_SCAN_FILES {
-            stop_reason = StopReason::ScanLimit;
-            break 'scan;
-        }
-        if scanned_bytes >= MAX_SCAN_BYTES {
-            stop_reason = StopReason::ScanLimit;
-            break 'scan;
-        }
-        if started.elapsed() > SCAN_DEADLINE {
-            stop_reason = StopReason::Deadline;
-            break 'scan;
-        }
-        if ctx.cancel.is_cancelled() {
-            stop_reason = StopReason::Cancelled;
-            break 'scan;
+            items.push(truncate_line(
+                &relative(&root, entry.path()),
+                MAX_RESULT_PATH_CHARS,
+            ));
         }
         if items.len() >= MAX_RESULTS {
             stop_reason = StopReason::ResultLimit;
@@ -174,6 +180,20 @@ pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
 pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
     if let Some(cursor) = &args.cursor {
         return page(cursor, ctx);
+    }
+    if args.pattern.len() > 32 * 1024 {
+        return ToolOutcome::failed(
+            "search",
+            ModelPayload {
+                status: ToolStatus::Rejected,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: "status: rejected\ntool: search\nerror: regex_too_large\n\n正则表达式最多 32 KiB。".into(),
+                effect: None,
+                artifact: None,
+            },
+        );
     }
     let pattern = match regex::Regex::new(&args.pattern) {
         Ok(pattern) => pattern,
@@ -225,13 +245,28 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
     let mut output_bytes = 0usize;
 
     'scan: for entry in WalkBuilder::new(&root, None) {
+        if ctx.cancel.is_cancelled() {
+            stop_reason = StopReason::Cancelled;
+            break;
+        }
+        if started.elapsed() > SCAN_DEADLINE {
+            stop_reason = StopReason::Deadline;
+            break;
+        }
         let Ok(entry) = entry else { continue };
+        if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
             continue;
         }
-        scanned_files += 1;
-        scanned_bytes += meta.len();
+        scanned_files = scanned_files.saturating_add(1);
+        scanned_bytes = scanned_bytes.saturating_add(meta.len());
+        if scanned_files >= MAX_SCAN_FILES || scanned_bytes >= MAX_SCAN_BYTES {
+            stop_reason = StopReason::ScanLimit;
+            break 'scan;
+        }
         if meta.len() > MAX_FILE_BYTES || meta.len() == 0 {
             continue;
         }
@@ -243,7 +278,9 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         {
             use std::io::Read;
             let mut head = [0u8; 8192];
-            let n = file.read(&mut head).unwrap_or(0);
+            let Ok(n) = file.read(&mut head) else {
+                continue;
+            };
             if head[..n].contains(&0) {
                 continue;
             }
@@ -251,40 +288,38 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         // head 读取已消费文件内容（小文件可能已到 EOF）：回退到文件头再流式读。
         {
             use std::io::{Seek, SeekFrom};
-            let _ = file.seek(SeekFrom::Start(0));
+            if file.seek(SeekFrom::Start(0)).is_err() {
+                continue;
+            }
         }
         // 流式按行匹配（P1-8：大文件不整读，内存峰值恒定）。
-        let relative_path = relative(&root, entry.path());
+        let relative_path = truncate_line(&relative(&root, entry.path()), MAX_RESULT_PATH_CHARS);
         use std::io::BufRead;
         let reader = std::io::BufReader::new(file);
         for (line_idx, line) in reader.lines().enumerate() {
+            if ctx.cancel.is_cancelled() {
+                stop_reason = StopReason::Cancelled;
+                break 'scan;
+            }
+            if started.elapsed() > SCAN_DEADLINE {
+                stop_reason = StopReason::Deadline;
+                break 'scan;
+            }
             let Ok(line) = line else { break };
             if pattern.is_match(&line) {
                 let line = truncate_line(&line, MAX_LINE_CHARS);
                 let item = format!("{}:{}: {}", relative_path, line_idx + 1, line);
-                output_bytes += item.len();
+                if output_bytes.saturating_add(item.len()) > MAX_OUTPUT_BYTES {
+                    stop_reason = StopReason::ResultLimit;
+                    break 'scan;
+                }
+                output_bytes = output_bytes.saturating_add(item.len());
                 items.push(item);
                 if items.len() >= MAX_MATCHES || output_bytes >= MAX_OUTPUT_BYTES {
                     stop_reason = StopReason::ResultLimit;
                     break 'scan;
                 }
             }
-        }
-        if scanned_files >= MAX_SCAN_FILES {
-            stop_reason = StopReason::ScanLimit;
-            break 'scan;
-        }
-        if scanned_bytes >= MAX_SCAN_BYTES {
-            stop_reason = StopReason::ScanLimit;
-            break 'scan;
-        }
-        if started.elapsed() > SCAN_DEADLINE {
-            stop_reason = StopReason::Deadline;
-            break 'scan;
-        }
-        if ctx.cancel.is_cancelled() {
-            stop_reason = StopReason::Cancelled;
-            break 'scan;
         }
     }
 
@@ -301,13 +336,14 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
 
 fn finish_scan(
     ctx: &ToolContext,
-    items: Vec<String>,
+    mut items: Vec<String>,
     scanned_files: u64,
     scanned_bytes: u64,
     started: Instant,
     stop_reason: StopReason,
     tool: &'static str,
 ) -> ToolOutcome {
+    items.sort_unstable();
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let snapshot = ScanSnapshot {
         tool: tool.to_string(),
@@ -341,8 +377,15 @@ pub fn evict_oldest_snapshot(store: &mut std::collections::HashMap<String, ScanS
 
 /// 翻页：从 snapshot 取 offset 窗口（不重新扫描，§8.4）。
 fn page(cursor: &str, ctx: &ToolContext) -> ToolOutcome {
+    if cursor.is_empty() || cursor.len() > 256 || cursor.chars().any(char::is_control) {
+        return invalid_cursor_outcome();
+    }
     let (snapshot_id, offset) = match cursor.split_once('#') {
-        Some((id, offset)) => (id.to_string(), offset.parse::<usize>().unwrap_or(0)),
+        Some((id, offset)) if !id.is_empty() => match offset.parse::<usize>() {
+            Ok(offset) => (id.to_string(), offset),
+            Err(_) => return invalid_cursor_outcome(),
+        },
+        Some(_) => return invalid_cursor_outcome(),
         None => (cursor.to_string(), 0),
     };
     let store = crate::util::lock_mutex(&ctx.scan_snapshots, "scan_snapshots");
@@ -402,6 +445,21 @@ cursor: {cursor}"
     };
     outcome
 }
+
+fn invalid_cursor_outcome() -> ToolOutcome {
+    ToolOutcome::failed(
+        "page",
+        ModelPayload {
+            status: ToolStatus::Rejected,
+            program: None,
+            exit_code: None,
+            duration_ms: 0,
+            output: "status: rejected\nerror: invalid_cursor".into(),
+            effect: None,
+            artifact: None,
+        },
+    )
+}
 fn truncate_line(line: &str, max_chars: usize) -> String {
     if line.chars().count() <= max_chars {
         line.to_string()
@@ -412,10 +470,22 @@ fn truncate_line(line: &str, max_chars: usize) -> String {
 }
 
 fn relative(root: &Utf8PathBuf, path: &std::path::Path) -> String {
-    let utf8 = Utf8PathBuf::from_path_buf(path.to_path_buf()).unwrap_or_default();
-    utf8.strip_prefix(root)
-        .map(|p| p.to_string())
-        .unwrap_or_else(|_| utf8.to_string())
+    path.strip_prefix(root.as_std_path())
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn is_binary_file(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return true;
+    };
+    let mut head = [0u8; 8192];
+    match file.read(&mut head) {
+        Ok(read) => head[..read].contains(&0),
+        Err(_) => true,
+    }
 }
 
 /// 有界目录遍历（§8.4：ignore 规则、不跟随 symlink、跳过 binary 大文件）。
@@ -455,10 +525,22 @@ impl Iterator for WalkBuilder {
 ///
 /// 相对路径、按目录优先排序（`dir/` 条目在前，便于 @ 逐级下钻）。
 pub fn index_files(root: &Utf8PathBuf, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let mut files: Vec<String> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
+    let started = Instant::now();
+    let mut visited = 0u64;
     for entry in WalkBuilder::new(root, None) {
+        visited = visited.saturating_add(1);
+        if visited > MAX_SCAN_FILES || started.elapsed() > SCAN_DEADLINE {
+            break;
+        }
         let Ok(entry) = entry else { continue };
+        if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         if entry.depth() == 0 {
             continue;
@@ -469,13 +551,15 @@ pub fn index_files(root: &Utf8PathBuf, limit: usize) -> Vec<String> {
         let relative = relative.to_string_lossy().replace('\\', "/");
         if meta.is_dir() {
             dirs.push(format!("{relative}/"));
-        } else {
+        } else if meta.len() <= MAX_FILE_BYTES && !is_binary_file(entry.path()) {
             files.push(relative);
         }
         if dirs.len() + files.len() >= limit {
             break;
         }
     }
+    dirs.sort_unstable();
+    files.sort_unstable();
     dirs.extend(files);
     dirs
 }
@@ -617,5 +701,85 @@ mod tests {
             !output.contains("d.txt"),
             "depth 2 之外的路径不得出现: {output}"
         );
+    }
+
+    #[test]
+    fn malformed_cursor_is_rejected_instead_of_restarting_first_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let ctx = test_ctx(&root);
+        for cursor in ["", "missing#not-a-number", "#1"] {
+            let outcome = page(cursor, &ctx);
+            assert_eq!(outcome.status, ToolStatus::Rejected);
+            assert!(outcome.model_payload.output.contains("invalid_cursor"));
+        }
+    }
+
+    #[test]
+    fn index_zero_limit_and_binary_filter_are_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::write(root.join("text.txt"), b"hello").unwrap();
+        std::fs::write(root.join("binary.bin"), b"a\0b").unwrap();
+        assert!(index_files(&root, 0).is_empty());
+        let indexed = index_files(&root, 10);
+        assert!(indexed.contains(&"text.txt".into()));
+        assert!(!indexed.contains(&"binary.bin".into()));
+    }
+
+    #[test]
+    fn cancelled_scans_stop_before_skipped_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::write(root.join("binary.bin"), b"a\0b").unwrap();
+        let ctx = test_ctx(&root);
+        ctx.cancel.cancel();
+
+        let listed = list(
+            ListArgs {
+                path: ".".into(),
+                depth: 2,
+                cursor: None,
+            },
+            &ctx,
+        );
+        assert!(
+            listed
+                .model_payload
+                .output
+                .contains("stop_reason: cancelled")
+        );
+
+        let searched = search(
+            SearchArgs {
+                pattern: "a".into(),
+                path: ".".into(),
+                cursor: None,
+            },
+            &ctx,
+        );
+        assert!(
+            searched
+                .model_payload
+                .output
+                .contains("stop_reason: cancelled")
+        );
+    }
+
+    #[test]
+    fn oversized_regex_is_rejected_before_compilation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let ctx = test_ctx(&root);
+        let outcome = search(
+            SearchArgs {
+                pattern: "a".repeat(32 * 1024 + 1),
+                path: ".".into(),
+                cursor: None,
+            },
+            &ctx,
+        );
+        assert_eq!(outcome.status, ToolStatus::Rejected);
+        assert!(outcome.model_payload.output.contains("regex_too_large"));
     }
 }

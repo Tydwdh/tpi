@@ -486,6 +486,48 @@ async fn finish_tool_calls_with_empty_calls_is_protocol_error() {
     );
 }
 
+#[tokio::test]
+async fn sparse_tool_call_index_is_rejected_before_allocation() {
+    let fixture = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":4294967295,\"id\":\"call_x\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    let (base_url, _body_handle) = mock_sse_server(fixture).await;
+    let mut client = OpenAiCompatClient::new(base_url, "m".into(), "k".into(), None, None, None);
+    let request = ModelRequest {
+        model: "m".into(),
+        messages: vec![ChatMessage::User("hi".into())],
+        tools: Vec::new(),
+        max_output_tokens: None,
+        reasoning: None,
+        context_window: None,
+    };
+    let (tx, _rx) = mpsc::channel(16);
+    let error = client
+        .stream(request, tx, CancellationToken::new())
+        .await
+        .expect_err("稀疏 tool index 必须被拒绝");
+    assert!(matches!(error, ProviderError::Protocol(_)), "{error:?}");
+}
+
+#[tokio::test]
+async fn tool_call_without_provider_id_is_protocol_error() {
+    let fixture = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    let (base_url, _body_handle) = mock_sse_server(fixture).await;
+    let mut client = OpenAiCompatClient::new(base_url, "m".into(), "k".into(), None, None, None);
+    let request = ModelRequest {
+        model: "m".into(),
+        messages: vec![ChatMessage::User("hi".into())],
+        tools: Vec::new(),
+        max_output_tokens: None,
+        reasoning: None,
+        context_window: None,
+    };
+    let (tx, _rx) = mpsc::channel(16);
+    let error = client
+        .stream(request, tx, CancellationToken::new())
+        .await
+        .expect_err("缺少 provider id 必须被拒绝");
+    assert!(matches!(error, ProviderError::Protocol(_)), "{error:?}");
+}
+
 /// §30 第 12 条：malformed streamed JSON args → 明确 protocol error（不猜补 JSON）。
 #[tokio::test]
 async fn malformed_streamed_arguments_is_protocol_error() {

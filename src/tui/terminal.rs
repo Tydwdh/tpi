@@ -31,8 +31,13 @@ impl ViewMode {
 
 /// inline 模式的活动区高度（约 2/5 屏，随终端行数自适应；§16.1 保留）。
 fn inline_activity_height(rows: u16) -> u16 {
-    let proportional = (rows * 2) / 5;
-    proportional.clamp(12, rows.saturating_sub(12).max(12))
+    if rows < 12 {
+        return rows.max(1);
+    }
+    let proportional = ((u32::from(rows) * 2) / 5) as u16;
+    proportional
+        .clamp(12, rows.saturating_sub(12).max(12))
+        .min(rows)
 }
 
 /// 终端生命周期唯一所有者：初始化/重绘/恢复全在这里（§29）。
@@ -143,20 +148,35 @@ impl TerminalDriver {
     /// 逆序恢复终端（§30）：show_cursor → DisableMouseCapture →
     /// DisableBracketedPaste → LeaveAlternateScreen → disable_raw_mode。
     pub fn restore(&mut self) -> std::io::Result<()> {
-        self.terminal.show_cursor()?;
-        let _ = execute!(
+        let mut first_error = self.terminal.show_cursor().err();
+        if let Err(error) = execute!(
             std::io::stdout(),
             DisableMouseCapture,
             DisableBracketedPaste,
-        );
-        if self.mode == ViewMode::Fullscreen {
-            let _ = execute!(
+        ) && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if self.mode == ViewMode::Fullscreen
+            && let Err(error) = execute!(
                 std::io::stdout(),
                 ratatui::crossterm::terminal::LeaveAlternateScreen
-            );
+            )
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
-        self.terminal.flush()?;
-        ratatui::crossterm::terminal::disable_raw_mode()
+        if let Err(error) = self.terminal.flush()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Err(error) = ratatui::crossterm::terminal::disable_raw_mode()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// 尽力恢复全局终端状态（不依赖实例；panic hook 与初始化失败路径用）。

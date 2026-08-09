@@ -146,6 +146,7 @@ fn crash_after_write_ahead_before_effect_is_not_applied() {
                 tool: "edit".into(),
                 target_path: target.to_string(),
                 expected_revision: expected.clone(),
+                candidate_revision: None,
                 temp_path: workspace.join(".tpi-edit-xxx.tmp").to_string(),
                 backup_path: None,
             }),
@@ -210,6 +211,7 @@ fn crash_after_effect_before_completed_is_committed() {
                 tool: "edit".into(),
                 target_path: target.to_string(),
                 expected_revision: expected,
+                candidate_revision: None,
                 temp_path: workspace.join(".tpi-edit-yyy.tmp").to_string(),
                 backup_path: Some(backup_path.to_string()),
             }),
@@ -271,7 +273,7 @@ fn crash_then_resume_appends_with_monotonic_seq() {
             content: "继续".into(),
         })
         .unwrap();
-    assert_eq!(seq, 5, "追加事件 seq 必须接续（4 条已有 + 1）");
+    assert_eq!(seq, 4, "追加事件 seq 必须紧接最后一条持久化事件");
 
     // 完整 resume 序列：User, Assistant(tool_calls), Tool(interrupted), User（追加后）。
     assert_eq!(history.len(), 3);

@@ -8,7 +8,7 @@
 //! - 不打开浏览器、不自动 fetch 全部结果、不调用 summary model。
 //! - DDG 可能对异常流量返回人机验证页：此时明确报错，不静默降级。
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use futures_util::StreamExt;
 use reqwest::Url;
@@ -85,23 +85,6 @@ impl TargetPolicy {
     }
 }
 
-fn web_fetch_client(policy: TargetPolicy) -> reqwest::Client {
-    let mut builder =
-        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            // P0-10：redirect 逐跳校验（此前 Policy::limited 自动跟随，
-            // 私有/loopback 目标直接可达）。
-            if let Err(error) = validate_url(attempt.url().clone(), policy) {
-                attempt.error(format!("blocked redirect target: {error}"))
-            } else {
-                attempt.follow()
-            }
-        }));
-    if policy.allows_private() {
-        builder = builder.no_proxy();
-    }
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
-}
-
 /// 校验 fetch 目标 URL（§17：仅 HTTP(S)，拒绝 loopback/私网/链路本地）。
 pub fn validate_fetch_url(url_str: &str) -> Result<Url, String> {
     let url = Url::parse(url_str.trim()).map_err(|error| format!("invalid url: {error}"))?;
@@ -114,6 +97,9 @@ fn validate_url(url: Url, policy: TargetPolicy) -> Result<Url, String> {
         return Err(format!("unsupported scheme: {scheme}"));
     }
     let host = url.host_str().ok_or_else(|| "missing host".to_string())?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("credentials in url are not allowed".to_string());
+    }
     if !policy.allows_private() && is_blocked_host(host) {
         return Err(format!("blocked host: {host}"));
     }
@@ -139,12 +125,21 @@ fn is_blocked_host(host: &str) -> bool {
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.octets()[0] == 0
+            let [a, b, c, _] = v4.octets();
+            a == 0
+                || a == 10
+                || a == 127
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 192 && b == 168)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 224
         }
         IpAddr::V6(v6) => {
             // P0-10：IPv4-mapped IPv6（::ffff:a.b.c.d）按映射的 v4 判定——
@@ -165,18 +160,113 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
             if (segments[0] & 0xfe00) == 0xfc00 {
                 return true;
             }
+            // multicast ff00::/8、文档 2001:db8::/32、discard-only 100::/64、
+            // benchmarking 2001:2::/48 都不是公开 Web 目标。
+            if (segments[0] & 0xff00) == 0xff00
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || (segments[0] == 0x0100
+                    && segments[1] == 0
+                    && segments[2] == 0
+                    && segments[3] == 0)
+                || (segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0)
+            {
+                return true;
+            }
             false
         }
     }
 }
 
+/// 为单次请求解析并固定 DNS 结果。客户端禁用代理和自动重定向，确保安全检查的
+/// 地址就是实际连接的地址；每个重定向目标都会重新执行本流程。
+async fn send_fetch_hop(url: &Url, policy: TargetPolicy) -> Result<reqwest::Response, String> {
+    validate_url(url.clone(), policy)?;
+    let host = url.host_str().ok_or_else(|| "missing host".to_string())?;
+    let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "missing port".to_string())?;
+
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    if bare_host.parse::<IpAddr>().is_err() {
+        let addresses: Vec<SocketAddr> = tokio::net::lookup_host((bare_host, port))
+            .await
+            .map_err(|error| format!("dns_failed: {error}"))?
+            .collect();
+        if addresses.is_empty() {
+            return Err("dns_failed: no addresses returned".to_string());
+        }
+        if !policy.allows_private()
+            && let Some(blocked) = addresses.iter().find(|addr| is_blocked_ip(addr.ip()))
+        {
+            return Err(format!(
+                "ssrf_blocked: domain {host} resolved to blocked address {}",
+                blocked.ip()
+            ));
+        }
+        builder = builder.resolve_to_addrs(bare_host, &addresses);
+    }
+
+    let client = builder
+        .build()
+        .map_err(|error| format!("client_build_failed: {error}"))?;
+    client
+        .get(url.clone())
+        .timeout(FETCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| format!("request_failed: {error}"))
+}
+
+async fn fetch_following_safe_redirects(
+    initial_url: Url,
+    policy: TargetPolicy,
+    ctx: &ToolContext,
+) -> Result<(Url, reqwest::Response), String> {
+    const MAX_REDIRECTS: usize = 5;
+    let mut current = initial_url;
+    for redirect_count in 0..=MAX_REDIRECTS {
+        let response = tokio::select! {
+            _ = ctx.cancel.cancelled() => return Err("cancelled".to_string()),
+            response = send_fetch_hop(&current, policy) => response?,
+        };
+        if !response.status().is_redirection() {
+            return Ok((current, response));
+        }
+        if redirect_count == MAX_REDIRECTS {
+            return Err(format!("too_many_redirects: exceeded {MAX_REDIRECTS}"));
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| "invalid_redirect: missing Location header".to_string())?
+            .to_str()
+            .map_err(|_| "invalid_redirect: Location is not valid text".to_string())?;
+        let next = current
+            .join(location)
+            .map_err(|error| format!("invalid_redirect: {error}"))?;
+        current = validate_url(next, policy)?;
+    }
+    unreachable!("bounded redirect loop always returns")
+}
+
 async fn read_bounded_bytes(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(format!("body_too_large: exceeded {limit} bytes"));
+    }
     let mut stream = response.bytes_stream();
     let mut total = 0usize;
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| format!("read_failed: {error}"))?;
-        total += chunk.len();
+        total = total
+            .checked_add(chunk.len())
+            .ok_or_else(|| "body_too_large: size overflow".to_string())?;
         if total > limit {
             return Err(format!("body_too_large: exceeded {limit} bytes"));
         }
@@ -196,6 +286,9 @@ async fn read_bounded_bytes(response: reqwest::Response, limit: usize) -> Result
 /// （本机实测 DDG/Bing 可能同时返回人机验证页，Yahoo 通常可用）。
 /// 全部引擎都失败时给出汇总错误，不产生乱码输出。
 pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
+    if let Err(error) = validate_search_args(&args) {
+        return failed_web_outcome("web_search", "invalid_arguments", error);
+    }
     let count = args.count.clamp(1, 20);
     let query = build_search_query(&args);
     let freshness = args.freshness.as_deref();
@@ -204,7 +297,11 @@ pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
     if ctx.cancel.is_cancelled() {
         return cancelled_outcome("web_search");
     }
-    match search_ddg(&query, freshness).await {
+    let ddg = tokio::select! {
+        _ = ctx.cancel.cancelled() => return cancelled_outcome("web_search"),
+        result = search_ddg(&query, freshness) => result,
+    };
+    match ddg {
         Ok(hits) => {
             if ctx.cancel.is_cancelled() {
                 cancelled_outcome("web_search")
@@ -217,7 +314,11 @@ pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
             if ctx.cancel.is_cancelled() {
                 return cancelled_outcome("web_search");
             }
-            match search_bing(&query, freshness).await {
+            let bing = tokio::select! {
+                _ = ctx.cancel.cancelled() => return cancelled_outcome("web_search"),
+                result = search_bing(&query, freshness) => result,
+            };
+            match bing {
                 Ok(hits) => {
                     if ctx.cancel.is_cancelled() {
                         cancelled_outcome("web_search")
@@ -230,7 +331,11 @@ pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
                     if ctx.cancel.is_cancelled() {
                         return cancelled_outcome("web_search");
                     }
-                    match search_yahoo(&query, freshness).await {
+                    let yahoo = tokio::select! {
+                        _ = ctx.cancel.cancelled() => return cancelled_outcome("web_search"),
+                        result = search_yahoo(&query, freshness) => result,
+                    };
+                    match yahoo {
                         Ok(hits) => {
                             if ctx.cancel.is_cancelled() {
                                 cancelled_outcome("web_search")
@@ -259,6 +364,21 @@ pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
     }
 }
 
+fn failed_web_outcome(tool: &str, code: &str, detail: impl std::fmt::Display) -> ToolOutcome {
+    ToolOutcome::failed(
+        tool,
+        ModelPayload {
+            status: ToolStatus::Failed,
+            program: None,
+            exit_code: None,
+            duration_ms: 0,
+            output: format!("status: failed\ntool: {tool}\nerror: {code}\n\n{detail}"),
+            effect: None,
+            artifact: None,
+        },
+    )
+}
+
 /// 取消的 web 工具结果（§PointerHit：Esc 后及时返回 Cancelled 而非继续等待）。
 fn cancelled_outcome(tool: &str) -> ToolOutcome {
     ToolOutcome::failed(
@@ -280,12 +400,52 @@ error: cancelled
     )
 }
 
+fn validate_search_args(args: &WebSearchArgs) -> Result<(), String> {
+    let query = args.query.trim();
+    if query.is_empty() {
+        return Err("query must not be empty".to_string());
+    }
+    if query.len() > 4096 {
+        return Err("query exceeds 4096 bytes".to_string());
+    }
+    if let Some(freshness) = args.freshness.as_deref()
+        && ddg_freshness(freshness).is_none()
+    {
+        return Err(format!("unsupported freshness: {freshness}"));
+    }
+    if let Some(domains) = &args.domains {
+        if domains.len() > 20 {
+            return Err("at most 20 domains are allowed".to_string());
+        }
+        for domain in domains {
+            let domain = domain.trim().trim_end_matches('.');
+            if domain.is_empty()
+                || domain.len() > 253
+                || domain.starts_with('-')
+                || domain.ends_with('-')
+                || domain.split('.').any(|label| {
+                    label.is_empty()
+                        || label.len() > 63
+                        || label.starts_with('-')
+                        || label.ends_with('-')
+                        || !label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+            {
+                return Err(format!("invalid domain filter: {domain}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 拼接查询（原始 query + site: 域过滤）。
 fn build_search_query(args: &WebSearchArgs) -> String {
-    let mut query = args.query.clone();
+    let mut query = args.query.trim().to_string();
     if let Some(domains) = &args.domains {
         for domain in domains {
-            query.push_str(&format!(" site:{domain}"));
+            query.push_str(&format!(" site:{}", domain.trim().trim_end_matches('.')));
         }
     }
     query
@@ -293,26 +453,42 @@ fn build_search_query(args: &WebSearchArgs) -> String {
 
 /// 成功输出（DDG/Bing 结果格式一致）。
 fn search_succeeded(args: &WebSearchArgs, hits: Vec<DdgHit>, count: u32) -> ToolOutcome {
+    let hits: Vec<DdgHit> = hits
+        .into_iter()
+        .filter(|hit| {
+            Url::parse(&hit.url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+        })
+        .take(count as usize)
+        .collect();
     let mut output = String::from("status: succeeded\ntool: web_search\n");
     output.push_str(&format!(
         "query: {}\nresults: {}\n\n",
         args.query,
-        hits.len().min(count as usize)
+        hits.len()
     ));
-    for (index, hit) in hits.iter().take(count as usize).enumerate() {
-        output.push_str(&format!(
+    for (index, hit) in hits.iter().enumerate() {
+        let item = format!(
             "{}. {}\n   url: {}\n   snippet: {}\n\n",
             index + 1,
-            hit.title,
-            hit.url,
-            hit.snippet,
-        ));
+            truncate_chars(&hit.title, 200),
+            truncate_chars(&hit.url, 2048),
+            truncate_chars(&hit.snippet, 500),
+        );
+        if output.len().saturating_add(item.len()) > FETCH_BODY_BUDGET {
+            output.push_str("truncated: true (output budget reached)\n");
+            break;
+        }
+        output.push_str(&item);
     }
     ToolOutcome::succeeded("web_search", output).with_metadata(ToolMetadata {
         tool: "web_search".into(),
         target: Some(args.query.clone()),
         ..Default::default()
     })
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 /// 通用 HTML GET：浏览器 UA + timeout + 有界读取 + HTTP 状态检查。
@@ -857,87 +1033,23 @@ async fn web_fetch_with_policy(
         }
     };
 
-    let client = web_fetch_client(policy);
-
-    // P0-10：DNS 预解析——域名解析出的任何地址命中私有/loopback 都拒绝。
-    // 字面 IP 已在 validate_fetch_url 校验；这里防“域名解析到私有地址”的
-    // SSRF 绕过（DNS rebinding 需要连接后二次验证，不在本次范围，§17 注释）。
-    if !policy.allows_private()
-        && let Some(host) = url.host_str()
-        // 字面 IP（含带括号的 IPv6）已由 validate_fetch_url 校验。
-        && host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_err()
-    {
-        let port = url.port_or_known_default().unwrap_or(80);
-        if let Ok(addresses) = tokio::net::lookup_host((host, port)).await {
-            let blocked = addresses
-                .map(|addr| addr.ip())
-                .find(|ip| is_blocked_ip(*ip));
-            if let Some(ip) = blocked {
-                return ToolOutcome::failed(
-                    "web_fetch",
-                    ModelPayload {
-                        status: ToolStatus::Failed,
-                        program: None,
-                        exit_code: None,
-                        duration_ms: 0,
-                        output: format!(
-                            "status: failed\ntool: web_fetch\nerror: ssrf_blocked\n\n域名 {host} 解析到被拦截地址 {ip}"
-                        ),
-                        effect: None,
-                        artifact: None,
-                    },
-                );
-            }
-        }
-        // 解析失败（NXDOMAIN 等）由请求阶段报错，不在此拦截。
-    }
-
-    let send_request = client.get(&args.url).timeout(FETCH_TIMEOUT).send();
-    tokio::pin!(send_request);
-    let response = tokio::select! {
-        // §PointerHit 4：取消（Esc）时及时返回 Cancelled，不等到 15s 超时。
-        _ = ctx.cancel.cancelled() => {
-            return cancelled_outcome("web_fetch");
-        }
-        result = &mut send_request => match result {
-            Ok(response) => response,
-            Err(error) => {
-                return ToolOutcome::failed(
-                    "web_fetch",
-                    ModelPayload {
-                        status: ToolStatus::Failed,
-                        program: None,
-                        exit_code: None,
-                        duration_ms: 0,
-                        output: format!(
-                            "status: failed\ntool: web_fetch\nerror: request_failed\n\n{error}"
-                        ),
-                        effect: None,
-                        artifact: None,
-                    },
-                );
-            }
+    let (final_url, response) = match fetch_following_safe_redirects(url, policy, ctx).await {
+        Ok(result) => result,
+        Err(error) if error == "cancelled" => return cancelled_outcome("web_fetch"),
+        Err(error) => {
+            let code = if error.contains("blocked") {
+                "ssrf_blocked"
+            } else if error.starts_with("too_many_redirects")
+                || error.starts_with("invalid_redirect")
+            {
+                "redirect_failed"
+            } else {
+                "request_failed"
+            };
+            return failed_web_outcome("web_fetch", code, error);
         }
     };
-
-    if let Err(error) = validate_url(response.url().clone(), policy) {
-        return ToolOutcome::failed(
-            "web_fetch",
-            ModelPayload {
-                status: ToolStatus::Failed,
-                program: None,
-                exit_code: None,
-                duration_ms: 0,
-                output: format!(
-                    "status: failed\ntool: web_fetch\nerror: ssrf_blocked\n\nredirect blocked: {error}"
-                ),
-                effect: None,
-                artifact: None,
-            },
-        );
-    }
-
-    let final_url = response.url().to_string();
+    let final_url = final_url.to_string();
     let status = response.status();
     let content_type = response
         .headers()
@@ -946,7 +1058,11 @@ async fn web_fetch_with_policy(
         .unwrap_or("")
         .to_string();
 
-    let bytes = match read_bounded_bytes(response, FETCH_RAW_LIMIT).await {
+    let read_result = tokio::select! {
+        _ = ctx.cancel.cancelled() => return cancelled_outcome("web_fetch"),
+        result = read_bounded_bytes(response, FETCH_RAW_LIMIT) => result,
+    };
+    let bytes = match read_result {
         Ok(bytes) => bytes,
         Err(error) if error.starts_with("body_too_large") => {
             return ToolOutcome::failed(
@@ -982,33 +1098,55 @@ async fn web_fetch_with_policy(
         }
     };
 
-    let text = convert_response_body(&bytes, &content_type);
+    let text = match convert_response_body(&bytes, &content_type) {
+        Ok(text) => text,
+        Err(error) => return failed_web_outcome("web_fetch", "html_convert_failed", error),
+    };
 
     // 有界正文（§8.4：48 KiB；BUG-002：UTF-8 安全截断，不 panic）。
     let (body, truncated) = bounded_body(&text);
 
     // artifact 记录完整正文。
-    let mut artifact = None;
-    if let Ok(mut writer) = crate::session::artifact::ArtifactWriter::create(
+    let artifact_mime = if content_type.contains("html") || looks_like_html(&bytes) {
+        "text/plain"
+    } else if content_type.is_empty() {
+        "application/octet-stream"
+    } else {
+        &content_type
+    };
+    let mut writer = match crate::session::artifact::ArtifactWriter::create(
         &ctx.artifacts_root,
         &ctx.session_id,
         "web_fetch",
-        if content_type.contains("html") || looks_like_html(&bytes) {
-            "text/plain"
-        } else {
-            &content_type
-        },
-    ) && writer.write("body", text.as_bytes()).is_ok()
-        && let Ok(record) = writer.finish()
-    {
-        artifact = Some(ArtifactRef {
-            session: ctx.session_id.clone(),
-            id: record.id,
-        });
+        artifact_mime,
+    ) {
+        Ok(writer) => writer,
+        Err(error) => return failed_web_outcome("web_fetch", "artifact_create_failed", error),
+    };
+    if let Err(error) = writer.write("body", text.as_bytes()) {
+        return failed_web_outcome("web_fetch", "artifact_write_failed", error);
     }
+    let record = match writer.finish() {
+        Ok(record) => record,
+        Err(error) => return failed_web_outcome("web_fetch", "artifact_finalize_failed", error),
+    };
+    let artifact = ArtifactRef {
+        session: ctx.session_id.clone(),
+        id: record.id,
+    };
 
+    let outcome_status = if status.is_success() {
+        "succeeded"
+    } else {
+        "failed"
+    };
+    let http_error = if status.is_success() {
+        String::new()
+    } else {
+        "error: http_status\n".to_string()
+    };
     let output = format!(
-        "status: succeeded\ntool: web_fetch\nurl: {final_url}\nhttp: {status}\ncontent_type: {}\ntitle: {}{}\n\n{}",
+        "status: {outcome_status}\ntool: web_fetch\n{http_error}url: {final_url}\nhttp: {status}\ncontent_type: {}\ntitle: {}{}\n\n{}",
         content_type,
         extract_title(&body),
         if truncated {
@@ -1021,16 +1159,29 @@ async fn web_fetch_with_policy(
         },
         body,
     );
-    let mut outcome = ToolOutcome::succeeded("web_fetch", output);
+    let mut outcome = if status.is_success() {
+        ToolOutcome::succeeded("web_fetch", output)
+    } else {
+        ToolOutcome::failed(
+            "web_fetch",
+            ModelPayload {
+                status: ToolStatus::Failed,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output,
+                effect: None,
+                artifact: None,
+            },
+        )
+    };
     // §8.4：artifact 引用进结构化字段与模型可见文本（完整正文的唯一读取入口）。
-    if let Some(reference) = &artifact {
-        outcome.model_payload.artifact = Some(reference.clone());
-        outcome
-            .model_payload
-            .output
-            .push_str(&format!("\nartifact: {reference}"));
-    }
-    outcome.artifacts = artifact.into_iter().collect();
+    outcome.model_payload.artifact = Some(artifact.clone());
+    outcome
+        .model_payload
+        .output
+        .push_str(&format!("\nartifact: {artifact}"));
+    outcome.artifacts = vec![artifact];
     outcome.session_metadata = ToolMetadata {
         tool: "web_fetch".into(),
         target: Some(args.url),
@@ -1039,14 +1190,12 @@ async fn web_fetch_with_policy(
     outcome
 }
 
-pub fn convert_response_body(bytes: &[u8], content_type: &str) -> String {
+pub fn convert_response_body(bytes: &[u8], content_type: &str) -> Result<String, String> {
     let is_html = content_type.contains("html") || looks_like_html(bytes);
     if is_html {
-        html2text::from_read(bytes, usize::MAX).unwrap_or_else(|error| {
-            format!("status: failed\ntool: web_fetch\nerror: html_convert_failed\n\n{error}")
-        })
+        html2text::from_read(bytes, 120).map_err(|error| error.to_string())
     } else {
-        String::from_utf8_lossy(bytes).to_string()
+        Ok(String::from_utf8_lossy(bytes).to_string())
     }
 }
 
@@ -1094,6 +1243,33 @@ mod tests {
     fn blocks_private_network_urls() {
         assert!(validate_fetch_url("http://192.168.1.1/").is_err());
         assert!(validate_fetch_url("http://10.0.0.5/").is_err());
+        assert!(validate_fetch_url("http://100.64.0.1/").is_err());
+        assert!(validate_fetch_url("http://192.0.2.1/").is_err());
+        assert!(validate_fetch_url("http://224.0.0.1/").is_err());
+        assert!(validate_fetch_url("http://[2001:db8::1]/").is_err());
+        assert!(validate_fetch_url("http://[ff02::1]/").is_err());
+    }
+
+    #[test]
+    fn rejects_credentials_in_fetch_urls() {
+        assert!(validate_fetch_url("https://user:secret@example.com/").is_err());
+    }
+
+    #[test]
+    fn validates_search_arguments() {
+        let valid = WebSearchArgs {
+            query: "rust".into(),
+            count: 5,
+            freshness: Some("pd_1w".into()),
+            domains: Some(vec!["rust-lang.org".into()]),
+        };
+        assert!(validate_search_args(&valid).is_ok());
+        let mut invalid = valid.clone();
+        invalid.freshness = Some("yesterday".into());
+        assert!(validate_search_args(&invalid).is_err());
+        invalid = valid;
+        invalid.domains = Some(vec!["example.com site:attacker.test".into()]);
+        assert!(validate_search_args(&invalid).is_err());
     }
 
     /// P0-10：IPv4-mapped IPv6（`::ffff:a.b.c.d`）必须按映射的 v4 地址判定——
@@ -1142,7 +1318,7 @@ mod tests {
     #[test]
     fn converts_html_body() {
         let html = b"<html><body><h1>Hello</h1></body></html>";
-        let text = convert_response_body(html, "text/html");
+        let text = convert_response_body(html, "text/html").unwrap();
         assert!(text.contains("Hello"));
     }
 

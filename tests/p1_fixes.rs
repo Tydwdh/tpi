@@ -6,7 +6,7 @@
 mod fixtures;
 
 use camino::Utf8PathBuf;
-use fixtures::fake_provider::{FakeProvider, FakeResponse};
+use fixtures::fake_provider::{FakeProvider, FakeResponse, tool_call};
 use fixtures::test_config;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -257,8 +257,9 @@ async fn p1_10_manual_compaction_runs_at_next_boundary() {
             FakeResponse::text(
                 "Goal: g\nConstraints: c\nDecisions: d\nCompleted: e\nIn progress: f\nNext exact action: g\nRelevant files and revisions: h\nVerification status: i\nFailed attempts and why: j",
             )
+            .with_usage(7, 11)
         } else {
-            FakeResponse::text("done")
+            FakeResponse::text("done").with_usage(3, 5)
         }
     }));
     let mut session = SessionLog::create(
@@ -297,6 +298,8 @@ async fn p1_10_manual_compaction_runs_at_next_boundary() {
 
     drain.abort();
     assert_eq!(outcome.reason, CompletionReason::Stop);
+    assert_eq!(outcome.usage.input_tokens, 10);
+    assert_eq!(outcome.usage.output_tokens, 16);
     let events = tpi::session::read_events(session.path()).unwrap();
     assert!(
         events
@@ -563,7 +566,15 @@ async fn text_only_interrupt_auto_continues_and_merges() {
     )
     .expect("create session");
     let (tx, mut rx) = mpsc::channel(16);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let request_ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_ids = request_ids.clone();
+    let drain = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let agent::RuntimeEvent::AssistantDelta { request_id, .. } = event {
+                captured_ids.lock().unwrap().push(request_id);
+            }
+        }
+    });
 
     let outcome = agent::run(
         &mut provider,
@@ -581,7 +592,7 @@ async fn text_only_interrupt_auto_continues_and_merges() {
     .await
     .expect("自动续写后 run 必须正常结束");
 
-    drain.abort();
+    drain.await.unwrap();
     assert_eq!(outcome.reason, CompletionReason::Stop);
     assert!(
         outcome.assistant_text.contains("write...")
@@ -604,6 +615,130 @@ async fn text_only_interrupt_auto_continues_and_merges() {
         committed.as_deref(),
         Some("问题在 src/tool/files.rs 的 write...因为 target_exists 分支"),
         "session 必须提交合并后的完整 assistant turn"
+    );
+    let request_ids = request_ids.lock().unwrap();
+    assert_eq!(request_ids.len(), 2);
+    assert_eq!(
+        request_ids[0], request_ids[1],
+        "同一逻辑 turn 的自动续写必须沿用 request_id"
+    );
+}
+
+struct ProtocolAfterDeltaProvider {
+    calls: usize,
+}
+
+impl Provider for ProtocolAfterDeltaProvider {
+    fn model_name(&self) -> &str {
+        "protocol-after-delta"
+    }
+
+    async fn stream(
+        &mut self,
+        _request: ModelRequest,
+        events: mpsc::Sender<ProviderEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderResponse, ProviderError> {
+        self.calls += 1;
+        events
+            .send(ProviderEvent::TextDelta("partial".into()))
+            .await
+            .map_err(|_| ProviderError::Protocol("closed".into()))?;
+        Err(ProviderError::Protocol("malformed SSE payload".into()))
+    }
+}
+
+#[tokio::test]
+async fn protocol_error_after_delta_is_recorded_without_automatic_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = ProtocolAfterDeltaProvider { calls: 0 };
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .unwrap();
+    let (tx, _rx) = mpsc::channel(16);
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "hello".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.reason, CompletionReason::ProviderInterrupted);
+    assert_eq!(provider.calls, 1, "协议错误不得按连接中断自动续写");
+    let events = tpi::session::read_events(session.path()).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::AssistantAttemptInterrupted {
+            cause: tpi::session::InterruptCause::Protocol,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn distinct_model_turns_use_distinct_request_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    std::fs::write(workspace.join("probe.txt"), "ok").unwrap();
+    let config = test_config(&workspace);
+    let mut provider = FakeProvider::new(vec![
+        FakeResponse::with_tool_calls(vec![tool_call(
+            "read",
+            serde_json::json!({"path": "probe.txt"}),
+        )])
+        .with_text("first"),
+        FakeResponse::text("second"),
+    ]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(64);
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "read it".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.reason, CompletionReason::Stop);
+
+    let mut request_ids = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let agent::RuntimeEvent::AssistantDelta { request_id, .. } = event {
+            request_ids.push(request_id);
+        }
+    }
+    assert_eq!(request_ids.len(), 2);
+    assert_ne!(
+        request_ids[0], request_ids[1],
+        "工具结果后的下一逻辑 model turn 必须分配新 request_id"
     );
 }
 

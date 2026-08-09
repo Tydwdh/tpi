@@ -35,6 +35,8 @@ pub struct Plan {
 
 /// 计划上限（§13：最多 7 项）。
 pub const MAX_PLAN_ITEMS: usize = 7;
+pub const MAX_PLAN_ITEM_BYTES: usize = 500;
+pub const MAX_PLAN_EXPLANATION_BYTES: usize = 2_000;
 
 /// update_plan 参数（§13：每次提交完整计划）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
@@ -49,6 +51,8 @@ pub enum PlanError {
     TooManyItems { count: usize },
     DuplicateItems { text: String },
     EmptyItem,
+    ItemTooLong { bytes: usize },
+    ExplanationTooLong { bytes: usize },
 }
 
 impl std::fmt::Display for PlanError {
@@ -59,6 +63,14 @@ impl std::fmt::Display for PlanError {
             }
             PlanError::DuplicateItems { text } => write!(f, "plan 项重复: {text:?}"),
             PlanError::EmptyItem => write!(f, "plan 项不能为空"),
+            PlanError::ItemTooLong { bytes } => write!(
+                f,
+                "plan 项最多 {MAX_PLAN_ITEM_BYTES} 字节（收到 {bytes} 字节）"
+            ),
+            PlanError::ExplanationTooLong { bytes } => write!(
+                f,
+                "plan explanation 最多 {MAX_PLAN_EXPLANATION_BYTES} 字节（收到 {bytes} 字节）"
+            ),
         }
     }
 }
@@ -69,11 +81,27 @@ impl std::fmt::Display for PlanError {
 /// 重新提交的旧项保持旧状态；新项为 InProgress 候选；
 /// 唯一 InProgress 取第一个非 Completed 项；空 items 清空计划。
 pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan, PlanError> {
+    let explanation = args
+        .explanation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(explanation) = &explanation
+        && explanation.len() > MAX_PLAN_EXPLANATION_BYTES
+    {
+        return Err(PlanError::ExplanationTooLong {
+            bytes: explanation.len(),
+        });
+    }
     let mut texts: Vec<String> = Vec::with_capacity(args.items.len());
     for raw in &args.items {
         let text = raw.trim().to_string();
         if text.is_empty() {
             return Err(PlanError::EmptyItem);
+        }
+        if text.len() > MAX_PLAN_ITEM_BYTES {
+            return Err(PlanError::ItemTooLong { bytes: text.len() });
         }
         if texts.contains(&text) {
             return Err(PlanError::DuplicateItems { text });
@@ -86,7 +114,7 @@ pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan
     // 空提交：清空计划（Completed 也不保留）。
     if texts.is_empty() {
         return Ok(Plan {
-            explanation: args.explanation.clone(),
+            explanation,
             items: Vec::new(),
         });
     }
@@ -135,10 +163,7 @@ pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan
         return Err(PlanError::TooManyItems { count: items.len() });
     }
 
-    Ok(Plan {
-        explanation: args.explanation.clone(),
-        items,
-    })
+    Ok(Plan { explanation, items })
 }
 
 /// 计划完成状态（§13：存在未完成项时必须且只能有一个 InProgress）。
@@ -159,6 +184,16 @@ pub fn validate_invariants(plan: &Plan) -> Result<(), PlanError> {
                 text: text.to_string(),
             });
         }
+        if text.len() > MAX_PLAN_ITEM_BYTES {
+            return Err(PlanError::ItemTooLong { bytes: text.len() });
+        }
+    }
+    if let Some(explanation) = plan.explanation.as_deref()
+        && explanation.len() > MAX_PLAN_EXPLANATION_BYTES
+    {
+        return Err(PlanError::ExplanationTooLong {
+            bytes: explanation.len(),
+        });
     }
     let has_unfinished = plan
         .items
@@ -186,8 +221,8 @@ pub fn update_plan(
     ctx: &crate::tool::ToolContext,
 ) -> crate::tool::outcome::ToolOutcome {
     use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
-    let previous = crate::util::lock_mutex(&ctx.current_plan, "current_plan").clone();
-    match build_plan(&args, previous.as_ref()) {
+    let mut current = crate::util::lock_mutex(&ctx.current_plan, "current_plan");
+    match build_plan(&args, current.as_ref()) {
         Ok(plan) => {
             if let Err(error) = validate_invariants(&plan) {
                 return ToolOutcome::failed(
@@ -214,7 +249,7 @@ pub fn update_plan(
                     plan_snapshot(Some(&plan))
                 )
             };
-            *crate::util::lock_mutex(&ctx.current_plan, "current_plan") = Some(plan);
+            *current = Some(plan);
             ToolOutcome::succeeded("update_plan", output)
         }
         Err(error) => ToolOutcome::failed(
@@ -320,5 +355,28 @@ mod tests {
         assert_eq!(next.items[1].status, PlanStatus::InProgress);
         assert_eq!(next.items[2].status, PlanStatus::Pending);
         validate_invariants(&next).unwrap();
+    }
+
+    #[test]
+    fn rejects_unbounded_plan_text() {
+        let error = build_plan(
+            &UpdatePlanArgs {
+                explanation: None,
+                items: vec!["x".repeat(MAX_PLAN_ITEM_BYTES + 1)],
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PlanError::ItemTooLong { .. }));
+
+        let error = build_plan(
+            &UpdatePlanArgs {
+                explanation: Some("x".repeat(MAX_PLAN_EXPLANATION_BYTES + 1)),
+                items: vec!["step".into()],
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PlanError::ExplanationTooLong { .. }));
     }
 }

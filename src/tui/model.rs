@@ -88,9 +88,15 @@ where
 pub const MAX_CARD_OUTPUT: usize = 32 * 1024;
 /// P1-9：assistant/reasoning 单条消息上限（工具卡输出另有 MAX_CARD_OUTPUT）。
 /// 超出丢弃中段并标记 truncated，防止 transcript 无限膨胀。
-pub const MAX_MESSAGE_CHARS: usize = 256 * 1024;
+pub const MAX_MESSAGE_CHARS: usize = 64 * 1024;
 /// 命令上限（overlay 展示用；正常命令远小于此）。
 pub const MAX_CARD_COMMAND: usize = 8 * 1024;
+pub const MAX_CARD_DIFF: usize = 64 * 1024;
+const MAX_TOOL_TARGET: usize = 4 * 1024;
+const MAX_TOOL_NAME: usize = 256;
+const MAX_MODAL_BODY: usize = 256 * 1024;
+const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SEARCH_QUERY: usize = 4 * 1024;
 
 /// 耗时格式化（Overlay 标题与 ToolCard metadata 共用）。
 pub fn fmt_duration(ms: u64) -> String {
@@ -171,14 +177,20 @@ pub struct ModalState {
     /// 正文（多行）。
     pub body: String,
     /// Modal 内滚动偏移（行）。
-    pub scroll: u16,
+    pub scroll: usize,
 }
 
 impl ModalState {
     pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
+        let title = title.into();
+        let body = body.into();
         Self {
-            title: title.into(),
-            body: body.into(),
+            title: crate::tui::text::truncate_middle_utf8(&title, 512, "…"),
+            body: crate::tui::text::truncate_middle_utf8(
+                &body,
+                MAX_MODAL_BODY,
+                "\n…[modal truncated]…\n",
+            ),
             scroll: 0,
         }
     }
@@ -196,7 +208,7 @@ pub struct OverlayState {
     /// 正文被截断。
     pub body_truncated: bool,
     /// Overlay 内滚动偏移（行）。
-    pub scroll: u16,
+    pub scroll: usize,
     /// 对应工具卡 id（P2：Alt+[/Alt+] 卡片间切换用；reasoning overlay 为 None）。
     pub tool_id: Option<String>,
 }
@@ -243,7 +255,7 @@ impl OverlayState {
         Self {
             title: "思考（reasoning）".into(),
             command: None,
-            body: text.to_string(),
+            body: bound_message(text),
             body_truncated: false,
             scroll: 0,
             tool_id: None,
@@ -531,7 +543,7 @@ impl ViewModel {
             id,
             line: TranscriptLine {
                 kind,
-                text: text.into(),
+                text: bound_message(&text.into()),
                 version,
             },
         });
@@ -578,20 +590,30 @@ impl ViewModel {
             return;
         };
         // P1-9：单条消息有界（超出丢弃中段并标记，防膨胀）。
-        if msg.text.len() < MAX_MESSAGE_CHARS {
+        if !msg.truncated && msg.text.len() < MAX_MESSAGE_CHARS {
             let room = MAX_MESSAGE_CHARS - msg.text.len();
             if text.len() <= room {
                 msg.text.push_str(text);
             } else {
-                // 截断到 UTF-8 字符边界，避免切出非法字节（§24 统一 helper）。
-                msg.text
-                    .push_str(&text[..crate::tui::text::floor_char_boundary(text, room)]);
-                msg.text.push_str("…[truncated]");
+                let marker = "…[truncated]";
+                let content_budget = MAX_MESSAGE_CHARS.saturating_sub(marker.len());
+                if msg.text.len() > content_budget {
+                    let keep = crate::tui::text::floor_char_boundary(&msg.text, content_budget);
+                    msg.text.truncate(keep);
+                }
+                let content_room = content_budget.saturating_sub(msg.text.len());
+                let keep =
+                    crate::tui::text::floor_char_boundary(text, content_room.min(text.len()));
+                msg.text.push_str(&text[..keep]);
+                msg.text.push_str(marker);
                 msg.truncated = true;
             }
-        } else if !msg.text.contains("truncated") {
-            // 已满后仍来内容：标记一次，后续静默丢弃。
-            msg.text.push_str("\n…[truncated]");
+        } else if !msg.truncated {
+            let marker = "…[truncated]";
+            let content_budget = MAX_MESSAGE_CHARS.saturating_sub(marker.len());
+            let keep = crate::tui::text::floor_char_boundary(&msg.text, content_budget);
+            msg.text.truncate(keep);
+            msg.text.push_str(marker);
             msg.truncated = true;
         }
         msg.version = version; // 文本变化 → 渲染缓存失效
@@ -641,9 +663,17 @@ impl ViewModel {
         let order = std::mem::take(&mut self.live.tool_order);
         for call_id in order {
             if let Some(tool) = self.live.tools.remove(&call_id) {
+                let mut card = tool.card;
+                if matches!(card.state, ToolCardState::Running) {
+                    card.state = ToolCardState::Done {
+                        status: ToolStatus::Interrupted,
+                        duration_ms: 0,
+                        exit_code: None,
+                    };
+                }
                 self.transcript.push(Entry::Tool {
                     id: tool.entry_id,
-                    card: tool.card,
+                    card,
                 });
                 self.note_new_content();
             }
@@ -674,7 +704,7 @@ impl ViewModel {
     /// 整改 C + TUI v2 §16：Locked 期间的新条目计数（footer 提示）。
     fn note_new_content(&mut self) {
         if self.scroll_mode != ScrollMode::Follow {
-            self.pending_below += 1;
+            self.pending_below = self.pending_below.saturating_add(1);
         }
         // 兼容投影：Locked 时保持非零（旧测试/旧渲染读 transcript_scroll）。
         self.transcript_scroll = if self.scroll_mode == ScrollMode::Follow {
@@ -738,7 +768,7 @@ impl ViewModel {
         let Some(search) = &mut self.search else {
             return;
         };
-        search.query = query.to_string();
+        search.query = crate::tui::text::truncate_middle_utf8(query, MAX_SEARCH_QUERY, "…");
         search.recompute(&self.transcript);
         if let Some(first) = search.hits.first().copied() {
             self.lock_to(first, 0);
@@ -844,7 +874,7 @@ impl ViewModel {
             let area = self.transcript_rows.max(1) as usize;
             let new_top = crate::tui::scroll::move_by_rows(&ids, &heights, top_row, delta as isize);
             let new_row = crate::tui::scroll::row_of(&ids, &heights, new_top.0, new_top.1);
-            if new_row + area >= total {
+            if new_row.saturating_add(area) >= total {
                 // 滚到最底部：回到 Follow（新内容自动跟随）。
                 // 此前保持 Locked 会让用户滚到底后新内容不再自动跟上，
                 // 反复滚动无视觉变化，表现为"滚动卡住"（§10 体验修复）。
@@ -888,14 +918,23 @@ impl ViewModel {
     ) {
         self.finalize_streaming();
         let call_id = id.into();
+        if self.live.tools.contains_key(&call_id) {
+            tracing::error!(%call_id, "duplicate live tool call id");
+            return;
+        }
         let entry_id = self.alloc_entry_id();
+        let name = crate::tui::text::truncate_middle_utf8(&name.into(), MAX_TOOL_NAME, "…");
+        let target = target
+            .map(|value| crate::tui::text::truncate_middle_utf8(&value, MAX_TOOL_TARGET, "…"));
+        let command = command
+            .map(|value| crate::tui::text::truncate_middle_utf8(&value, MAX_CARD_COMMAND, "…"));
         self.live.tools.insert(
             call_id.clone(),
             LiveTool {
                 entry_id,
                 card: ToolCard {
                     id: call_id.clone(),
-                    name: name.into(),
+                    name,
                     target,
                     command,
                     state: ToolCardState::Running,
@@ -920,11 +959,14 @@ impl ViewModel {
         };
         let card = &mut tool.card;
         let current = card.output.get_or_insert_with(String::new);
-        if current.len() + text.len() > MAX_CARD_OUTPUT {
+        if current.len().saturating_add(text.len()) > MAX_CARD_OUTPUT {
             card.output_truncated = true;
             // 丢弃旧内容超出部分（保留尾部：错误相关输出通常在末尾）。
             // §24：drain 起点必须落在字符边界，否则中文/emoji 输出会 panic。
-            let overflow = current.len() + text.len() - MAX_CARD_OUTPUT;
+            let overflow = current
+                .len()
+                .saturating_add(text.len())
+                .saturating_sub(MAX_CARD_OUTPUT);
             let drop = crate::tui::text::floor_char_boundary(current, overflow.min(current.len()));
             current.drain(..drop);
             // 单块超大时只保留其尾部（起点同样按字符边界对齐）。
@@ -1193,6 +1235,7 @@ impl ViewModel {
         diff: Option<String>,
     ) {
         let ToolIdentity { id, name } = identity.into();
+        let name = crate::tui::text::truncate_middle_utf8(&name, MAX_TOOL_NAME, "…");
         let tail = tail.into();
         if let Some(mut tool) = self.live.tools.remove(&id) {
             tool.card.name = name;
@@ -1202,7 +1245,7 @@ impl ViewModel {
                 exit_code,
             };
             // §用户诉求：edit/write 的 diff 独立保存（默认展开渲染）。
-            tool.card.diff = diff;
+            tool.card.diff = diff.map(|value| bound_diff(&value));
             // 完整输出始终保留（成功也可见，Alt+E/鼠标展开）；失败时折叠态显示 tail。
             if !tail.is_empty() {
                 tool.card.output = Some(bound_output(&tail));
@@ -1234,7 +1277,7 @@ impl ViewModel {
                     duration_ms,
                     exit_code,
                 };
-                card.diff = diff;
+                card.diff = diff.map(|value| bound_diff(&value));
                 if !tail.is_empty() {
                     card.output = Some(bound_output(&tail));
                     if tail.len() > MAX_CARD_OUTPUT {
@@ -1266,7 +1309,7 @@ impl ViewModel {
                 } else {
                     Some(bound_output(&tail))
                 },
-                diff,
+                diff: diff.map(|value| bound_diff(&value)),
                 output_truncated: tail.len() > MAX_CARD_OUTPUT,
                 expanded: false,
                 tail: if status == ToolStatus::Succeeded {
@@ -1276,16 +1319,32 @@ impl ViewModel {
                 },
             },
         });
+        self.note_new_content();
         self.trim_transcript();
     }
 
     /// 有界转录（防止长会话内存无限增长）。trim 不改变 EntryId（§4.1）；
     /// 锚点 entry 被 trim 后由布局侧回退到最早现存 entry（scroll.rs，§68）。
     fn trim_transcript(&mut self) {
-        if self.transcript.len() > 2000 {
-            let keep = self.transcript.len() - 2000;
+        let mut total_bytes = self.transcript.iter().fold(0usize, |total, entry| {
+            total.saturating_add(entry_memory_bytes(entry))
+        });
+        if self.transcript.len() > 2000 || total_bytes > MAX_TRANSCRIPT_BYTES {
+            let mut keep = self.transcript.len().saturating_sub(2000);
+            while keep < self.transcript.len() && total_bytes > MAX_TRANSCRIPT_BYTES {
+                total_bytes =
+                    total_bytes.saturating_sub(entry_memory_bytes(&self.transcript[keep]));
+                keep += 1;
+            }
             let removed: Vec<EntryId> = self.transcript[..keep].iter().map(Entry::id).collect();
             let removed_set: std::collections::HashSet<EntryId> = removed.iter().copied().collect();
+            let removed_tool_ids: std::collections::HashSet<String> = self.transcript[..keep]
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Tool { card, .. } => Some(card.id.clone()),
+                    _ => None,
+                })
+                .collect();
             self.transcript.drain(..keep);
             for id in &removed {
                 self.entry_heights.remove(id);
@@ -1307,10 +1366,18 @@ impl ViewModel {
                     anchor.row_in_entry = 0;
                 }
             }
+            if self
+                .layout_top
+                .is_some_and(|(entry_id, _)| removed_set.contains(&entry_id))
+            {
+                self.layout_top = self.transcript.first().map(|entry| (entry.id(), 0));
+            }
+            self.reasoning_expanded
+                .retain(|id| !removed_set.contains(id));
             if let Some(hit) = &mut self.active_hit {
                 let valid = match hit {
                     crate::tui::HitTarget::Reasoning(id) => !removed_set.contains(id),
-                    crate::tui::HitTarget::Tool(_) => true, // tool id 是字符串，非 EntryId
+                    crate::tui::HitTarget::Tool(id) => !removed_tool_ids.contains(id),
                 };
                 if !valid {
                     self.active_hit = None;
@@ -1327,9 +1394,11 @@ impl ViewModel {
 
     /// 累积一次 run 的 token 用量（§16.2：footer 展示）。
     pub fn add_usage(&mut self, usage: &Usage) {
-        self.input_tokens += usage.input_tokens;
-        self.output_tokens += usage.output_tokens;
-        self.cache_read_tokens += usage.cache_read_tokens;
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(usage.cache_read_tokens);
         // §16.2：配置单价后按输入/输出 token 累计花费（每百万 token 美元）。
         if let Some(pi) = self.price_input {
             self.cost_usd += (usage.input_tokens as f64 / 1_000_000.0) * pi;
@@ -1455,6 +1524,29 @@ fn bound_tail(tail: &str) -> String {
     let suffix: String = tail.chars().rev().take(MAX_CHARS).collect();
     out.extend(suffix.chars().rev());
     out
+}
+
+fn bound_message(text: &str) -> String {
+    crate::tui::text::truncate_middle_utf8(text, MAX_MESSAGE_CHARS, "\n…[message truncated]…\n")
+}
+
+fn bound_diff(diff: &str) -> String {
+    crate::tui::text::truncate_middle_utf8(diff, MAX_CARD_DIFF, "\n…[diff truncated]…\n")
+}
+
+fn entry_memory_bytes(entry: &Entry) -> usize {
+    match entry {
+        Entry::Message { line, .. } => line.text.len(),
+        Entry::Tool { card, .. } => card
+            .id
+            .len()
+            .saturating_add(card.name.len())
+            .saturating_add(card.target.as_ref().map_or(0, String::len))
+            .saturating_add(card.command.as_ref().map_or(0, String::len))
+            .saturating_add(card.output.as_ref().map_or(0, String::len))
+            .saturating_add(card.diff.as_ref().map_or(0, String::len))
+            .saturating_add(card.tail.as_ref().map_or(0, String::len)),
+    }
 }
 
 /// ③ Canonical Semantic Text：消息的「用户看到的纯文本」（markdown 渲染后

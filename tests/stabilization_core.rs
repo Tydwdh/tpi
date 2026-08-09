@@ -589,7 +589,7 @@ async fn replay_after_compaction_matches_runtime() {
     }
 }
 
-/// §21 场景 9：corrupt trailing line 不破坏 replay 等价。
+/// §21 场景 9：崩溃留下的未完成尾部不破坏 replay 等价。
 #[tokio::test]
 async fn replay_survives_corrupt_trailing_line() {
     let dir = tempfile::tempdir().unwrap();
@@ -605,11 +605,11 @@ async fn replay_survives_corrupt_trailing_line() {
             .append(true)
             .open(h.session.path())
             .unwrap();
-        writeln!(f, "{{not json at all").unwrap();
+        write!(f, "{{not json at all").unwrap();
     }
 
     let resumed = h.replay();
-    assert_eq!(runtime, resumed, "corrupt trailing line 必须被跳过");
+    assert_eq!(runtime, resumed, "未完成尾部必须被跳过");
     assert_eq!(resumed.len(), 2);
 }
 

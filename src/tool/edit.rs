@@ -8,7 +8,7 @@
 //! - M3：Windows 提交使用 `ReplaceFileW` + 同卷唯一 backup（§10.7）；
 //!   成功校验 backup digest，失败/校验不符进入可诊断恢复。
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,7 +31,8 @@ pub struct EditArgs {
 pub const REVISION_PREFIX: &str = "b3:";
 
 /// 读文件的大小上限（超过视为不可合理快照，返回类型化结果）。
-const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_REPLACEMENTS: usize = 256;
 
 /// 计算文件原始字节的 revision（§10.1）。
 pub fn revision_of(raw: &[u8]) -> String {
@@ -88,25 +89,74 @@ pub struct FileSnapshot {
     pub has_bom: bool,
     /// 替换编码使用的行尾（文件多数行尾；mixed 文件按 §10.5 策略）。
     pub line_ending: LineEnding,
-    /// 逻辑 byte 位置 → 原始 byte 位置的单调映射（len = logical len + 1）。
-    logical_to_raw: Vec<usize>,
+    /// 逻辑文本中由 CRLF 归一化而来的 `\n` 字节偏移。用稀疏偏移表代替
+    /// 每字节 `usize` 映射，避免大文件产生数百 MiB 的映射内存。
+    crlf_logical_offsets: Vec<usize>,
+}
+
+impl FileSnapshot {
+    fn raw_offset(&self, logical_offset: usize) -> usize {
+        let bom = usize::from(self.has_bom) * 3;
+        let removed_crs = self
+            .crlf_logical_offsets
+            .partition_point(|offset| *offset < logical_offset);
+        bom.saturating_add(logical_offset)
+            .saturating_add(removed_crs)
+    }
 }
 
 /// 解析文本文件为快照（§10.1：UTF-8 与 UTF-8 BOM；二进制返回类型化错误）。
 pub fn snapshot_file(path: &Utf8PathBuf) -> Result<FileSnapshot, EditError> {
-    let raw = match std::fs::read(path.as_std_path()) {
-        Ok(raw) => raw,
+    let raw = read_raw_file(path)?;
+    build_snapshot(path.clone(), raw)
+}
+
+/// 有界读取写/编辑目标。外部进程可在 freshness 校验前把文件替换为巨型文件，
+/// 因此每一次校验读取都必须独立执行同一上限，不能只依赖最初的 metadata。
+pub fn read_raw_file(path: &Utf8PathBuf) -> Result<Vec<u8>, EditError> {
+    read_raw_path(path.as_std_path(), path)
+}
+
+fn read_raw_path(path: &Path, error_path: &Utf8PathBuf) -> Result<Vec<u8>, EditError> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(EditError::NotFound { path: path.clone() });
+            return Err(EditError::NotFound {
+                path: error_path.clone(),
+            });
         }
         Err(error) => {
             return Err(EditError::Io {
-                path: path.clone(),
+                path: error_path.clone(),
                 message: error.to_string(),
             });
         }
     };
-    build_snapshot(path.clone(), raw)
+    let metadata = file.metadata().map_err(|error| EditError::Io {
+        path: error_path.clone(),
+        message: error.to_string(),
+    })?;
+    if metadata.len() > MAX_SNAPSHOT_BYTES as u64 {
+        return Err(EditError::FileTooLarge {
+            path: error_path.clone(),
+            bytes: usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+        });
+    }
+    let mut raw = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take((MAX_SNAPSHOT_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut raw)
+        .map_err(|error| EditError::Io {
+            path: error_path.clone(),
+            message: error.to_string(),
+        })?;
+    if raw.len() > MAX_SNAPSHOT_BYTES {
+        return Err(EditError::FileTooLarge {
+            path: error_path.clone(),
+            bytes: raw.len(),
+        });
+    }
+    Ok(raw)
 }
 
 pub fn build_snapshot(path: Utf8PathBuf, raw: Vec<u8>) -> Result<FileSnapshot, EditError> {
@@ -124,7 +174,7 @@ pub fn build_snapshot(path: Utf8PathBuf, raw: Vec<u8>) -> Result<FileSnapshot, E
     // 严格 UTF-8 解码（§10.1：无法解码返回类型化结果，不做 lossy rewrite）。
     let text = std::str::from_utf8(body)
         .map_err(|_| EditError::UnsupportedEncoding { path: path.clone() })?;
-    let (logical_lf_text, logical_to_raw, line_ending) = normalize_lf(text, has_bom);
+    let (logical_lf_text, crlf_logical_offsets, line_ending) = normalize_lf(text);
     let revision = revision_of(&raw);
     Ok(FileSnapshot {
         path,
@@ -133,49 +183,42 @@ pub fn build_snapshot(path: Utf8PathBuf, raw: Vec<u8>) -> Result<FileSnapshot, E
         revision,
         has_bom,
         line_ending,
-        logical_to_raw,
+        crlf_logical_offsets,
     })
 }
 
 /// 把 UTF-8 文本归一化为 LF 逻辑文本，同时构建逻辑偏移 → 原始偏移映射。
 ///
 /// BOM 已剥离；`\r\n` 的 `\r` 不进入逻辑文本（§10.1：`logical_lf_text` 去 BOM 并统一 `\n`）。
-fn normalize_lf(text: &str, has_bom: bool) -> (String, Vec<usize>, LineEnding) {
-    let raw_offset_base = if has_bom { 3 } else { 0 };
+fn normalize_lf(text: &str) -> (String, Vec<usize>, LineEnding) {
     let mut logical = String::with_capacity(text.len());
-    // 字节级映射：logical 字符串的每个**字节**位置 → 该字符起始的原始字节偏移。
-    // 多字节字符的所有字节映射到同一 raw 偏移；find()/len() 的字节索引可直接用。
-    let mut map = Vec::with_capacity(text.len() + 1);
+    let mut crlf_logical_offsets = Vec::new();
     let mut crlf_count = 0usize;
     let mut lf_count = 0usize;
     // 按字符迭代（UTF-8 安全）：此前按字节 `push(b as char)` 会把多字节
     // 字符拆成 Latin-1 乱码（中文/emoji 文件 read/edit 全部损坏）。
     let mut chars = text.char_indices().peekable();
-    while let Some((i, ch)) = chars.next() {
+    while let Some((_i, ch)) = chars.next() {
         if ch == '\r'
             && let Some(&(_, '\n')) = chars.peek()
         {
             chars.next(); // 消费 \n
             crlf_count += 1;
-            map.push(raw_offset_base + i);
+            crlf_logical_offsets.push(logical.len());
             logical.push('\n');
             continue;
         }
         if ch == '\n' {
             lf_count += 1;
         }
-        for _ in 0..ch.len_utf8() {
-            map.push(raw_offset_base + i);
-        }
         logical.push(ch);
     }
-    map.push(raw_offset_base + text.len());
     let line_ending = if crlf_count > lf_count {
         LineEnding::Crlf
     } else {
         LineEnding::Lf
     };
-    (logical, map, line_ending)
+    (logical, crlf_logical_offsets, line_ending)
 }
 
 /// 编辑错误诊断（§10.3 第 12 条：机器可辨）。
@@ -197,6 +240,8 @@ pub enum EditError {
     InvalidRevision { value: String },
     #[error("old_text must not be empty (path={path})")]
     EmptyOldText { path: Utf8PathBuf },
+    #[error("too many replacements in {path}: {count} (max {MAX_REPLACEMENTS})")]
+    TooManyReplacements { path: Utf8PathBuf, count: usize },
     #[error("no match for replacements[{index}] in {path}")]
     NoMatch { path: Utf8PathBuf, index: usize },
     #[error("multiple matches for replacements[{index}] in {path} (must be unique)")]
@@ -233,6 +278,7 @@ impl EditError {
             EditError::StaleRevision { .. } => "stale_revision",
             EditError::InvalidRevision { .. } => "invalid_revision",
             EditError::EmptyOldText { .. } => "empty_old_text",
+            EditError::TooManyReplacements { .. } => "too_many_replacements",
             EditError::NoMatch { .. } => "no_match",
             EditError::MultipleMatches { .. } => "multiple_matches",
             EditError::Overlap { .. } => "overlap",
@@ -276,6 +322,19 @@ pub struct EditResult {
 
 /// 生成 unified diff（§10.3 第 10 条；仅用于展示与验证，不用于猜测式修改）。
 pub fn unified_diff(result: &EditResult) -> String {
+    const MAX_DIFF_INPUT_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_DIFF_OUTPUT_BYTES: usize = 256 * 1024;
+    if result
+        .previous_raw
+        .len()
+        .saturating_add(result.new_raw.len())
+        > MAX_DIFF_INPUT_BYTES
+    {
+        return format!(
+            "[diff omitted: input exceeds {} bytes; revisions {} -> {}]",
+            MAX_DIFF_INPUT_BYTES, result.previous_revision, result.current_revision
+        );
+    }
     use similar::TextDiff;
     let old_text = String::from_utf8_lossy(&result.previous_raw);
     let new_text = String::from_utf8_lossy(&result.new_raw);
@@ -283,18 +342,14 @@ pub fn unified_diff(result: &EditResult) -> String {
         return String::new();
     }
     let diff = TextDiff::from_lines(&old_text, &new_text);
-    let mut out = String::new();
-    for change in diff.iter_all_changes() {
-        let sign = match change.tag() {
-            similar::ChangeTag::Delete => "-",
-            similar::ChangeTag::Insert => "+",
-            similar::ChangeTag::Equal => " ",
-        };
-        out.push_str(sign);
-        out.push_str(change.value());
-        if !change.value().ends_with('\n') {
-            out.push('\n');
-        }
+    let mut out = diff
+        .unified_diff()
+        .context_radius(3)
+        .header("before", "after")
+        .to_string();
+    if out.len() > MAX_DIFF_OUTPUT_BYTES {
+        crate::util::truncate_to_char_boundary(&mut out, MAX_DIFF_OUTPUT_BYTES);
+        out.push_str("\n[diff truncated]\n");
     }
     out
 }
@@ -311,7 +366,13 @@ pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
         if count > 1 {
             return count;
         }
-        start += offset + needle.len();
+        let match_start = start + offset;
+        let advance = haystack[match_start..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+        start = match_start.saturating_add(advance);
     }
     count
 }
@@ -342,6 +403,12 @@ fn apply_edit_to_snapshot(
     if replacements.is_empty() {
         return Err(EditError::EmptyOldText {
             path: snapshot.path.clone(),
+        });
+    }
+    if replacements.len() > MAX_REPLACEMENTS {
+        return Err(EditError::TooManyReplacements {
+            path: snapshot.path.clone(),
+            count: replacements.len(),
         });
     }
     if snapshot.revision != expected_revision {
@@ -422,14 +489,41 @@ fn apply_edit_to_snapshot(
         }
     }
 
+    // 在分配/拼接新缓冲区前计算精确原始字节大小（含 CRLF 扩张）。
+    let mut projected_size = snapshot.raw.len();
+    for replacement in &sorted {
+        let raw_start = snapshot.raw_offset(replacement.logical_start);
+        let raw_end = snapshot.raw_offset(replacement.logical_end);
+        let encoded_len = encode_replacement(
+            &replacement.new_logical,
+            raw_start,
+            &snapshot.raw,
+            snapshot.line_ending,
+            snapshot.has_bom,
+        )
+        .len();
+        projected_size = projected_size
+            .checked_sub(raw_end - raw_start)
+            .and_then(|size| size.checked_add(encoded_len))
+            .ok_or_else(|| EditError::FileTooLarge {
+                path: snapshot.path.clone(),
+                bytes: usize::MAX,
+            })?;
+    }
+    if projected_size > MAX_SNAPSHOT_BYTES {
+        return Err(EditError::FileTooLarge {
+            path: snapshot.path.clone(),
+            bytes: projected_size,
+        });
+    }
+
     // 一次性应用：从后往前替换（保持前缀偏移有效）。
     let mut new_raw = snapshot.raw.to_vec();
     let has_bom = snapshot.has_bom;
     let line_ending = snapshot.line_ending;
-    let logical_to_raw = &snapshot.logical_to_raw;
-    for r in prepared.iter().rev() {
-        let raw_start = logical_to_raw[r.logical_start];
-        let raw_end = logical_to_raw[r.logical_end];
+    for r in sorted.iter().rev() {
+        let raw_start = snapshot.raw_offset(r.logical_start);
+        let raw_end = snapshot.raw_offset(r.logical_end);
         let new_bytes =
             encode_replacement(&r.new_logical, raw_start, &new_raw, line_ending, has_bom);
         new_raw.splice(raw_start..raw_end, new_bytes);
@@ -566,7 +660,15 @@ pub fn replace_file(
     }
     #[cfg(not(windows))]
     {
-        std::fs::rename(temp_path, target)?;
+        if let Some(backup) = backup_path {
+            std::fs::hard_link(target, backup)?;
+        }
+        if let Err(error) = std::fs::rename(temp_path, target) {
+            if let Some(backup) = backup_path {
+                let _ = std::fs::remove_file(backup);
+            }
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -599,13 +701,18 @@ pub fn install_no_clobber(temp_path: &Path, target: &Path) -> Result<(), Install
     }
     #[cfg(not(windows))]
     {
-        std::fs::rename(temp_path, target).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                InstallError::AlreadyExists
-            } else {
-                InstallError::Io(e.to_string())
+        match std::fs::hard_link(temp_path, target) {
+            Ok(()) => {
+                if let Err(error) = std::fs::remove_file(temp_path) {
+                    tracing::warn!(%error, path = %temp_path.display(), "failed to clean installed temp link");
+                }
+                Ok(())
             }
-        })
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(InstallError::AlreadyExists)
+            }
+            Err(error) => Err(InstallError::Io(error.to_string())),
+        }
     }
 }
 
@@ -634,12 +741,7 @@ pub fn commit_edit(
     })?;
 
     // §10.3 第 6 条：临时文件准备完成后紧邻提交再校验一次 file identity 与完整 digest。
-    let current = revision_of(
-        &std::fs::read(path.as_std_path()).map_err(|e| EditError::Io {
-            path: path.clone(),
-            message: format!("final freshness read: {e}"),
-        })?,
-    );
+    let current = revision_of(&read_raw_file(path)?);
     if current != result.previous_revision {
         let _ = std::fs::remove_file(temp_path);
         return Err(EditError::StaleRevision {
@@ -653,7 +755,17 @@ pub fn commit_edit(
     let backup_path = plan.backup_path.clone();
     if let Err(error) = replace_file(temp_path, path.as_std_path(), backup_path.as_deref()) {
         // §10.7 第 5 步：API 失败 → 根据 target/temp/backup 的存在性和 digest 恢复。
-        return recover_after_failure(path, &result.new_raw, &backup_path, error);
+        let recovered = recover_after_failure(
+            path,
+            &result.new_raw,
+            &backup_path,
+            &result.previous_revision,
+            error,
+        );
+        if matches!(recovered, Err(EditError::CommitFailed { .. })) {
+            let _ = std::fs::remove_file(temp_path);
+        }
+        return recovered;
     }
 
     // §10.7 第 4 步：成功后校验 target 为 candidate、backup 为 expected。
@@ -681,28 +793,23 @@ pub fn verify_after_replace(
     expected_revision: &str,
     candidate_digest: &str,
 ) -> Result<(), EditError> {
-    let target_now =
-        revision_of(
-            &std::fs::read(path.as_std_path()).map_err(|e| EditError::Io {
-                path: path.clone(),
-                message: format!("post-commit read: {e}"),
-            })?,
-        );
+    let target_now = revision_of(&read_raw_file(path)?);
     if target_now != candidate_digest {
         // 提交后 target 不是 candidate：外部并发修改（§10.4 竞态窗口）。
-        restore_target(path, backup_path, "target != candidate");
+        restore_target(path, backup_path, "target != candidate")?;
         return Err(EditError::ConcurrentModification { path: path.clone() });
     }
-    if let Some(backup) = backup_path
-        && backup.exists()
-    {
-        let backup_digest = revision_of(&std::fs::read(backup).map_err(|e| EditError::Io {
-            path: path.clone(),
-            message: format!("backup read: {e}"),
-        })?);
+    if let Some(backup) = backup_path {
+        if !backup.exists() {
+            return Err(EditError::CommitRecoveryFailed {
+                path: path.clone(),
+                message: "replacement succeeded but backup is missing".into(),
+            });
+        }
+        let backup_digest = revision_of(&read_raw_path(backup, path)?);
         if backup_digest != expected_revision {
             // §10.4：backup 已包含未预期的外部变化 → 恢复并返回并发诊断。
-            restore_target(path, backup_path, "backup digest mismatch");
+            restore_target(path, backup_path, "backup digest mismatch")?;
             return Err(EditError::ConcurrentModification { path: path.clone() });
         }
     }
@@ -710,15 +817,32 @@ pub fn verify_after_replace(
 }
 
 /// 用 backup 恢复 target（§10.7 第 5 步：API 失败或校验不符时的恢复流程）。
-fn restore_target(path: &Utf8PathBuf, backup_path: &Option<std::path::PathBuf>, reason: &str) {
-    if let Some(backup) = backup_path
-        && backup.exists()
-        && std::fs::copy(backup, path.as_std_path()).is_ok()
-    {
-        tracing::warn!(%path, %reason, "edit commit restored target from backup");
-        return;
-    }
-    tracing::warn!(%path, %reason, "edit commit: backup unavailable, target state uncertain");
+fn restore_target(
+    path: &Utf8PathBuf,
+    backup_path: &Option<std::path::PathBuf>,
+    reason: &str,
+) -> Result<(), EditError> {
+    let Some(backup) = backup_path.as_ref().filter(|backup| backup.exists()) else {
+        return Err(EditError::CommitRecoveryFailed {
+            path: path.clone(),
+            message: format!("backup unavailable while restoring after {reason}"),
+        });
+    };
+    std::fs::copy(backup, path.as_std_path()).map_err(|error| EditError::CommitRecoveryFailed {
+        path: path.clone(),
+        message: format!("restore after {reason}: {error}"),
+    })?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.as_std_path())
+        .and_then(|file| file.sync_all())
+        .map_err(|error| EditError::CommitRecoveryFailed {
+            path: path.clone(),
+            message: format!("sync restored target after {reason}: {error}"),
+        })?;
+    tracing::warn!(%path, %reason, "edit commit restored target from backup");
+    Ok(())
 }
 
 /// §10.7 第 5 步：ReplaceFileW 失败后的确定性恢复。
@@ -726,49 +850,56 @@ fn recover_after_failure(
     path: &Utf8PathBuf,
     new_raw: &[u8],
     backup_path: &Option<std::path::PathBuf>,
+    expected_revision: &str,
     error: std::io::Error,
 ) -> Result<(), EditError> {
-    let target_exists = path.as_std_path().exists();
-    let target_digest = target_exists
-        .then(|| std::fs::read(path.as_std_path()).ok())
-        .flatten()
-        .map(|raw| revision_of(&raw));
+    let read_revision = |source: &Path| -> Result<Option<String>, EditError> {
+        match read_raw_path(source, path) {
+            Ok(raw) => Ok(Some(revision_of(&raw))),
+            Err(EditError::NotFound { .. }) => Ok(None),
+            Err(read_error) => Err(read_error),
+        }
+    };
+    let target_digest = read_revision(path.as_std_path())?;
     let new_digest = revision_of(new_raw);
-    let backup_digest = backup_path
-        .as_ref()
-        .filter(|p| p.exists())
-        .and_then(|p| std::fs::read(p).ok())
-        .map(|raw| revision_of(&raw));
+    let backup_digest = match backup_path {
+        Some(backup) => read_revision(backup)?,
+        None => None,
+    };
 
     match (target_digest, backup_digest) {
         // target 已包含新内容：提交实际成功（ReplaceFileW 返回失败但完成）。
         (Some(digest), _) if digest == new_digest => {
-            if let Some(backup) = backup_path {
-                let _ = std::fs::remove_file(backup);
-            }
+            verify_after_replace(path, backup_path, expected_revision, &new_digest)?;
             tracing::warn!(%path, %error, "ReplaceFileW reported failure but target is candidate");
             Ok(())
         }
-        // target 是旧内容且 backup 是旧内容：未提交，恢复完成。
-        (Some(expected), Some(backup)) if expected == backup => {
+        // target 是旧内容：未提交。清理可证明属于旧版本的 backup/temp，明确报失败。
+        (Some(target), backup)
+            if target == expected_revision
+                && backup
+                    .as_deref()
+                    .is_none_or(|value| value == expected_revision) =>
+        {
             if let Some(backup) = backup_path {
                 let _ = std::fs::remove_file(backup);
             }
             tracing::warn!(%path, %error, "ReplaceFileW failed; target unchanged (restored)");
-            Ok(())
+            Err(EditError::CommitFailed {
+                path: path.clone(),
+                message: format!("replacement failed and target is unchanged: {error}"),
+            })
         }
         // target 不存在但 backup 存在：原文件已被移动，用 backup 恢复。
-        (None, Some(_)) => {
-            if let Some(backup) = backup_path
-                && std::fs::copy(backup, path.as_std_path()).is_ok()
-            {
-                let _ = std::fs::remove_file(backup);
-                tracing::warn!(%path, %error, "ReplaceFileW failed; restored from backup");
-                return Ok(());
+        (None, Some(backup)) if backup == expected_revision => {
+            restore_target(path, backup_path, "target missing after replace failure")?;
+            if let Some(backup_path) = backup_path {
+                let _ = std::fs::remove_file(backup_path);
             }
-            Err(EditError::CommitRecoveryFailed {
+            tracing::warn!(%path, %error, "ReplaceFileW failed; restored from backup");
+            Err(EditError::CommitFailed {
                 path: path.clone(),
-                message: format!("target missing, backup restore failed: {error}"),
+                message: format!("replacement failed; old target restored: {error}"),
             })
         }
         // 无法证明恢复完成：保留所有文件并返回 commit_recovery_failed（§10.7 第 5 条）。
@@ -843,6 +974,24 @@ pub struct SnapshotStore {
     order: std::collections::VecDeque<Utf8PathBuf>,
     max_paths: usize,
     max_versions_per_path: usize,
+    stored_bytes: usize,
+    max_total_bytes: usize,
+}
+
+const MAX_STORED_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SNAPSHOT_STORE_BYTES: usize = 128 * 1024 * 1024;
+
+fn snapshot_memory_bytes(snapshot: &FileSnapshot) -> usize {
+    snapshot
+        .raw
+        .len()
+        .saturating_add(snapshot.logical_lf_text.len())
+        .saturating_add(
+            snapshot
+                .crlf_logical_offsets
+                .len()
+                .saturating_mul(std::mem::size_of::<usize>()),
+        )
 }
 
 impl Default for SnapshotStore {
@@ -858,6 +1007,8 @@ impl SnapshotStore {
             order: Default::default(),
             max_paths,
             max_versions_per_path,
+            stored_bytes: 0,
+            max_total_bytes: MAX_SNAPSHOT_STORE_BYTES,
         }
     }
 
@@ -865,21 +1016,44 @@ impl SnapshotStore {
     /// P1-7：同 path 更新时 move-to-back——活跃文件不能因为最早插入被淘汰
     /// （此前 order 只在首次插入时 push_back，不是真 LRU）。
     pub fn record(&mut self, snapshot: FileSnapshot) {
+        let snapshot_bytes = snapshot_memory_bytes(&snapshot);
+        if snapshot_bytes > MAX_STORED_SNAPSHOT_BYTES || self.max_versions_per_path == 0 {
+            return;
+        }
         let path = snapshot.path.clone();
         if let Some(pos) = self.order.iter().position(|p| *p == path) {
             self.order.remove(pos);
         }
         self.order.push_back(path.clone());
         let entry = self.versions.entry(path.clone()).or_default();
-        entry.retain(|old| old.revision != snapshot.revision);
+        if let Some(position) = entry
+            .iter()
+            .position(|old| old.revision == snapshot.revision)
+            && let Some(old) = entry.remove(position)
+        {
+            self.stored_bytes = self
+                .stored_bytes
+                .saturating_sub(snapshot_memory_bytes(&old));
+        }
         entry.push_front(snapshot);
+        self.stored_bytes = self.stored_bytes.saturating_add(snapshot_bytes);
         while entry.len() > self.max_versions_per_path {
-            entry.pop_back();
+            if let Some(old) = entry.pop_back() {
+                self.stored_bytes = self
+                    .stored_bytes
+                    .saturating_sub(snapshot_memory_bytes(&old));
+            }
         }
         // 淘汰最旧 path（按插入顺序）。
-        while self.versions.len() > self.max_paths {
+        while self.versions.len() > self.max_paths || self.stored_bytes > self.max_total_bytes {
             if let Some(oldest) = self.order.pop_front() {
-                self.versions.remove(&oldest);
+                if let Some(versions) = self.versions.remove(&oldest) {
+                    for snapshot in versions {
+                        self.stored_bytes = self
+                            .stored_bytes
+                            .saturating_sub(snapshot_memory_bytes(&snapshot));
+                    }
+                }
             } else {
                 break;
             }
@@ -901,6 +1075,7 @@ impl SnapshotStore {
     pub fn clear(&mut self) {
         self.versions.clear();
         self.order.clear();
+        self.stored_bytes = 0;
     }
 }
 
@@ -922,21 +1097,29 @@ pub fn read_window(
     line_count: usize,
 ) -> Result<ReadWindow, EditError> {
     let snapshot = snapshot_file(path)?;
+    Ok(read_window_from_snapshot(&snapshot, start_line, line_count))
+}
+
+pub fn read_window_from_snapshot(
+    snapshot: &FileSnapshot,
+    start_line: usize,
+    line_count: usize,
+) -> ReadWindow {
     let lines: Vec<&str> = snapshot.logical_lf_text.lines().collect();
     let total_lines = lines.len();
     let start = start_line.saturating_sub(1).min(total_lines);
     let end = start + line_count;
     let truncated = end < total_lines;
     let text = lines[start..end.min(total_lines)].join("\n");
-    Ok(ReadWindow {
-        path: path.clone(),
-        revision: snapshot.revision,
+    ReadWindow {
+        path: snapshot.path.clone(),
+        revision: snapshot.revision.clone(),
         start_line: start + 1,
         returned_lines: end.min(total_lines) - start,
         total_lines,
         truncated,
         text,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -970,7 +1153,7 @@ mod tests {
         assert_eq!(&*snapshot.logical_lf_text, "fn main() {\n    work();\n}\n");
         assert_eq!(snapshot.line_ending, LineEnding::Crlf);
         // 逻辑偏移 0 → 原始 3（BOM 后）。
-        assert_eq!(snapshot.logical_to_raw[0], 3);
+        assert_eq!(snapshot.raw_offset(0), 3);
     }
 
     /// 回归：normalize_lf 此前按字节 push(b as char)，中文/emoji 被拆成
@@ -985,7 +1168,7 @@ mod tests {
             "// 目标：让 `cargo build` 通过。\nfn 主() {}\n"
         );
         // 字符边界映射：'目' 的原始字节偏移 = 3（"// " 之后）。
-        assert_eq!(snapshot.logical_to_raw[3], 3);
+        assert_eq!(snapshot.raw_offset(3), 3);
         // 行数正确（logical 按字符换行）。
         assert_eq!(snapshot.logical_lf_text.lines().count(), 2);
     }
@@ -1001,10 +1184,9 @@ mod tests {
         assert_eq!(snapshot.line_ending, LineEnding::Crlf);
         // '正' 的 logical 字节偏移 = 3("// ") + 6("标题") + 1(\n) = 10；
         // raw 偏移 = 3(BOM) + 3 + 6 + 2(\r\n) = 14。
-        assert_eq!(snapshot.logical_to_raw[10], 14);
-        // 多字节字符的每个字节映射到同一 raw 偏移。
-        assert_eq!(snapshot.logical_to_raw[11], 14);
-        assert_eq!(snapshot.logical_to_raw[12], 14);
+        assert_eq!(snapshot.raw_offset(10), 14);
+        // 下一个字符边界保持 UTF-8 字节距离。
+        assert_eq!(snapshot.raw_offset(13), 17);
     }
 
     /// 回归：中文文件 read_window 返回正确文本（此前乱码）。
@@ -1171,6 +1353,39 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_replacements_apply_by_file_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("order.txt")).unwrap();
+        let original = "alpha beta gamma delta\n";
+        std::fs::write(path.as_std_path(), original).unwrap();
+        let revision = revision_of(original.as_bytes());
+        let result = apply_edit(
+            &path,
+            &revision,
+            &[
+                Replacement {
+                    old_text: "gamma".into(),
+                    new_text: "G".into(),
+                },
+                Replacement {
+                    old_text: "alpha".into(),
+                    new_text: "a-much-longer-alpha".into(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(result.new_raw).unwrap(),
+            "a-much-longer-alpha beta G delta\n"
+        );
+    }
+
+    #[test]
+    fn overlapping_occurrences_are_not_treated_as_unique() {
+        assert_eq!(count_occurrences("aaa", "aa"), 2);
+    }
+
+    #[test]
     fn crlf_file_keeps_untouched_bytes_and_encodes_newline() {
         let dir = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
@@ -1209,6 +1424,75 @@ mod tests {
     }
 
     #[test]
+    fn failed_replace_with_unchanged_target_is_not_reported_as_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("a.txt")).unwrap();
+        let backup = dir.path().join("backup.tmp");
+        std::fs::write(path.as_std_path(), b"old").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        let expected = revision_of(b"old");
+
+        let error = recover_after_failure(
+            &path,
+            b"new",
+            &Some(backup.clone()),
+            &expected,
+            std::io::Error::other("simulated replace failure"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, EditError::CommitFailed { .. }));
+        assert_eq!(std::fs::read(path.as_std_path()).unwrap(), b"old");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn failed_replace_that_committed_candidate_keeps_backup_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("a.txt")).unwrap();
+        let backup = dir.path().join("backup.tmp");
+        std::fs::write(path.as_std_path(), b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+
+        recover_after_failure(
+            &path,
+            b"new",
+            &Some(backup.clone()),
+            &revision_of(b"old"),
+            std::io::Error::other("ambiguous OS result"),
+        )
+        .unwrap();
+        assert!(backup.exists(), "ToolCompleted 前必须保留 backup 证据");
+    }
+
+    #[test]
+    fn post_replace_verification_rejects_missing_planned_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("a.txt")).unwrap();
+        std::fs::write(path.as_std_path(), b"new").unwrap();
+        let missing = Some(dir.path().join("missing.backup"));
+        let error =
+            verify_after_replace(&path, &missing, &revision_of(b"old"), &revision_of(b"new"))
+                .unwrap_err();
+        assert!(matches!(error, EditError::CommitRecoveryFailed { .. }));
+    }
+
+    #[test]
+    fn unified_diff_is_bounded_for_large_rewrites() {
+        let previous_raw = vec![b'a'; 3 * 1024 * 1024];
+        let new_raw = vec![b'b'; 3 * 1024 * 1024];
+        let result = EditResult {
+            previous_revision: revision_of(&previous_raw),
+            current_revision: revision_of(&new_raw),
+            applied: 1,
+            previous_raw,
+            new_raw,
+        };
+        let diff = unified_diff(&result);
+        assert!(diff.contains("diff omitted"));
+        assert!(diff.len() < 1024);
+    }
+
+    #[test]
     fn read_window_reports_lines_and_truncation() {
         let dir = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
@@ -1229,7 +1513,6 @@ mod p1_lru_tests {
     fn snapshot(path: &str, tag: &str) -> (FileSnapshot, String) {
         let logical_lf_text: Arc<str> = Arc::from(format!("content-{tag}"));
         let raw: Arc<[u8]> = Arc::from(logical_lf_text.as_bytes().to_vec());
-        let logical_len = logical_lf_text.len();
         let revision = revision_of(&raw);
         (
             FileSnapshot {
@@ -1239,8 +1522,7 @@ mod p1_lru_tests {
                 revision: revision.clone(),
                 has_bom: false,
                 line_ending: LineEnding::Lf,
-                // 单调映射：0..=logical_len → 0..=logical_len（LF 文本无转换）。
-                logical_to_raw: (0..=logical_len).collect(),
+                crlf_logical_offsets: Vec::new(),
             },
             revision,
         )

@@ -5,8 +5,8 @@
 //!
 //! 文件布局：`~/.tpi/sessions/<workspace-id>/<session-id>.jsonl`。
 
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::ids::{EventId, RequestId, RunId, SessionId, ToolCallId};
@@ -96,10 +96,13 @@ pub struct Usage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryMetadata {
     pub tool: String,
-    /// 目标文件路径（workspace-relative）。
+    /// 已解析的目标文件绝对路径（仅内部恢复使用，不发送给模型）。
     pub target_path: String,
     /// 期望的 target revision（写入前的 current revision）。
     pub expected_revision: String,
+    /// 候选新内容的 revision；新建文件提交后 temp 已被移动时用于确认 committed。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_revision: Option<String>,
     /// 临时文件路径（同目录唯一 temp）。
     pub temp_path: String,
     /// 备份路径（§10.7 Windows ReplaceFileW backup；M3 起非空）。
@@ -447,9 +450,14 @@ pub struct SessionLog {
     workspace_id: String,
     path: PathBuf,
     file: File,
+    /// 独占锁持有在 sidecar 上，避免 Windows 下锁住 JSONL 后连投影读取也被拒绝。
+    _lock_file: File,
     seq: u64,
     /// 是否需要 fsync 后才算 durable（写工具 write-ahead 使用）。
     pending_sync: bool,
+    /// 无法回滚的部分写会使 append 边界失去可信性；此后拒绝继续追加。
+    poisoned: bool,
+    protocol: SessionProtocolState,
 }
 
 impl SessionLog {
@@ -473,17 +481,23 @@ impl SessionLog {
         let dir = sessions_root.join(&workspace_id);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{session_id}.jsonl"));
+        let lock_file = open_and_lock_session(&path)?;
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
         let log = Self {
             session_id,
             run_id,
             workspace_id,
             path: path.clone(),
-            file: OpenOptions::new()
-                .create_new(true)
-                .append(true)
-                .open(&path)?,
+            file,
+            _lock_file: lock_file,
             seq: 0,
             pending_sync: false,
+            poisoned: false,
+            protocol: SessionProtocolState::default(),
         };
         Ok(log)
     }
@@ -501,19 +515,33 @@ impl SessionLog {
         let path = sessions_root
             .join(&workspace_id)
             .join(format!("{session_id}.jsonl"));
-        let mut log = Self {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "session 路径不是普通文件",
+            ));
+        }
+        let lock_file = open_and_lock_session(&path)?;
+
+        // 锁内完成验证和尾部修复，确保随后 append 总是从完整 JSONL 边界开始。
+        let parsed = read_envelopes_state(&path)?;
+        repair_session_tail(&path, parsed.tail_repair)?;
+        let file = OpenOptions::new().read(true).append(true).open(&path)?;
+        let max_seq = parsed.envelopes.last().map_or(0, |envelope| envelope.seq);
+        let protocol = parsed.protocol;
+        let log = Self {
             session_id,
             run_id: RunId::new_v7(),
             workspace_id,
             path: path.clone(),
-            file: OpenOptions::new().append(true).open(&path)?,
-            seq: 0,
+            file,
+            _lock_file: lock_file,
+            seq: max_seq,
             pending_sync: false,
+            poisoned: false,
+            protocol,
         };
-        // 恢复 seq：历史最大 envelope seq + 1（P0-12：不能按 events.len()——
-        // 中间有损坏行时 len 小于 max_seq，续写会导致 seq 重复/倒退）。
-        let (_, max_seq) = read_events_and_max_seq(&path)?;
-        log.seq = max_seq + 1;
         Ok(log)
     }
 
@@ -522,6 +550,12 @@ impl SessionLog {
     }
 
     pub fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    /// 为新的用户 run 分配 envelope run_id；session_id 保持不变。
+    pub fn begin_run(&mut self) -> RunId {
+        self.run_id = RunId::new_v7();
         self.run_id
     }
 
@@ -543,11 +577,35 @@ impl SessionLog {
     /// 写工具 write-ahead（§14.2）：对 `Write`/`WorkspaceUnknown` call 必须先
     /// append `ToolStarted` 并等待 [`sync_data`](Self::sync_data) 成功，随后才能产生外部副作用。
     pub fn append_event(&mut self, event: &SessionEvent) -> std::io::Result<u64> {
-        self.seq += 1;
-        let envelope = Envelope::new(self.seq, self.session_id, self.run_id, event);
+        if self.poisoned {
+            return Err(std::io::Error::other(
+                "session log 在不可恢复的部分写后已停止追加",
+            ));
+        }
+        let next_seq = self
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("session seq 已耗尽"))?;
+        let envelope = Envelope::new(next_seq, self.session_id, self.run_id, event);
+        self.protocol
+            .validate(&envelope.body, envelope.seq)
+            .map_err(std::io::Error::other)?;
         let line = serde_json::to_string(&envelope)
             .map_err(|e| std::io::Error::other(format!("serialize event: {e}")))?;
-        writeln!(self.file, "{line}")?;
+        let original_len = self.file.metadata()?.len();
+        let mut bytes = line.into_bytes();
+        bytes.push(b'\n');
+        if let Err(write_error) = self.file.write_all(&bytes) {
+            if let Err(rollback_error) = self.file.set_len(original_len) {
+                self.poisoned = true;
+                return Err(std::io::Error::other(format!(
+                    "追加 session 失败: {write_error}; 回滚部分写失败: {rollback_error}"
+                )));
+            }
+            return Err(write_error);
+        }
+        self.protocol.apply(&envelope.body);
+        self.seq = next_seq;
         self.pending_sync = true;
         Ok(self.seq)
     }
@@ -593,34 +651,10 @@ pub fn read_events(path: &Path) -> std::io::Result<Vec<SessionEvent>> {
 /// index != seq，compaction 覆盖范围与投影跳过必须基于真实 seq，
 /// 不能拿 vector index 假装等于事件 seq）。
 pub fn read_events_with_seq(path: &Path) -> std::io::Result<Vec<(u64, SessionEvent)>> {
-    let file = File::open(path)?;
-    let mut lines = BufReader::new(file).lines();
-    let mut events = Vec::new();
-    loop {
-        match lines.next() {
-            Some(Ok(line)) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Envelope>(&line) {
-                    Ok(envelope) => events.push((envelope.seq, envelope.to_session_event())),
-                    Err(error) => {
-                        // 非最后一行损坏：记录并跳过。
-                        tracing::warn!(%error, "skipping unparseable session line");
-                    }
-                }
-            }
-            Some(Err(error)) => {
-                // 最后一行因崩溃不完整（§14.2）：只丢弃残行。
-                if events.is_empty() || error.kind() == std::io::ErrorKind::UnexpectedEof {
-                    tracing::warn!(%error, "dropping incomplete trailing session line");
-                }
-                break;
-            }
-            None => break,
-        }
-    }
-    Ok(events)
+    Ok(read_envelopes(path)?
+        .into_iter()
+        .map(|envelope| (envelope.seq, envelope.to_session_event()))
+        .collect())
 }
 
 /// 从 session 文件重建对话消息（P0-3 replay 入口）：模拟进程重启后
@@ -677,8 +711,22 @@ pub fn compacted_range(
             summary: s,
         } = event
         {
-            let end_seq = covered.end.0.as_u128() as u64;
-            if end.is_none_or(|prev| end_seq > prev) {
+            let Ok(start_seq) = u64::try_from(covered.start.0.as_u128()) else {
+                tracing::warn!(seq, "ignoring compaction with out-of-range covered.start");
+                continue;
+            };
+            let Ok(end_seq) = u64::try_from(covered.end.0.as_u128()) else {
+                tracing::warn!(seq, "ignoring compaction with out-of-range covered.end");
+                continue;
+            };
+            if start_seq == 0 || start_seq >= end_seq || end_seq > *seq {
+                tracing::warn!(seq, start_seq, end_seq, "ignoring invalid compaction range");
+                continue;
+            }
+            if end.is_none_or(|prev| {
+                end_seq > prev
+                    || (end_seq == prev && comp_seq.is_none_or(|prev_seq| *seq > prev_seq))
+            }) {
                 end = Some(end_seq);
                 comp_seq = Some(*seq);
                 summary = Some(s.text.clone());
@@ -703,10 +751,11 @@ pub fn project_messages_with_ranges(
     // 不会出现 request 覆盖而 completed 保留）。
     let mut raw: Vec<(u64, ChatMessage)> = Vec::new();
     let mut last_assistant_idx: Option<usize> = None;
-    let mut pending_calls: Vec<ToolCall> = Vec::new();
+    let mut pending_calls: std::collections::HashMap<ToolCallId, ToolCall> =
+        std::collections::HashMap::new();
     for (seq, event) in events {
         if let SessionEvent::ToolRequested { call } = event {
-            pending_calls.push(call.clone());
+            pending_calls.insert(call.call_id, call.clone());
         }
         if let Some(up_to) = compacted_up_to
             && *seq < up_to
@@ -737,12 +786,12 @@ pub fn project_messages_with_ranges(
                 }
             }
             SessionEvent::ToolCompleted { call_id, outcome } => {
-                if let Some(call) = pending_calls.iter().find(|call| call.call_id == *call_id) {
+                if let Some(call) = pending_calls.remove(call_id) {
                     raw.push((
                         *seq,
                         ChatMessage::Tool {
-                            tool_call_id: call.provider_id.clone(),
-                            name: call.name.clone(),
+                            tool_call_id: call.provider_id,
+                            name: call.name,
                             content: outcome.model_payload.output.clone(),
                         },
                     ));
@@ -759,7 +808,7 @@ pub fn project_messages_with_ranges(
         let end = raw
             .get(i + 1)
             .map(|(next_start, _)| *next_start)
-            .unwrap_or(max_seq + 1);
+            .unwrap_or(max_seq.saturating_add(1));
         out.push((message.clone(), *start, end));
     }
 
@@ -783,40 +832,251 @@ pub fn project_messages_with_ranges(
 /// max_seq 而不是 events.len()——中间存在损坏行时两者不一致，继续 append
 /// 会导致 seq 重复/倒退，破坏 envelope seq 单调性契约）。
 pub fn read_events_and_max_seq(path: &Path) -> std::io::Result<(Vec<SessionEvent>, u64)> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut events = Vec::new();
-    let mut max_seq: u64 = 0;
-    let mut lines = reader.lines();
-    loop {
-        let line = lines.next();
-        match line {
-            Some(Ok(line)) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Envelope>(&line) {
-                    Ok(envelope) => {
-                        max_seq = max_seq.max(envelope.seq);
-                        events.push(envelope.to_session_event());
-                    }
-                    Err(error) => {
-                        // 非最后一行损坏：记录并跳过。
-                        tracing::warn!(%error, "skipping unparseable session line");
-                    }
+    let envelopes = read_envelopes(path)?;
+    let max_seq = envelopes.last().map_or(0, |envelope| envelope.seq);
+    Ok((
+        envelopes
+            .into_iter()
+            .map(|envelope| envelope.to_session_event())
+            .collect(),
+        max_seq,
+    ))
+}
+
+/// 读取并验证完整 envelope 序列。只容忍“文件末尾没有换行且 JSON 不完整”这一种
+/// 崩溃形态；中间损坏、已换行的坏记录、schema/session/seq 异常都必须报错。
+fn read_envelopes(path: &Path) -> std::io::Result<Vec<Envelope>> {
+    Ok(read_envelopes_state(path)?.envelopes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailRepair {
+    None,
+    /// 丢弃从该 byte offset 开始的未完成尾部。
+    Truncate(u64),
+    /// 最后一条 envelope 完整但缺少 JSONL 分隔换行。
+    AppendNewline,
+}
+
+struct EnvelopeRead {
+    envelopes: Vec<Envelope>,
+    tail_repair: TailRepair,
+    protocol: SessionProtocolState,
+}
+
+#[derive(Default)]
+struct SessionProtocolState {
+    requested_calls: std::collections::HashSet<ToolCallId>,
+    started_calls: std::collections::HashSet<ToolCallId>,
+    completed_calls: std::collections::HashSet<ToolCallId>,
+}
+
+impl SessionProtocolState {
+    fn validate(&self, body: &EventBody, seq: u64) -> Result<(), &'static str> {
+        match body {
+            EventBody::ToolRequested { payload } => {
+                if payload.call.provider_id.trim().is_empty() || payload.call.name.trim().is_empty()
+                {
+                    Err("工具调用缺少 provider_id/name")
+                } else if self.requested_calls.contains(&payload.call.call_id) {
+                    Err("tool call id 重复")
+                } else {
+                    Ok(())
                 }
             }
-            Some(Err(error)) => {
-                // 最后一行因崩溃不完整（§14.2）：只丢弃残行。
-                if events.is_empty() || error.kind() == std::io::ErrorKind::UnexpectedEof {
-                    tracing::warn!(%error, "dropping incomplete trailing session line");
+            EventBody::ToolStarted { payload } => {
+                if !self.requested_calls.contains(&payload.call_id)
+                    || self.completed_calls.contains(&payload.call_id)
+                    || self.started_calls.contains(&payload.call_id)
+                {
+                    Err("ToolStarted 顺序无效")
+                } else {
+                    Ok(())
                 }
-                break;
             }
-            None => break,
+            EventBody::ToolCompleted { payload } => {
+                if !self.requested_calls.contains(&payload.call_id)
+                    || self.completed_calls.contains(&payload.call_id)
+                {
+                    Err("ToolCompleted 顺序无效")
+                } else {
+                    Ok(())
+                }
+            }
+            EventBody::CompactionCommitted { payload } => {
+                let start = u64::try_from(payload.covered.start.0.as_u128());
+                let end = u64::try_from(payload.covered.end.0.as_u128());
+                if matches!((start, end), (Ok(start), Ok(end)) if start > 0 && start < end && end <= seq)
+                {
+                    Ok(())
+                } else {
+                    Err("compaction 覆盖范围无效")
+                }
+            }
+            _ => Ok(()),
         }
     }
-    Ok((events, max_seq))
+
+    fn apply(&mut self, body: &EventBody) {
+        match body {
+            EventBody::ToolRequested { payload } => {
+                self.requested_calls.insert(payload.call.call_id);
+            }
+            EventBody::ToolStarted { payload } => {
+                self.started_calls.insert(payload.call_id);
+            }
+            EventBody::ToolCompleted { payload } => {
+                self.completed_calls.insert(payload.call_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 读取 envelope，并返回下一次追加前需要在独占锁内完成的尾部修复。
+fn read_envelopes_state(path: &Path) -> std::io::Result<EnvelopeRead> {
+    let raw = std::fs::read(path)?;
+    let expected_from_name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| uuid::Uuid::parse_str(stem).ok())
+        .map(SessionId);
+    let mut expected_session = expected_from_name;
+    let mut previous_seq = 0u64;
+    let mut event_ids = std::collections::HashSet::new();
+    let mut protocol = SessionProtocolState::default();
+    let mut envelopes = Vec::new();
+    let mut tail_repair = TailRepair::None;
+    let mut offset = 0usize;
+
+    for (index, chunk) in raw.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let line_start = offset;
+        offset = offset.saturating_add(chunk.len());
+        let has_newline = chunk.ends_with(b"\n");
+        let bytes = if has_newline {
+            &chunk[..chunk.len() - 1]
+        } else {
+            chunk
+        };
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            if !has_newline {
+                tail_repair = TailRepair::Truncate(line_start as u64);
+            }
+            continue;
+        }
+        let envelope = match serde_json::from_slice::<Envelope>(bytes) {
+            Ok(envelope) => envelope,
+            Err(error) if !has_newline && offset == raw.len() => {
+                tracing::warn!(line = index + 1, %error, "dropping incomplete trailing session line");
+                tail_repair = TailRepair::Truncate(line_start as u64);
+                break;
+            }
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("session 第 {} 行损坏: {error}", index + 1),
+                ));
+            }
+        };
+        if envelope.schema != SCHEMA_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "session 第 {} 行 schema={}，当前仅支持 {}",
+                    index + 1,
+                    envelope.schema,
+                    SCHEMA_VERSION
+                ),
+            ));
+        }
+        let session_id = *expected_session.get_or_insert(envelope.session_id);
+        if envelope.session_id != session_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("session 第 {} 行 session_id 不一致", index + 1),
+            ));
+        }
+        if envelope.seq <= previous_seq {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "session 第 {} 行 seq={} 未严格递增（前一条 {}）",
+                    index + 1,
+                    envelope.seq,
+                    previous_seq
+                ),
+            ));
+        }
+        if !event_ids.insert(envelope.event_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("session 第 {} 行 event_id 重复", index + 1),
+            ));
+        }
+        if time::OffsetDateTime::parse(
+            &envelope.timestamp,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_err()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("session 第 {} 行 timestamp 无效", index + 1),
+            ));
+        }
+        if let Err(error) = protocol.validate(&envelope.body, envelope.seq) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("session 第 {} 行 {error}", index + 1),
+            ));
+        }
+        protocol.apply(&envelope.body);
+        previous_seq = envelope.seq;
+        envelopes.push(envelope);
+        if !has_newline {
+            tail_repair = TailRepair::AppendNewline;
+        }
+    }
+    Ok(EnvelopeRead {
+        envelopes,
+        tail_repair,
+        protocol,
+    })
+}
+
+fn open_and_lock_session(session_path: &Path) -> std::io::Result<File> {
+    let mut lock_name = session_path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(PathBuf::from(lock_name))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "session 正被另一个 TPI 实例使用",
+        )),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+fn repair_session_tail(path: &Path, repair: TailRepair) -> std::io::Result<()> {
+    match repair {
+        TailRepair::None => Ok(()),
+        TailRepair::Truncate(len) => {
+            let file = OpenOptions::new().write(true).open(path)?;
+            file.set_len(len)?;
+            file.sync_data()
+        }
+        TailRepair::AppendNewline => {
+            let mut file = OpenOptions::new().append(true).open(path)?;
+            file.write_all(b"\n")?;
+            file.sync_data()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -825,10 +1085,9 @@ mod tests {
     use crate::ids::RunId;
     use camino::Utf8PathBuf;
 
-    /// P0-12：session 文件中存在损坏行时，恢复 seq 必须基于历史最大 envelope
-    /// seq（而不是 events.len()），否则继续 append 会 seq 重复，破坏单调性。
+    /// 中间/已换行的损坏记录不能静默跳过；只有未换行的尾部残片可丢弃。
     #[test]
-    fn seq_after_open_is_max_seq_plus_one_even_with_corrupt_lines() {
+    fn middle_corruption_is_rejected_but_incomplete_tail_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
         let sessions_root = dir.path().join("sessions");
@@ -839,7 +1098,7 @@ mod tests {
             .join(&workspace_id)
             .join(format!("{session_id}.jsonl"));
 
-        // 手工构造：seq 1、seq 2、损坏行、seq 4（3 是垃圾）。
+        // 先写两条完整事件。
         let mut log = SessionLog::create_with_id(
             &sessions_root,
             workspace.as_std_path(),
@@ -856,30 +1115,170 @@ mod tests {
         })
         .unwrap();
         drop(log);
-        std::fs::write(
-            &path,
-            std::fs::read_to_string(&path).unwrap() + "this-is-not-json\n",
-        )
-        .unwrap();
-        // 崩溃后恢复：open 既有 session，追加一条（应为 seq 4）。
-        let mut log =
-            SessionLog::open(&sessions_root, workspace.as_std_path(), session_id).unwrap();
-        let seq = log
+        let valid = std::fs::read(&path).unwrap();
+        let mut corrupt = valid.clone();
+        corrupt.extend_from_slice(b"this-is-not-json\n");
+        std::fs::write(&path, corrupt).unwrap();
+        let error = SessionLog::open(&sessions_root, workspace.as_std_path(), session_id)
+            .err()
+            .expect("完整坏行必须拒绝");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        // 崩溃只可能留下未换行尾部残片；该残片丢弃后仍可恢复完整事件。
+        let mut trailing = valid;
+        trailing.extend_from_slice(b"{\"schema\":1");
+        std::fs::write(&path, trailing).unwrap();
+        let mut reopened = SessionLog::open(&sessions_root, workspace.as_std_path(), session_id)
+            .expect("未完成尾部可恢复");
+        assert_eq!(reopened.seq(), 2, "恢复游标等于最后完整 seq");
+        let seq = reopened
             .append_event(&SessionEvent::UserSubmitted {
-                content: "four".into(),
+                content: "three".into(),
             })
             .unwrap();
-        assert_eq!(seq, 4, "损坏行之后的 append 必须是 max_seq+1");
+        assert_eq!(seq, 3, "修复残片后必须连续续写");
+        drop(reopened);
+        assert_eq!(read_events(&path).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn open_repairs_missing_newline_before_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let sessions_root = dir.path().join("sessions");
+        let mut log =
+            SessionLog::create(&sessions_root, workspace.as_std_path(), RunId::new_v7()).unwrap();
+        log.append_event(&SessionEvent::UserSubmitted {
+            content: "one".into(),
+        })
+        .unwrap();
+        let session_id = log.session_id();
+        let path = log.path().to_path_buf();
         drop(log);
 
-        let (events, max_seq) = read_events_and_max_seq(&path).unwrap();
-        assert_eq!(max_seq, 4, "max_seq 必须包含损坏行之后的事件");
-        assert_eq!(events.len(), 3, "损坏行被跳过");
+        let mut raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.pop(), Some(b'\n'));
+        std::fs::write(&path, raw).unwrap();
 
-        // 重新 open 后 seq 必须是 max_seq+1，append 的事件 seq 单调且不重复。
-        let reopened = SessionLog::open(&sessions_root, workspace.as_std_path(), session_id)
-            .expect("open session");
-        assert_eq!(reopened.seq(), 5, "恢复 seq 必须基于 max_seq（P0-12）");
+        let mut reopened =
+            SessionLog::open(&sessions_root, workspace.as_std_path(), session_id).unwrap();
+        assert_eq!(reopened.seq(), 1);
+        assert_eq!(
+            reopened
+                .append_event(&SessionEvent::UserSubmitted {
+                    content: "two".into(),
+                })
+                .unwrap(),
+            2
+        );
+        drop(reopened);
+        assert_eq!(read_events(&path).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn session_has_a_single_exclusive_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let sessions_root = dir.path().join("sessions");
+        let first =
+            SessionLog::create(&sessions_root, workspace.as_std_path(), RunId::new_v7()).unwrap();
+        let session_id = first.session_id();
+
+        let error = SessionLog::open(&sessions_root, workspace.as_std_path(), session_id)
+            .err()
+            .expect("第二个 writer 必须被拒绝");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+
+        drop(first);
+        SessionLog::open(&sessions_root, workspace.as_std_path(), session_id)
+            .expect("writer 退出后应能恢复 session");
+    }
+
+    #[test]
+    fn append_rejects_invalid_tool_protocol_without_advancing_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let sessions_root = dir.path().join("sessions");
+        let mut log =
+            SessionLog::create(&sessions_root, workspace.as_std_path(), RunId::new_v7()).unwrap();
+        let call_id = ToolCallId::new_v7();
+        let outcome =
+            crate::tool::outcome::ToolOutcome::succeeded("read", "ok".into()).into_stored();
+
+        assert!(
+            log.append_event(&SessionEvent::ToolCompleted { call_id, outcome })
+                .is_err()
+        );
+        assert_eq!(log.seq(), 0, "被拒事件不得消耗 seq");
+
+        log.append_event(&SessionEvent::ToolRequested {
+            call: ToolCall {
+                call_id,
+                provider_id: "provider-call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+        })
+        .unwrap();
+        assert_eq!(log.seq(), 1);
+    }
+
+    #[test]
+    fn compacted_range_rejects_invalid_ranges_and_prefers_later_equal_coverage() {
+        let summary = |text: &str| SessionEvent::CompactionCommitted {
+            covered: EventRange {
+                start: EventId::from_u128(1),
+                end: EventId::from_u128(3),
+            },
+            summary: CompactSummary { text: text.into() },
+        };
+        let events = vec![
+            (
+                2,
+                SessionEvent::CompactionCommitted {
+                    covered: EventRange {
+                        start: EventId::from_u128(1),
+                        end: EventId::from_u128(99),
+                    },
+                    summary: CompactSummary {
+                        text: "invalid".into(),
+                    },
+                },
+            ),
+            (3, summary("first")),
+            (5, summary("latest")),
+        ];
+
+        assert_eq!(
+            compacted_range(&events),
+            (Some(3), Some(5), Some("latest".into()))
+        );
+    }
+
+    #[test]
+    fn begin_run_rotates_envelope_run_id_without_changing_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let sessions_root = dir.path().join("sessions");
+        let initial_run = RunId::new_v7();
+        let mut log =
+            SessionLog::create(&sessions_root, workspace.as_std_path(), initial_run).unwrap();
+        log.append_event(&SessionEvent::UserSubmitted {
+            content: "first".into(),
+        })
+        .unwrap();
+        let next_run = log.begin_run();
+        assert_ne!(initial_run, next_run);
+        log.append_event(&SessionEvent::UserSubmitted {
+            content: "second".into(),
+        })
+        .unwrap();
+        let session_id = log.session_id();
+        let envelopes = read_envelopes(log.path()).unwrap();
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(envelopes[0].run_id, initial_run);
+        assert_eq!(envelopes[1].run_id, next_run);
+        assert!(envelopes.iter().all(|event| event.session_id == session_id));
     }
 
     /// §16：WallTimeExceeded 是新增完成原因，必须能持久化并读回（session 文件兼容）。

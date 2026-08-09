@@ -52,6 +52,7 @@ fn crashed_session(
                 tool: "edit".into(),
                 target_path: workspace.join(relative_target).to_string(),
                 expected_revision: expected_revision.into(),
+                candidate_revision: None,
                 temp_path: plan.temp_path.to_string_lossy().to_string(),
                 backup_path: plan
                     .backup_path

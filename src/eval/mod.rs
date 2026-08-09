@@ -932,6 +932,7 @@ mod tests {
                 tool: "edit".into(),
                 target_path: "a.rs".into(),
                 expected_revision: String::new(),
+                candidate_revision: None,
                 temp_path: String::new(),
                 backup_path: Some(String::new()),
             }),

@@ -26,6 +26,14 @@ const MAX_ATTEMPTS: u32 = 4;
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 /// 首次退避基准（第 0 次重试）；每次尝试翻倍：500ms → 1s → 2s。
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+/// 单个响应允许的 tool call 槽位上限，防止稀疏/恶意 index 触发巨量分配。
+const MAX_STREAM_TOOL_CALLS: usize = 256;
+const MAX_SSE_EVENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STREAM_TEXT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PROVIDER_CALL_ID_BYTES: usize = 1024;
+const MAX_TOOL_NAME_BYTES: usize = 256;
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 
 /// OpenAI-compatible adapter（P0-4：只保存连接级状态）。
 ///
@@ -262,7 +270,9 @@ impl Provider for OpenAiCompatClient {
                     if attempt + 1 >= MAX_ATTEMPTS || retry_wait >= MAX_RETRY_WAIT {
                         return Err(classify_error(error, attempt));
                     }
-                    let delay = backoff_delay(attempt, None);
+                    let Some(delay) = retry_delay_within_budget(attempt, None, retry_wait) else {
+                        return Err(classify_error(error, attempt));
+                    };
                     tracing::warn!(
                         attempt,
                         error = %error,
@@ -295,7 +305,10 @@ impl Provider for OpenAiCompatClient {
                                 return Err(error);
                             }
                             // 未收到任何事件：传输层失败，短暂等待后重发请求。
-                            let delay = backoff_delay(attempt, None);
+                            let Some(delay) = retry_delay_within_budget(attempt, None, retry_wait)
+                            else {
+                                return Err(error);
+                            };
                             tracing::warn!(
                                 attempt,
                                 error = %error,
@@ -310,7 +323,10 @@ impl Provider for OpenAiCompatClient {
                         }
                     }
                 }
-                SendResult::Retryable { retry_after } => {
+                SendResult::Retryable {
+                    retry_after,
+                    status,
+                } => {
                     if trace::enabled() {
                         let mut fields = serde_json::Map::new();
                         fields.insert(
@@ -320,11 +336,12 @@ impl Provider for OpenAiCompatClient {
                         trace::log("retryable", fields);
                     }
                     if attempt + 1 >= MAX_ATTEMPTS || retry_wait >= MAX_RETRY_WAIT {
-                        return Err(ProviderError::RateLimited(format!(
-                            "attempt {attempt}: retry budget exhausted"
-                        )));
+                        return Err(retryable_status_error(status, attempt));
                     }
-                    let delay = backoff_delay(attempt, retry_after);
+                    let Some(delay) = retry_delay_within_budget(attempt, retry_after, retry_wait)
+                    else {
+                        return Err(retryable_status_error(status, attempt));
+                    };
                     tracing::warn!(
                         attempt,
                         backoff_ms = delay.as_millis(),
@@ -358,6 +375,18 @@ fn backoff_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
     }
 }
 
+fn retry_delay_within_budget(
+    attempt: u32,
+    retry_after: Option<Duration>,
+    already_waited: Duration,
+) -> Option<Duration> {
+    let delay = backoff_delay(attempt, retry_after);
+    already_waited
+        .checked_add(delay)
+        .filter(|total| *total <= MAX_RETRY_WAIT)
+        .map(|_| delay)
+}
+
 /// 0..1 的伪随机比例（jitter 用；不用引全局 RNG 依赖）。
 fn random_ratio() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -388,7 +417,10 @@ enum ConsumeResult {
 
 enum SendResult {
     Ok(reqwest::Response),
-    Retryable { retry_after: Option<Duration> },
+    Retryable {
+        retry_after: Option<Duration>,
+        status: reqwest::StatusCode,
+    },
 }
 
 impl OpenAiCompatClient {
@@ -414,7 +446,10 @@ impl OpenAiCompatClient {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(Duration::from_secs);
-            return Ok(SendResult::Retryable { retry_after });
+            return Ok(SendResult::Retryable {
+                retry_after,
+                status,
+            });
         }
         let status_text = status.as_u16();
         let message = match status {
@@ -424,8 +459,19 @@ impl OpenAiCompatClient {
             _ => {
                 // §27：4xx/5xx 错误带 provider body（诊断；截断避免刷屏）。
                 // 此前只报 status code，真实 400 的具体原因完全不可见。
-                let body = response.text().await.unwrap_or_default();
-                let snippet: String = body.chars().take(300).collect();
+                let mut stream = response.bytes_stream();
+                let mut body = Vec::new();
+                while body.len() < MAX_ERROR_BODY_BYTES {
+                    let next = tokio::select! {
+                        _ = cancel.cancelled() => return Err("cancelled".into()),
+                        next = stream.next() => next,
+                    };
+                    let Some(chunk) = next else { break };
+                    let Ok(chunk) = chunk else { break };
+                    let remaining = MAX_ERROR_BODY_BYTES - body.len();
+                    body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                }
+                let snippet: String = String::from_utf8_lossy(&body).chars().take(300).collect();
                 format!("http {status_text}: {snippet}")
             }
         };
@@ -446,6 +492,15 @@ fn classify_error(message: String, attempt: u32) -> ProviderError {
     ProviderError::Connection(format!("attempt {attempt}: {message}"))
 }
 
+fn retryable_status_error(status: reqwest::StatusCode, attempt: u32) -> ProviderError {
+    let message = format!("attempt {attempt}: HTTP {status}; retry budget exhausted");
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        ProviderError::RateLimited(message)
+    } else {
+        ProviderError::Http(message)
+    }
+}
+
 /// §7.3/§15：SSE 传输错误是否可安全重试。
 /// 收到任何事件后重试会重复内容（重复 assistant 文本/工具调用），必须不可重试。
 fn sse_transport_error_retryable(received_any: bool) -> bool {
@@ -464,6 +519,8 @@ async fn consume_stream(
     // 正常 OpenAI SSE 流以 `[DONE]` 结束；EOF 前未见 [DONE] = 流被截断
     // （此前静默丢失尾部内容——事件中间中断被当成正常结束）。
     let mut saw_done = false;
+    let mut streamed_text_bytes = 0usize;
+    let mut tool_argument_bytes = 0usize;
 
     loop {
         let next = tokio::select! {
@@ -481,13 +538,21 @@ async fn consume_stream(
             Ok(event) => event,
             Err(e) => {
                 return ConsumeResult::Failed {
-                    error: ProviderError::Protocol(e.to_string()),
+                    error: ProviderError::Connection(e.to_string()),
                     // §7.3/§15：只有未收到任何事件时才能重试——否则重发请求会重复
                     // 已到达的文本/工具调用（此前恒为 true，SSE 中途断开会重复内容）。
                     retryable: sse_transport_error_retryable(received_any),
                 };
             }
         };
+        if event.data.len() > MAX_SSE_EVENT_BYTES {
+            return ConsumeResult::Failed {
+                error: ProviderError::Protocol(format!(
+                    "SSE event exceeds {MAX_SSE_EVENT_BYTES} byte limit"
+                )),
+                retryable: false,
+            };
+        }
         if trace::enabled() {
             let mut fields = serde_json::Map::new();
             fields.insert("event_type".into(), json!(event.event));
@@ -527,20 +592,66 @@ async fn consume_stream(
             if let Some(content) = &choice.delta.content
                 && !content.is_empty()
             {
+                streamed_text_bytes = match streamed_text_bytes.checked_add(content.len()) {
+                    Some(total) if total <= MAX_STREAM_TEXT_BYTES => total,
+                    _ => {
+                        return ConsumeResult::Failed {
+                            error: ProviderError::Protocol(format!(
+                                "assistant text exceeds {MAX_STREAM_TEXT_BYTES} byte limit"
+                            )),
+                            retryable: false,
+                        };
+                    }
+                };
                 chunk_had_semantic = true;
-                let _ = events.send(ProviderEvent::TextDelta(content.clone())).await;
+                if events
+                    .send(ProviderEvent::TextDelta(content.clone()))
+                    .await
+                    .is_err()
+                {
+                    return ConsumeResult::Failed {
+                        error: ProviderError::Cancelled,
+                        retryable: false,
+                    };
+                }
             }
             if let Some(reasoning) = &choice.delta.reasoning_content
                 && !reasoning.is_empty()
             {
+                streamed_text_bytes = match streamed_text_bytes.checked_add(reasoning.len()) {
+                    Some(total) if total <= MAX_STREAM_TEXT_BYTES => total,
+                    _ => {
+                        return ConsumeResult::Failed {
+                            error: ProviderError::Protocol(format!(
+                                "stream text exceeds {MAX_STREAM_TEXT_BYTES} byte limit"
+                            )),
+                            retryable: false,
+                        };
+                    }
+                };
                 chunk_had_semantic = true;
-                let _ = events
+                if events
                     .send(ProviderEvent::ReasoningDelta(reasoning.clone()))
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    return ConsumeResult::Failed {
+                        error: ProviderError::Cancelled,
+                        retryable: false,
+                    };
+                }
             }
             for call in &choice.delta.tool_calls {
                 chunk_had_semantic = true;
                 let index = call.index.unwrap_or(0) as usize;
+                if index >= MAX_STREAM_TOOL_CALLS {
+                    return ConsumeResult::Failed {
+                        error: ProviderError::Protocol(format!(
+                            "tool call index {index} exceeds limit {MAX_STREAM_TOOL_CALLS}"
+                        )),
+                        retryable: false,
+                    };
+                }
                 if pending.len() <= index {
                     pending.resize_with(index + 1, || PendingToolCall {
                         provider_id: None,
@@ -550,9 +661,27 @@ async fn consume_stream(
                 }
                 let slot = &mut pending[index];
                 if let Some(id) = &call.id {
+                    if id.is_empty()
+                        || id.len() > MAX_PROVIDER_CALL_ID_BYTES
+                        || id.chars().any(char::is_control)
+                    {
+                        return ConsumeResult::Failed {
+                            error: ProviderError::Protocol("invalid tool call id".into()),
+                            retryable: false,
+                        };
+                    }
                     slot.provider_id = Some(id.clone());
                 }
                 if let Some(name) = &call.function.as_ref().and_then(|f| f.name.as_ref()) {
+                    if name.is_empty()
+                        || name.len() > MAX_TOOL_NAME_BYTES
+                        || name.chars().any(char::is_control)
+                    {
+                        return ConsumeResult::Failed {
+                            error: ProviderError::Protocol("invalid tool call name".into()),
+                            retryable: false,
+                        };
+                    }
                     slot.name = name.to_string();
                     if trace::enabled() {
                         let mut fields = serde_json::Map::new();
@@ -561,17 +690,35 @@ async fn consume_stream(
                         fields.insert("provider_id".into(), json!(slot.provider_id));
                         trace::log("tool_call_started", fields);
                     }
-                    let _ = events
+                    if events
                         .send(ProviderEvent::ToolCallStarted {
                             index: index as u32,
                             id: slot.provider_id.clone().unwrap_or_default(),
                             name: name.to_string(),
                         })
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        return ConsumeResult::Failed {
+                            error: ProviderError::Cancelled,
+                            retryable: false,
+                        };
+                    }
                 }
                 if let Some(arguments) = call.function.as_ref().and_then(|f| f.arguments.as_ref())
                     && !arguments.is_empty()
                 {
+                    tool_argument_bytes = match tool_argument_bytes.checked_add(arguments.len()) {
+                        Some(total) if total <= MAX_TOOL_ARGUMENT_BYTES => total,
+                        _ => {
+                            return ConsumeResult::Failed {
+                                error: ProviderError::Protocol(format!(
+                                    "tool arguments exceed {MAX_TOOL_ARGUMENT_BYTES} byte limit"
+                                )),
+                                retryable: false,
+                            };
+                        }
+                    };
                     slot.arguments.push_str(arguments);
                     if trace::enabled() {
                         let mut fields = serde_json::Map::new();
@@ -579,12 +726,19 @@ async fn consume_stream(
                         fields.insert("arguments_len".into(), json!(arguments.len()));
                         trace::log("tool_arguments_delta", fields);
                     }
-                    let _ = events
+                    if events
                         .send(ProviderEvent::ToolArgumentsDelta {
                             index: index as u32,
                             chunk: arguments.clone(),
                         })
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        return ConsumeResult::Failed {
+                            error: ProviderError::Cancelled,
+                            retryable: false,
+                        };
+                    }
                 }
             }
             if let Some(reason) = &choice.finish_reason {
@@ -596,16 +750,19 @@ async fn consume_stream(
             received_any = true;
         }
         if let Some(usage_value) = &chunk.usage {
-            usage = Usage {
-                input_tokens: usage_value.prompt_tokens.unwrap_or(0),
-                output_tokens: usage_value.completion_tokens.unwrap_or(0),
-                // §16.2：缓存命中 token（OpenAI-compatible prompt_tokens_details）。
-                cache_read_tokens: usage_value
-                    .prompt_tokens_details
-                    .as_ref()
-                    .and_then(|d| d.cached_tokens)
-                    .unwrap_or(0),
-            };
+            if let Some(input_tokens) = usage_value.prompt_tokens {
+                usage.input_tokens = input_tokens;
+            }
+            if let Some(output_tokens) = usage_value.completion_tokens {
+                usage.output_tokens = output_tokens;
+            }
+            if let Some(cache_read_tokens) = usage_value
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens)
+            {
+                usage.cache_read_tokens = cache_read_tokens;
+            }
         }
     }
 
@@ -617,42 +774,60 @@ async fn consume_stream(
         } else if received_any {
             // 已发出事件：不可重试（避免事件重复/乱序）。
             return ConsumeResult::Failed {
-                error: ProviderError::Protocol(
+                error: ProviderError::Connection(
                     "stream ended before [DONE] and no finish_reason".into(),
                 ),
                 retryable: false,
             };
         } else {
             return ConsumeResult::Failed {
-                error: ProviderError::Protocol("empty stream".into()),
+                error: ProviderError::Connection("empty stream".into()),
                 retryable: true,
             };
         }
     }
 
     // §7.3：tool arguments 不完整（未闭合 JSON）时返回协议错误，不能猜补 JSON。
-    let tool_calls = pending
-        .into_iter()
-        .filter(|call| !call.name.is_empty())
-        .map(|call| {
+    let tool_calls = (|| -> Result<Vec<crate::provider::ToolCall>, ProviderError> {
+        let mut complete = Vec::new();
+        let mut provider_ids = std::collections::HashSet::new();
+        for call in pending {
+            let touched =
+                call.provider_id.is_some() || !call.name.is_empty() || !call.arguments.is_empty();
+            if !touched {
+                continue;
+            }
+            if call.name.is_empty() {
+                return Err(ProviderError::Protocol(
+                    "tool call is missing function name".into(),
+                ));
+            }
             let arguments = call.arguments;
             if !arguments.trim().is_empty() {
                 serde_json::from_str::<serde_json::Value>(&arguments)
                     .map_err(|_| ProviderError::Protocol("incomplete tool arguments".into()))?;
             }
-            let provider_id = call.provider_id.unwrap_or_default();
-            Ok(crate::provider::ToolCall {
+            let provider_id = call.provider_id.ok_or_else(|| {
+                ProviderError::Protocol(format!("tool call {} is missing id", call.name))
+            })?;
+            if !provider_ids.insert(provider_id.clone()) {
+                return Err(ProviderError::Protocol(format!(
+                    "duplicate tool call id: {provider_id}"
+                )));
+            }
+            complete.push(crate::provider::ToolCall {
                 call_id: ToolCallId::new_v7(),
                 provider_id,
                 name: call.name,
                 arguments,
-            })
-        })
-        .collect::<Result<Vec<_>, ProviderError>>()
-        .map_err(|error| ConsumeResult::Failed {
-            error,
-            retryable: false,
-        });
+            });
+        }
+        Ok(complete)
+    })()
+    .map_err(|error| ConsumeResult::Failed {
+        error,
+        retryable: false,
+    });
     let tool_calls = match tool_calls {
         Ok(tool_calls) => tool_calls,
         Err(failed) => return failed,
@@ -837,6 +1012,34 @@ fn retry_after_respected_when_larger() {
     assert_eq!(backoff_delay(0, Some(server_longer)), server_longer);
     let server_shorter = Duration::from_millis(10);
     assert_eq!(backoff_delay(0, Some(server_shorter)), local);
+}
+
+#[test]
+fn retry_after_cannot_exceed_total_wait_budget() {
+    assert_eq!(
+        retry_delay_within_budget(0, Some(Duration::from_secs(61)), Duration::ZERO),
+        None
+    );
+    assert_eq!(
+        retry_delay_within_budget(0, Some(Duration::from_secs(30)), Duration::from_secs(31)),
+        None
+    );
+    assert_eq!(
+        retry_delay_within_budget(0, Some(Duration::from_secs(30)), Duration::from_secs(30)),
+        Some(Duration::from_secs(30))
+    );
+}
+
+#[test]
+fn exhausted_retryable_status_keeps_error_class() {
+    assert!(matches!(
+        retryable_status_error(reqwest::StatusCode::TOO_MANY_REQUESTS, 3),
+        ProviderError::RateLimited(_)
+    ));
+    assert!(matches!(
+        retryable_status_error(reqwest::StatusCode::BAD_GATEWAY, 3),
+        ProviderError::Http(_)
+    ));
 }
 
 /// §16.2：缓存命中 token 解析——prompt_tokens_details.cached_tokens。

@@ -631,10 +631,17 @@ fn recovery_metadata(
                 allow_outside_workspace,
             )
             .ok()?;
+            let expected_revision = tool::edit::parse_revision_token(&parsed.revision)
+                .unwrap_or_else(|| parsed.revision.clone());
+            let candidate_revision =
+                tool::edit::apply_edit(&target, &parsed.revision, &parsed.replacements)
+                    .ok()
+                    .map(|result| result.current_revision);
             Some(RecoveryMetadata {
                 tool: "edit".into(),
                 target_path: target.to_string(),
-                expected_revision: parsed.revision,
+                expected_revision,
+                candidate_revision,
                 temp_path: temp,
                 backup_path: backup,
             })
@@ -651,7 +658,12 @@ fn recovery_metadata(
             Some(RecoveryMetadata {
                 tool: "write".into(),
                 target_path: target.to_string(),
-                expected_revision: String::new(),
+                expected_revision: parsed
+                    .revision
+                    .as_deref()
+                    .and_then(tool::edit::parse_revision_token)
+                    .unwrap_or_default(),
+                candidate_revision: Some(tool::edit::revision_of(parsed.content.as_bytes())),
                 temp_path: temp,
                 backup_path: backup,
             })
@@ -662,6 +674,7 @@ fn recovery_metadata(
                 tool: "bash".into(),
                 target_path: parsed.command,
                 expected_revision: String::new(),
+                candidate_revision: None,
                 temp_path: String::new(),
                 backup_path: None,
             })

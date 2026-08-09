@@ -55,8 +55,13 @@ pub const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// - 下限 12 行（小终端仍可读）；
 /// - 上限为 `rows - 12`（给 plan/footer/input 区域留空间），大终端自动拓展。
 pub fn activity_height(rows: u16) -> u16 {
-    let proportional = (rows * 2) / 5;
-    proportional.clamp(12, rows.saturating_sub(12).max(12))
+    if rows < 12 {
+        return rows.max(1);
+    }
+    let proportional = ((u32::from(rows) * 2) / 5) as u16;
+    proportional
+        .clamp(12, rows.saturating_sub(12).max(12))
+        .min(rows)
 }
 
 /// spinner 动画帧（§16.1：动画时钟独立，活动时推进）。
@@ -287,17 +292,22 @@ impl Renderer {
         // fullscreen：alternate screen 内直接绘制整个终端，无 scrollback。
         if scrollback && !overflow.is_empty() {
             let lines = std::mem::take(&mut overflow);
-            let height = lines.len() as u16;
-            if self
-                .driver
-                .insert_before(height, |buf| {
-                    let area = Rect::new(0, 0, buf.area().width, height);
-                    ratatui::widgets::Paragraph::new(Text::from(lines.clone())).render(area, buf);
-                })
-                .is_err()
-            {
-                // 终端不支持 scrolling region：降级为活动区内部滚动（footer 提示）。
-                self.scrollback = false;
+            for chunk in lines.chunks(u16::MAX as usize) {
+                let chunk = chunk.to_vec();
+                let height = u16::try_from(chunk.len()).unwrap_or(u16::MAX);
+                if self
+                    .driver
+                    .insert_before(height, |buf| {
+                        let area = Rect::new(0, 0, buf.area().width, height);
+                        ratatui::widgets::Paragraph::new(Text::from(chunk.clone()))
+                            .render(area, buf);
+                    })
+                    .is_err()
+                {
+                    // 终端不支持 scrolling region：降级为活动区内部滚动（footer 提示）。
+                    self.scrollback = false;
+                    break;
+                }
             }
         }
         self.committed_lines = new_committed;
@@ -1903,8 +1913,8 @@ fn draw_modal(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: t
     }
     let wrapped = wrap_lines(content, inner_w);
     let total = wrapped.len();
-    let scroll = modal.scroll.min(total.saturating_sub(inner_h) as u16);
-    let start = scroll as usize;
+    let scroll = modal.scroll.min(total.saturating_sub(inner_h));
+    let start = scroll;
     let window = wrapped[start..start + inner_h.min(total)].to_vec();
 
     frame.render_widget(ratatui::widgets::Clear, rect);
@@ -1984,9 +1994,9 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
     // 内部滚动（逻辑行按 inner_w 折行后窗口化）。
     let rows = wrap_with_semantic(content, Vec::new(), &[], inner_w, EntryId(0));
     let wrapped: Vec<Line<'static>> = rows.into_iter().map(|r| r.line).collect();
-    let total = wrapped.len() as u16;
-    let scroll = overlay.scroll.min(total.saturating_sub(inner_h as u16));
-    let start = scroll as usize;
+    let total = wrapped.len();
+    let scroll = overlay.scroll.min(total.saturating_sub(inner_h));
+    let start = scroll;
     let end = (start + inner_h).min(wrapped.len());
     let window = wrapped[start..end].to_vec();
 
@@ -2184,12 +2194,15 @@ pub fn draw_captured_bytes(view: &mut ViewModel) -> Vec<u8> {
             })
             .ok();
         if !overflow.is_empty() {
-            let height = overflow.len() as u16;
             let lines = std::mem::take(&mut overflow);
-            let _ = terminal.insert_before(height, |buf| {
-                let area = Rect::new(0, 0, buf.area().width, height);
-                Paragraph::new(Text::from(lines.clone())).render(area, buf);
-            });
+            for chunk in lines.chunks(u16::MAX as usize) {
+                let chunk = chunk.to_vec();
+                let height = u16::try_from(chunk.len()).unwrap_or(u16::MAX);
+                let _ = terminal.insert_before(height, |buf| {
+                    let area = Rect::new(0, 0, buf.area().width, height);
+                    Paragraph::new(Text::from(chunk.clone())).render(area, buf);
+                });
+            }
         }
     }
     out

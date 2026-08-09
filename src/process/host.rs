@@ -53,6 +53,10 @@ pub fn run_host() -> i32 {
         Ok(child) => child,
         Err(error) => {
             // spawn 失败：发 Exit(码 -2，进程不可能返回的哨兵值) 并退出。
+            let mut diagnostic = vec![STREAM_STDERR];
+            diagnostic
+                .extend_from_slice(format!("process-host: spawn failed: {error}\n").as_bytes());
+            write_message(MSG_OUTPUT, &diagnostic);
             let payload = (-2i32).to_le_bytes().to_vec();
             write_message(MSG_EXIT, &payload);
             eprintln!("process-host: spawn failed: {error}");
@@ -134,9 +138,13 @@ fn read_start_spec() -> Option<StartSpec> {
 /// 并发写同一 stdout，分两次调用会被其他线程的写入插到中间（帧撕裂），
 /// 主进程 read_frame 会把拼接的帧解析成损坏数据。
 fn write_message(kind: u8, payload: &[u8]) {
+    let Ok(payload_len) = u32::try_from(payload.len()) else {
+        eprintln!("process-host: outgoing frame too large");
+        return;
+    };
     let mut stdout = std::io::stdout().lock();
     let mut message = Vec::with_capacity(5 + payload.len());
-    message.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    message.extend_from_slice(&payload_len.to_le_bytes());
     message.push(kind);
     message.extend_from_slice(payload);
     let _ = stdout.write_all(&message);

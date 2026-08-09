@@ -216,6 +216,7 @@ async fn recovery_never_replays_write_tools() {
                 tool: "edit".into(),
                 target_path: "sample.rs".into(),
                 expected_revision: current_revision(&workspace, "sample.rs"),
+                candidate_revision: None,
                 temp_path: String::new(),
                 backup_path: None,
             }),
@@ -228,7 +229,7 @@ async fn recovery_never_replays_write_tools() {
         .append(true)
         .open(session.path())
         .unwrap();
-    writeln!(file, "{{\"schema\":1,\"seq\":99,\"event_id\":\"broken").unwrap();
+    write!(file, "{{\"schema\":1,\"seq\":99,\"event_id\":\"broken").unwrap();
     drop(file);
 
     // 恢复：残行丢弃；未完成 edit 合成 Interrupted(unknown)；绝不重放工具。

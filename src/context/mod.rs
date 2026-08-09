@@ -28,7 +28,10 @@ pub fn estimate_tokens(text: &str) -> u64 {
 
 /// 估算一组消息的 token 数。
 pub fn estimate_messages(messages: &[ChatMessage]) -> u64 {
-    messages.iter().map(estimate_message).sum()
+    messages
+        .iter()
+        .map(estimate_message)
+        .fold(0, u64::saturating_add)
 }
 
 /// 请求级 token 估算（P0-9：compaction 判断与用量条必须包含 system prompt、
@@ -40,14 +43,15 @@ pub fn estimate_request(
     tools: &[crate::provider::ToolDef],
 ) -> u64 {
     let mut total = estimate_tokens(system_prompt);
-    total += estimate_messages(messages);
+    total = total.saturating_add(estimate_messages(messages));
     for tool in tools {
-        total += estimate_tokens(&tool.name);
-        total += estimate_tokens(&tool.description);
-        total += estimate_tokens(&tool.parameters.to_string());
+        total = total.saturating_add(estimate_tokens(&tool.name));
+        total = total.saturating_add(estimate_tokens(&tool.description));
+        total = total.saturating_add(estimate_tokens(&tool.parameters.to_string()));
     }
     // 每条消息的 role/tool_call_id/name 等 envelope 开销（§15.4 保守系数）。
-    total += (messages.len() as u64) * 8;
+    let message_count = u64::try_from(messages.len()).unwrap_or(u64::MAX);
+    total = total.saturating_add(message_count.saturating_mul(8));
     total
 }
 
@@ -57,13 +61,10 @@ fn estimate_message(message: &ChatMessage) -> u64 {
         ChatMessage::Assistant {
             content,
             tool_calls,
-        } => {
-            estimate_tokens(content)
-                + tool_calls
-                    .iter()
-                    .map(|call| estimate_tokens(&call.arguments))
-                    .sum::<u64>()
-        }
+        } => tool_calls
+            .iter()
+            .map(|call| estimate_tokens(&call.arguments))
+            .fold(estimate_tokens(content), u64::saturating_add),
         ChatMessage::Tool { content, .. } => estimate_tokens(content),
     }
 }
@@ -125,26 +126,52 @@ pub fn prune_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
 /// 关键行（artifact/error/status/exit_code/program）即使不在尾部也保留，
 /// 避免模型失去完整输出入口（如 `artifact: @artifact/...`）。
 fn prune_tool_output(content: &str) -> String {
+    const MAX_PRUNED_TOKENS: u64 = 800;
+    const MAX_KEY_TOKENS: u64 = 400;
+    const MAX_LINES_PER_KEY: usize = 2;
+    const MAX_LINE_CHARS: usize = 256;
+
     let digest = blake3::hash(content.as_bytes());
-    let tail: Vec<&str> = content
+    let tail: Vec<String> = content
         .lines()
         .rev()
         .take(8)
+        .map(|line| truncate_line(line, MAX_LINE_CHARS))
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .collect();
-    let mut key_lines: Vec<&str> = Vec::new();
+    let mut key_lines: Vec<String> = Vec::new();
+    let mut key_counts = [0usize; 5];
+    let mut omitted_key_lines = 0usize;
+    let mut line_count = 0usize;
     for line in content.lines() {
+        line_count = line_count.saturating_add(1);
         let trimmed = line.trim_start();
-        let is_key = trimmed.starts_with("status:")
-            || trimmed.starts_with("program:")
-            || trimmed.starts_with("exit_code:")
-            || trimmed.starts_with("artifact:")
-            || trimmed.starts_with("error:");
-        if is_key && !tail.contains(&line) && !key_lines.contains(&line) {
-            key_lines.push(line);
+        let key_kind = if trimmed.starts_with("status:") {
+            Some(0)
+        } else if trimmed.starts_with("program:") {
+            Some(1)
+        } else if trimmed.starts_with("exit_code:") {
+            Some(2)
+        } else if trimmed.starts_with("artifact:") {
+            Some(3)
+        } else if trimmed.starts_with("error:") {
+            Some(4)
+        } else {
+            None
+        };
+        let Some(key_kind) = key_kind else { continue };
+        let bounded = truncate_line(line, MAX_LINE_CHARS);
+        if tail.contains(&bounded) || key_lines.contains(&bounded) {
+            continue;
         }
+        if key_counts[key_kind] >= MAX_LINES_PER_KEY {
+            omitted_key_lines = omitted_key_lines.saturating_add(1);
+            continue;
+        }
+        key_counts[key_kind] += 1;
+        key_lines.push(bounded);
     }
     let mut out = format!(
         "[output pruned: {} tokens, digest {}]",
@@ -152,15 +179,53 @@ fn prune_tool_output(content: &str) -> String {
         &digest.to_hex()[..16]
     );
     if !key_lines.is_empty() {
-        out.push('\n');
-        out.push_str(&key_lines.join("\n"));
+        for line in key_lines {
+            if !push_line_within_budget(&mut out, &line, MAX_KEY_TOKENS) {
+                omitted_key_lines = omitted_key_lines.saturating_add(1);
+            }
+        }
     }
-    out.push('\n');
-    out.push_str(&tail.join("\n"));
-    if content.lines().count() > 8 {
-        out.push_str("\n--- tail ---");
+    if omitted_key_lines > 0 {
+        let marker = format!("[{} additional key lines omitted]", omitted_key_lines);
+        let _ = push_line_within_budget(&mut out, &marker, MAX_KEY_TOKENS);
     }
+    if line_count > 8 {
+        let _ = push_line_within_budget(&mut out, "--- tail ---", MAX_PRUNED_TOKENS);
+    }
+    for line in tail {
+        if !push_line_within_budget(&mut out, &line, MAX_PRUNED_TOKENS) {
+            let _ = push_line_within_budget(
+                &mut out,
+                "[remaining tail lines omitted]",
+                MAX_PRUNED_TOKENS,
+            );
+            break;
+        }
+    }
+    debug_assert!(estimate_tokens(&out) <= MAX_PRUNED_TOKENS);
     out
+}
+
+fn truncate_line(line: &str, max_chars: usize) -> String {
+    let mut chars = line.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}… [line truncated]")
+    } else {
+        prefix
+    }
+}
+
+fn push_line_within_budget(out: &mut String, line: &str, max_tokens: u64) -> bool {
+    let original_len = out.len();
+    out.push('\n');
+    out.push_str(line);
+    if estimate_tokens(out) <= max_tokens {
+        true
+    } else {
+        out.truncate(original_len);
+        false
+    }
 }
 
 /// Compaction summary schema（§15.4 固定字段）。
@@ -195,7 +260,33 @@ pub fn parse_summary(text: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    // 保留结构化字段；压缩为可注入的 summary 文本。
+    const FIELDS: [&str; 9] = [
+        "Goal",
+        "Constraints",
+        "Decisions",
+        "Completed",
+        "In progress",
+        "Next exact action",
+        "Relevant files and revisions",
+        "Verification status",
+        "Failed attempts and why",
+    ];
+    let mut seen = [false; FIELDS.len()];
+    for line in trimmed.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((name, value)) = line.split_once(':') else {
+            return String::new();
+        };
+        let Some(index) = FIELDS.iter().position(|field| *field == name.trim()) else {
+            return String::new();
+        };
+        if seen[index] || value.trim().is_empty() {
+            return String::new();
+        }
+        seen[index] = true;
+    }
+    if seen.iter().any(|present| !present) {
+        return String::new();
+    }
     trimmed.to_string()
 }
 
@@ -218,7 +309,7 @@ pub fn is_significant_shrink(original_tokens: u64, summary_tokens: u64) -> bool 
     } else {
         4u64
     };
-    summary_tokens * required_ratio < original_tokens
+    summary_tokens <= original_tokens.saturating_sub(1) / required_ratio
 }
 
 #[cfg(test)]
@@ -279,5 +370,37 @@ mod tests {
             "非关键内容只允许出现在 tail 8 行内（实际 {} 行）",
             pruned.matches("line of filler content").count()
         );
+    }
+
+    #[test]
+    fn prune_result_stays_bounded_with_key_line_flood_and_huge_tail_line() {
+        let mut content = String::new();
+        for index in 0..10_000 {
+            content.push_str(&format!("error: repeated diagnostic {index}\n"));
+        }
+        content.push_str("artifact: @artifact/session/id\n");
+        content.push_str(&"界".repeat(20_000));
+
+        let pruned = prune_tool_output(&content);
+        assert!(estimate_tokens(&pruned) <= 800, "裁剪结果仍超限");
+        assert!(pruned.contains("artifact: @artifact/session/id"));
+        assert!(pruned.contains("additional key lines omitted"));
+        assert!(pruned.contains("line truncated"));
+    }
+
+    #[test]
+    fn significant_shrink_handles_extreme_token_counts_without_overflow() {
+        assert!(!is_significant_shrink(u64::MAX, u64::MAX - 1));
+        assert!(is_significant_shrink(u64::MAX, u64::MAX / 3));
+    }
+
+    #[test]
+    fn summary_parser_requires_each_schema_field_once_with_a_value() {
+        let valid = "Goal: g\nConstraints: c\nDecisions: d\nCompleted: c\nIn progress: i\nNext exact action: n\nRelevant files and revisions: r\nVerification status: v\nFailed attempts and why: f";
+        assert_eq!(parse_summary(valid), valid);
+        assert!(parse_summary("Goal: only one field").is_empty());
+        assert!(parse_summary(&format!("{valid}\nGoal: duplicate")).is_empty());
+        assert!(parse_summary(&valid.replace("Constraints: c", "Constraints:")).is_empty());
+        assert!(parse_summary(&format!("{valid}\nUnknown: x")).is_empty());
     }
 }

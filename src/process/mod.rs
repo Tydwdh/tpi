@@ -48,6 +48,18 @@ pub struct HostRunOutput {
     pub launcher: Option<&'static str>,
 }
 
+fn terminal_without_start(ended_by: EndReason, launcher: Option<&'static str>) -> HostRunOutput {
+    HostRunOutput {
+        exit_code: None,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        stdout_total: 0,
+        stderr_total: 0,
+        ended_by,
+        launcher,
+    }
+}
+
 /// 模型侧输出预算（§8.4：run/bash 24 KiB，保留错误相关 tail）。
 pub const OUTPUT_BUDGET: usize = 24 * 1024;
 
@@ -98,6 +110,12 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
         mut artifact,
         stream_sink,
     } = request;
+    if cancel.is_cancelled() {
+        return Ok(terminal_without_start(EndReason::Cancelled, launcher));
+    }
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "command timeout exceeds platform clock range".to_string())?;
     // 单二进制 process-host（§11.5）：默认用自身；测试用 TPI_PROCESS_HOST 指向真实 tpi.exe。
     let exe = std::env::var_os("TPI_PROCESS_HOST")
         .map(PathBuf::from)
@@ -142,6 +160,15 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
         });
     }
 
+    // 归组期间可能已取消或耗尽 timeout；发送 Start 前再检查，避免目标进程
+    // 获得哪怕一个短暂的副作用窗口。
+    if cancel.is_cancelled() {
+        return Ok(terminal_without_start(EndReason::Cancelled, launcher));
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Ok(terminal_without_start(EndReason::TimedOut, launcher));
+    }
+
     // 发送 Start spec（framed：len + kind + payload）。
     let spec = serde_json::json!({
         "program": resolved_program,
@@ -150,8 +177,10 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
         "env": args.env,
     });
     let payload = serde_json::to_vec(&spec).map_err(|e| format!("spec json: {e}"))?;
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| "process-host start spec exceeds protocol limit".to_string())?;
     let mut header = [0u8; 5];
-    header[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    header[..4].copy_from_slice(&payload_len.to_le_bytes());
     header[4] = MSG_START;
     stdin
         .write_all(&header)
@@ -176,7 +205,6 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
         ended_by: EndReason::Exited,
         launcher,
     };
-    let deadline = tokio::time::Instant::now() + timeout;
     let mut exited = false;
     let mut terminated = false;
 
@@ -184,13 +212,15 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
     loop {
         tokio::select! {
             _ = cancel.cancelled(), if !terminated => {
-                job.terminate(1);
+                job.terminate(1)
+                    .map_err(|error| format!("terminate cancelled process tree: {error}"))?;
                 terminated = true;
                 output.ended_by = EndReason::Cancelled;
                 // host 已被终止，管道将 EOF；继续读完残余帧。
             }
             _ = tokio::time::sleep_until(deadline), if !terminated => {
-                job.terminate(1);
+                job.terminate(1)
+                    .map_err(|error| format!("terminate timed-out process tree: {error}"))?;
                 terminated = true;
                 output.ended_by = EndReason::TimedOut;
             }
@@ -201,30 +231,38 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
                     // 会把这些小输出丢帧并刷“unknown process-host message kind=1”告警。
                     Ok(Some((MSG_OUTPUT, payload))) if !payload.is_empty() => {
                         let stream = payload[0];
+                        if stream != STREAM_STDOUT && stream != STREAM_STDERR {
+                            return Err(format!("invalid process-host stream id {stream}"));
+                        }
                         let bytes = &payload[1..];
                         if let Some(sink) = stream_sink {
                             // 实时转发（bash 执行中 UI 可见增量输出；同步回调不阻塞读循环）。
                             sink(stream, bytes);
                         }
                         if let Some(writer) = artifact.as_mut() {
-                            let _ = writer.write(
+                            writer.write(
                                 if stream == STREAM_STDOUT {
                                     "stdout"
                                 } else {
                                     "stderr"
                                 },
                                 bytes,
-                            );
+                            )
+                            .map_err(|error| format!("write command artifact: {error}"))?;
                         }
                         if stream == STREAM_STDOUT {
-                            output.stdout_total += bytes.len() as u64;
+                            output.stdout_total = output
+                                .stdout_total
+                                .saturating_add(bytes.len() as u64);
                             append_bounded(&mut output.stdout, bytes);
                         } else {
-                            output.stderr_total += bytes.len() as u64;
+                            output.stderr_total = output
+                                .stderr_total
+                                .saturating_add(bytes.len() as u64);
                             append_bounded(&mut output.stderr, bytes);
                         }
                     }
-                    Ok(Some((MSG_EXIT, payload))) if payload.len() >= 4 => {
+                    Ok(Some((MSG_EXIT, payload))) if payload.len() == 4 => {
                         let code = i32::from_le_bytes(
                             payload[..4]
                                 .try_into()
@@ -233,8 +271,14 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
                         output.exit_code = Some(code);
                         exited = true;
                     }
+                    Ok(Some((MSG_OUTPUT, _))) => {
+                        return Err("invalid empty process-host output frame".into());
+                    }
+                    Ok(Some((MSG_EXIT, _))) => {
+                        return Err("invalid process-host exit frame".into());
+                    }
                     Ok(Some((kind, _))) => {
-                        tracing::warn!(kind, "unknown process-host message");
+                        return Err(format!("unknown process-host message kind {kind}"));
                     }
                     Ok(None) => break, // EOF：host 已退出
                     Err(e) => {
@@ -251,6 +295,9 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
 
     let _ = host.kill().await;
     let _ = host.wait().await;
+    if !terminated && !exited {
+        return Err("process-host exited without an Exit frame".into());
+    }
     Ok(output)
 }
 
@@ -266,7 +313,11 @@ async fn read_frame<R: AsyncReadExt + Unpin>(
             .await
             .map_err(|e| e.to_string())?;
         if n == 0 {
-            return Ok(None);
+            return if read == 0 {
+                Ok(None)
+            } else {
+                Err("process-host frame header truncated".into())
+            };
         }
         read += n;
     }
@@ -396,10 +447,15 @@ impl Job {
     }
 
     #[cfg(windows)]
-    pub fn terminate(&self, exit_code: u32) {
+    pub fn terminate(&self, exit_code: u32) -> std::io::Result<()> {
         // SAFETY: self owns a live job handle for the lifetime of this call.
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle, exit_code);
+        let result = unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle, exit_code)
+        };
+        if result == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     }
 
@@ -414,7 +470,9 @@ impl Job {
     }
 
     #[cfg(not(windows))]
-    pub fn terminate(&self, _exit_code: u32) {}
+    pub fn terminate(&self, _exit_code: u32) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Drop for Job {
@@ -447,5 +505,22 @@ mod tests {
         let frame = read_frame(&mut rx).await.unwrap().expect("frame");
         assert_eq!(frame.0, MSG_OUTPUT, "小帧 kind 必须保持 MSG_OUTPUT");
         assert_eq!(frame.1, vec![0, b'x'], "小帧 payload 不得丢失");
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_truncated_header_but_accepts_clean_eof() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&[1, 0]).await.unwrap();
+        drop(tx);
+        assert!(
+            read_frame(&mut rx)
+                .await
+                .unwrap_err()
+                .contains("header truncated")
+        );
+
+        let (tx, mut rx) = tokio::io::duplex(64);
+        drop(tx);
+        assert!(read_frame(&mut rx).await.unwrap().is_none());
     }
 }

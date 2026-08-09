@@ -299,12 +299,35 @@ fn run_eval_cli(
 fn prune_old_data(older_than_days: u64, dry_run: bool) -> Result<(), String> {
     let home = tpi::config::tpi_home();
     let cutoff = retention_cutoff(std::time::SystemTime::now(), older_than_days)?;
+    let sessions_root = home.join("sessions");
+    let active_sessions = active_session_ids(&sessions_root)?;
     let mut removed = 0usize;
-    for root in [home.join("sessions"), home.join("artifacts")] {
+    for root in [sessions_root, home.join("artifacts")] {
         if !root.exists() {
             continue;
         }
         for entry in walk_files(&root)? {
+            let file_name = entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            // 锁文件本身永不由 prune 删除；孤儿锁体积很小，保留它比在检查与
+            // 删除间破坏另一个进程的独占锁安全得多。
+            if file_name.ends_with(".jsonl.lock") {
+                continue;
+            }
+            let belongs_to_active_session = entry.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|part| active_sessions.contains(part))
+            }) || entry
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| active_sessions.contains(stem));
+            if belongs_to_active_session {
+                continue;
+            }
             let meta = std::fs::symlink_metadata(&entry)
                 .map_err(|e| format!("读取 {} 元数据失败: {e}", entry.display()))?;
             let modified = meta
@@ -329,6 +352,42 @@ fn prune_old_data(older_than_days: u64, dry_run: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn active_session_ids(
+    sessions_root: &std::path::Path,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut active = std::collections::HashSet::new();
+    if !sessions_root.exists() {
+        return Ok(active);
+    }
+    for path in walk_files(sessions_root)? {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(id) = name.strip_suffix(".jsonl.lock") else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(id).is_err() {
+            continue;
+        }
+        let locked = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => false,
+                Err(std::fs::TryLockError::WouldBlock) => true,
+                Err(std::fs::TryLockError::Error(_)) => true,
+            },
+            Err(_) => true,
+        };
+        if locked {
+            active.insert(id.to_string());
+        }
+    }
+    Ok(active)
+}
+
 fn retention_cutoff(
     now: std::time::SystemTime,
     older_than_days: u64,
@@ -342,28 +401,36 @@ fn retention_cutoff(
 
 /// 递归收集文件（prune 用）。目录链接和 Windows reparse point 一律不跟随。
 fn walk_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    const MAX_WALK_ENTRIES: usize = 100_000;
     let mut files = Vec::new();
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("读取目录 {} 失败: {e}", dir.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("读取目录项 {} 失败: {e}", dir.display()))?;
-        let path = entry.path();
-        // 不跟随符号链目录：prune 只应在 TPI 管理目录内递归，
-        // 否则链到外部目录时会把外部文件也删掉（安全陷阱）。
-        // 符号链文件本身可收集：remove_file 只删链接不触及目标。
-        let ft = entry
-            .file_type()
-            .map_err(|e| format!("读取 {} 类型失败: {e}", path.display()))?;
-        if is_reparse_point(&path)? {
-            if !ft.is_dir() {
+    let mut pending = vec![dir.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(current) = pending.pop() {
+        let entries = std::fs::read_dir(&current)
+            .map_err(|e| format!("读取目录 {} 失败: {e}", current.display()))?;
+        for entry in entries {
+            visited = visited.saturating_add(1);
+            if visited > MAX_WALK_ENTRIES {
+                return Err(format!("清理扫描超过 {MAX_WALK_ENTRIES} 个目录项，已停止"));
+            }
+            let entry = entry.map_err(|e| format!("读取目录项 {} 失败: {e}", current.display()))?;
+            let path = entry.path();
+            // 不跟随符号链目录：prune 只应在 TPI 管理目录内递归，
+            // 否则链到外部目录时会把外部文件也删掉（安全陷阱）。
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("读取 {} 类型失败: {e}", path.display()))?;
+            if is_reparse_point(&path)? {
+                if !ft.is_dir() {
+                    files.push(path);
+                }
+                continue;
+            }
+            if ft.is_dir() {
+                pending.push(path);
+            } else if ft.is_file() || ft.is_symlink() {
                 files.push(path);
             }
-            continue;
-        }
-        if ft.is_dir() {
-            files.extend(walk_files(&path)?);
-        } else if ft.is_file() || ft.is_symlink() {
-            files.push(path);
         }
     }
     Ok(files)
@@ -795,6 +862,28 @@ mod tests {
     #[test]
     fn retention_cutoff_rejects_overflow() {
         assert!(retention_cutoff(std::time::SystemTime::now(), u64::MAX).is_err());
+    }
+
+    #[test]
+    fn active_session_ids_reports_exclusively_locked_sessions() {
+        let root =
+            std::env::temp_dir().join(format!("tpi-active-session-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let session_id = uuid::Uuid::now_v7().to_string();
+        let lock_path = root.join(format!("{session_id}.jsonl.lock"));
+        let lock = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+
+        let active = active_session_ids(&root).unwrap();
+        assert!(active.contains(&session_id));
+
+        drop(lock);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

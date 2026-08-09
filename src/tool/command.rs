@@ -16,6 +16,8 @@ use serde::Deserialize;
 pub const DEFAULT_RUN_MAX_BYTES: usize = 24 * 1024;
 /// 默认超时（120 秒，§11.1 示例）。
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+pub const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
+pub const MAX_COMMAND_BYTES: usize = 1024 * 1024;
 /// stderr 最小保留预算（§14/BUG-007：失败原因优先于 stdout 刷屏；
 /// stdout 灌满总预算时 stderr 仍至少保留这一段）。
 pub const STDERR_MIN_BUDGET: usize = 4 * 1024;
@@ -53,7 +55,36 @@ fn default_timeout() -> u64 {
 
 /// `bash` 工具（§11.2：Git Bash 解析固定顺序；wrapper 统一 `set -o pipefail`）。
 pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
-    let timeout = Duration::from_millis(args.timeout_ms.max(1));
+    if args.command.trim().is_empty() {
+        return rejected_bash("empty_command", "command 不能为空。");
+    }
+    if args.command.len() > MAX_COMMAND_BYTES {
+        return rejected_bash(
+            "command_too_large",
+            format!("command 最多 {MAX_COMMAND_BYTES} 字节。"),
+        );
+    }
+    if args.timeout_ms == 0 || args.timeout_ms > MAX_TIMEOUT_MS {
+        return rejected_bash(
+            "invalid_timeout",
+            format!("timeout_ms 必须在 1..={MAX_TIMEOUT_MS} 范围内。"),
+        );
+    }
+    if ctx.cancel.is_cancelled() {
+        return ToolOutcome::failed(
+            "bash",
+            ModelPayload {
+                status: ToolStatus::Cancelled,
+                program: Some("bash".into()),
+                exit_code: None,
+                duration_ms: 0,
+                output: "status: cancelled\ntool: bash\nerror: cancelled".into(),
+                effect: None,
+                artifact: None,
+            },
+        );
+    }
+    let timeout = Duration::from_millis(args.timeout_ms);
     let start = std::time::Instant::now();
     let bash_exe = locate_git_bash(ctx);
     let Some(bash_exe) = bash_exe else {
@@ -77,17 +108,34 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
 {}",
         args.command
     );
-    let mut artifact = crate::session::artifact::ArtifactWriter::create(
-        &ctx.artifacts_root,
-        &ctx.session_id,
-        "bash",
-        "text/plain",
-    )
-    .ok();
     let exec_cwd = match crate::tool::resolve_tool_path(ctx, &args.cwd) {
         Ok(path) => path.to_string(),
         Err(error) => {
             return crate::tool::path_rejected_outcome("bash", error);
+        }
+    };
+    let mut artifact = match crate::session::artifact::ArtifactWriter::create(
+        &ctx.artifacts_root,
+        &ctx.session_id,
+        "bash",
+        "text/plain",
+    ) {
+        Ok(writer) => writer,
+        Err(error) => {
+            return ToolOutcome::failed(
+                "bash",
+                ModelPayload {
+                    status: ToolStatus::Failed,
+                    program: Some("bash".into()),
+                    exit_code: None,
+                    duration_ms: 0,
+                    output: format!(
+                        "status: failed\ntool: bash\nerror: artifact_create_failed\n\n{error}"
+                    ),
+                    effect: None,
+                    artifact: None,
+                },
+            );
         }
     };
     let run_args = RunArgs {
@@ -118,18 +166,12 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
         launcher: Some("git-bash"),
         cancel: ctx.cancel.clone(),
         timeout,
-        artifact: artifact.as_mut(),
+        artifact: Some(&mut artifact),
         stream_sink: stream_sink
             .as_ref()
             .map(|sink| sink as &(dyn Fn(u8, &[u8]) + Sync)),
     })
     .await;
-    let record = artifact.and_then(|writer| writer.finish().ok());
-    let artifact_ref = record.map(|record| crate::tool::outcome::ArtifactRef {
-        session: ctx.session_id.clone(),
-        id: record.id,
-    });
-
     let result = match result {
         Ok(result) => result,
         Err(error) => {
@@ -143,16 +185,17 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
                     output: format!(
                         "status: failed
 tool: bash
-error: process_isolation_unavailable
+error: process_execution_failed
 
 {error}"
                     ),
                     effect: None,
-                    artifact: artifact_ref,
+                    artifact: None,
                 },
             );
         }
     };
+    let artifact_result = artifact.finish();
     let tool_status = match result.ended_by {
         crate::process::EndReason::Cancelled => ToolStatus::Cancelled,
         crate::process::EndReason::TimedOut => ToolStatus::TimedOut,
@@ -176,6 +219,21 @@ error: process_isolation_unavailable
         stdout_bytes: &result.stdout,
         stderr_bytes: &result.stderr,
     });
+    let artifact_ref = match artifact_result {
+        Ok(record) => Some(crate::tool::outcome::ArtifactRef {
+            session: ctx.session_id.clone(),
+            id: record.id,
+        }),
+        Err(error) => {
+            let original_status = status_name(outcome.status);
+            outcome.status = ToolStatus::Failed;
+            outcome.model_payload.status = ToolStatus::Failed;
+            outcome.model_payload.output = format!(
+                "status: failed\ntool: bash\nerror: artifact_finalize_failed\noriginal_status: {original_status}\n\n{error}"
+            );
+            None
+        }
+    };
     // §8.4：opaque 引用必须同时进入结构化字段与模型可见文本
     //（模型读完整输出的唯一入口是 `read @artifact/...`）。
     if let Some(reference) = &artifact_ref {
@@ -187,6 +245,21 @@ error: process_isolation_unavailable
     }
     outcome.artifacts = artifact_ref.into_iter().collect();
     outcome
+}
+
+fn rejected_bash(code: &str, detail: impl std::fmt::Display) -> ToolOutcome {
+    ToolOutcome::failed(
+        "bash",
+        ModelPayload {
+            status: ToolStatus::Rejected,
+            program: Some("bash".into()),
+            exit_code: None,
+            duration_ms: 0,
+            output: format!("status: rejected\ntool: bash\nerror: {code}\n\n{detail}"),
+            effect: None,
+            artifact: None,
+        },
+    )
 }
 
 /// Git Bash 定位（§11.2 解析顺序固定且记录实际选择）。

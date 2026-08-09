@@ -22,6 +22,7 @@ pub struct Editor {
 
 /// 历史条数上限（防长会话内存增长）。
 const HISTORY_CAP: usize = 100;
+pub const MAX_INPUT_BYTES: usize = 256 * 1024;
 
 impl Editor {
     pub fn new() -> Self {
@@ -29,13 +30,18 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        if self.text.len().saturating_add(c.len_utf8()) > MAX_INPUT_BYTES {
+            return;
+        }
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
     }
 
     pub fn insert_str(&mut self, s: &str) {
-        self.text.insert_str(self.cursor, s);
-        self.cursor += s.len();
+        let room = MAX_INPUT_BYTES.saturating_sub(self.text.len());
+        let keep = crate::tui::text::floor_char_boundary(s, room.min(s.len()));
+        self.text.insert_str(self.cursor, &s[..keep]);
+        self.cursor += keep;
     }
 
     /// 光标所在 logical line 的字节范围（[start, end)，不含换行符；§22）。
@@ -223,7 +229,15 @@ impl Editor {
 
     /// 整行替换（历史浏览、命令补全用）；光标移到末尾。
     pub fn set_text(&mut self, text: String) {
-        self.text = text;
+        self.text = if text.len() <= MAX_INPUT_BYTES {
+            text
+        } else {
+            crate::tui::text::truncate_middle_utf8(
+                &text,
+                MAX_INPUT_BYTES,
+                "\n…[input truncated]…\n",
+            )
+        };
         self.cursor = self.text.len();
         self.preferred_column = None;
     }

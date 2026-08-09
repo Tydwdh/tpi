@@ -16,15 +16,7 @@ use std::sync::{Mutex, OnceLock};
 static TRACE_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
 fn log_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("TPI_HOME")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir).join("logs");
-    }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".tpi").join("logs")
+    crate::config::tpi_home().join("logs")
 }
 
 /// TPI_TRACE_PROVIDER=1（元数据）或 =body（含 request body）时启用。
@@ -81,6 +73,10 @@ pub fn log(kind: &str, mut fields: serde_json::Map<String, serde_json::Value>) {
     fields.insert("kind".into(), serde_json::json!(kind));
     let line = serde_json::Value::Object(fields).to_string() + "\n";
     let mut guard = crate::util::lock_mutex(writer, "provider_trace");
-    let _ = guard.write_all(line.as_bytes());
-    let _ = guard.flush();
+    if let Err(error) = guard
+        .write_all(line.as_bytes())
+        .and_then(|()| guard.flush())
+    {
+        tracing::warn!(%error, "provider trace 写入失败");
+    }
 }

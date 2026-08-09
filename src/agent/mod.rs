@@ -24,6 +24,16 @@ use crate::session::{
 use crate::tool::outcome::{StoredToolOutcome, ToolStatus};
 use crate::tool::{self, BuiltinTool};
 
+/// Tokio 的 JoinHandle 在 drop 时会脱离而不是取消；run 的 watchdog 必须随
+/// 任意返回路径终止，避免失败后仍发送警告或取消已结束的 token。
+struct AbortTaskOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortTaskOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// 内建 system prompt（§23 草案）。
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
 
@@ -169,9 +179,8 @@ pub async fn run<P: Provider>(
         interactive,
         force_compaction,
     } = input;
-    let run_id = session.run_id();
-    let request_id = RequestId::new_v7();
-    let span = tracing::info_span!("agent.run", %run_id, %request_id);
+    let run_id = session.begin_run();
+    let span = tracing::info_span!("agent.run", %run_id);
     let _enter = span.enter();
     // §44：run 级耗时基线。
     let run_started = std::time::Instant::now();
@@ -202,50 +211,17 @@ pub async fn run<P: Provider>(
         .and_then(|_| session.sync_data())
         .map_err(|e| RunFailure::Session(e.to_string()))?;
 
-    let mut messages: Vec<ChatMessage> = history.to_vec();
-    if !user_message.is_empty() {
-        messages.push(ChatMessage::User(user_message.clone()));
-    }
-    // P1-10：手动 /compact——在第一个完整边界无条件执行一次压缩。
-    // 失败（历史不足/不显著）不中断 run，只记录日志。
-    if force_compaction
-        && messages.len() > 1
-        && let Err(error) = compact_turn(provider, &mut messages, session, config, &cancel).await
-    {
-        tracing::warn!(error = %error, "manual compaction failed");
-    }
-    // 工具共享状态与 ToolContext 构造由 run-scoped runtime 统一管理。
-    let tool_runtime = ToolRuntime::new(
-        config,
-        session.session_id().to_string(),
-        cancel.clone(),
-        interactive,
-    );
-
-    let mut usage_total = Usage::default();
-    let mut turn = 0u32;
-    let mut tool_calls_total = 0u32;
-    let tools = tool::implemented_tools();
-    let tool_defs: Vec<crate::provider::ToolDef> = tools.iter().map(BuiltinTool::schema).collect();
-
-    let mut assistant_text = String::new();
-    // §12.3：确定性无进展检测（不调用额外模型）。
-    let mut progress = crate::agent::scheduler::ProgressTracker::default();
-    // §12.4：wall-clock watchdog（实时主动取消）。
-    // P1-3：接近预算时向 TUI 发送 BudgetWarning（此前只写日志）。
-    // §16：取消来源（用户 vs wall-time）——watchdog 到期前写入 WALL_TIME，
-    // 否则 UI/session 会把系统超时显示成用户取消。
+    // watchdog 必须覆盖手动 compaction 在内的整个模型工作阶段，并通过
+    // AbortTaskOnDrop 保证所有 `?`/early return 路径都停止后台任务。
     let cancel_cause = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
         crate::agent::limits::CANCEL_CAUSE_USER,
     ));
     let warn_ui = ui.clone();
-
     let cause_for_watchdog = cancel_cause.clone();
     let (watchdog, _wall) = crate::agent::limits::spawn_watchdog(
         &config.limits,
         cancel.clone(),
         move || {
-            // §16：硬限制到期前标记来源，run 结束时据此记录 WallTimeExceeded。
             cause_for_watchdog.store(
                 crate::agent::limits::CANCEL_CAUSE_WALL_TIME,
                 std::sync::atomic::Ordering::SeqCst,
@@ -256,6 +232,47 @@ pub async fn run<P: Provider>(
             let _ = warn_ui.try_send(RuntimeEvent::BudgetWarning);
         },
     );
+    let watchdog = AbortTaskOnDrop(watchdog);
+
+    let mut usage_total = Usage::default();
+    let mut messages: Vec<ChatMessage> = history.to_vec();
+    if !user_message.is_empty() {
+        messages.push(ChatMessage::User(user_message.clone()));
+    }
+    // P1-10：手动 /compact——在第一个完整边界无条件执行一次压缩。
+    // 失败（历史不足/不显著）不中断 run，只记录日志。
+    if force_compaction && messages.len() > 1 {
+        match compact_turn(
+            provider,
+            &mut messages,
+            session,
+            config,
+            &cancel,
+            &mut usage_total,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error @ RunFailure::Session(_)) => return Err(error),
+            Err(error) => tracing::warn!(error = %error, "manual compaction failed"),
+        }
+    }
+    // 工具共享状态与 ToolContext 构造由 run-scoped runtime 统一管理。
+    let tool_runtime = ToolRuntime::new(
+        config,
+        session.session_id().to_string(),
+        cancel.clone(),
+        interactive,
+    );
+
+    let mut turn = 0u32;
+    let mut tool_calls_total = 0u32;
+    let tools = tool::implemented_tools();
+    let tool_defs: Vec<crate::provider::ToolDef> = tools.iter().map(BuiltinTool::schema).collect();
+
+    let mut assistant_text = String::new();
+    // §12.3：确定性无进展检测（不调用额外模型）。
+    let mut progress = crate::agent::scheduler::ProgressTracker::default();
     // §15.4：同一阈值区间内 compaction 失败后不反复调用模型。
     let mut compaction_failed = false;
     let final_reason: CompletionReason = 'run_loop: loop {
@@ -270,6 +287,9 @@ pub async fn run<P: Provider>(
             break CompletionReason::MaxTurns;
         }
         turn += 1;
+        // 一个 request_id 标识一个逻辑 model turn；自动续写/restart 沿用它，
+        // 下一轮（通常在工具结果之后）必须分配新 id。
+        let request_id = RequestId::new_v7();
         let _ = ui.send(RuntimeEvent::TurnStarted { turn }).await;
 
         // §15.4：compaction 检查（只在下一次请求前；完整 boundary 之后）。
@@ -285,7 +305,16 @@ pub async fn run<P: Provider>(
             let system_prompt = system_prompt_text(config, plan.as_ref(), None);
             let projected = crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
             if crate::context::should_compact(projected, usable) && !compaction_failed {
-                match compact_turn(provider, &mut messages, session, config, &cancel).await {
+                match compact_turn(
+                    provider,
+                    &mut messages,
+                    session,
+                    config,
+                    &cancel,
+                    &mut usage_total,
+                )
+                .await
+                {
                     Ok(()) => {
                         // P1-4：compaction 成功后若仍无法容纳（窗口过小），
                         // 不再发起普通请求（必然 length error），明确结束并提示用户。
@@ -304,6 +333,7 @@ pub async fn run<P: Provider>(
                             break 'run_loop CompletionReason::ContextOverflow;
                         }
                     }
+                    Err(error @ RunFailure::Session(_)) => return Err(error),
                     Err(error) => {
                         // §15.4 第 6 条：失败不循环；继续确定性 prune，仍无法容纳则明确停止。
                         compaction_failed = true;
@@ -469,7 +499,10 @@ pub async fn run<P: Provider>(
                             // §4.3 第二阶段：text-only attempt 断联 → 自动续写一次。
                             // 条件：已产生文本（非连接不可用）、未出现 tool delta（partial
                             // JSON 恢复风险大）、还有续写额度。
-                            if saw_any_semantic && !saw_tool_calls && stream_recoveries < MAX_STREAM_RECOVERIES
+                            if saw_any_semantic
+                                && !saw_tool_calls
+                                && recoverable_stream_interrupt(&e)
+                                && stream_recoveries < MAX_STREAM_RECOVERIES
                             {
                                 let cause = interrupt_cause(&e);
                                 session
@@ -494,7 +527,10 @@ pub async fn run<P: Provider>(
                             // §4.3 第三阶段：partial tool-call 后断联 → 整个 turn 重新生成。
                             // 条件：已出现 tool delta（saw_tool_calls=true）、还有 restart 额度。
                             // 不尝试续接 partial JSON（风险大）；重新发起原始请求。
-                            if saw_tool_calls && turn_restarts < MAX_TURN_RESTARTS {
+                            if saw_tool_calls
+                                && recoverable_stream_interrupt(&e)
+                                && turn_restarts < MAX_TURN_RESTARTS
+                            {
                                 let cause = interrupt_cause(&e);
                                 session
                                     .append_event(&SessionEvent::AssistantAttemptInterrupted {
@@ -549,7 +585,8 @@ pub async fn run<P: Provider>(
                                         reason: CompletionReason::ProviderUnavailable,
                                         usage: usage_total,
                                     })
-                                    .ok();
+                                    .and_then(|_| session.sync_data())
+                                    .map_err(|e2| RunFailure::Session(e2.to_string()))?;
                                 return Err(RunFailure::Provider(e.to_string()));
                             }
                         };
@@ -572,8 +609,7 @@ pub async fn run<P: Provider>(
             }
         };
         // provider 返回的 usage 是本次请求的用量；跨轮累加（§2.2/§12.4）。
-        usage_total.input_tokens += response.usage.input_tokens;
-        usage_total.output_tokens += response.usage.output_tokens;
+        accumulate_usage(&mut usage_total, response.usage);
         // §27：每个 model turn 至少记录可回答“哪一轮、什么模型、多少工具、
         // 什么 finish reason、多少 token”的诊断行。
         tracing::debug!(
@@ -652,7 +688,7 @@ pub async fn run<P: Provider>(
         break reason;
     };
 
-    watchdog.abort();
+    watchdog.0.abort();
     // §27/§44：run 级汇总（turn/tool 计数、总 token、总耗时）——性能基线的最小记录。
     tracing::info!(
         run_id = %run_id,
@@ -743,6 +779,10 @@ fn interrupt_cause(error: &crate::provider::ProviderError) -> crate::session::In
     }
 }
 
+fn recoverable_stream_interrupt(error: &crate::provider::ProviderError) -> bool {
+    matches!(error, crate::provider::ProviderError::Connection(_))
+}
+
 /// compaction 一轮（§15.4）。
 async fn compact_turn<P: Provider>(
     provider: &mut P,
@@ -750,6 +790,7 @@ async fn compact_turn<P: Provider>(
     session: &mut SessionLog,
     config: &Config,
     cancel: &CancellationToken,
+    usage_total: &mut Usage,
 ) -> Result<(), RunFailure> {
     // 1. 先 prune 大 tool output（§15.3）。
     // P0-3：以 runtime messages 计算压缩内容（与调用方看到的上下文一致）；
@@ -776,6 +817,9 @@ async fn compact_turn<P: Provider>(
     // 需要跳过；recent 内没有真实消息或投影与 runtime 不一致时
     // fallback 覆盖全部压缩前事件。
     let seq = session.seq();
+    let next_seq = seq
+        .checked_add(1)
+        .ok_or_else(|| RunFailure::Session("session seq 已耗尽".into()))?;
     let events = crate::session::read_events_with_seq(session.path())
         .map_err(|e| RunFailure::Session(e.to_string()))?;
     let projected = crate::session::project_messages_with_ranges(&events);
@@ -784,9 +828,9 @@ async fn compact_turn<P: Provider>(
             .iter()
             .find(|(_, start, _)| *start > 0)
             .map(|(_, start, _)| *start)
-            .unwrap_or(seq + 1)
+            .unwrap_or(next_seq)
     } else {
-        seq + 1
+        next_seq
     };
     let covered = crate::session::EventRange {
         start: EventId::from_u128(1),
@@ -808,7 +852,7 @@ async fn compact_turn<P: Provider>(
     let stream = provider.stream(request, event_tx, cancel.clone());
     tokio::pin!(stream);
     let mut summary_text = String::new();
-    loop {
+    let response = loop {
         tokio::select! {
             Some(event) = event_rx.recv() => {
                 if let ProviderEvent::TextDelta(text) = event {
@@ -816,16 +860,25 @@ async fn compact_turn<P: Provider>(
                 }
             }
             result = &mut stream => {
-                let _response = result.map_err(|e| RunFailure::Provider(e.to_string()))?;
-                break;
+                break result.map_err(|e| RunFailure::Provider(e.to_string()))?;
             }
         }
-    }
+    };
     // stream 返回后 channel 中可能还有已入队的尾部 delta，全部收完。
     while let Ok(event) = event_rx.try_recv() {
         if let ProviderEvent::TextDelta(text) = event {
             summary_text.push_str(&text);
         }
+    }
+    accumulate_usage(usage_total, response.usage);
+    if response.finish_reason != crate::provider::FinishReason::Stop
+        || !response.tool_calls.is_empty()
+    {
+        return Err(RunFailure::Provider(format!(
+            "invalid compaction response: finish={:?}, tool_calls={}",
+            response.finish_reason,
+            response.tool_calls.len()
+        )));
     }
     let summary_text = crate::context::parse_summary(&summary_text);
     let summary_tokens = crate::context::estimate_tokens(&summary_text);
@@ -864,6 +917,14 @@ async fn compact_turn<P: Provider>(
     )));
     messages.extend(recent);
     Ok(())
+}
+
+fn accumulate_usage(total: &mut Usage, additional: Usage) {
+    total.input_tokens = total.input_tokens.saturating_add(additional.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(additional.output_tokens);
+    total.cache_read_tokens = total
+        .cache_read_tokens
+        .saturating_add(additional.cache_read_tokens);
 }
 
 /// 拼接 system prompt 文本（P0-9 提取：预算估算与请求构造共用同一来源）。
@@ -938,4 +999,42 @@ pub fn session_path(
     sessions_root
         .join(session::workspace_id_for(workspace_root.as_std_path()))
         .join(format!("{session_id}.jsonl"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AbortTaskOnDrop;
+
+    struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_task_on_drop_does_not_detach_background_task() {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _probe = DropProbe(task_dropped);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+
+        drop(AbortTaskOnDrop(handle));
+        for _ in 0..10 {
+            if dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "guard drop 必须 abort 并销毁后台 task"
+        );
+    }
 }

@@ -37,7 +37,9 @@ pub fn window_start_row(
     area_h: usize,
 ) -> usize {
     debug_assert_eq!(ids.len(), heights.len());
-    let total: usize = heights.iter().sum();
+    let total = heights
+        .iter()
+        .fold(0usize, |total, height| total.saturating_add(*height));
     let area_h = area_h.max(1);
     let follow_start = total.saturating_sub(area_h);
     match scroll {
@@ -61,7 +63,7 @@ pub fn entry_start_row(ids: &[EntryId], heights: &[usize], entry: EntryId) -> us
         if *id == entry {
             return row;
         }
-        row += height;
+        row = row.saturating_add(*height);
     }
     row // 未找到：内容末尾（调用方按 §68 回退）
 }
@@ -90,7 +92,9 @@ pub fn locate_row(ids: &[EntryId], heights: &[usize], row: usize) -> (EntryId, u
 /// row_in_entry 超 entry 高度时 clamp 到 entry 末行）。
 pub fn row_of(ids: &[EntryId], heights: &[usize], entry: EntryId, row_in_entry: usize) -> usize {
     let start = entry_start_row(ids, heights, entry);
-    let total: usize = heights.iter().sum();
+    let total = heights
+        .iter()
+        .fold(0usize, |total, height| total.saturating_add(*height));
     // entry 高度（未找到时按 0 处理，start 已为末尾）。
     let height = ids
         .iter()
@@ -99,7 +103,7 @@ pub fn row_of(ids: &[EntryId], heights: &[usize], entry: EntryId, row_in_entry: 
         .map(|(_, h)| *h)
         .unwrap_or(0);
     let row = row_in_entry.min(height.saturating_sub(1));
-    (start + row).min(total.saturating_sub(1))
+    start.saturating_add(row).min(total.saturating_sub(1))
 }
 
 /// 从指定全局行向上/向下移动 `delta` 行（§10：PageUp 移动 viewport-2 行）。
@@ -111,11 +115,15 @@ pub fn move_by_rows(
     from_row: usize,
     delta: isize,
 ) -> (EntryId, usize) {
-    let total: usize = heights.iter().sum();
+    let total = heights
+        .iter()
+        .fold(0usize, |total, height| total.saturating_add(*height));
     let target = if delta >= 0 {
-        (from_row + delta as usize).min(total.saturating_sub(1))
+        from_row
+            .saturating_add(delta as usize)
+            .min(total.saturating_sub(1))
     } else {
-        from_row.saturating_sub((-delta) as usize)
+        from_row.saturating_sub(delta.unsigned_abs())
     };
     locate_row(ids, heights, target)
 }

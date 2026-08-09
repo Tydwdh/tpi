@@ -82,6 +82,20 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
                 },
             );
         }
+        if session_id != ctx.session_id {
+            return ToolOutcome::failed(
+                "read",
+                ModelPayload {
+                    status: ToolStatus::Rejected,
+                    program: None,
+                    exit_code: None,
+                    duration_ms: 0,
+                    output: "status: rejected\ntool: read\nerror: artifact_session_mismatch".into(),
+                    effect: None,
+                    artifact: None,
+                },
+            );
+        }
         return read_artifact(ctx, session_id, id, args.start_line, args.line_count);
     }
     let path = match resolve_tool_path(ctx, &args.path) {
@@ -89,11 +103,10 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
         Err(error) => return path_rejected_outcome("read", error),
     };
     let line_count = args.line_count.clamp(1, DEFAULT_READ_LINES);
-    if let Ok(snapshot) = edit::snapshot_file(&path) {
-        crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
-    }
-    match edit::read_window(&path, args.start_line, line_count) {
-        Ok(window) => {
+    match edit::snapshot_file(&path) {
+        Ok(snapshot) => {
+            let window = edit::read_window_from_snapshot(&snapshot, args.start_line, line_count);
+            crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
             let mut text = window.text;
             let mut truncated = window.truncated;
             if text.len() > DEFAULT_READ_MAX_BYTES {
@@ -153,8 +166,14 @@ fn read_artifact(
             },
         );
     };
-    let bytes = match crate::session::artifact::read_bounded(&record, MAX_ARTIFACT_READ_BYTES) {
-        Ok(bytes) => bytes,
+    let line_count = line_count.clamp(1, DEFAULT_READ_LINES);
+    let window = match crate::session::artifact::read_line_window(
+        &record,
+        start_line,
+        line_count,
+        MAX_ARTIFACT_READ_BYTES,
+    ) {
+        Ok(window) => window,
         Err(error) => {
             return ToolOutcome::failed(
                 "read",
@@ -170,22 +189,22 @@ fn read_artifact(
             );
         }
     };
-    let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = text.lines().collect();
-    let total_lines = lines.len();
-    let start = start_line.saturating_sub(1).min(total_lines);
-    let end = (start + line_count.min(DEFAULT_READ_LINES)).min(total_lines);
-    let shown = end.saturating_sub(start);
-    let truncated = end < total_lines || bytes.len() >= MAX_ARTIFACT_READ_BYTES;
-    let body = lines[start..end].join("\n");
+    let text = String::from_utf8_lossy(&window.bytes);
+    let shown_start = if window.returned_lines == 0 {
+        0
+    } else {
+        start_line.max(1)
+    };
+    let shown_end = if window.returned_lines == 0 {
+        0
+    } else {
+        shown_start.saturating_add(window.returned_lines - 1)
+    };
     let output = format!(
-        "path: @artifact/{session_id}/{id}\nbytes: {}\nlines: {}-{} of {}{}\n\n{}",
+        "path: @artifact/{session_id}/{id}\nbytes: {}\nlines: {shown_start}-{shown_end}{}\n\n{}",
         record.byte_length,
-        start + 1,
-        start + shown,
-        total_lines,
-        if truncated { " (truncated)" } else { "" },
-        body,
+        if window.truncated { " (truncated)" } else { "" },
+        text,
     );
     ToolOutcome::succeeded("read", output).with_metadata(ToolMetadata {
         tool: "read".into(),
@@ -233,13 +252,8 @@ pub fn edit(
         Ok(result) => {
             // §10.3 第 10 条：返回 unified diff 与修改统计。
             let diff = crate::tool::edit::unified_diff(&result);
-            let diff_summary = if diff.is_empty() {
-                String::new()
-            } else {
-                format!("\ndiff:\n{diff}")
-            };
             let output = format!(
-                "status: succeeded\ntool: edit\npath: {}\napplied: {}\nprevious_revision: {}\ncurrent_revision: {}{diff_summary}",
+                "status: succeeded\ntool: edit\npath: {}\napplied: {}\nprevious_revision: {}\ncurrent_revision: {}",
                 display_path(&ctx.workspace_root, &path),
                 result.applied,
                 result.previous_revision,
@@ -274,6 +288,15 @@ pub fn write(
         Ok(path) => path,
         Err(error) => return path_rejected_outcome("write", error),
     };
+    if args.content.len() > crate::tool::edit::MAX_SNAPSHOT_BYTES {
+        return failed_outcome(
+            "write",
+            crate::tool::edit::EditError::FileTooLarge {
+                path,
+                bytes: args.content.len(),
+            },
+        );
+    }
     let Some(plan) = plan else {
         return ToolOutcome::failed(
             "write",
@@ -293,19 +316,11 @@ pub fn write(
     if path.as_std_path().exists() {
         // 先读当前内容：already_exists 拒绝时把当前 revision 直接告诉模型，
         // 省去“再 read 一次才能重试”（edit 的 stale_revision 报错同样带 current）。
-        let current = match std::fs::read(path.as_std_path()) {
+        let current = match crate::tool::edit::read_raw_file(&path) {
             Ok(raw) => crate::tool::edit::revision_of(&raw),
-            Err(e) => {
-                return failed_outcome(
-                    "write",
-                    crate::tool::edit::EditError::Io {
-                        path: path.clone(),
-                        message: format!("read for revision: {e}"),
-                    },
-                );
-            }
+            Err(error) => return failed_outcome("write", error),
         };
-        let Some(expected) = args.revision.as_deref() else {
+        let Some(expected_token) = args.revision.as_deref() else {
             return ToolOutcome::failed(
                 "write",
                 ModelPayload {
@@ -324,13 +339,21 @@ pub fn write(
                 },
             );
         };
+        let Some(expected) = crate::tool::edit::parse_revision_token(expected_token) else {
+            return failed_outcome(
+                "write",
+                crate::tool::edit::EditError::InvalidRevision {
+                    value: expected_token.to_string(),
+                },
+            );
+        };
         if current != expected {
             return failed_outcome(
                 "write",
                 crate::tool::edit::EditError::StaleRevision {
                     path: path.clone(),
                     current,
-                    expected: expected.to_string(),
+                    expected: expected.clone(),
                 },
             );
         }
@@ -340,6 +363,8 @@ pub fn write(
             args.content.as_bytes(),
             plan,
             &display_path(&ctx.workspace_root, &path),
+            &expected,
+            ctx,
         );
     }
     match edit::write_new_file(&path, args.content.as_bytes(), plan) {
@@ -350,6 +375,17 @@ pub fn write(
                 revision,
             );
             let mut outcome = ToolOutcome::succeeded("write", output);
+            if let Ok(snapshot) =
+                crate::tool::edit::build_snapshot(path.clone(), args.content.into_bytes())
+            {
+                crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
+            }
+            outcome
+                .observed_resources
+                .push(crate::tool::outcome::ResourceVersion {
+                    path: display_path(&ctx.workspace_root, &path),
+                    revision: revision.clone(),
+                });
             outcome.session_metadata = ToolMetadata {
                 tool: "write".into(),
                 target: Some(display_path(&ctx.workspace_root, &path)),
@@ -368,21 +404,26 @@ fn rewrite_with_revision(
     content: &[u8],
     plan: &crate::tool::edit::CommitPlan,
     display_path: &str,
+    expected_revision: &str,
+    ctx: &ToolContext,
 ) -> ToolOutcome {
-    let previous_raw = match std::fs::read(path.as_std_path()) {
+    let previous_raw = match crate::tool::edit::read_raw_file(path) {
         Ok(raw) => raw,
-        Err(e) => {
-            return failed_outcome(
-                "write",
-                crate::tool::edit::EditError::Io {
-                    path: path.clone(),
-                    message: format!("read for rewrite: {e}"),
-                },
-            );
-        }
+        Err(error) => return failed_outcome("write", error),
     };
+    let observed_revision = crate::tool::edit::revision_of(&previous_raw);
+    if observed_revision != expected_revision {
+        return failed_outcome(
+            "write",
+            crate::tool::edit::EditError::StaleRevision {
+                path: path.clone(),
+                current: observed_revision,
+                expected: expected_revision.to_string(),
+            },
+        );
+    }
     let result = crate::tool::edit::EditResult {
-        previous_revision: crate::tool::edit::revision_of(&previous_raw),
+        previous_revision: observed_revision,
         current_revision: crate::tool::edit::revision_of(content),
         applied: 1,
         previous_raw,
@@ -391,16 +432,22 @@ fn rewrite_with_revision(
     match crate::tool::edit::commit_edit(&result, path, plan) {
         Ok(()) => {
             let diff = crate::tool::edit::unified_diff(&result);
-            let diff_summary = if diff.is_empty() {
-                String::new()
-            } else {
-                format!("\ndiff:\n{diff}")
-            };
             let output = format!(
-                "status: succeeded\ntool: write\npath: {display_path}\nrewritten: true\nprevious_revision: {}\ncurrent_revision: {}{diff_summary}",
+                "status: succeeded\ntool: write\npath: {display_path}\nrewritten: true\nprevious_revision: {}\ncurrent_revision: {}",
                 result.previous_revision, result.current_revision,
             );
             let mut outcome = ToolOutcome::succeeded("write", output);
+            if let Ok(snapshot) =
+                crate::tool::edit::build_snapshot(path.clone(), result.new_raw.clone())
+            {
+                crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
+            }
+            outcome
+                .observed_resources
+                .push(crate::tool::outcome::ResourceVersion {
+                    path: display_path.to_string(),
+                    revision: result.current_revision.clone(),
+                });
             // §用户诉求：重写已有文件时 diff 独立字段（TUI 默认展开红绿 diff）。
             outcome.session_metadata = ToolMetadata {
                 tool: "write".into(),
@@ -512,6 +559,55 @@ mod tests {
             body.len() <= 32 * 1024,
             "正文超出预算: {} bytes",
             body.len()
+        );
+    }
+
+    #[test]
+    fn write_accepts_revision_header_and_revalidates_before_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("a.txt")).unwrap();
+        std::fs::write(path.as_std_path(), b"old").unwrap();
+        let revision = crate::tool::edit::revision_of(b"old");
+        let ctx = ToolContext {
+            workspace_root: workspace,
+            cancel: CancellationToken::new(),
+            artifacts_root: dir.path().join("artifacts"),
+            session_id: "test-session".into(),
+            call_id: crate::ids::ToolCallId::new_v7(),
+            output_tx: None,
+            scan_snapshots: Default::default(),
+            shell_path: None,
+            snapshot_store: Default::default(),
+            current_plan: Default::default(),
+            interactive: false,
+            allow_outside_workspace: true,
+        };
+        let plan = crate::tool::edit::prepare_commit(&path);
+        let outcome = write(
+            WriteArgs {
+                path: path.to_string(),
+                content: "new".into(),
+                revision: Some(crate::tool::edit::format_revision_header(&revision)),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        assert!(outcome.session_metadata.diff.is_some());
+        assert!(
+            !outcome.model_payload.output.contains("\ndiff:\n"),
+            "完整 diff 只能进入 TUI 字段，不能重复占用模型上下文"
+        );
+        assert_eq!(std::fs::read(path.as_std_path()).unwrap(), b"new");
+
+        std::fs::write(path.as_std_path(), b"external change").unwrap();
+        let stale = rewrite_with_revision(&path, b"overwrite", &plan, "a.txt", &revision, &ctx);
+        assert_eq!(stale.status, ToolStatus::Failed);
+        assert!(stale.model_payload.output.contains("stale_revision"));
+        assert_eq!(
+            std::fs::read(path.as_std_path()).unwrap(),
+            b"external change"
         );
     }
 }

@@ -97,43 +97,69 @@ fn classify_effect(tool_name: &str, recovery: Option<&RecoveryMetadata>) -> Effe
             let Some(metadata) = recovery else {
                 return Effect::Unknown;
             };
-            let target_digest = std::path::Path::new(&metadata.target_path)
-                .exists()
-                .then(|| std::fs::read(&metadata.target_path).ok())
-                .flatten()
-                .map(|raw| crate::tool::edit::revision_of(&raw));
-            let temp_digest = std::path::Path::new(&metadata.temp_path)
-                .exists()
-                .then(|| std::fs::read(&metadata.temp_path).ok())
-                .flatten()
-                .map(|raw| crate::tool::edit::revision_of(&raw));
-            let backup_digest = metadata
-                .backup_path
-                .as_deref()
-                .filter(|p| std::path::Path::new(p).exists())
-                .and_then(|p| std::fs::read(p).ok())
-                .map(|raw| crate::tool::edit::revision_of(&raw));
+            let Ok(target_digest) = revision_of_path(std::path::Path::new(&metadata.target_path))
+            else {
+                return Effect::Unknown;
+            };
+            let Ok(temp_digest) = revision_of_path(std::path::Path::new(&metadata.temp_path))
+            else {
+                return Effect::Unknown;
+            };
+            let backup_digest = match metadata.backup_path.as_deref() {
+                Some(path) => match revision_of_path(std::path::Path::new(path)) {
+                    Ok(digest) => digest,
+                    Err(_) => return Effect::Unknown,
+                },
+                None => None,
+            };
             let expected = if metadata.expected_revision.is_empty() {
                 None
             } else {
                 Some(metadata.expected_revision.as_str())
             };
-            match (target_digest, temp_digest, backup_digest, expected) {
+            match (
+                target_digest,
+                temp_digest,
+                backup_digest,
+                expected,
+                metadata.candidate_revision.as_deref(),
+            ) {
+                // target 仍是调用前 revision：即使候选内容相同，也没有可观察副作用。
+                (Some(target), _, _, Some(expected), _) if target == expected => Effect::NotApplied,
+                // 新建文件且 target 仍不存在：尚未提交。
+                (None, _, _, None, _) => Effect::NotApplied,
                 // temp 仍在且 target == temp：已提交（commit 后 temp 未清理即崩溃）。
-                (Some(target), Some(temp), _, _) if target == temp => Effect::Committed,
-                // target 仍是 expected：未提交（replace 前崩溃，或失败后已恢复）。
-                (Some(target), _, _, Some(expected)) if target == expected => Effect::NotApplied,
-                // temp 已清理但 backup 是 expected 且 target 已变化：已提交（ToolCompleted 前崩溃）。
-                (Some(_), None, Some(backup), Some(expected)) if backup == expected => {
+                (Some(target), Some(temp), _, _, _) if target == temp => Effect::Committed,
+                // 新建成功后 temp 已移动且无 backup，用持久化的候选 revision 确认。
+                (Some(target), None, _, None, Some(candidate)) if target == candidate => {
                     Effect::Committed
                 }
-                (Some(_), None, None, Some(_expected)) if !metadata.temp_path.is_empty() => {
+                // temp 已清理但 backup 是 expected 且 target 已变化：已提交（ToolCompleted 前崩溃）。
+                (Some(_), None, Some(backup), Some(expected), _) if backup == expected => {
+                    Effect::Committed
+                }
+                (Some(_), None, None, Some(_expected), _) if !metadata.temp_path.is_empty() => {
                     Effect::Unknown
                 }
                 _ => Effect::Unknown,
             }
         }
     }
+}
+
+fn revision_of_path(path: &Path) -> std::io::Result<Option<String>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(Some(format!(
+        "{}{}",
+        crate::tool::edit::REVISION_PREFIX,
+        hasher.finalize().to_hex()
+    )))
 }
 
 /// 合成 Interrupted outcome（§4.3：model payload 明确写 effect）。
@@ -159,5 +185,35 @@ pub fn interrupted_outcome(
             tool: tool_name.to_string(),
             ..Default::default()
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_file_recovery_uses_candidate_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("created.txt");
+        let temp = dir.path().join("missing.tmp");
+        let content = b"new content";
+        let metadata = RecoveryMetadata {
+            tool: "write".into(),
+            target_path: target.to_string_lossy().into_owned(),
+            expected_revision: String::new(),
+            candidate_revision: Some(crate::tool::edit::revision_of(content)),
+            temp_path: temp.to_string_lossy().into_owned(),
+            backup_path: None,
+        };
+
+        assert_eq!(
+            classify_effect("write", Some(&metadata)),
+            Effect::NotApplied
+        );
+        std::fs::write(&target, content).unwrap();
+        assert_eq!(classify_effect("write", Some(&metadata)), Effect::Committed);
+        std::fs::write(&target, b"different").unwrap();
+        assert_eq!(classify_effect("write", Some(&metadata)), Effect::Unknown);
     }
 }

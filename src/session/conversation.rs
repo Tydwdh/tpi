@@ -52,10 +52,12 @@ impl Conversation {
             return Err(format!("session 不存在: {session_id}"));
         }
 
-        let recovered =
-            recovery::recover(&path).map_err(|error| format!("恢复 session 失败: {error}"))?;
+        // 先取得单写者锁，再检查 pending tool。否则另一个进程可能在 recover 与
+        // open 之间提交 ToolCompleted，当前进程随后会错误追加第二个 Interrupted 终态。
         let mut log = SessionLog::open(sessions_root, workspace_root.as_std_path(), session_id)
             .map_err(|error| format!("打开 session 失败: {error}"))?;
+        let recovered =
+            recovery::recover(&path).map_err(|error| format!("恢复 session 失败: {error}"))?;
         for (call_id, _provider_id, outcome) in &recovered.interrupted {
             let call_id = uuid::Uuid::parse_str(call_id)
                 .map(ToolCallId)

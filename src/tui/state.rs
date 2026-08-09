@@ -61,6 +61,11 @@ impl UiState {
     /// 入队一条待提交消息（Enter 提交）。超上限时丢弃最旧并写入系统行提示
     /// （避免无限增长，同时让“消息被丢弃”对用户可见）。
     pub fn push_pending(&mut self, message: String) {
+        let message = crate::tui::text::truncate_middle_utf8(
+            &message,
+            crate::tui::editor::MAX_INPUT_BYTES,
+            "\n…[input truncated]…\n",
+        );
         if message.is_empty() {
             return;
         }
@@ -70,7 +75,8 @@ impl UiState {
             self.view.push_line(
                 crate::tui::model::LineKind::System,
                 format!(
-                    "排队消息超过 {PENDING_CAP} 条，最旧消息已丢弃：{dropped}（请等当前 run 结束后再提交）"
+                    "排队消息超过 {PENDING_CAP} 条，最旧消息已丢弃：{}（请等当前 run 结束后再提交）",
+                    crate::tui::text::truncate_middle_utf8(&dropped, 160, "…")
                 ),
             );
             return;

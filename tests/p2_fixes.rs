@@ -53,13 +53,13 @@ fn p2_write_rewrite_requires_matching_revision() {
         outcome.model_text()
     );
 
-    // 2. revision 不匹配 → stale_rejected + hint。
+    // 2. 合法 revision 不匹配 → stale_rejected + hint。
     let plan = tpi::tool::edit::prepare_commit(&target);
     let outcome = write(
         WriteArgs {
             path: "app.txt".into(),
             content: "new content\n".into(),
-            revision: Some("b3:wrong-revision".into()),
+            revision: Some(format!("b3:{}", "0".repeat(64))),
         },
         &ctx,
         Some(&plan),

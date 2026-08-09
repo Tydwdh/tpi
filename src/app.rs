@@ -112,6 +112,12 @@ pub async fn run(
         if prompt.is_empty() {
             return Err("非交互模式需要提供 prompt：tpi -p \"...\"".into());
         }
+        if prompt.len() > crate::tui::editor::MAX_INPUT_BYTES {
+            return Err(format!(
+                "prompt 超过 {} KiB 上限",
+                crate::tui::editor::MAX_INPUT_BYTES / 1024
+            ));
+        }
         let message = prompt.to_string();
         conversation.ensure_started(&sessions_root, &workspace_root)?;
         let outcome = {
@@ -543,6 +549,7 @@ web_search: DuckDuckGo（免费，无需 API key）
                         Ctrl+Home 顶部 · Ctrl+End 最新 · Modal ↑/↓ 滚动 ·
                         点击工具卡片展开 · Esc 取消 run",
                     );
+                    ui_state.view.open_modal("/help", text);
                     renderer
                         .draw(&mut ui_state.view)
                         .map_err(|e| e.to_string())?;
@@ -1125,16 +1132,16 @@ fn last_edit_diff(log: &SessionLog) -> String {
         .iter()
         .filter_map(|event| match event {
             SessionEvent::ToolCompleted { outcome, .. }
-                if outcome.session_metadata.tool == "edit"
+                if matches!(outcome.session_metadata.tool.as_str(), "edit" | "write")
                     && outcome.status == crate::tool::outcome::ToolStatus::Succeeded =>
             {
-                Some(outcome.model_payload.output.clone())
+                outcome.session_metadata.diff.clone()
             }
             _ => None,
         })
         .collect();
     if diffs.is_empty() {
-        return "本轮还没有成功的 edit（写文件请用 edit 工具）".to_string();
+        return "本轮还没有带 diff 的成功 edit/write".to_string();
     }
     let mut out = String::new();
     const MAX_DIFF_BYTES: usize = 48 * 1024;
@@ -1142,11 +1149,18 @@ fn last_edit_diff(log: &SessionLog) -> String {
         if i > 0 {
             out.push_str("\n---\n\n");
         }
-        out.push_str(diff);
-        if out.len() >= MAX_DIFF_BYTES {
-            out.push_str("\n…（diff 超过 48KiB 预算，已截断）");
+        let remaining = MAX_DIFF_BYTES.saturating_sub(out.len());
+        if diff.len() > remaining {
+            let marker = "\n…（diff 超过 48KiB 预算，已截断）";
+            let content_budget = remaining.saturating_sub(marker.len());
+            let keep = crate::tui::text::floor_char_boundary(diff, content_budget);
+            out.push_str(&diff[..keep]);
+            if remaining >= marker.len() {
+                out.push_str(marker);
+            }
             break;
         }
+        out.push_str(diff);
     }
     out
 }
@@ -1248,7 +1262,8 @@ fn list_sessions(
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut entries: Vec<(std::time::SystemTime, SessionId, usize, String)> = Vec::new();
+    const MAX_SESSION_CHOICES: usize = 100;
+    let mut candidates: Vec<(std::time::SystemTime, SessionId, std::path::PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let Ok(entry) = entry else { continue };
         if entry
@@ -1261,16 +1276,18 @@ fn list_sessions(
             && let Some(name) = entry.path().file_stem().and_then(|s| s.to_str())
             && let Ok(id) = parse_session_id(name)
         {
-            let count = count_jsonl_lines(&entry.path());
-            // P2：首条用户消息预览（只解析事件头；列表辨识用）。
-            let preview = first_user_preview(&entry.path());
-            entries.push((modified, id, count, preview));
+            candidates.push((modified, id, entry.path()));
         }
     }
-    entries.sort_by_key(|(time, _, _, _)| std::cmp::Reverse(*time));
-    Ok(entries
+    candidates.sort_by_key(|(time, _, _)| std::cmp::Reverse(*time));
+    candidates.truncate(MAX_SESSION_CHOICES);
+    Ok(candidates
         .into_iter()
-        .map(|(t, id, n, p)| (id, t, n, p))
+        .map(|(modified, id, path)| {
+            let count = count_jsonl_lines(&path);
+            let preview = first_user_preview(&path);
+            (id, modified, count, preview)
+        })
         .collect())
 }
 
@@ -1317,14 +1334,33 @@ fn first_user_preview(path: &std::path::Path) -> String {
 /// P1-13：事件数 = JSONL 行数（每行一个事件，§14.2）；只数行不 serde 解析，
 /// session 增多时 `/sessions` 列表仍保持轻量（此前对每个文件解析全部事件）。
 fn count_jsonl_lines(path: &std::path::Path) -> usize {
-    use std::io::BufRead;
-    let Ok(file) = std::fs::File::open(path) else {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
         return 0;
     };
-    std::io::BufReader::new(file)
-        .lines()
-        .filter(|line| line.as_ref().is_ok_and(|l| !l.trim().is_empty()))
-        .count()
+    let mut buffer = [0u8; 64 * 1024];
+    let mut count = 0usize;
+    let mut line_has_content = false;
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        for byte in &buffer[..read] {
+            if *byte == b'\n' {
+                if line_has_content {
+                    count = count.saturating_add(1);
+                }
+                line_has_content = false;
+            } else if !byte.is_ascii_whitespace() {
+                line_has_content = true;
+            }
+        }
+    }
+    if line_has_content {
+        count = count.saturating_add(1);
+    }
+    count
 }
 
 /// 模型单价格式化（§16.2）：None → "未配置"；有值 → "$X"。
@@ -1420,25 +1456,30 @@ mod tests {
             session_metadata: ToolMetadata {
                 tool: "edit".into(),
                 target: Some("a.rs".into()),
+                diff: Some(output.to_string()),
                 ..Default::default()
             },
         };
         // 成功 1（带 diff）、失败（不应出现）、成功 2。
-        log.append_event(&SessionEvent::ToolCompleted {
-            call_id: crate::ids::ToolCallId::new_v7(),
-            outcome: edit_outcome("diff-one", ToolStatus::Succeeded),
-        })
-        .unwrap();
-        log.append_event(&SessionEvent::ToolCompleted {
-            call_id: crate::ids::ToolCallId::new_v7(),
-            outcome: edit_outcome("diff-failed", ToolStatus::Failed),
-        })
-        .unwrap();
-        log.append_event(&SessionEvent::ToolCompleted {
-            call_id: crate::ids::ToolCallId::new_v7(),
-            outcome: edit_outcome("diff-two", ToolStatus::Succeeded),
-        })
-        .unwrap();
+        let append_edit =
+            |log: &mut crate::session::SessionLog, output: &str, status: ToolStatus| {
+                let call_id = crate::ids::ToolCallId::new_v7();
+                log.append_event(&SessionEvent::ToolRequested {
+                    call: crate::provider::ToolCall {
+                        call_id,
+                        provider_id: format!("provider-{call_id}"),
+                        name: "edit".into(),
+                        arguments: "{}".into(),
+                    },
+                })?;
+                log.append_event(&SessionEvent::ToolCompleted {
+                    call_id,
+                    outcome: edit_outcome(output, status),
+                })
+            };
+        append_edit(&mut log, "diff-one", ToolStatus::Succeeded).unwrap();
+        append_edit(&mut log, "diff-failed", ToolStatus::Failed).unwrap();
+        append_edit(&mut log, "diff-two", ToolStatus::Succeeded).unwrap();
         let text = last_edit_diff(&log);
         assert!(
             text.contains("diff-one"),
