@@ -133,17 +133,7 @@ impl<'a> ToolBatchExecutor<'a> {
         calls: Vec<ToolCall>,
         tool_calls_total: &mut u32,
     ) -> Result<BatchEnd, RunFailure> {
-        execute_batch(
-            calls,
-            tool_calls_total,
-            self.config,
-            self.session,
-            self.messages,
-            self.progress,
-            self.runtime,
-            self.ui,
-        )
-        .await
+        execute_batch(self, calls, tool_calls_total).await
     }
 }
 
@@ -155,14 +145,9 @@ impl<'a> ToolBatchExecutor<'a> {
 ///    Write / WorkspaceUnknown 按源顺序；
 /// 4. 结果无论完成先后都按原 call index 送回 provider（§12.2 第 6 条）。
 async fn execute_batch(
+    executor: ToolBatchExecutor<'_>,
     calls: Vec<ToolCall>,
     tool_calls_total: &mut u32,
-    config: &Config,
-    session: &mut SessionLog,
-    messages: &mut Vec<ChatMessage>,
-    progress: &mut crate::agent::scheduler::ProgressTracker,
-    tool_runtime: &ToolRuntime,
-    ui: &mpsc::Sender<RuntimeEvent>,
 ) -> Result<BatchEnd, RunFailure> {
     use crate::agent::scheduler::{
         PreparedCall, action_key, build_waves, stable_observation, state_stamp_from_ctx,
@@ -170,6 +155,14 @@ async fn execute_batch(
     use futures_util::future::join_all;
     use std::collections::HashMap;
 
+    let ToolBatchExecutor {
+        config,
+        session,
+        messages,
+        progress,
+        runtime: tool_runtime,
+        ui,
+    } = executor;
     let max_parallel = config.limits.max_parallel_tools as usize;
 
     // 1. 预检全部参数（§12.2 第 1 条）。
