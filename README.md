@@ -1,8 +1,8 @@
 # TPI：个人终端 Coding Agent
 
 面向 Windows、以 Bash 为 Shell 方言、由 Rust 实现的个人终端 Coding Agent。
-实现契约与设计决策见 [TPI_DESIGN.md](TPI_DESIGN.md)（绝对标准）；从 Pi 迁移
-个人配置见 [MIGRATION.md](MIGRATION.md)。
+设计契约（§N.M 交叉引用）与实现依据见 [ai_project_dump.md](ai_project_dump.md)
+（完整代码导出）；配置与迁移见 [MIGRATION.md](MIGRATION.md)。
 
 ## 快速开始
 
@@ -13,7 +13,7 @@
 
 # 2. 配置模型（§18.1：不允许"看不见的默认模型"）
 #    在 ~/.tpi/config.toml 写入 [model.primary]（provider/name/base_url），
-#    示例见 MIGRATION.md。
+#    完整示例含 serverless/reasoning/shell.path 见 MIGRATION.md。
 
 # 3. 凭据（§18.4：写入 Windows Credential Manager，不写进 TOML）
 tpi auth set opencode-go

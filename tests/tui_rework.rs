@@ -160,7 +160,7 @@ fn output_flood_does_not_grow_transcript() {
         text.chars().filter(|c| *c == 'x').count() < 1000,
         "成功卡片不输出日志正文"
     );
-    assert!(text.contains("✓"), "成功单行卡可见");
+    assert!(text.contains("✓"), "成功单行卡可见: {text}");
 }
 
 /// 13.5：Failure preview——1000 行失败输出只显示预算内 tail。

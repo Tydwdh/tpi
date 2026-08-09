@@ -65,14 +65,14 @@ fn scenario_b_resize_keeps_anchor_semantic_position() {
             format!("msg {i} 内容 {}", "x".repeat(60)),
         );
     }
-    layout(&mut view, 120, 40); // 视口 = 40-4(header2+footer+input) = 36；60 条 → 顶部行 24
+    layout(&mut view, 120, 40); // 视口 = 40-2(footer+input) = 38；60 条×1 行 → 顶部行 22
     for _ in 0..3 {
-        view.scroll_up(7); // 24 - 21 = 3 → EntryId(4)
+        view.scroll_up(7); // 22 - 21 = 1 → EntryId(2)
     }
     let ScrollMode::Locked(anchor) = view.scroll_mode else {
         panic!("滚动后必须 Locked");
     };
-    assert_eq!(anchor.entry_id, EntryId(4), "锚点应落在 entry 4");
+    assert_eq!(anchor.entry_id, EntryId(2), "锚点应落在 entry 2");
     // 依次经过不同尺寸：锚点（视口顶部）必须保持同一语义位置。
     for (w, h) in [(70u16, 25u16), (160, 50), (120, 40), (80, 24)] {
         let (top_entry, top_row) = layout(&mut view, w, h);
@@ -174,8 +174,8 @@ fn wheel_moves_anchor_by_three_rows() {
         .map(|id| view.entry_heights.get(id).copied().unwrap_or(1))
         .collect();
     let top_row = tpi::tui::scroll::row_of(&ids, &heights, anchor.entry_id, anchor.row_in_entry);
-    // 初始 Follow 视口顶部 = 30 - 20(header2+footer+input) = 行 10；上移 3 → 行 7。
-    assert_eq!(top_row, 7);
+    // 初始 Follow 视口顶部 = 30 - 22(视口：24-2 footer+input) = 行 8；上移 3 → 行 5。
+    assert_eq!(top_row, 5);
 }
 
 #[test]

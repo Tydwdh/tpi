@@ -255,24 +255,28 @@ fn failed_tool_card_shows_status_and_tail() {
     );
 }
 
-/// §16.2：thinking 可折叠——Alt+T 后只显示折叠提示行。
+/// §16.2：thinking 可折叠——溢出时默认折叠显示提示行，Alt+T 后显示全文。
 #[test]
 fn reasoning_can_be_folded() {
     let mut view = ViewModel::default();
-    // 整改 A1：默认折叠（不显示正文）。
-    view.push_line(LineKind::Reasoning, "内部推理过程");
+    // §PointerHit：折叠只对溢出内容生效（单行 thinking 无需折叠，直接显示）。
+    let text = (0..10)
+        .map(|i| format!("推理第{i}行"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    view.push_line(LineKind::Reasoning, text);
     let buffer = draw_to_test_backend(&mut view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(
-        rendered.contains("点击展开"),
+        rendered.contains("点击展开思考"),
         "默认折叠显示提示行: {rendered:?}"
     );
-    assert!(!rendered.contains("内部推理过程"));
+    assert!(!rendered.contains("推理第9行"), "超 6 行的内容折叠不可见");
 
     // Alt+T 全局展开后显示原文。
     view.reasoning_visible = true;
     let buffer = draw_to_test_backend(&mut view, 80, 12);
-    assert!(buffer_text(&buffer).contains("内部推理过程"));
+    assert!(buffer_text(&buffer).contains("推理第9行"), "展开后全文可见");
 }
 
 /// Markdown 渲染：assistant 消息中加粗/行内代码进入 buffer 且带样式。

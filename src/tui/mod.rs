@@ -516,8 +516,25 @@ fn plan_window(
     }
 
     let area_h = area_h.max(1) as usize;
-    let window_start =
+    let mut window_start =
         crate::tui::scroll::window_start_row(&ids, &heights, &view.scroll_mode, area_h);
+    // §PointerHit：Follow 模式、无 live 流式内容时，若最后一个 transcript entry
+    // 是完成态工具卡片且高度超过视口，锚定到卡片主行（状态/exit code 可见），
+    // 避免主行被 `total - area_h` 的底部对齐滚出视口。
+    if view.scroll_mode == ScrollMode::Follow
+        && view.live.reasoning.is_none()
+        && view.live.assistant.is_none()
+        && ids.last().is_some_and(|last_id| {
+            matches!(view.transcript.last(), Some(Entry::Tool { .. }))
+                && *last_id == view.transcript.last().map(Entry::id).unwrap_or(EntryId(0))
+        })
+    {
+        let last_h = heights.last().copied().unwrap_or(0);
+        if last_h > area_h {
+            let total: usize = heights.iter().sum();
+            window_start = total.saturating_sub(last_h);
+        }
+    }
     // 写回布局结果：视口顶部行 + 视口高度（renderer 写回，滚动基础）。
     view.layout_top = Some(crate::tui::scroll::locate_row(&ids, &heights, window_start));
     view.transcript_rows = area_h as u16;
@@ -2169,6 +2186,11 @@ fn tool_card_lines(
     // - 无 diff（bash 等）：渲染输出文本，同样前 N 行 + "… 点击展开"；
     // - 已展开：显示全部内容。
     const COLLAPSED_LINES: usize = 10;
+    // §PointerHit：失败/运行中折叠态用更小的尾部窗口——注释契约
+    // （"失败 tail ≤4 行、运行中实时输出 ≤3 行"），避免错误诊断被 10 行窗口
+    // 推到主行之后滚出视口。
+    const FAILED_LINES: usize = 4;
+    const RUNNING_LINES: usize = 3;
 
     // §PointerHit：失败卡片折叠态显示错误 tail（不是 output 开头）；
     // 运行中卡片折叠态显示实时尾部（最新进度）。
@@ -2239,9 +2261,12 @@ fn tool_card_lines(
     let overflow = total > COLLAPSED_LINES;
     let shown = if card.expanded || !overflow {
         content_lines.as_slice()
-    } else if is_running || is_failed {
-        // §PointerHit：运行中显示实时尾部（最新进度）；失败显示错误尾部。
-        &content_lines[content_lines.len().saturating_sub(COLLAPSED_LINES)..]
+    } else if is_running {
+        // §PointerHit：运行中显示实时尾部（最新进度）。
+        &content_lines[content_lines.len().saturating_sub(RUNNING_LINES)..]
+    } else if is_failed {
+        // §PointerHit：失败显示错误尾部（tail 末尾，诊断优先）。
+        &content_lines[content_lines.len().saturating_sub(FAILED_LINES)..]
     } else {
         &content_lines[..COLLAPSED_LINES]
     };
