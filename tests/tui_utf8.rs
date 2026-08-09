@@ -67,8 +67,7 @@ fn finish_tool_huge_cjk_tail_bounds_without_panic() {
     view.begin_tool("c2", "bash", Some("cmd".into()), Some("cmd".into()));
     let tail = multibyte_flood("错误👨\u{200d}💻中文e\u{301}", MAX_CARD_OUTPUT * 2);
     view.finish_tool(
-        "c2",
-        "bash",
+        ("c2", "bash"),
         ToolStatus::Failed,
         1000,
         Some(101),
@@ -123,7 +122,7 @@ fn overlay_body_huge_multibyte_stays_valid() {
     view.begin_tool("c4", "read", Some("a.rs".into()), None);
     let big = multibyte_flood("中文😀e\u{301}", MAX_CARD_OUTPUT * 2);
     view.append_tool_output("c4", &big);
-    view.finish_tool("c4", "read", ToolStatus::Succeeded, 5, None, &big, None);
+    view.finish_tool(("c4", "read"), ToolStatus::Succeeded, 5, None, &big, None);
     view.open_tool_overlay("c4");
     let overlay = view.overlay.as_ref().expect("overlay 必须打开");
     assert!(overlay.body.is_char_boundary(overlay.body.len()));

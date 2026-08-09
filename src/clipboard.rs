@@ -70,13 +70,13 @@ unsafe fn close_clipboard() -> bool {
 unsafe fn global_alloc(bytes: usize) -> *mut std::ffi::c_void {
     use windows_sys::Win32::System::Memory::GlobalAlloc;
     const GMEM_MOVEABLE: u32 = 0x0002;
-    GlobalAlloc(GMEM_MOVEABLE, bytes) as *mut std::ffi::c_void
+    GlobalAlloc(GMEM_MOVEABLE, bytes)
 }
 
 #[cfg(windows)]
 unsafe fn global_lock(h: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
     use windows_sys::Win32::System::Memory::GlobalLock;
-    GlobalLock(h as _) as *mut std::ffi::c_void
+    GlobalLock(h as _)
 }
 
 #[cfg(windows)]
@@ -88,7 +88,7 @@ unsafe fn global_unlock(h: *mut std::ffi::c_void) {
 #[cfg(windows)]
 unsafe fn set_clipboard_data(h: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
     use windows_sys::Win32::System::DataExchange::SetClipboardData;
-    SetClipboardData(CF_UNICODETEXT, h as _) as *mut std::ffi::c_void
+    SetClipboardData(CF_UNICODETEXT, h as _)
 }
 
 // 非 Windows 平台（编译兜底；TPI 面向 Windows，此处仅保证可编译）。

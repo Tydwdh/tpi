@@ -70,8 +70,7 @@ fn one_call_id_never_renders_two_cards() {
     );
     view.append_tool_output("call-1", "running...\n");
     view.finish_tool(
-        "call-1",
-        "bash",
+        ("call-1", "bash"),
         ToolStatus::Succeeded,
         3600,
         Some(0),
@@ -81,8 +80,7 @@ fn one_call_id_never_renders_two_cards() {
     assert_eq!(card_rows(&view, "call-1"), 1, "同一 call_id 只能有一张卡");
     // 多次 finish（防御）也不追加新卡。
     view.finish_tool(
-        "call-1",
-        "bash",
+        ("call-1", "bash"),
         ToolStatus::Succeeded,
         3600,
         Some(0),
@@ -98,7 +96,7 @@ fn long_command_stays_single_line_with_ellipsis() {
     let mut view = ViewModel::default();
     let long = format!("git commit -m \"{}\"", "x".repeat(400));
     view.begin_tool("c", "bash", Some(long.clone()), Some(long));
-    view.finish_tool("c", "bash", ToolStatus::Succeeded, 113, Some(0), "", None);
+    view.finish_tool(("c", "bash"), ToolStatus::Succeeded, 113, Some(0), "", None);
     let buffer = draw_to_test_backend(&mut view, 80, 12);
     let text = buffer_text(&buffer);
     assert!(text.contains('…'), "超长命令必须 ellipsis: {text}");
@@ -146,7 +144,14 @@ fn output_flood_does_not_grow_transcript() {
     view.begin_tool("c", "bash", Some("echo big".into()), None);
     let big = "x".repeat(10 * 1024 * 1024);
     view.append_tool_output("c", &big);
-    view.finish_tool("c", "bash", ToolStatus::Succeeded, 100, Some(0), &big, None);
+    view.finish_tool(
+        ("c", "bash"),
+        ToolStatus::Succeeded,
+        100,
+        Some(0),
+        &big,
+        None,
+    );
     let Entry::Tool { card, .. } = &view.transcript[0] else {
         panic!();
     };
@@ -174,8 +179,7 @@ fn failure_shows_bounded_tail_only() {
     lines.push_str("error[E0308]: mismatched types\n");
     view.begin_tool("c", "bash", Some("cargo build".into()), None);
     view.finish_tool(
-        "c",
-        "bash",
+        ("c", "bash"),
         ToolStatus::Failed,
         3600,
         Some(101),
@@ -242,7 +246,14 @@ fn layout_works_at_80_120_180_columns() {
         "参数".repeat(30)
     );
     view.begin_tool("c", "bash", Some(long.clone()), Some(long));
-    view.finish_tool("c", "bash", ToolStatus::Succeeded, 2500, Some(0), "", None);
+    view.finish_tool(
+        ("c", "bash"),
+        ToolStatus::Succeeded,
+        2500,
+        Some(0),
+        "",
+        None,
+    );
     view.push_stream_delta(LineKind::Assistant, "已完成修复。");
 
     for width in [80u16, 120, 180] {
@@ -280,7 +291,7 @@ fn scroll_lock_keeps_position_and_counts() {
     // Agent 继续产生事件。
     view.push_line(LineKind::Assistant, "new-1");
     view.begin_tool("c", "bash", Some("cargo test".into()), None);
-    view.finish_tool("c", "bash", ToolStatus::Succeeded, 100, Some(0), "", None);
+    view.finish_tool(("c", "bash"), ToolStatus::Succeeded, 100, Some(0), "", None);
     assert_eq!(
         view.transcript_scroll, locked_scroll,
         "scroll lock 期间位置不被拉回"
@@ -301,7 +312,7 @@ fn hit_targets_distinguish_tool_and_reasoning() {
     let mut view = ViewModel::default();
     view.push_line(LineKind::Reasoning, "思考");
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
-    view.finish_tool("c1", "bash", ToolStatus::Succeeded, 10, Some(0), "", None);
+    view.finish_tool(("c1", "bash"), ToolStatus::Succeeded, 10, Some(0), "", None);
     let buffer = draw_to_test_backend(&mut view, 80, 20);
     // 通过渲染路径验证（间接）：构造渲染并检查 overlay 数据流。
     view.open_last_tool_overlay();

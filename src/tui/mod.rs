@@ -172,9 +172,7 @@ impl Renderer {
             return None;
         }
         let index = (row - rect.y) as usize;
-        let Some((target, end_col)) = self.last_row_hits.get(index).cloned().flatten() else {
-            return None;
-        };
+        let (target, end_col) = self.last_row_hits.get(index).cloned().flatten()?;
         // 列必须是可点击区域内（含 0..=end_col；end_col==0 表示该行不可点）。
         let col = column.saturating_sub(rect.x);
         if end_col == 0 || col > end_col {
@@ -434,7 +432,7 @@ fn render_frame(
 
     // 搜索框（§14：Ctrl+F；悬浮在转录区顶部）。
     if let Some(search) = &view.search {
-        let w = area.width.min(56).max(1);
+        let w = area.width.clamp(1, 56);
         let x = area.x + (area.width.saturating_sub(w)) / 2;
         let y = trans_area.y;
         let hit_info = if search.query.is_empty() {
@@ -573,8 +571,8 @@ fn plan_window(
                     .collect::<String>()
                     .as_str(),
             );
-            if cur < width as usize {
-                let pad = width as usize - cur;
+            if cur < width {
+                let pad = width - cur;
                 line.spans
                     .push(Span::styled(" ".repeat(pad), Style::default().bg(color)));
             }
@@ -843,10 +841,10 @@ fn wrap_with_semantic(
                     if cur_sem_start.is_none() {
                         cur_sem_start = Some(line_start + line_consumed);
                     }
-                    if let Some(text) = semantic.map(|s| s.text.as_str()) {
-                        if let Some(ch_sem) = text.chars().nth(line_consumed) {
-                            cur_sem_text.push(ch_sem);
-                        }
+                    if let Some(text) = semantic.map(|s| s.text.as_str())
+                        && let Some(ch_sem) = text.chars().nth(line_consumed)
+                    {
+                        cur_sem_text.push(ch_sem);
                     }
                     line_consumed += 1;
                 }
@@ -967,6 +965,16 @@ type EntryGroup = (
     Vec<Option<HitRange>>,
     Vec<SemanticLine>,
 );
+
+/// Scratch buffers populated while rendering one or more transcript groups.
+/// Bundling them keeps the rendering boundary cohesive and prevents call sites
+/// from accidentally swapping parallel vectors.
+struct GroupBuffers<'a> {
+    lines: &'a mut Vec<Line<'static>>,
+    hits: &'a mut Vec<Option<HitRange>>,
+    semantic: &'a mut Vec<SemanticLine>,
+    groups: &'a mut Vec<EntryGroup>,
+}
 
 /// entry 是否命中当前 active_hit（§24 点击高亮）：hits 中任意一行与
 /// active_hit 相等即为命中（工具卡片所有行共享同一 hit）。
@@ -1293,10 +1301,12 @@ fn build_transcript_text(
         theme,
         cache,
         width,
-        &mut out,
-        &mut hits,
-        &mut semantic,
-        &mut groups,
+        GroupBuffers {
+            lines: &mut out,
+            hits: &mut hits,
+            semantic: &mut semantic,
+            groups: &mut groups,
+        },
     );
     groups
 }
@@ -1308,11 +1318,14 @@ fn build_live_group(
     theme: theme::Theme,
     cache: &mut HashMap<(u64, u16), Vec<Line<'static>>>,
     width: usize,
-    out: &mut Vec<Line<'static>>,
-    hits: &mut Vec<Option<HitRange>>,
-    semantic: &mut Vec<SemanticLine>,
-    groups: &mut Vec<EntryGroup>,
+    buffers: GroupBuffers<'_>,
 ) {
+    let GroupBuffers {
+        lines: out,
+        hits,
+        semantic,
+        groups,
+    } = buffers;
     let live = &view.live;
     if live.reasoning.is_none() && live.assistant.is_none() && live.tools.is_empty() {
         return;
@@ -1328,7 +1341,7 @@ fn build_live_group(
         if view.reasoning_visible {
             for s in msg.text.split('\n') {
                 let rendered = format!("思考 {s}");
-                let decor = unicode_width::UnicodeWidthStr::width("思考 ") as usize;
+                let decor = unicode_width::UnicodeWidthStr::width("思考 ");
                 out.push(Line::styled(
                     rendered.clone(),
                     Style::default()
@@ -1692,10 +1705,10 @@ pub(crate) fn render_markdown(
                     }
                 }
                 TagEnd::TableRow => {
-                    if let Some(t) = &mut table {
-                        if !t.current_row.is_empty() {
-                            t.rows.push(std::mem::take(&mut t.current_row));
-                        }
+                    if let Some(t) = &mut table
+                        && !t.current_row.is_empty()
+                    {
+                        t.rows.push(std::mem::take(&mut t.current_row));
                     }
                 }
                 TagEnd::TableHead => {
@@ -2352,8 +2365,8 @@ fn card_semantic_content(card: &ToolCard, index: usize, raw: &str) -> String {
     let source = card
         .diff
         .as_deref()
-        .or_else(|| card.output.as_deref())
-        .or_else(|| card.tail.as_deref())
+        .or(card.output.as_deref())
+        .or(card.tail.as_deref())
         .unwrap_or_default();
     let line_of_source = source.split('\n').nth(content_index);
     match line_of_source {
@@ -2639,8 +2652,12 @@ fn draw_scrollbar(
         } else {
             ((window_start as u64 * (area_h - thumb_h) as u64) / max_start as u64) as usize
         };
-        for y in top..(top + thumb_h).min(area_h) {
-            glyphs[y] = "▐";
+        for glyph in glyphs
+            .iter_mut()
+            .take((top + thumb_h).min(area_h))
+            .skip(top)
+        {
+            *glyph = "▐";
         }
     }
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(area_h);
@@ -2744,8 +2761,6 @@ fn input_cursor_cell(input: &str, cursor: usize, width: u16) -> (u16, u16) {
 
 /// 详情 Overlay（整改 B）：带边框对话框，展示 command/output/status；
 /// Esc 关闭、PgUp/PgDn 内部滚动；不修改 scrollback。
-/// 操作型 Modal（§42）：标题 + 正文（内部滚动，Esc 关闭，PgUp/PgDn 翻页）。
-
 /// Modal/Overlay 宽度：优先 ≤88-4，但绝不超过终端宽度-2（窄屏不溢出）。
 fn modal_width(area_width: u16) -> u16 {
     let max_w = area_width.saturating_sub(2).max(1);
@@ -3170,8 +3185,7 @@ mod tests {
         let mut view = ViewModel::default();
         view.begin_tool("c1", "bash", Some("cmd".into()), None);
         view.finish_tool(
-            "c1",
-            "bash",
+            ("c1", "bash"),
             crate::tool::outcome::ToolStatus::Failed,
             10,
             Some(1),
@@ -3885,8 +3899,7 @@ fn overlay_clears_background_before_rendering() {
     }
     view.begin_tool("c", "bash", Some("cmd".into()), None);
     view.finish_tool(
-        "c",
-        "bash",
+        ("c", "bash"),
         crate::tool::outcome::ToolStatus::Failed,
         1,
         Some(1),
@@ -4032,24 +4045,29 @@ fn cursor_hidden_during_run_when_input_empty() {
     ));
 
     // Byte level: running + empty input must emit the hide sequence.
-    let mut view = ViewModel::default();
-    view.status = StatusLine::Running {
-        turn: 1,
-        tool: "generating".into(),
+    let mut view = ViewModel {
+        status: StatusLine::Running {
+            turn: 1,
+            tool: "generating".into(),
+        },
+        ..ViewModel::default()
     };
-    view.input = String::new();
     let s = String::from_utf8_lossy(&draw_captured_bytes(&mut view)).into_owned();
     assert!(s.contains("\x1b[?25l"), "running must hide cursor: {s:?}");
 
     // Idle frame must show cursor.
-    let mut view2 = ViewModel::default();
-    view2.status = StatusLine::Idle;
+    let mut view2 = ViewModel {
+        status: StatusLine::Idle,
+        ..ViewModel::default()
+    };
     let s2 = String::from_utf8_lossy(&draw_captured_bytes(&mut view2)).into_owned();
     assert!(s2.contains("\x1b[?25h"), "idle must show cursor: {s2:?}");
 
     // Search open (Ctrl+F): typing goes into the search box, composer cursor must hide.
-    let mut view3 = ViewModel::default();
-    view3.status = StatusLine::Idle;
+    let mut view3 = ViewModel {
+        status: StatusLine::Idle,
+        ..ViewModel::default()
+    };
     view3.open_search();
     let s3 = String::from_utf8_lossy(&draw_captured_bytes(&mut view3)).into_owned();
     assert!(

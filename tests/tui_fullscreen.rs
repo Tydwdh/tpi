@@ -258,8 +258,7 @@ fn tool_card_stays_single_line_on_narrow_terminal() {
     let long = format!("cargo test -- --nocapture {}", "x".repeat(200));
     view.begin_tool("c", "bash", Some(long.clone()), Some(long));
     view.finish_tool(
-        "c",
-        "bash",
+        ("c", "bash"),
         tpi::tool::outcome::ToolStatus::Failed,
         123_456,
         Some(101),
@@ -289,8 +288,7 @@ fn success_card_hides_exit_zero_failure_keeps_it() {
     let mut view = ViewModel::default();
     view.begin_tool("c", "bash", Some("cargo test".into()), None);
     view.finish_tool(
-        "c",
-        "bash",
+        ("c", "bash"),
         tpi::tool::outcome::ToolStatus::Succeeded,
         100,
         Some(0),
@@ -304,8 +302,7 @@ fn success_card_hides_exit_zero_failure_keeps_it() {
     let mut view2 = ViewModel::default();
     view2.begin_tool("c", "bash", Some("cargo test".into()), None);
     view2.finish_tool(
-        "c",
-        "bash",
+        ("c", "bash"),
         tpi::tool::outcome::ToolStatus::Failed,
         100,
         Some(101),
@@ -327,8 +324,10 @@ fn footer_shows_multi_line_input_hint() {
     let all: String = row_texts(&buf).join("\n");
     assert!(all.contains("输入3行"), "多行输入必须显示行数: {all:?}");
 
-    let mut view2 = ViewModel::default();
-    view2.input = "单行".into();
+    let mut view2 = ViewModel {
+        input: "单行".into(),
+        ..ViewModel::default()
+    };
     let buf2 = draw_to_test_backend_mode(&mut view2, 80, 24, ViewMode::Fullscreen);
     let all2: String = row_texts(&buf2).join("\n");
     assert!(!all2.contains("输入"), "单行输入不应显示行数: {all2:?}");

@@ -60,6 +60,30 @@ pub struct ToolCard {
     pub tail: Option<String>,
 }
 
+/// Stable identity carried by every tool lifecycle event.
+///
+/// Treating the call id and tool name as one value prevents lifecycle APIs from
+/// accepting a mismatched pair and keeps terminal updates below an argument list
+/// that obscures their meaning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolIdentity {
+    pub id: String,
+    pub name: String,
+}
+
+impl<I, N> From<(I, N)> for ToolIdentity
+where
+    I: Into<String>,
+    N: Into<String>,
+{
+    fn from((id, name): (I, N)) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+}
+
 /// 卡片输出上限（UI 内存与渲染预算；完整输出仍可通过 read @artifact 读取）。
 pub const MAX_CARD_OUTPUT: usize = 32 * 1024;
 /// P1-9：assistant/reasoning 单条消息上限（工具卡输出另有 MAX_CARD_OUTPUT）。
@@ -656,8 +680,6 @@ impl ViewModel {
         };
     }
 
-    /// 恢复 follow-tail（End/Ctrl+End，§3.1）：回到底部并清空新消息计数。
-
     /// §24：跳转到转录的绝对比例位置（scrollbar 点击/拖拽）。
     /// ratio ∈ [0,1] 对应视口顶部在内容中的位置（0 = 顶部，1 = 底部）。
     pub fn scroll_to_ratio(&mut self, ratio: f64) {
@@ -694,6 +716,8 @@ impl ViewModel {
             self.lock_to(first, 0);
         }
     }
+
+    /// 恢复 follow-tail（End/Ctrl+End，§3.1）：回到底部并清空新消息计数。
     pub fn follow_tail(&mut self) {
         self.scroll_mode = ScrollMode::Follow;
         self.transcript_scroll = 0;
@@ -1157,16 +1181,14 @@ impl ViewModel {
     /// （终态 immutable，历史不再因 live 输出重排）。失败保留关键 tail（有界）。
     pub fn finish_tool(
         &mut self,
-        id: impl Into<String>,
-        name: impl Into<String>,
+        identity: impl Into<ToolIdentity>,
         status: ToolStatus,
         duration_ms: u64,
         exit_code: Option<i32>,
         tail: impl Into<String>,
         diff: Option<String>,
     ) {
-        let id = id.into();
-        let name = name.into();
+        let ToolIdentity { id, name } = identity.into();
         let tail = tail.into();
         if let Some(mut tool) = self.live.tools.remove(&id) {
             tool.card.name = name;
@@ -1584,8 +1606,7 @@ mod tests {
         view.begin_tool("call-1", "bash", Some("bash: cargo test".into()), None);
         view.begin_tool("call-2", "read", Some("read src/main.rs".into()), None);
         view.finish_tool(
-            "call-1",
-            "bash",
+            ("call-1", "bash"),
             ToolStatus::Failed,
             1234,
             Some(2),
@@ -1625,8 +1646,7 @@ mod tests {
         let mut view = ViewModel::default();
         view.begin_tool("call-1", "bash", None, None);
         view.finish_tool(
-            "call-1",
-            "bash",
+            ("call-1", "bash"),
             ToolStatus::Succeeded,
             42,
             Some(0),
@@ -1652,8 +1672,7 @@ mod tests {
         let mut view = ViewModel::default();
         view.begin_tool("c", "bash", None, None);
         view.finish_tool(
-            "c",
-            "bash",
+            ("c", "bash"),
             ToolStatus::Failed,
             0,
             None,
@@ -1770,8 +1789,7 @@ mod tests {
         view.append_tool_output("call-1", "line-1\n");
         view.append_tool_output("call-1", "line-2\n");
         view.finish_tool(
-            "call-1",
-            "bash",
+            ("call-1", "bash"),
             ToolStatus::Succeeded,
             42,
             Some(0),
@@ -1902,8 +1920,7 @@ mod p2_card_nav_tests {
             None,
         );
         view.finish_tool(
-            String::from("call-1"),
-            String::from("read"),
+            (String::from("call-1"), String::from("read")),
             ToolStatus::Succeeded,
             10,
             None,
@@ -1918,8 +1935,7 @@ mod p2_card_nav_tests {
             Some(String::from("ls")),
         );
         view.finish_tool(
-            String::from("call-2"),
-            String::from("bash"),
+            (String::from("call-2"), String::from("bash")),
             ToolStatus::Failed,
             20,
             Some(1),
@@ -2037,8 +2053,7 @@ mod p2_card_nav_tests {
         let mut view = ViewModel::default();
         view.begin_tool("call-1", "bash", Some("run".into()), None);
         view.finish_tool(
-            "call-1",
-            "bash",
+            ("call-1", "bash"),
             ToolStatus::Succeeded,
             10,
             Some(0),
@@ -2210,7 +2225,7 @@ mod p2_card_nav_tests {
         });
         assert_eq!(view.selected_text(), "running");
         // finish_tool：沿用同一 id，选区不悬空。
-        view.finish_tool("c1", "bash", ToolStatus::Succeeded, 10, None, "", None);
+        view.finish_tool(("c1", "bash"), ToolStatus::Succeeded, 10, None, "", None);
         let finalized = view.transcript.last().expect("finish 后必须提交").id();
         assert_eq!(finalized, live_id, "finish_tool 必须沿用 begin 的稳定 id");
         assert_eq!(

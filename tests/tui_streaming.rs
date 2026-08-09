@@ -218,7 +218,14 @@ fn tool_card_renders_running_and_done_states() {
         "运行中卡片显示 spinner、工具名与命令摘要: {rendered:?}"
     );
 
-    view.finish_tool("c1", "bash", ToolStatus::Succeeded, 2345, Some(0), "", None);
+    view.finish_tool(
+        ("c1", "bash"),
+        ToolStatus::Succeeded,
+        2345,
+        Some(0),
+        "",
+        None,
+    );
     let buffer = draw_to_test_backend(&mut view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(
@@ -233,8 +240,7 @@ fn failed_tool_card_shows_status_and_tail() {
     let mut view = ViewModel::default();
     view.begin_tool("c1", "bash", Some("bash: cargo test".into()), None);
     view.finish_tool(
-        "c1",
-        "bash",
+        ("c1", "bash"),
         ToolStatus::Failed,
         500,
         Some(2),

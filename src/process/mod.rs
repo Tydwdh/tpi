@@ -190,7 +190,7 @@ pub async fn run_in_host(
                     // payload = [stream][bytes]?子进程输出 1-3 字节的小块时
                     // 框长度为 2-4（正常有效）。此前要求 >= 5
                     // 会把这些小输出丢帧并刷“unknown process-host message kind=1”告警。
-                    Ok(Some((MSG_OUTPUT, payload))) if payload.len() >= 1 => {
+                    Ok(Some((MSG_OUTPUT, payload))) if !payload.is_empty() => {
                         let stream = payload[0];
                         let bytes = &payload[1..];
                         if let Some(sink) = stream_sink {

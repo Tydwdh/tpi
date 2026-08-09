@@ -19,8 +19,7 @@ fn busy_view() -> ViewModel {
     }
     view.begin_tool("c", "bash", Some("cargo test -- --nocapture".into()), None);
     view.finish_tool(
-        "c",
-        "bash",
+        ("c", "bash"),
         tpi::tool::outcome::ToolStatus::Failed,
         1234,
         Some(101),

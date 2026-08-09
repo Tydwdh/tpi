@@ -89,7 +89,7 @@ fn esc_priority_overlay_over_menu_over_cancel() {
     s.running = true;
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
-        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
+        .finish_tool(("c1", "bash"), ToolStatus::Failed, 1, Some(1), "err", None);
     s.view.open_tool_overlay("c1");
     assert!(s.view.overlay.is_some());
     let effects = reducer::update(&mut s, key(KeyCode::Esc));
@@ -429,7 +429,7 @@ fn ctrl_c_does_not_close_overlay() {
     s.running = true;
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
-        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
+        .finish_tool(("c1", "bash"), ToolStatus::Failed, 1, Some(1), "err", None);
     s.view.open_tool_overlay("c1");
     assert!(s.view.overlay.is_some());
     let effects = reducer::update(
@@ -676,7 +676,7 @@ fn overlay_blocks_composer_typing() {
     let mut s = state();
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
-        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
+        .finish_tool(("c1", "bash"), ToolStatus::Failed, 1, Some(1), "err", None);
     s.view.open_tool_overlay("c1");
     assert!(s.view.overlay.is_some());
     reducer::update(
@@ -705,7 +705,7 @@ fn paste_blocked_while_modal_or_overlay_open() {
     let mut s2 = state();
     s2.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s2.view
-        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
+        .finish_tool(("c1", "bash"), ToolStatus::Failed, 1, Some(1), "err", None);
     s2.view.open_tool_overlay("c1");
     assert!(s2.view.overlay.is_some());
     reducer::update(&mut s2, UiEvent::Paste("junk".into()));
@@ -758,7 +758,7 @@ fn clicks_blocked_while_modal_open() {
         s.view.push_line(LineKind::Assistant, format!("line {i}"));
     }
     s.view.scroll_up(20); // enter Locked so a scrollbar click would otherwise move the viewport
-    let locked_before = s.view.scroll_mode.clone();
+    let locked_before = s.view.scroll_mode;
     let scroll_before = s.view.transcript_scroll;
     s.view.open_modal("/help", "content");
     reducer::update(&mut s, UiEvent::ScrollbarClick(5));
@@ -770,7 +770,7 @@ fn clicks_blocked_while_modal_open() {
     // ClickTool must not expand a card behind the modal.
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
-        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
+        .finish_tool(("c1", "bash"), ToolStatus::Failed, 1, Some(1), "err", None);
     reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
     assert!(
         !matches!(
@@ -789,7 +789,7 @@ fn clicks_blocked_while_overlay_open() {
     }
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
-        .finish_tool("c1", "bash", ToolStatus::Failed, 1, Some(1), "err", None);
+        .finish_tool(("c1", "bash"), ToolStatus::Failed, 1, Some(1), "err", None);
     s.view.open_tool_overlay("c1");
     assert!(s.view.overlay.is_some());
     let scroll_before = s.view.transcript_scroll;

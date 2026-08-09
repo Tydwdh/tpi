@@ -427,8 +427,7 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
             diff,
         } => {
             view.finish_tool(
-                call_id.to_string(),
-                name,
+                (call_id.to_string(), name),
                 status,
                 duration_ms,
                 exit_code,

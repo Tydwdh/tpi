@@ -72,6 +72,38 @@ pub fn truncate_middle_utf8(s: &str, max_bytes: usize, marker: &str) -> String {
     out
 }
 
+/// 单个字符的显示宽度（0 = 零宽：组合符/ZWJ/控制符）。
+///
+/// 之前各处用 `width(ch).unwrap_or(0).max(1)`，把 ZWJ/组合符也算 1 列，
+/// 导致 emoji 序列（如 👨‍💻）在折行/光标列计算时漂移。终端实际按 0 列渲染。
+pub fn char_cell_width(ch: char) -> usize {
+    if matches!(ch, '\u{FF9E}' | '\u{FF9F}') {
+        // 半角假名浊音点（ｶﾞ 的 ﾞ）：Ratatui 按 1 cell 计，unicode-width 却算 0。
+        // 移植自 codex width.rs（Apache-2.0）。
+        1
+    } else {
+        unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+    }
+}
+
+/// 字符串的终端显示宽度（`usize` 精度，匹配 Ratatui cell 语义）。
+/// 与 [`char_cell_width`] 一致：半角音标点按 1 cell。
+pub fn display_width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+        + text
+            .chars()
+            .filter(|ch| matches!(ch, '\u{FF9E}' | '\u{FF9F}'))
+            .count()
+}
+
+/// 扣除固定前缀列后的可用内容宽度；`None` = 前缀耗尽全部宽度。
+/// 极窄终端下避免 0 宽渲染产生空/不稳定输出（移植自 codex width.rs）。
+pub fn usable_content_width(total_width: usize, reserved_cols: usize) -> Option<usize> {
+    total_width
+        .checked_sub(reserved_cols)
+        .filter(|remaining| *remaining > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,36 +195,4 @@ mod tests {
     fn middle_truncation_short_input_is_unchanged() {
         assert_eq!(truncate_middle_utf8("你好", 100, "…"), "你好");
     }
-}
-
-/// 单个字符的显示宽度（0 = 零宽：组合符/ZWJ/控制符）。
-///
-/// 之前各处用 `width(ch).unwrap_or(0).max(1)`，把 ZWJ/组合符也算 1 列，
-/// 导致 emoji 序列（如 👨‍💻）在折行/光标列计算时漂移。终端实际按 0 列渲染。
-pub fn char_cell_width(ch: char) -> usize {
-    if matches!(ch, '\u{FF9E}' | '\u{FF9F}') {
-        // 半角假名浊音点（ｶﾞ 的 ﾞ）：Ratatui 按 1 cell 计，unicode-width 却算 0。
-        // 移植自 codex width.rs（Apache-2.0）。
-        1
-    } else {
-        unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
-    }
-}
-
-/// 字符串的终端显示宽度（`usize` 精度，匹配 Ratatui cell 语义）。
-/// 与 [`char_cell_width`] 一致：半角音标点按 1 cell。
-pub fn display_width(text: &str) -> usize {
-    unicode_width::UnicodeWidthStr::width(text)
-        + text
-            .chars()
-            .filter(|ch| matches!(ch, '\u{FF9E}' | '\u{FF9F}'))
-            .count()
-}
-
-/// 扣除固定前缀列后的可用内容宽度；`None` = 前缀耗尽全部宽度。
-/// 极窄终端下避免 0 宽渲染产生空/不稳定输出（移植自 codex width.rs）。
-pub fn usable_content_width(total_width: usize, reserved_cols: usize) -> Option<usize> {
-    total_width
-        .checked_sub(reserved_cols)
-        .filter(|remaining| *remaining > 0)
 }
