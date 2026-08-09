@@ -6,11 +6,10 @@ use camino::Utf8PathBuf;
 use fixtures::test_tool_context;
 use tpi::tool::files::{ReadArgs, WriteArgs, read, write};
 use tpi::tool::outcome::ToolStatus;
-use tpi::tool::web::{WebFetchArgs, validate_fetch_url, web_fetch};
+use tpi::tool::web::{
+    WebFetchArgs, validate_fetch_url, web_fetch, web_fetch_allowing_private_for_test,
+};
 use tpi::tool::{resolve_workspace_path, validate_artifact_component};
-
-/// 串行化依赖全局 allow_private 测试开关的两个 web_fetch 测试（并行互相覆盖会失败/死锁）。
-static WEB_FETCH_TESTS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// §9.1：workspace 内 junction/symlink 指向外部时，写入不得穿过链接逃逸。
 ///
@@ -145,15 +144,12 @@ fn write_rejects_outside_workspace() {
 
 #[tokio::test]
 async fn web_fetch_blocks_private_targets_by_default() {
-    let _guard = WEB_FETCH_TESTS_LOCK.lock().await;
     assert!(validate_fetch_url("http://127.0.0.1:8080/").is_err());
     assert!(validate_fetch_url("http://192.168.0.1/").is_err());
 }
 
 #[tokio::test]
-async fn web_fetch_localhost_is_blocked_without_test_override() {
-    let _guard = WEB_FETCH_TESTS_LOCK.lock().await;
-    tpi::tool::web::set_allow_private_web_targets_for_tests(false);
+async fn production_web_fetch_blocks_localhost() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let mut ctx = test_tool_context(&workspace);
@@ -170,9 +166,7 @@ async fn web_fetch_localhost_is_blocked_without_test_override() {
 }
 
 #[tokio::test]
-async fn web_fetch_allows_localhost_when_test_override_enabled() {
-    let _guard = WEB_FETCH_TESTS_LOCK.lock().await;
-    tpi::tool::web::set_allow_private_web_targets_for_tests(true);
+async fn private_target_policy_is_scoped_to_test_request() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let mut ctx = test_tool_context(&workspace);
@@ -208,7 +202,7 @@ async fn web_fetch_allows_localhost_when_test_override_enabled() {
             }
         }
     });
-    let outcome = web_fetch(
+    let outcome = web_fetch_allowing_private_for_test(
         WebFetchArgs {
             url: format!("http://{addr}/page"),
         },
@@ -216,7 +210,6 @@ async fn web_fetch_allows_localhost_when_test_override_enabled() {
     )
     .await;
     handle.join().unwrap();
-    tpi::tool::web::set_allow_private_web_targets_for_tests(false);
     assert_eq!(outcome.status, ToolStatus::Succeeded);
     assert!(outcome.model_text().contains("Hello TPI"));
 }

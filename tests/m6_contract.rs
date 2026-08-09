@@ -1,4 +1,4 @@
-﻿//! M6 验收契约（§21 M6、§17）。
+//! M6 验收契约（§21 M6、§17）。
 //!
 //! - `web_search` 使用免费 DuckDuckGo 端点（无需 API key，零配置；§17）；
 //!   解析器契约在此 + src/tool/web.rs 单测覆盖（广告过滤、uddg 链接还原）；
@@ -11,10 +11,9 @@ mod fixtures;
 use camino::Utf8PathBuf;
 use fixtures::test_tool_context;
 use tpi::tool::outcome::ToolStatus;
-use tpi::tool::web::{WebFetchArgs, WebSearchArgs, parse_ddg_results, web_fetch};
-
-/// 串行化依赖全局 allow_private 测试开关的两个 web_fetch 测试（并行互相覆盖会死锁）。
-static WEB_FETCH_TESTS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use tpi::tool::web::{
+    WebFetchArgs, WebSearchArgs, parse_ddg_results, web_fetch, web_fetch_allowing_private_for_test,
+};
 
 /// §17：web_search 免费方案（无 key）——解析器对真实端点 fixture 的契约。
 #[test]
@@ -70,14 +69,9 @@ async fn live_ddg_search_returns_results() {
     );
 }
 
-/// §17：web_fetch 对私有地址默认 SSRF 拦截。
-///
-/// 与 web_fetch_converts_html_and_bounds_body 串行（二者共享全局
-/// allow_private 测试开关，并行时互相覆盖会导致 accept 死锁）。
+/// web_fetch 对私有地址默认执行 SSRF 拦截。
 #[tokio::test]
 async fn web_fetch_failure_is_explicit() {
-    let _guard = WEB_FETCH_TESTS_LOCK.lock().await;
-    tpi::tool::web::set_allow_private_web_targets_for_tests(false);
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let ctx = test_tool_context(&workspace);
@@ -92,11 +86,9 @@ async fn web_fetch_failure_is_explicit() {
     assert!(outcome.model_text().contains("ssrf_blocked"));
 }
 
-/// §17：web_fetch 对 HTML 做转换，正文有界。
+/// web_fetch 对 HTML 做转换，正文有界。
 #[tokio::test]
 async fn web_fetch_converts_html_and_bounds_body() {
-    let _guard = WEB_FETCH_TESTS_LOCK.lock().await;
-    tpi::tool::web::set_allow_private_web_targets_for_tests(true);
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let ctx = test_tool_context(&workspace);
@@ -135,7 +127,7 @@ async fn web_fetch_converts_html_and_bounds_body() {
             }
         }
     });
-    let outcome = web_fetch(
+    let outcome = web_fetch_allowing_private_for_test(
         WebFetchArgs {
             url: format!("http://{addr}/page"),
         },
@@ -143,7 +135,6 @@ async fn web_fetch_converts_html_and_bounds_body() {
     )
     .await;
     handle.join().unwrap();
-    tpi::tool::web::set_allow_private_web_targets_for_tests(false);
     assert_eq!(outcome.status, ToolStatus::Succeeded);
     let text = outcome.model_text();
     assert!(text.contains("http: 200"), "{text}");

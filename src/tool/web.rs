@@ -1,12 +1,12 @@
-//! Web 工具（文档 §17、§8.1 P1）。
+//! 有界且默认拒绝私网目标的 Web 工具。
 //!
 //! - `web_search`：DuckDuckGo HTML 端点（免费、无需 API key，社区 skills 通用
 //!   方案，参考 pi-web-access 的无 key 思路）；结果只用于发现来源，
-//!   不调用 LLM/Answers endpoint（§17：避免隐藏模型成本）。
+//!   不调用 LLM/Answers endpoint，避免隐藏模型成本。
 //! - `web_fetch`：reqwest 限制 redirect、响应体大小和 timeout；HTML 用
-//!   html2text 转换；正文有界（§8.4：48 KiB）。
-//! - 不打开浏览器、不自动 fetch 全部结果、不调用 summary model（§17）。
-//! - DDG 可能对异常流量返回人机验证页：此时明确报错，不静默降级（§17）。
+//!   html2text 转换；正文上限为 48 KiB。
+//! - 不打开浏览器、不自动 fetch 全部结果、不调用 summary model。
+//! - DDG 可能对异常流量返回人机验证页：此时明确报错，不静默降级。
 
 use std::net::IpAddr;
 
@@ -73,37 +73,30 @@ pub struct WebFetchArgs {
     pub url: String,
 }
 
-/// 测试专用：允许访问私有地址（生产默认拒绝 SSRF）。
-fn allow_private_web_targets() -> bool {
-    if ALLOW_PRIVATE_WEB_TARGETS.load(std::sync::atomic::Ordering::SeqCst) {
-        return true;
+#[derive(Clone, Copy)]
+enum TargetPolicy {
+    PublicOnly,
+    AllowPrivateForTest,
+}
+
+impl TargetPolicy {
+    fn allows_private(self) -> bool {
+        matches!(self, Self::AllowPrivateForTest)
     }
-    std::env::var("TPI_WEB_FETCH_ALLOW_PRIVATE")
-        .map(|value| value == "1")
-        .unwrap_or(false)
 }
 
-static ALLOW_PRIVATE_WEB_TARGETS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// 集成测试专用：切换是否允许 fetch 私有地址（避免并行测试污染环境变量）。
-#[doc(hidden)]
-pub fn set_allow_private_web_targets_for_tests(allow: bool) {
-    ALLOW_PRIVATE_WEB_TARGETS.store(allow, std::sync::atomic::Ordering::SeqCst);
-}
-
-fn web_fetch_client() -> reqwest::Client {
+fn web_fetch_client(policy: TargetPolicy) -> reqwest::Client {
     let mut builder =
-        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(move |attempt| {
             // P0-10：redirect 逐跳校验（此前 Policy::limited 自动跟随，
             // 私有/loopback 目标直接可达）。
-            if let Err(error) = redirect_allowed(attempt.url()) {
+            if let Err(error) = validate_url(attempt.url().clone(), policy) {
                 attempt.error(format!("blocked redirect target: {error}"))
             } else {
                 attempt.follow()
             }
         }));
-    if allow_private_web_targets() {
+    if policy.allows_private() {
         builder = builder.no_proxy();
     }
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
@@ -112,12 +105,16 @@ fn web_fetch_client() -> reqwest::Client {
 /// 校验 fetch 目标 URL（§17：仅 HTTP(S)，拒绝 loopback/私网/链路本地）。
 pub fn validate_fetch_url(url_str: &str) -> Result<Url, String> {
     let url = Url::parse(url_str.trim()).map_err(|error| format!("invalid url: {error}"))?;
+    validate_url(url, TargetPolicy::PublicOnly)
+}
+
+fn validate_url(url: Url, policy: TargetPolicy) -> Result<Url, String> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(format!("unsupported scheme: {scheme}"));
     }
     let host = url.host_str().ok_or_else(|| "missing host".to_string())?;
-    if !allow_private_web_targets() && is_blocked_host(host) {
+    if !policy.allows_private() && is_blocked_host(host) {
         return Err(format!("blocked host: {host}"));
     }
     Ok(url)
@@ -171,20 +168,6 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
             false
         }
     }
-}
-
-/// P0-10：redirect 目标逐跳校验（policy 闭包与 web_fetch 共用）。
-/// 校验 scheme 与 host；`allow_private_web_targets()` 开启时放行。
-fn redirect_allowed(url: &Url) -> Result<(), String> {
-    let scheme = url.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(format!("unsupported scheme: {scheme}"));
-    }
-    let host = url.host_str().ok_or_else(|| "missing host".to_string())?;
-    if !allow_private_web_targets() && is_blocked_host(host) {
-        return Err(format!("blocked host: {host}"));
-    }
-    Ok(())
 }
 
 async fn read_bounded_bytes(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
@@ -833,7 +816,28 @@ fn decode_yahoo_href(href: &str) -> String {
 
 /// web_fetch（§17：限制 redirect、响应体大小和 timeout；HTML 转换）。
 pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
-    let url = match validate_fetch_url(&args.url) {
+    web_fetch_with_policy(args, ctx, TargetPolicy::PublicOnly).await
+}
+
+/// Integration-test entry point. Production callers cannot select this policy
+/// through configuration or environment state.
+#[doc(hidden)]
+pub async fn web_fetch_allowing_private_for_test(
+    args: WebFetchArgs,
+    ctx: &ToolContext,
+) -> ToolOutcome {
+    web_fetch_with_policy(args, ctx, TargetPolicy::AllowPrivateForTest).await
+}
+
+async fn web_fetch_with_policy(
+    args: WebFetchArgs,
+    ctx: &ToolContext,
+    policy: TargetPolicy,
+) -> ToolOutcome {
+    let url = match Url::parse(args.url.trim())
+        .map_err(|error| format!("invalid url: {error}"))
+        .and_then(|url| validate_url(url, policy))
+    {
         Ok(url) => url,
         Err(error) => {
             return ToolOutcome::failed(
@@ -853,12 +857,12 @@ pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
         }
     };
 
-    let client = web_fetch_client();
+    let client = web_fetch_client(policy);
 
     // P0-10：DNS 预解析——域名解析出的任何地址命中私有/loopback 都拒绝。
     // 字面 IP 已在 validate_fetch_url 校验；这里防“域名解析到私有地址”的
     // SSRF 绕过（DNS rebinding 需要连接后二次验证，不在本次范围，§17 注释）。
-    if !allow_private_web_targets()
+    if !policy.allows_private()
         && let Some(host) = url.host_str()
         // 字面 IP（含带括号的 IPv6）已由 validate_fetch_url 校验。
         && host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_err()
@@ -916,7 +920,7 @@ pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
         }
     };
 
-    if let Err(error) = validate_fetch_url(response.url().as_str()) {
+    if let Err(error) = validate_url(response.url().clone(), policy) {
         return ToolOutcome::failed(
             "web_fetch",
             ModelPayload {
@@ -1123,11 +1127,11 @@ mod tests {
     fn redirect_target_is_ssrf_checked() {
         // 逐跳验证函数：redirect policy 与 web_fetch 共用同一校验。
         let public: Url = "https://example.com/page".parse().unwrap();
-        assert!(redirect_allowed(&public).is_ok());
+        assert!(validate_url(public, TargetPolicy::PublicOnly).is_ok());
         let private: Url = "http://127.0.0.1:8080/ssrf".parse().unwrap();
-        assert!(redirect_allowed(&private).is_err());
+        assert!(validate_url(private, TargetPolicy::PublicOnly).is_err());
         let mapped: Url = "http://[::ffff:10.0.0.5]/".parse().unwrap();
-        assert!(redirect_allowed(&mapped).is_err());
+        assert!(validate_url(mapped, TargetPolicy::PublicOnly).is_err());
     }
 
     #[test]
