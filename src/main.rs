@@ -116,6 +116,8 @@ enum AuthCommand {
 fn setup_console_utf8() {
     use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
     const CP_UTF8: u32 = 65001;
+    // SAFETY: These process-wide console setters accept a numeric code page and
+    // have no pointer or lifetime preconditions. Failure is intentionally benign.
     unsafe {
         SetConsoleCP(CP_UTF8);
         SetConsoleOutputCP(CP_UTF8);
@@ -147,6 +149,9 @@ fn with_input_echo<T>(echo: bool, f: impl FnOnce() -> T) -> T {
         use windows_sys::Win32::System::Console::{
             ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
         };
+        // SAFETY: The standard-input handle comes from GetStdHandle; mode points
+        // to live writable storage, and SetConsoleMode is called only when the
+        // handle is confirmed to represent a console.
         unsafe {
             let handle = GetStdHandle(STD_INPUT_HANDLE);
             let mut mode: u32 = 0;

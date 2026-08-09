@@ -125,6 +125,7 @@ pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Console::GetConsoleOutputCP;
+        // SAFETY: GetConsoleOutputCP has no pointer arguments or caller-side preconditions.
         let cp = unsafe { GetConsoleOutputCP() };
         checks.push(DoctorCheck {
             name: "console",

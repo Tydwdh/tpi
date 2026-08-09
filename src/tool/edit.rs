@@ -543,6 +543,8 @@ pub fn replace_file(
         let replaced = to_wide(target);
         let replacement = to_wide(temp_path);
         let backup = backup_path.map(to_wide).unwrap_or_default();
+        // SAFETY: Every non-null pointer references a live, NUL-terminated UTF-16
+        // buffer for the duration of the call. The two reserved arguments are null.
         let result = unsafe {
             ReplaceFileW(
                 replaced.as_ptr(),
@@ -582,6 +584,8 @@ pub fn install_no_clobber(temp_path: &Path, target: &Path) -> Result<(), Install
         };
         let from = to_wide(temp_path);
         let to = to_wide(target);
+        // SAFETY: Both pointers reference live, NUL-terminated UTF-16 buffers
+        // for the duration of this synchronous call.
         let result = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
         if result == 0 {
             let error = std::io::Error::last_os_error();

@@ -311,8 +311,9 @@ pub struct Job {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
-// HANDLE 是进程内可跨线程使用的值（CreateJobObjectW 的句柄语义），
-// 允许 run_in_host 的 async future 跨 tokio 线程持有 Job。
+// SAFETY: Job has unique ownership of a Windows kernel HANDLE. Windows kernel
+// handles may be used and closed from any process thread; no thread-affine state
+// or borrowed memory is stored in this wrapper.
 #[cfg(windows)]
 unsafe impl Send for Job {}
 
@@ -324,6 +325,8 @@ impl Job {
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JobObjectExtendedLimitInformation, SetInformationJobObject,
         };
+        // SAFETY: Both optional pointer arguments are null, which requests an
+        // unnamed job with the default security descriptor.
         let handle = unsafe {
             windows_sys::Win32::System::JobObjects::CreateJobObjectW(
                 std::ptr::null(),
@@ -342,6 +345,9 @@ impl Job {
             ..Default::default()
         };
         // 不允许 breakaway：不设置 BREAKAWAY_OK / SILENT_BREAKAWAY_OK。
+        // SAFETY: handle is live and owned by this function. `info` has the
+        // exact structure and byte length required for this information class
+        // and remains alive for the duration of the call.
         let result = unsafe {
             SetInformationJobObject(
                 handle,
@@ -351,8 +357,11 @@ impl Job {
             )
         };
         if result == 0 {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: handle was returned successfully above, remains owned by
+            // this function, and has not previously been closed.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
-            return Err(std::io::Error::last_os_error());
+            return Err(error);
         }
         Ok(Self { handle })
     }
@@ -361,6 +370,8 @@ impl Job {
     pub fn assign_process(&self, pid: u32) -> std::io::Result<()> {
         use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
         use windows_sys::Win32::System::Threading::OpenProcess;
+        // SAFETY: OpenProcess accepts any process id value and has no pointer
+        // arguments; failure is represented by a null handle below.
         let process_handle = unsafe {
             OpenProcess(
                 windows_sys::Win32::System::Threading::PROCESS_SET_QUOTA
@@ -372,16 +383,21 @@ impl Job {
         if process_handle == windows_sys::Win32::Foundation::HANDLE::default() {
             return Err(std::io::Error::last_os_error());
         }
+        // SAFETY: self owns a live job handle and process_handle is live with
+        // the access rights requested above.
         let result = unsafe { AssignProcessToJobObject(self.handle, process_handle) };
+        let error = (result == 0).then(std::io::Error::last_os_error);
+        // SAFETY: process_handle is locally owned and has not been closed yet.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(process_handle) };
-        if result == 0 {
-            return Err(std::io::Error::last_os_error());
+        if let Some(error) = error {
+            return Err(error);
         }
         Ok(())
     }
 
     #[cfg(windows)]
     pub fn terminate(&self, exit_code: u32) {
+        // SAFETY: self owns a live job handle for the lifetime of this call.
         unsafe {
             windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle, exit_code);
         }
@@ -405,6 +421,7 @@ impl Drop for Job {
     #[cfg(windows)]
     fn drop(&mut self) {
         // §11.5：关闭 job handle 触发 KILL_ON_JOB_CLOSE，父进程崩溃时整棵树退出。
+        // SAFETY: Job uniquely owns this live handle and Drop runs exactly once.
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.handle);
         }

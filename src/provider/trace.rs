@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 /// 当前 trace 模式：None = 关闭，Some(false) = 元数据，Some(true) = 含 body。
-static TRACE_MODE: OnceLock<Option<bool>> = OnceLock::new();
 static TRACE_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
 fn log_dir() -> PathBuf {
@@ -39,11 +38,11 @@ pub fn include_body() -> bool {
 }
 
 fn mode() -> Option<bool> {
-    *TRACE_MODE.get_or_init(|| match std::env::var("TPI_TRACE_PROVIDER") {
+    match std::env::var("TPI_TRACE_PROVIDER") {
         Ok(value) if value == "body" || value == "full" => Some(true),
         Ok(value) if value == "1" || value == "true" => Some(false),
         _ => None,
-    })
+    }
 }
 
 fn writer() -> Option<&'static Mutex<File>> {

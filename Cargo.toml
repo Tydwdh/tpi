@@ -3,7 +3,7 @@ name = "tpi"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-description = "TPI: a personal terminal coding agent for Windows (see TPI_DESIGN.md)"
+description = "A personal terminal coding agent for Windows"
 
 [dependencies]
 tokio = { version = "1.53", features = [
@@ -46,6 +46,7 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+socket2 = "0.6"
 
 [profile.release]
 lto = "thin"

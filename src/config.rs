@@ -170,6 +170,14 @@ impl Default for LimitsConfig {
 /// 模型配置缺失时返回明确错误（§18.1：不允许看不见的默认模型）。
 pub fn load(workspace_root: &Utf8PathBuf, cli_model: Option<&str>) -> Result<Config, String> {
     let home = tpi_home();
+    load_from_home(workspace_root, cli_model, &home)
+}
+
+fn load_from_home(
+    workspace_root: &Utf8PathBuf,
+    cli_model: Option<&str>,
+    home: &std::path::Path,
+) -> Result<Config, String> {
     let home_file = home.join("config.toml");
     let workspace_file = workspace_root.join(".tpi").join("config.toml");
 
@@ -387,10 +395,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(workspace.join("AGENTS.md"), "永远使用 LF 换行\n").unwrap();
-        unsafe {
-            std::env::set_var("TPI_HOME", &home);
-        }
-        let config = load(&workspace, None).expect("load");
+        let config = load_from_home(&workspace, None, &home).expect("load");
         let extra = config.system_prompt_extra.expect("AGENTS.md 必须注入");
         assert!(extra.contains("[project rule: AGENTS.md]"), "{extra}");
         assert!(extra.contains("LF 换行"), "{extra}");

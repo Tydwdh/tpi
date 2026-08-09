@@ -651,6 +651,9 @@ async fn provider_trace_writes_metadata_without_auth() {
     // 先设环境变量（trace 模式是进程级 OnceLock，首次检查前必须设置）。
     let dir = tempfile::tempdir().unwrap();
     let tpi_home = dir.path().to_str().unwrap().to_string();
+    // SAFETY: This Windows-only project relies on the OS-synchronized process
+    // environment. These test-only keys are initialized before this test starts
+    // its provider request and are never removed or freed.
     unsafe {
         std::env::set_var("TPI_TRACE_PROVIDER", "1");
         std::env::set_var("TPI_HOME", &tpi_home);
@@ -752,8 +755,6 @@ async fn provider_failure_keeps_session_recoverable() {
     );
 }
 
-#[allow(deprecated)]
-// SO_LINGER 是触发 RST 的标准手段；tokio 标记 deprecated（drop 可能阻塞线程）。
 /// 模拟 SSE 中途断开：返回头部 + 一个事件后以 RST（SO_LINGER=0）断开。
 /// 最多接受 4 个连接（若客户端错误地重试，计数会 >1；修复后应恒为 1）。
 async fn mock_sse_server_rst_after_partial(
@@ -789,6 +790,8 @@ async fn mock_sse_server_rst_after_partial(
             let _ = socket.write_all(response.as_bytes()).await;
             let _ = socket.flush().await;
             tokio::time::sleep(Duration::from_millis(50)).await;
+            let std_socket = socket.into_std().unwrap();
+            let socket = socket2::Socket::from(std_socket);
             let _ = socket.set_linger(Some(Duration::from_secs(0)));
             drop(socket);
         }

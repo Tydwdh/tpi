@@ -2,7 +2,10 @@
 //!
 //! integration tests 通过 `mod fixtures;` 共享本目录。
 //! 夹具函数由不同测试文件按需使用，允许单文件编译单元内未引用。
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "each integration-test crate consumes a different fixture subset"
+)]
 
 pub mod deterministic;
 pub mod fake_provider;
@@ -42,7 +45,8 @@ pub fn test_config(workspace_root: &Utf8PathBuf) -> Config {
 
 /// 测试进程不是 tpi.exe；必须显式指向真实 host 二进制（§11.5 单二进制 handshake）。
 pub fn point_host_at_real_tpi() {
-    // Rust 2024：set_var 是 unsafe。
+    // SAFETY: TPI targets Windows, whose process environment is synchronized by
+    // the OS. Every test writer uses the same immutable executable path.
     unsafe {
         std::env::set_var("TPI_PROCESS_HOST", env!("CARGO_BIN_EXE_tpi"));
     }
