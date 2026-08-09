@@ -11,6 +11,7 @@ use std::path::Path;
 use crate::session::{RecoveryMetadata, SessionEvent, read_events};
 use crate::tool::edit::Effect;
 use crate::tool::outcome::{ModelPayload, StoredToolOutcome, ToolMetadata, ToolStatus};
+use crate::tool::{BuiltinTool, ToolRecoveryPolicy};
 
 /// 恢复结果。
 pub struct RecoveryOutcome {
@@ -88,18 +89,14 @@ pub fn recover(path: &Path) -> std::io::Result<RecoveryOutcome> {
 ///
 /// 纯读工具无副作用，记为 not_applied。
 fn classify_effect(tool_name: &str, recovery: Option<&RecoveryMetadata>) -> Effect {
-    match tool_name {
-        "read" | "list" | "search" | "web_search" | "web_fetch" | "update_plan" => {
-            Effect::NotApplied
-        }
-        _ => {
+    let policy = BuiltinTool::from_name(tool_name).map(BuiltinTool::recovery_policy);
+    match policy {
+        Some(ToolRecoveryPolicy::NoEffect) => Effect::NotApplied,
+        Some(ToolRecoveryPolicy::Unknown) | None => Effect::Unknown,
+        Some(ToolRecoveryPolicy::FileCommit) => {
             let Some(metadata) = recovery else {
                 return Effect::Unknown;
             };
-            if metadata.temp_path.is_empty() {
-                // run/bash：无法从文件状态判定（进程可能已执行）。
-                return Effect::Unknown;
-            }
             let target_digest = std::path::Path::new(&metadata.target_path)
                 .exists()
                 .then(|| std::fs::read(&metadata.target_path).ok())

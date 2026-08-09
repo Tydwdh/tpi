@@ -917,7 +917,7 @@ error: invalid_arguments
                 &config.workspace_root,
                 config.allow_outside_workspace,
             );
-            if tool::requires_write_ahead(call.tool) {
+            if call.tool.requires_write_ahead() {
                 session
                     .write_ahead_tool(source.call_id, recovery)
                     .map_err(|e| RunFailure::Session(e.to_string()))?;
@@ -1488,36 +1488,6 @@ fn recovery_metadata(
             })
         }
         _ => None,
-    }
-}
-
-impl StoredToolOutcome {
-    pub fn status_name(&self) -> &'static str {
-        match self.status {
-            ToolStatus::Succeeded => "succeeded",
-            ToolStatus::Failed => "failed",
-            ToolStatus::TimedOut => "timed_out",
-            ToolStatus::Cancelled => "cancelled",
-            ToolStatus::Interrupted => "interrupted",
-            ToolStatus::Rejected => "rejected",
-        }
-    }
-}
-
-impl BuiltinTool {
-    pub fn from_name(name: &str) -> Option<BuiltinTool> {
-        match name {
-            "read" => Some(BuiltinTool::Read),
-            "list" => Some(BuiltinTool::List),
-            "search" => Some(BuiltinTool::Search),
-            "edit" => Some(BuiltinTool::Edit),
-            "write" => Some(BuiltinTool::Write),
-            "bash" => Some(BuiltinTool::Bash),
-            "update_plan" => Some(BuiltinTool::UpdatePlan),
-            "web_search" => Some(BuiltinTool::WebSearch),
-            "web_fetch" => Some(BuiltinTool::WebFetch),
-            _ => None,
-        }
     }
 }
 

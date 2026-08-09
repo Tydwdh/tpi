@@ -114,6 +114,19 @@ pub struct StoredToolOutcome {
     pub session_metadata: ToolMetadata,
 }
 
+impl StoredToolOutcome {
+    pub fn status_name(&self) -> &'static str {
+        match self.status {
+            ToolStatus::Succeeded => "succeeded",
+            ToolStatus::Failed => "failed",
+            ToolStatus::TimedOut => "timed_out",
+            ToolStatus::Cancelled => "cancelled",
+            ToolStatus::Interrupted => "interrupted",
+            ToolStatus::Rejected => "rejected",
+        }
+    }
+}
+
 /// 统一工具结果（文档 §8.2）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutcome {

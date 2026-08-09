@@ -165,6 +165,47 @@ pub enum BuiltinTool {
     WebFetch,
 }
 
+/// 工具对调度器和崩溃恢复真正重要的执行语义。
+///
+/// 这个分类刻意归属于 [`BuiltinTool`]：新增工具时，编译器会要求在
+/// [`BuiltinTool::execution_class`] 中明确选择行为，不能由调度器的兜底分支
+/// 静默假设为 `Pure`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolExecutionClass {
+    Pure,
+    FileReadExact,
+    FileReadRecursive,
+    FileWriteExact,
+    WorkspaceUnknown,
+}
+
+/// session 中断后如何解释“缺少 ToolCompleted”的调用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolRecoveryPolicy {
+    /// 工具不会改变需要恢复的外部状态。
+    NoEffect,
+    /// edit/write 使用 commit metadata 判定已提交、未提交或未知。
+    FileCommit,
+    /// bash 等任意副作用工具无法可靠推断执行结果。
+    Unknown,
+}
+
+impl ToolExecutionClass {
+    pub(crate) fn requires_write_ahead(self) -> bool {
+        matches!(self, Self::FileWriteExact | Self::WorkspaceUnknown)
+    }
+
+    pub(crate) fn recovery_policy(self) -> ToolRecoveryPolicy {
+        match self {
+            Self::Pure | Self::FileReadExact | Self::FileReadRecursive => {
+                ToolRecoveryPolicy::NoEffect
+            }
+            Self::FileWriteExact => ToolRecoveryPolicy::FileCommit,
+            Self::WorkspaceUnknown => ToolRecoveryPolicy::Unknown,
+        }
+    }
+}
+
 impl BuiltinTool {
     pub fn name(&self) -> &'static str {
         match self {
@@ -178,6 +219,41 @@ impl BuiltinTool {
             BuiltinTool::WebSearch => "web_search",
             BuiltinTool::WebFetch => "web_fetch",
         }
+    }
+
+    /// 持久化/provider 名称到内建工具的唯一反解析入口。
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "read" => Some(Self::Read),
+            "list" => Some(Self::List),
+            "search" => Some(Self::Search),
+            "edit" => Some(Self::Edit),
+            "write" => Some(Self::Write),
+            "bash" => Some(Self::Bash),
+            "update_plan" => Some(Self::UpdatePlan),
+            "web_search" => Some(Self::WebSearch),
+            "web_fetch" => Some(Self::WebFetch),
+            _ => None,
+        }
+    }
+
+    /// 调度、write-ahead 与恢复共同使用的行为事实源。
+    pub(crate) fn execution_class(self) -> ToolExecutionClass {
+        match self {
+            Self::Read => ToolExecutionClass::FileReadExact,
+            Self::List | Self::Search => ToolExecutionClass::FileReadRecursive,
+            Self::Edit | Self::Write => ToolExecutionClass::FileWriteExact,
+            Self::Bash => ToolExecutionClass::WorkspaceUnknown,
+            Self::UpdatePlan | Self::WebSearch | Self::WebFetch => ToolExecutionClass::Pure,
+        }
+    }
+
+    pub(crate) fn requires_write_ahead(self) -> bool {
+        self.execution_class().requires_write_ahead()
+    }
+
+    pub(crate) fn recovery_policy(self) -> ToolRecoveryPolicy {
+        self.execution_class().recovery_policy()
     }
 
     pub fn description(&self) -> &'static str {
@@ -270,6 +346,37 @@ pub enum ValidatedArgs {
     UpdatePlan(plan::UpdatePlanArgs),
     WebSearch(web::WebSearchArgs),
     WebFetch(web::WebFetchArgs),
+}
+
+impl ValidatedArgs {
+    /// 参数由哪个工具产生。调度边界用它验证 `(BuiltinTool, ValidatedArgs)`
+    /// 没有被错误拼接；不变量破坏时必须保守隔离而不是提升为 Pure。
+    pub(crate) fn tool(&self) -> BuiltinTool {
+        match self {
+            Self::Read(_) => BuiltinTool::Read,
+            Self::List(_) => BuiltinTool::List,
+            Self::Search(_) => BuiltinTool::Search,
+            Self::Edit(_) => BuiltinTool::Edit,
+            Self::Write(_) => BuiltinTool::Write,
+            Self::Bash(_) => BuiltinTool::Bash,
+            Self::UpdatePlan(_) => BuiltinTool::UpdatePlan,
+            Self::WebSearch(_) => BuiltinTool::WebSearch,
+            Self::WebFetch(_) => BuiltinTool::WebFetch,
+        }
+    }
+
+    /// 文件资源型工具的原始 path 参数；具体 Exact/Recursive 和 Read/Write
+    /// 由 [`BuiltinTool::execution_class`] 决定。
+    pub(crate) fn path(&self) -> Option<&str> {
+        match self {
+            Self::Read(args) => Some(&args.path),
+            Self::List(args) => Some(&args.path),
+            Self::Search(args) => Some(&args.path),
+            Self::Edit(args) => Some(&args.path),
+            Self::Write(args) => Some(&args.path),
+            Self::Bash(_) | Self::UpdatePlan(_) | Self::WebSearch(_) | Self::WebFetch(_) => None,
+        }
+    }
 }
 
 /// 工具流式输出事件（bash 实时输出 → UI；tool 层不依赖 agent 层）。
@@ -600,14 +707,6 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
     ]
 }
 
-/// 工具是否需要在副作用前 write-ahead（§12.1：Write / WorkspaceUnknown）。
-pub fn requires_write_ahead(tool: BuiltinTool) -> bool {
-    matches!(
-        tool,
-        BuiltinTool::Edit | BuiltinTool::Write | BuiltinTool::Bash
-    )
-}
-
 /// update_plan 是否计入工具调用预算（§13：计入）。
 pub const UPDATE_PLAN_COUNTS_TO_BUDGET: bool = true;
 
@@ -615,6 +714,33 @@ pub const UPDATE_PLAN_COUNTS_TO_BUDGET: bool = true;
 mod tests {
     use super::*;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn implemented_tool_names_round_trip_to_the_same_behavior_owner() {
+        let mut names = std::collections::BTreeSet::new();
+        for tool in implemented_tools() {
+            assert!(names.insert(tool.name()), "工具名必须唯一: {}", tool.name());
+            assert_eq!(BuiltinTool::from_name(tool.name()), Some(tool));
+            // 调用穷尽分类，确保测试覆盖当前暴露的每个工具。
+            let _ = tool.execution_class();
+        }
+        assert_eq!(BuiltinTool::from_name("unknown_tool"), None);
+    }
+
+    #[test]
+    fn write_ahead_and_recovery_policy_come_from_execution_class() {
+        for tool in implemented_tools() {
+            let class = tool.execution_class();
+            assert_eq!(
+                tool.requires_write_ahead(),
+                matches!(
+                    class,
+                    ToolExecutionClass::FileWriteExact | ToolExecutionClass::WorkspaceUnknown
+                )
+            );
+            assert_eq!(tool.recovery_policy(), class.recovery_policy());
+        }
+    }
 
     /// BUG-009：同步工具（read）经 spawn_blocking 执行后仍返回正确结果。
     #[tokio::test]

@@ -818,11 +818,6 @@ pub fn read_events_and_max_seq(path: &Path) -> std::io::Result<(Vec<SessionEvent
     Ok((events, max_seq))
 }
 
-/// 该工具是否属于需要 write-ahead 的类型（§12.1：Write / WorkspaceUnknown）。
-pub fn requires_write_ahead(tool_name: &str) -> bool {
-    matches!(tool_name, "edit" | "write" | "bash")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

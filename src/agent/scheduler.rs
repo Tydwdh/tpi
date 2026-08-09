@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use crate::tool::{BuiltinTool, ToolContext, ValidatedArgs};
+use crate::tool::{BuiltinTool, ToolContext, ToolExecutionClass, ValidatedArgs};
 
 /// 资源访问声明（§12.1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,33 +58,51 @@ pub fn tool_access(
     ) -> camino::Utf8PathBuf {
         crate::tool::resolve_lock_path(workspace_root, path, allow_outside)
     }
-    match (tool, args) {
-        (BuiltinTool::Read, ValidatedArgs::Read(args)) => {
-            let path = resolved_path(workspace_root, &args.path, allow_outside_workspace);
-            file_lock(FileScope::Exact(path), AccessMode::Read)
+    if args.tool() != tool {
+        tracing::error!(
+            tool = ?tool,
+            args_tool = ?args.tool(),
+            "tool_access: tool 与已校验参数不匹配；保守隔离执行"
+        );
+        return ToolAccess::WorkspaceUnknown;
+    }
+
+    let class = tool.execution_class();
+    match class {
+        ToolExecutionClass::Pure => ToolAccess::Pure,
+        ToolExecutionClass::WorkspaceUnknown => ToolAccess::WorkspaceUnknown,
+        ToolExecutionClass::FileReadExact
+        | ToolExecutionClass::FileReadRecursive
+        | ToolExecutionClass::FileWriteExact => {
+            let Some(raw_path) = args.path() else {
+                tracing::error!(
+                    tool = ?tool,
+                    class = ?class,
+                    "tool_access: 文件资源工具缺少 path；保守隔离执行"
+                );
+                return ToolAccess::WorkspaceUnknown;
+            };
+            let path = resolved_path(workspace_root, raw_path, allow_outside_workspace);
+            match class {
+                ToolExecutionClass::FileReadExact => {
+                    file_lock(FileScope::Exact(path), AccessMode::Read)
+                }
+                ToolExecutionClass::FileReadRecursive => {
+                    file_lock(FileScope::Recursive(path), AccessMode::Read)
+                }
+                ToolExecutionClass::FileWriteExact => {
+                    file_lock(FileScope::Exact(path), AccessMode::Write)
+                }
+                ToolExecutionClass::Pure | ToolExecutionClass::WorkspaceUnknown => {
+                    tracing::error!(
+                        tool = ?tool,
+                        class = ?class,
+                        "tool_access: 执行类别在资源锁构造期间发生不一致；保守隔离执行"
+                    );
+                    ToolAccess::WorkspaceUnknown
+                }
+            }
         }
-        (BuiltinTool::List, ValidatedArgs::List(args)) => {
-            let path = resolved_path(workspace_root, &args.path, allow_outside_workspace);
-            file_lock(FileScope::Recursive(path), AccessMode::Read)
-        }
-        (BuiltinTool::Search, ValidatedArgs::Search(args)) => {
-            let path = resolved_path(workspace_root, &args.path, allow_outside_workspace);
-            file_lock(FileScope::Recursive(path), AccessMode::Read)
-        }
-        (BuiltinTool::Edit, ValidatedArgs::Edit(args)) => {
-            let path = resolved_path(workspace_root, &args.path, allow_outside_workspace);
-            file_lock(FileScope::Exact(path), AccessMode::Write)
-        }
-        (BuiltinTool::Write, ValidatedArgs::Write(args)) => {
-            let path = resolved_path(workspace_root, &args.path, allow_outside_workspace);
-            file_lock(FileScope::Exact(path), AccessMode::Write)
-        }
-        (BuiltinTool::Bash, _) => ToolAccess::WorkspaceUnknown,
-        // update_plan 是原生同步控制操作（§13）：不进入普通调度队列。
-        (BuiltinTool::UpdatePlan, _) | (BuiltinTool::WebSearch, _) | (BuiltinTool::WebFetch, _) => {
-            ToolAccess::Pure
-        }
-        _ => ToolAccess::Pure,
     }
 }
 

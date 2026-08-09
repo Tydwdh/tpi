@@ -169,6 +169,28 @@ fn config_of(workspace: &Utf8PathBuf) -> tpi::config::Config {
     test_config(workspace)
 }
 
+/// 工具与已校验参数的组合是内部不变量；一旦边界被误用，调度器必须保守地
+/// 隔离执行，不能把潜在写工具静默降级为 Pure 并与其他调用并行。
+#[test]
+fn mismatched_tool_and_args_never_default_to_pure() {
+    use tpi::agent::scheduler::{ToolAccess, tool_access};
+    use tpi::tool::{BuiltinTool, ValidatedArgs, files::ReadArgs};
+
+    let workspace = Utf8PathBuf::from("C:/workspace");
+    let read_args = ValidatedArgs::Read(ReadArgs {
+        path: "state.txt".into(),
+        start_line: 1,
+        line_count: 20,
+    });
+
+    let access = tool_access(BuiltinTool::Edit, &read_args, &workspace, false);
+    assert_eq!(
+        access,
+        ToolAccess::WorkspaceUnknown,
+        "参数/工具不匹配时必须保守隔离，不能因兜底分支获得 Pure 权限"
+    );
+}
+
 /// §15：edit + edit 同文件 → 独占串行（第二个因 revision 变化必然 stale）。
 #[tokio::test]
 async fn edit_and_edit_same_file_are_serialized() {
