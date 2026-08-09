@@ -4,6 +4,7 @@
 //! 避免两处维护不同的检查逻辑。
 
 use camino::Utf8PathBuf;
+use std::io::Write;
 
 /// 单项检查结果。
 #[derive(Debug, Clone)]
@@ -18,54 +19,81 @@ pub struct DoctorCheck {
 
 /// 运行全部环境检查。
 pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
+    doctor_report_with_home(workspace_root, &crate::config::tpi_home())
+}
+
+fn doctor_report_with_home(
+    workspace_root: &Utf8PathBuf,
+    home: &std::path::Path,
+) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
 
     // 1. 配置与模型。
-    let home = crate::config::tpi_home();
     let config_path = home.join("config.toml");
-    let config_exists = config_path.exists();
-    let model_configured = crate::config::load(workspace_root, None)
-        .map(|config| {
-            let has_primary = !config.model.name.is_empty();
-            (true, has_primary)
-        })
-        .unwrap_or((false, false));
+    let workspace_config_path = workspace_root.join(".tpi").join("config.toml");
+    let config_exists = config_path.exists() || workspace_config_path.exists();
+    let loaded_config = crate::config::load_from_home(workspace_root, None, home);
+    let model_configured = loaded_config
+        .as_ref()
+        .map(|config| !config.model.name.is_empty())
+        .unwrap_or(false);
     checks.push(DoctorCheck {
         name: "config",
         ok: config_exists,
         detail: if config_exists {
-            format!("{} 存在", config_path.display())
+            let active_path = if workspace_config_path.exists() {
+                workspace_config_path.as_std_path()
+            } else {
+                &config_path
+            };
+            format!("{} 存在", active_path.display())
         } else {
-            format!("{} 不存在（运行 `tpi init` 生成）", config_path.display())
+            format!(
+                "{} 与 {} 均不存在（运行 `tpi init` 生成用户配置）",
+                config_path.display(),
+                workspace_config_path
+            )
         },
     });
     checks.push(DoctorCheck {
         name: "model",
-        ok: model_configured.1,
-        detail: if model_configured.0 {
+        ok: model_configured,
+        detail: if model_configured {
             "模型配置可用".into()
         } else {
-            "未配置 [model.primary]（provider/name/base_url 必填）".into()
+            loaded_config
+                .as_ref()
+                .err()
+                .cloned()
+                .unwrap_or_else(|| "未配置 [model.primary]（provider/name/base_url 必填）".into())
         },
     });
 
     // 2. API key（环境变量或 keyring）。
-    let api_key_ok = crate::config::load(workspace_root, None)
-        .and_then(|config| crate::config::read_api_key(&config))
-        .is_ok();
+    let api_key_env = loaded_config
+        .as_ref()
+        .ok()
+        .map(|config| config.model.api_key_env.as_str())
+        .unwrap_or("TPI_API_KEY");
+    let api_key_ok = loaded_config
+        .as_ref()
+        .ok()
+        .and_then(|config| crate::config::read_api_key(config).ok())
+        .is_some();
     checks.push(DoctorCheck {
         name: "api_key",
         ok: api_key_ok,
         detail: if api_key_ok {
             "API key 可读取（环境变量或凭据管理器）".into()
         } else {
-            "未找到 API key：设置 TPI_API_KEY 或用 `tpi auth set <provider>`".into()
+            format!("未找到 API key：设置 {api_key_env} 或用 `tpi auth set <provider>`")
         },
     });
 
     // 3. Git Bash（bash 是唯一命令执行通道）。
     // §PointerHit 10：优先用配置的 shell.path（locate_git_bash 第一优先级）。
-    let configured_shell = crate::config::load(workspace_root, None)
+    let configured_shell = loaded_config
+        .as_ref()
         .ok()
         .and_then(|config| config.shell_path.clone());
     let ctx = crate::tool::ToolContext {
@@ -109,7 +137,7 @@ pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
         ("artifacts", home.join("artifacts")),
         ("logs", home.join("logs")),
     ] {
-        let ok = dir.exists() || std::fs::create_dir_all(&dir).is_ok();
+        let ok = probe_directory_writable(&dir).is_ok();
         checks.push(DoctorCheck {
             name,
             ok,
@@ -139,10 +167,7 @@ pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
     }
 
     // 5. workspace 可写。
-    let ws_writable = std::fs::File::create(workspace_root.join(".doctor-probe"))
-        .and_then(|mut f| std::io::Write::write_all(&mut f, b"x"))
-        .map(|_| std::fs::remove_file(workspace_root.join(".doctor-probe")).is_ok())
-        .unwrap_or(false);
+    let ws_writable = probe_directory_writable(workspace_root.as_std_path()).is_ok();
     checks.push(DoctorCheck {
         name: "workspace",
         ok: ws_writable,
@@ -156,6 +181,33 @@ pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
     checks
 }
 
+fn probe_directory_writable(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for _ in 0..4 {
+        let probe = dir.join(format!(".tpi-write-probe-{}", uuid::Uuid::now_v7()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(mut file) => {
+                let write_result = file.write_all(b"probe");
+                drop(file);
+                let cleanup_result = std::fs::remove_file(&probe);
+                write_result?;
+                cleanup_result?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique write probe",
+    ))
+}
+
 /// 报告渲染（CLI 与 /doctor 共用）。
 pub fn render_report(workspace_root: &Utf8PathBuf) -> String {
     let mut out = String::from("TPI 环境检查\n");
@@ -164,4 +216,40 @@ pub fn render_report(workspace_root: &Utf8PathBuf) -> String {
         out.push_str(&format!("{mark} {}：{}\n", check.name, check.detail));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_probe_never_clobbers_legacy_probe_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(".doctor-probe");
+        std::fs::write(&sentinel, "user data").unwrap();
+
+        probe_directory_writable(dir.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "user data");
+    }
+
+    #[test]
+    fn workspace_only_config_is_reported_as_present() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = Utf8PathBuf::from_path_buf(root.path().join("workspace")).unwrap();
+        std::fs::create_dir_all(workspace.join(".tpi")).unwrap();
+        std::fs::write(
+            workspace.join(".tpi/config.toml"),
+            "[model.primary]\nprovider = \"test\"\nname = \"m\"\nbase_url = \"https://example.invalid/v1\"\n",
+        )
+        .unwrap();
+
+        let report = doctor_report_with_home(&workspace, &home);
+        let config = report.iter().find(|check| check.name == "config").unwrap();
+        let model = report.iter().find(|check| check.name == "model").unwrap();
+        assert!(config.ok, "{config:?}");
+        assert!(model.ok, "{model:?}");
+        assert!(config.detail.contains("workspace"), "{}", config.detail);
+    }
 }

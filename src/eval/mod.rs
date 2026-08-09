@@ -35,7 +35,7 @@ pub const SESSIONS_DIR: &str = "evals/sessions";
 
 /// 验收断言（expected.toml 的 `[[verify]]`）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum VerifyStep {
     /// 在 repo 根执行 bash 命令并断言。
     Bash {
@@ -66,6 +66,7 @@ impl VerifyStep {
 
 /// expected.toml。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Expected {
     pub name: String,
     /// 套件名（`tpi eval --suite <name>` 批量运行）。
@@ -114,8 +115,16 @@ pub fn discover(evals_root: &Path) -> Result<Vec<TaskEntry>, String> {
         let task_md_path = dir.join("task.md");
         let expected_path = dir.join("expected.toml");
         let repo_dir = dir.join("repo");
+        let has_any_task_component =
+            task_md_path.exists() || expected_path.exists() || repo_dir.exists();
+        if !has_any_task_component {
+            continue;
+        }
         if !task_md_path.is_file() || !expected_path.is_file() || !repo_dir.is_dir() {
-            continue; // 结构不完整，跳过。
+            return Err(format!(
+                "评测任务目录结构不完整: {}（需要 task.md、expected.toml 与 repo/）",
+                dir.display()
+            ));
         }
         let task_md = std::fs::read_to_string(&task_md_path)
             .map_err(|e| format!("读取 {} 失败: {e}", task_md_path.display()))?;
@@ -129,6 +138,31 @@ pub fn discover(evals_root: &Path) -> Result<Vec<TaskEntry>, String> {
                 expected_path.display(),
                 entry.file_name().to_string_lossy()
             ));
+        }
+        if task_md.trim().is_empty() {
+            return Err(format!("{}: task.md 不能为空", task_md_path.display()));
+        }
+        if expected.timeout_sec == 0 {
+            return Err(format!(
+                "{}: timeout_sec 必须大于 0",
+                expected_path.display()
+            ));
+        }
+        if expected.verify.is_empty() {
+            return Err(format!(
+                "{}: 至少需要一条 [[verify]]",
+                expected_path.display()
+            ));
+        }
+        for step in &expected.verify {
+            match step {
+                VerifyStep::FileExists { path } | VerifyStep::FileContains { path, .. } => {
+                    validate_verify_relative_path(path).map_err(|error| {
+                        format!("{}: verify 路径无效: {error}", expected_path.display())
+                    })?;
+                }
+                VerifyStep::Bash { .. } => {}
+            }
         }
         tasks.push(TaskEntry {
             id: entry.file_name().to_string_lossy().into_owned(),
@@ -433,7 +467,12 @@ pub async fn run_task(
     let stats = stats_from_events(&events);
 
     // 6. 验收断言。
-    let verify = run_verify(&task.expected.verify, &task.repo_dir).await;
+    let verify = run_verify(
+        &task.expected.verify,
+        &task.repo_dir,
+        eval_config.shell_path.as_ref(),
+    )
+    .await;
     let verification_passed = verify.iter().all(|v| v.passed);
 
     // 7. 汇总。
@@ -473,7 +512,12 @@ pub async fn run_task(
 }
 
 /// 探测 bash（eval 无 ToolContext；优先常见 Git Bash 路径，其次 PATH）。
-fn locate_bash() -> Option<String> {
+fn locate_bash(configured: Option<&Utf8PathBuf>) -> Option<String> {
+    if let Some(path) = configured
+        && path.is_file()
+    {
+        return Some(path.to_string());
+    }
     let candidates = [
         "C:\\Program Files\\Git\\bin\\bash.exe",
         "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
@@ -494,8 +538,12 @@ fn locate_bash() -> Option<String> {
 }
 
 /// 执行验收断言（bash 步骤在 repo 根运行，timeout 60s/步）。
-async fn run_verify(steps: &[VerifyStep], repo_dir: &Path) -> Vec<VerifyResult> {
-    let bash = locate_bash();
+async fn run_verify(
+    steps: &[VerifyStep],
+    repo_dir: &Path,
+    configured_shell: Option<&Utf8PathBuf>,
+) -> Vec<VerifyResult> {
+    let bash = locate_bash(configured_shell);
     let mut results = Vec::new();
     for step in steps {
         let result = match step {
@@ -507,12 +555,14 @@ async fn run_verify(steps: &[VerifyStep], repo_dir: &Path) -> Vec<VerifyResult> 
             } => {
                 let shell = bash.clone().unwrap_or_else(|| "bash".to_string());
                 let run = async {
-                    let child = tokio::process::Command::new(&shell)
+                    let mut command_line = tokio::process::Command::new(&shell);
+                    command_line
                         .args(["-lc", command])
                         .current_dir(repo_dir)
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped())
-                        .spawn();
+                        .kill_on_drop(true);
+                    let child = command_line.spawn();
                     match child {
                         Ok(child) => {
                             let output = child.wait_with_output().await;
@@ -567,28 +617,64 @@ async fn run_verify(steps: &[VerifyStep], repo_dir: &Path) -> Vec<VerifyResult> 
                     Ok(_) => VerifyResult::new(step, false, Some("未知错误".into())),
                 }
             }
-            VerifyStep::FileExists { path } => {
-                let full = repo_dir.join(path);
-                if full.is_file() {
-                    VerifyResult::new(step, true, None)
-                } else {
-                    VerifyResult::new(step, false, Some("文件不存在".into()))
-                }
-            }
+            VerifyStep::FileExists { path } => match resolve_verify_path(repo_dir, path) {
+                Ok(full) if full.is_file() => VerifyResult::new(step, true, None),
+                Ok(_) => VerifyResult::new(step, false, Some("文件不存在".into())),
+                Err(error) => VerifyResult::new(step, false, Some(error)),
+            },
             VerifyStep::FileContains { path, contains } => {
-                let full = repo_dir.join(path);
-                match std::fs::read_to_string(&full) {
-                    Ok(text) if text.contains(contains) => VerifyResult::new(step, true, None),
-                    Ok(_) => {
-                        VerifyResult::new(step, false, Some(format!("文件缺少内容: {contains:?}")))
-                    }
-                    Err(e) => VerifyResult::new(step, false, Some(format!("读取失败: {e}"))),
+                match resolve_verify_path(repo_dir, path) {
+                    Ok(full) => match std::fs::read_to_string(&full) {
+                        Ok(text) if text.contains(contains) => VerifyResult::new(step, true, None),
+                        Ok(_) => VerifyResult::new(
+                            step,
+                            false,
+                            Some(format!("文件缺少内容: {contains:?}")),
+                        ),
+                        Err(e) => VerifyResult::new(step, false, Some(format!("读取失败: {e}"))),
+                    },
+                    Err(error) => VerifyResult::new(step, false, Some(error)),
                 }
             }
         };
         results.push(result);
     }
     results
+}
+
+fn validate_verify_relative_path(path: &str) -> Result<(), String> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty() {
+        return Err("路径不能为空".into());
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => return Err("路径必须位于 eval repo 内，不能是绝对路径或包含 '..'".into()),
+        }
+    }
+    Ok(())
+}
+
+fn resolve_verify_path(repo_dir: &Path, path: &str) -> Result<PathBuf, String> {
+    validate_verify_relative_path(path)?;
+    let root = repo_dir
+        .canonicalize()
+        .map_err(|error| format!("解析 repo 路径失败: {error}"))?;
+    let candidate = repo_dir.join(path);
+    let mut existing = candidate.as_path();
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or_else(|| "verify 路径没有可解析的祖先".to_string())?;
+    }
+    let resolved_ancestor = existing
+        .canonicalize()
+        .map_err(|error| format!("解析 verify 路径失败: {error}"))?;
+    if !resolved_ancestor.starts_with(&root) {
+        return Err("verify 路径通过链接逃出了 eval repo".into());
+    }
+    Ok(candidate)
 }
 
 /// 把结果写入 `<results_dir>/<task-id>.json` 并追加 `runs.jsonl`。
@@ -687,7 +773,9 @@ mod tests {
         std::fs::write(dir.join("task.md"), task_md).unwrap();
         std::fs::write(
             dir.join("expected.toml"),
-            format!("name = \"{id}\"\nsuite = \"{suite}\"\n"),
+            format!(
+                "name = \"{id}\"\nsuite = \"{suite}\"\n\n[[verify]]\ntype = \"file_exists\"\npath = \"hello.txt\"\n"
+            ),
         )
         .unwrap();
         // repo：初始化 git 并提交一个文件。
@@ -725,14 +813,56 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         make_task(dir.path(), "aaa-001", "core", "fix it");
         make_task(dir.path(), "bbb-001", "ext", "do it");
-        make_task(dir.path(), "incomplete", "core", "no repo");
-        std::fs::remove_dir_all(dir.path().join("incomplete/repo")).unwrap();
+        std::fs::create_dir(dir.path().join("unrelated-empty-dir")).unwrap();
 
         let tasks = discover(dir.path()).unwrap();
-        assert_eq!(tasks.len(), 2, "结构不完整的任务必须跳过");
+        assert_eq!(tasks.len(), 2, "不含任务组件的目录应被忽略");
         assert_eq!(tasks[0].id, "aaa-001");
         assert_eq!(tasks[1].id, "bbb-001");
         assert_eq!(list_suites(dir.path()).unwrap(), vec!["core", "ext"]);
+    }
+
+    #[test]
+    fn discover_rejects_incomplete_or_unverifiable_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let incomplete = dir.path().join("incomplete");
+        std::fs::create_dir(&incomplete).unwrap();
+        std::fs::write(incomplete.join("task.md"), "do it").unwrap();
+        assert!(discover(dir.path()).unwrap_err().contains("结构不完整"));
+
+        std::fs::remove_dir_all(&incomplete).unwrap();
+        let no_verify = dir.path().join("no-verify");
+        std::fs::create_dir_all(no_verify.join("repo")).unwrap();
+        std::fs::write(no_verify.join("task.md"), "do it").unwrap();
+        std::fs::write(no_verify.join("expected.toml"), "name = \"no-verify\"\n").unwrap();
+        assert!(discover(dir.path()).unwrap_err().contains("至少需要一条"));
+    }
+
+    #[tokio::test]
+    async fn file_verification_cannot_escape_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "secret").unwrap();
+        let steps = vec![VerifyStep::FileContains {
+            path: "../secret.txt".into(),
+            contains: "secret".into(),
+        }];
+
+        let results = run_verify(&steps, &repo, None).await;
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].passed);
+        assert!(results[0].detail.as_deref().unwrap().contains("repo 内"));
+    }
+
+    #[test]
+    fn configured_bash_takes_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let bash = dir.path().join("custom-bash.exe");
+        std::fs::write(&bash, "stub").unwrap();
+        let bash = Utf8PathBuf::from_path_buf(bash).unwrap();
+        assert_eq!(locate_bash(Some(&bash)).as_deref(), Some(bash.as_str()));
     }
 
     #[test]
@@ -918,5 +1048,28 @@ contains = "fn main"
             expected.verify[2],
             VerifyStep::FileContains { ref contains, .. } if contains == "fn main"
         ));
+    }
+
+    #[test]
+    fn expected_toml_rejects_misplaced_or_unknown_fields() {
+        let misplaced = r#"
+name = "task"
+
+[[verify]]
+type = "file_exists"
+path = "src/main.rs"
+base_commit = "abc123"
+"#;
+        assert!(toml::from_str::<Expected>(misplaced).is_err());
+
+        let root_unknown = r#"
+name = "task"
+typo_timeout = 10
+
+[[verify]]
+type = "file_exists"
+path = "src/main.rs"
+"#;
+        assert!(toml::from_str::<Expected>(root_unknown).is_err());
     }
 }

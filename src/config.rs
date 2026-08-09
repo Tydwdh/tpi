@@ -9,10 +9,12 @@ use serde::Deserialize;
 /// 配置根目录（~/.tpi，§14.1）。
 pub fn tpi_home() -> std::path::PathBuf {
     std::env::var_os("TPI_HOME")
+        .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::env::var_os("USERPROFILE")
                 .or_else(|| std::env::var_os("HOME"))
+                .filter(|value| !value.is_empty())
                 .map(|home| std::path::PathBuf::from(home).join(".tpi"))
                 .unwrap_or_else(|| std::path::PathBuf::from(".tpi"))
         })
@@ -20,6 +22,7 @@ pub fn tpi_home() -> std::path::PathBuf {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     pub model: ModelFile,
     pub agent: AgentFile,
@@ -31,6 +34,7 @@ pub struct ConfigFile {
 /// §16.3 [ui] 配置（P2：主题可选，默认 omp；TUI v2：模式可选，默认 fullscreen）。
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct UiFile {
     /// 主题名：omp / dark / light（未知值回退 omp）。
     pub theme: Option<String>,
@@ -40,6 +44,7 @@ pub struct UiFile {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct ContextFile {
     /// §15.4 safety reserve（默认 8192；compaction 触发阈值用）。
     pub safety_reserve_tokens: Option<u64>,
@@ -47,6 +52,7 @@ pub struct ContextFile {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct ShellFile {
     pub kind: Option<String>,
     /// 显式 Git Bash 路径（§11.2 解析顺序第 1 位）。
@@ -55,11 +61,13 @@ pub struct ShellFile {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct ModelFile {
     pub primary: Option<PrimaryModelFile>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrimaryModelFile {
     pub provider: String,
     pub name: String,
@@ -78,6 +86,7 @@ pub struct PrimaryModelFile {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct AgentFile {
     pub limits: Option<AgentLimitsFile>,
     /// 是否允许文件工具访问 workspace 外的绝对路径（§9.1 自由模式；
@@ -86,6 +95,7 @@ pub struct AgentFile {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentLimitsFile {
     pub max_model_turns: Option<u32>,
     pub max_tool_calls: Option<u32>,
@@ -173,7 +183,7 @@ pub fn load(workspace_root: &Utf8PathBuf, cli_model: Option<&str>) -> Result<Con
     load_from_home(workspace_root, cli_model, &home)
 }
 
-fn load_from_home(
+pub(crate) fn load_from_home(
     workspace_root: &Utf8PathBuf,
     cli_model: Option<&str>,
     home: &std::path::Path,
@@ -202,6 +212,7 @@ fn load_from_home(
         })?;
 
     let name = cli_model.unwrap_or(&primary.name).to_string();
+    validate_model(&primary, &name)?;
     let source = if cli_model.is_some() {
         "cli --model".to_string()
     } else if workspace_has_model {
@@ -212,16 +223,58 @@ fn load_from_home(
         "builtin defaults".to_string()
     };
 
-    let system_prompt_extra = read_system_md(&home.join("SYSTEM.md"));
+    let system_prompt_extra = read_system_md(&home.join("SYSTEM.md"))?;
     // P1-12：workspace 项目规则（AGENTS.md）——叠加在个人全局规则之后，
     // 注入时标明来源（§18.2：项目级约束进入 system prompt）。
-    let system_prompt_extra = match read_system_md(workspace_root.join("AGENTS.md").as_std_path()) {
+    let system_prompt_extra = match read_system_md(workspace_root.join("AGENTS.md").as_std_path())?
+    {
         Some(project_rules) => Some(match system_prompt_extra {
             Some(global) => format!("{global}\n\n[project rule: AGENTS.md]\n{project_rules}"),
             None => format!("[project rule: AGENTS.md]\n{project_rules}"),
         }),
         None => system_prompt_extra,
     };
+
+    let limits = LimitsConfig {
+        max_model_turns: merged
+            .agent
+            .limits
+            .as_ref()
+            .and_then(|l| l.max_model_turns)
+            .unwrap_or(80),
+        max_tool_calls: merged
+            .agent
+            .limits
+            .as_ref()
+            .and_then(|l| l.max_tool_calls)
+            .unwrap_or(160),
+        max_wall_time_minutes: merged
+            .agent
+            .limits
+            .as_ref()
+            .and_then(|l| l.max_wall_time_minutes)
+            .unwrap_or(45),
+        max_parallel_tools: merged
+            .agent
+            .limits
+            .as_ref()
+            .and_then(|l| l.max_parallel_tools)
+            .unwrap_or(4),
+        max_identical_no_progress: merged
+            .agent
+            .limits
+            .as_ref()
+            .and_then(|l| l.max_identical_no_progress)
+            .unwrap_or(2),
+    };
+    validate_limits(&limits)?;
+    let shell_path = merged.shell.path.as_deref().map(Utf8PathBuf::from);
+    if shell_path
+        .as_ref()
+        .is_some_and(|path| path.as_str().trim().is_empty())
+    {
+        return Err("shell.path 不能为空".into());
+    }
 
     Ok(Config {
         model: ModelConfig {
@@ -235,42 +288,11 @@ fn load_from_home(
             price_input: primary.price_input,
             price_output: primary.price_output,
         },
-        limits: LimitsConfig {
-            max_model_turns: merged
-                .agent
-                .limits
-                .as_ref()
-                .and_then(|l| l.max_model_turns)
-                .unwrap_or(80),
-            max_tool_calls: merged
-                .agent
-                .limits
-                .as_ref()
-                .and_then(|l| l.max_tool_calls)
-                .unwrap_or(160),
-            max_wall_time_minutes: merged
-                .agent
-                .limits
-                .as_ref()
-                .and_then(|l| l.max_wall_time_minutes)
-                .unwrap_or(45),
-            max_parallel_tools: merged
-                .agent
-                .limits
-                .as_ref()
-                .and_then(|l| l.max_parallel_tools)
-                .unwrap_or(4),
-            max_identical_no_progress: merged
-                .agent
-                .limits
-                .as_ref()
-                .and_then(|l| l.max_identical_no_progress)
-                .unwrap_or(2),
-        },
+        limits,
         workspace_root: workspace_root.clone(),
         sessions_root: home.join("sessions"),
         artifacts_root: home.join("artifacts"),
-        shell_path: merged.shell.path.as_deref().map(Utf8PathBuf::from),
+        shell_path,
         safety_reserve_tokens: merged.context.safety_reserve_tokens.unwrap_or(8192),
         auto_open_browser: false,
         web_summary_model: "none".into(),
@@ -347,14 +369,73 @@ fn merge_limits(
     }
 }
 
-fn read_system_md(path: &std::path::Path) -> Option<String> {
-    if path.exists() {
-        std::fs::read_to_string(path)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    } else {
-        None
+fn validate_model(primary: &PrimaryModelFile, effective_name: &str) -> Result<(), String> {
+    if primary.provider.trim().is_empty() {
+        return Err("model.primary.provider 不能为空".into());
     }
+    if effective_name.trim().is_empty() {
+        return Err("model.primary.name 不能为空".into());
+    }
+    let url = reqwest::Url::parse(&primary.base_url)
+        .map_err(|error| format!("model.primary.base_url 无效: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("model.primary.base_url 只支持 http 或 https".into());
+    }
+    if primary
+        .api_key_env
+        .as_deref()
+        .is_some_and(|name| name.trim().is_empty() || name.contains('='))
+    {
+        return Err("model.primary.api_key_env 不是有效的环境变量名".into());
+    }
+    if primary.max_output_tokens == Some(0) {
+        return Err("model.primary.max_output_tokens 必须大于 0".into());
+    }
+    if primary.context_window == Some(0) {
+        return Err("model.primary.context_window 必须大于 0".into());
+    }
+    if let (Some(output), Some(context)) = (primary.max_output_tokens, primary.context_window)
+        && u64::from(output) > context
+    {
+        return Err("model.primary.max_output_tokens 不能大于 context_window".into());
+    }
+    for (name, price) in [
+        ("price_input", primary.price_input),
+        ("price_output", primary.price_output),
+    ] {
+        if price.is_some_and(|value| !value.is_finite() || value < 0.0) {
+            return Err(format!("model.primary.{name} 必须是非负有限数"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_limits(limits: &LimitsConfig) -> Result<(), String> {
+    if limits.max_model_turns == 0 {
+        return Err("agent.limits.max_model_turns 必须大于 0".into());
+    }
+    if limits.max_wall_time_minutes == 0 {
+        return Err("agent.limits.max_wall_time_minutes 必须大于 0".into());
+    }
+    if limits.max_wall_time_minutes > u64::MAX / 60 {
+        return Err("agent.limits.max_wall_time_minutes 过大".into());
+    }
+    if limits.max_parallel_tools == 0 {
+        return Err("agent.limits.max_parallel_tools 必须大于 0".into());
+    }
+    if limits.max_identical_no_progress == 0 {
+        return Err("agent.limits.max_identical_no_progress 必须大于 0".into());
+    }
+    Ok(())
+}
+
+fn read_system_md(path: &std::path::Path) -> Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| format!("读取指令文件 {} 失败: {error}", path.display()))?;
+    Ok((!content.trim().is_empty()).then_some(content))
 }
 
 /// 读取 API key（§18.4：环境变量显式覆盖；keyring 属 M6）。
@@ -366,7 +447,7 @@ pub fn read_api_key(config: &Config) -> Result<String, String> {
     {
         return Ok(key);
     }
-    if let Some(key) = crate::auth::auth_get(&config.model.provider) {
+    if let Some(key) = crate::auth::auth_get(&config.model.provider)? {
         return Ok(key);
     }
     Err(format!(
@@ -468,5 +549,58 @@ mod tests {
             Some(4096),
             "workspace 未设置 context 时 home 的值必须保留"
         );
+    }
+
+    #[test]
+    fn load_rejects_unknown_fields_and_invalid_runtime_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().join("workspace")).unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let write_config = |text: &str| std::fs::write(home.join("config.toml"), text).unwrap();
+        write_config(
+            "[model.primary]\nprovider = \"p\"\nname = \"m\"\nbase_url = \"https://example.invalid\"\ntypo_field = true\n",
+        );
+        assert!(
+            load_from_home(&workspace, None, &home)
+                .unwrap_err()
+                .contains("unknown field")
+        );
+
+        write_config(
+            "[model.primary]\nprovider = \"p\"\nname = \"m\"\nbase_url = \"file:///tmp/model\"\n",
+        );
+        assert!(
+            load_from_home(&workspace, None, &home)
+                .unwrap_err()
+                .contains("http")
+        );
+
+        write_config(
+            "[model.primary]\nprovider = \"p\"\nname = \"m\"\nbase_url = \"https://example.invalid\"\n\n[agent.limits]\nmax_parallel_tools = 0\n",
+        );
+        assert!(
+            load_from_home(&workspace, None, &home)
+                .unwrap_err()
+                .contains("max_parallel_tools")
+        );
+    }
+
+    #[test]
+    fn cli_model_override_cannot_be_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().join("workspace")).unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[model.primary]\nprovider = \"p\"\nname = \"m\"\nbase_url = \"https://example.invalid\"\n",
+        )
+        .unwrap();
+
+        assert!(load_from_home(&workspace, Some(""), &home).is_err());
     }
 }

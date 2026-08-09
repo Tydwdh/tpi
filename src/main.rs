@@ -36,11 +36,11 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
     /// 不写 session
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["continue_session", "resume"])]
     no_session: bool,
     /// 继续当前 workspace 最近 session
     // 字段名会让 clap 生成 `--continue-session`；显式保持稳定的 `--continue` CLI。
-    #[arg(long = "continue")]
+    #[arg(long = "continue", conflicts_with = "resume")]
     continue_session: bool,
     /// 恢复指定 session
     #[arg(long)]
@@ -80,15 +80,16 @@ enum Command {
     /// 会调用真实 provider（产生费用）——仅在你显式运行时发生。
     Eval {
         /// 任务 ID（evals/<id>/；与 --suite 互斥）。
+        #[arg(conflicts_with_all = ["suite", "list", "list_suites"])]
         task: Option<String>,
         /// 运行整个套件（expected.toml 的 suite 字段；与 task 互斥）。
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["task", "list", "list_suites"])]
         suite: Option<String>,
         /// 列出全部任务（不运行、不花钱）。
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["task", "suite", "list_suites"])]
         list: bool,
         /// 列出全部套件（不运行、不花钱）。
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["task", "suite", "list"])]
         list_suites: bool,
         /// 结果目录（默认 ~/.tpi/evals/results）。
         #[arg(long)]
@@ -148,27 +149,42 @@ fn with_input_echo<T>(echo: bool, f: impl FnOnce() -> T) -> T {
         use windows_sys::Win32::System::Console::{
             ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
         };
-        // SAFETY: The standard-input handle comes from GetStdHandle; mode points
-        // to live writable storage, and SetConsoleMode is called only when the
-        // handle is confirmed to represent a console.
-        unsafe {
-            let handle = GetStdHandle(STD_INPUT_HANDLE);
-            let mut mode: u32 = 0;
-            let ok = GetConsoleMode(handle, &mut mode) != 0;
-            if ok {
-                if echo {
-                    SetConsoleMode(handle, mode | ENABLE_ECHO_INPUT);
-                } else {
-                    SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT);
+        struct ConsoleModeGuard {
+            handle: windows_sys::Win32::Foundation::HANDLE,
+            original_mode: u32,
+        }
+
+        impl Drop for ConsoleModeGuard {
+            fn drop(&mut self) {
+                // SAFETY: The handle was obtained from GetStdHandle and was
+                // confirmed to be a console when this guard was constructed.
+                unsafe {
+                    SetConsoleMode(self.handle, self.original_mode);
                 }
             }
-            let result = f();
-            if ok {
-                // 恢复原模式（无论闭包是否 panic）。
-                SetConsoleMode(handle, mode);
-            }
-            result
         }
+
+        // SAFETY: GetStdHandle has no caller-owned pointer arguments.
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let mut mode: u32 = 0;
+        // SAFETY: `mode` points to live writable storage for this call.
+        let ok = unsafe { GetConsoleMode(handle, &mut mode) != 0 };
+        let _guard = ok.then(|| ConsoleModeGuard {
+            handle,
+            original_mode: mode,
+        });
+        if ok {
+            let requested_mode = if echo {
+                mode | ENABLE_ECHO_INPUT
+            } else {
+                mode & !ENABLE_ECHO_INPUT
+            };
+            // SAFETY: GetConsoleMode established that handle is a console handle.
+            unsafe {
+                SetConsoleMode(handle, requested_mode);
+            }
+        }
+        f()
     }
     #[cfg(not(windows))]
     {
@@ -270,7 +286,11 @@ fn run_eval_cli(
             }
         }
         println!("==== 汇总: pass={passed} fail={failed} ====");
-        Ok::<(), String>(())
+        if failed == 0 {
+            Ok(())
+        } else {
+            Err(format!("{failed} 个 eval 任务失败"))
+        }
     })
 }
 
@@ -278,19 +298,18 @@ fn run_eval_cli(
 /// 返回被删除的文件数（dry_run 时只列出）。
 fn prune_old_data(older_than_days: u64, dry_run: bool) -> Result<(), String> {
     let home = tpi::config::tpi_home();
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(older_than_days * 86400))
-        .ok_or_else(|| "无效天数".to_string())?;
+    let cutoff = retention_cutoff(std::time::SystemTime::now(), older_than_days)?;
     let mut removed = 0usize;
     for root in [home.join("sessions"), home.join("artifacts")] {
         if !root.exists() {
             continue;
         }
-        for entry in walk_files(&root) {
-            let Ok(meta) = entry.metadata() else { continue };
-            let Ok(modified) = meta.modified() else {
-                continue;
-            };
+        for entry in walk_files(&root)? {
+            let meta = std::fs::symlink_metadata(&entry)
+                .map_err(|e| format!("读取 {} 元数据失败: {e}", entry.display()))?;
+            let modified = meta
+                .modified()
+                .map_err(|e| format!("读取 {} 修改时间失败: {e}", entry.display()))?;
             if modified < cutoff {
                 if dry_run {
                     println!("[dry-run] {}", entry.display());
@@ -310,25 +329,60 @@ fn prune_old_data(older_than_days: u64, dry_run: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// 递归收集文件（prune 用；目录为空时尝试删除）。
-fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+fn retention_cutoff(
+    now: std::time::SystemTime,
+    older_than_days: u64,
+) -> Result<std::time::SystemTime, String> {
+    let seconds = older_than_days
+        .checked_mul(86_400)
+        .ok_or_else(|| "天数过大".to_string())?;
+    now.checked_sub(std::time::Duration::from_secs(seconds))
+        .ok_or_else(|| "天数超出系统时间范围".to_string())
+}
+
+/// 递归收集文件（prune 用）。目录链接和 Windows reparse point 一律不跟随。
+fn walk_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
     let mut files = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return files;
-    };
-    for entry in entries.flatten() {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("读取目录 {} 失败: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取目录项 {} 失败: {e}", dir.display()))?;
         let path = entry.path();
-        // 不跟随符号链目录：prnune 只应在 TPI 管理目录内递归，
+        // 不跟随符号链目录：prune 只应在 TPI 管理目录内递归，
         // 否则链到外部目录时会把外部文件也删掉（安全陷阱）。
         // 符号链文件本身可收集：remove_file 只删链接不触及目标。
-        let Ok(ft) = entry.file_type() else { continue };
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("读取 {} 类型失败: {e}", path.display()))?;
+        if is_reparse_point(&path)? {
+            if !ft.is_dir() {
+                files.push(path);
+            }
+            continue;
+        }
         if ft.is_dir() {
-            files.extend(walk_files(&path));
+            files.extend(walk_files(&path)?);
         } else if ft.is_file() || ft.is_symlink() {
             files.push(path);
         }
     }
-    files
+    Ok(files)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(path: &std::path::Path) -> Result<bool, String> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("读取 {} 元数据失败: {e}", path.display()))?;
+    Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(path: &std::path::Path) -> Result<bool, String> {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .map_err(|e| format!("读取 {} 元数据失败: {e}", path.display()))
 }
 
 /// 断言：prnune 遍历不得跟随符号链目录（防止删除 TPI 目录外的文件）。
@@ -346,7 +400,7 @@ fn walk_files_does_not_follow_symlink_dirs() {
     std::fs::write(sessions.join("keep.txt"), b"x").unwrap();
     let link = sessions.join("link");
     symlink(&outside, &link).unwrap();
-    let files = walk_files(&sessions);
+    let files = walk_files(&sessions).unwrap();
     let paths: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     assert!(
         !paths.iter().any(|p| p.contains("secret.txt")),
@@ -397,42 +451,101 @@ fn run_init() -> Result<(), String> {
     let max_output = prompt("max_output_tokens（回车默认 16384）", "16384")?;
     let context_window = prompt("context_window（回车默认 1000000）", "1000000")?;
     let api_key_env = prompt("API key 环境变量名（回车默认 TPI_API_KEY）", "TPI_API_KEY")?;
+    // 先验证配置，避免输入无效时已向凭据管理器留下副作用。
+    let content = render_initial_config(
+        &provider,
+        &name,
+        &base_url,
+        &max_output,
+        &context_window,
+        &api_key_env,
+    )?;
     print!("写入 API key 到凭据管理器？(y/N) ");
     std::io::stdout().flush().ok();
     let mut answer = String::new();
     std::io::stdin()
         .read_line(&mut answer)
         .map_err(|e| format!("读取输入失败: {e}"))?;
-    if answer.trim().eq_ignore_ascii_case("y") {
+    let token = if answer.trim().eq_ignore_ascii_case("y") {
         print!("输入 token（粘贴后回车，输入不回显）: ");
         std::io::stdout().flush().ok();
         let mut token = String::new();
         let read = with_input_echo(false, || std::io::stdin().read_line(&mut token));
         read.map_err(|e| format!("读取输入失败: {e}"))?;
-        let token = token.trim();
+        let token = token.trim_end_matches(['\r', '\n']);
         if token.is_empty() {
             return Err("token 为空".into());
         }
-        tpi::auth::auth_set(&provider, token)?;
-    }
-    let content = format!(
-        "[model.primary]\nprovider = \"{provider}\"\nname = \"{name}\"\nbase_url = \"{base_url}\"\nmax_output_tokens = {max_output}\ncontext_window = {context_window}\n# api_key_env = \"{api_key_env}\"   # 环境变量显式覆盖（§18.4）\n# price_input = 0.0       # 每百万输入 token 美元（§16.2 花费展示，可选）\n# price_output = 0.0      # 每百万输出 token 美元\n"
-    );
+        Some(token.to_string())
+    } else {
+        None
+    };
     std::fs::write(&config_path, content)
         .map_err(|e| format!("写入 {} 失败: {e}", config_path.display()))?;
+    if let Some(token) = token {
+        tpi::auth::auth_set(&provider, &token).map_err(|error| {
+            format!(
+                "配置已写入 {}，但保存凭据失败: {error}",
+                config_path.display()
+            )
+        })?;
+    }
     println!("已生成 {}", config_path.display());
     println!("下一步：`tpi doctor` 检查环境，然后直接运行 `tpi`。");
     Ok(())
 }
 
+fn render_initial_config(
+    provider: &str,
+    name: &str,
+    base_url: &str,
+    max_output: &str,
+    context_window: &str,
+    api_key_env: &str,
+) -> Result<String, String> {
+    let max_output: u32 = max_output
+        .parse()
+        .map_err(|_| "max_output_tokens 必须是 0..=4294967295 的整数".to_string())?;
+    let context_window: u64 = context_window
+        .parse()
+        .map_err(|_| "context_window 必须是非负整数".to_string())?;
+    let url = reqwest::Url::parse(base_url).map_err(|error| format!("base_url 无效: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("base_url 只支持 http 或 https".into());
+    }
+    if provider.trim().is_empty() || name.trim().is_empty() || api_key_env.trim().is_empty() {
+        return Err("provider、model name 与 API key 环境变量名不能为空".into());
+    }
+    if api_key_env.contains('=') || api_key_env.chars().any(char::is_whitespace) {
+        return Err("API key 环境变量名不能包含空白或 `=`".into());
+    }
+    if max_output == 0 || context_window == 0 || u64::from(max_output) > context_window {
+        return Err("token 上限必须大于 0，且 max_output_tokens 不能超过 context_window".into());
+    }
+    let string_literal = |value: &str| toml::Value::String(value.to_string()).to_string();
+    Ok(format!(
+        "[model.primary]\nprovider = {}\nname = {}\nbase_url = {}\nmax_output_tokens = {max_output}\ncontext_window = {context_window}\napi_key_env = {}\n# price_input = 0.0       # 每百万输入 token 美元（可选）\n# price_output = 0.0      # 每百万输出 token 美元\n",
+        string_literal(provider),
+        string_literal(name),
+        string_literal(base_url),
+        string_literal(api_key_env),
+    ))
+}
+
 /// 解析工作目录（默认当前目录）。
 fn current_workspace_root(cwd: Option<&std::path::Path>) -> Result<Utf8PathBuf, String> {
-    match cwd {
-        Some(path) => Utf8PathBuf::from_path_buf(path.to_path_buf())
-            .map_err(|p| format!("无效路径: {}", p.display())),
-        None => Utf8PathBuf::from_path_buf(std::env::current_dir().map_err(|e| e.to_string())?)
-            .map_err(|p| format!("无效路径: {}", p.display())),
+    let requested = match cwd {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().map_err(|e| e.to_string())?,
+    };
+    let canonical = requested
+        .canonicalize()
+        .map_err(|error| format!("工作目录 {} 不可用: {error}", requested.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("工作目录不是目录: {}", canonical.display()));
     }
+    Utf8PathBuf::from_path_buf(canonical)
+        .map_err(|path| format!("路径不是 UTF-8: {}", path.display()))
 }
 
 fn run(cli: Cli) -> Result<(), String> {
@@ -446,7 +559,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 let mut token = String::new();
                 let read = with_input_echo(false, || std::io::stdin().read_line(&mut token));
                 read.map_err(|e| format!("读取输入失败: {e}"))?;
-                let token = token.trim();
+                let token = token.trim_end_matches(['\r', '\n']);
                 if token.is_empty() {
                     return Err("token 为空".into());
                 }
@@ -459,7 +572,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 println!("已清除凭据: {provider}");
                 Ok(())
             }
-            AuthCommand::Status { provider } => match tpi::auth::auth_get(provider) {
+            AuthCommand::Status { provider } => match tpi::auth::auth_get(provider)? {
                 Some(_) => {
                     println!("凭据已配置: {provider}");
                     Ok(())
@@ -669,5 +782,54 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn mutually_exclusive_session_and_eval_modes_are_rejected() {
+        assert!(Cli::try_parse_from(["tpi", "--continue", "--resume", "id"]).is_err());
+        assert!(Cli::try_parse_from(["tpi", "--no-session", "--continue"]).is_err());
+        assert!(Cli::try_parse_from(["tpi", "eval", "task", "--suite", "core"]).is_err());
+        assert!(Cli::try_parse_from(["tpi", "eval", "--list", "--list-suites"]).is_err());
+    }
+
+    #[test]
+    fn retention_cutoff_rejects_overflow() {
+        assert!(retention_cutoff(std::time::SystemTime::now(), u64::MAX).is_err());
+    }
+
+    #[test]
+    fn init_config_escapes_strings_and_honors_custom_api_key_env() {
+        let text = render_initial_config(
+            "provider\"quoted",
+            "model",
+            "https://example.invalid/v1",
+            "16384",
+            "1000000",
+            "CUSTOM_API_KEY",
+        )
+        .unwrap();
+        let parsed: tpi::config::ConfigFile = toml::from_str(&text).unwrap();
+        let primary = parsed.model.primary.unwrap();
+        assert_eq!(primary.provider, "provider\"quoted");
+        assert_eq!(primary.api_key_env.as_deref(), Some("CUSTOM_API_KEY"));
+    }
+
+    #[test]
+    fn init_config_rejects_invalid_numbers_and_url_scheme() {
+        assert!(
+            render_initial_config("p", "m", "https://example.invalid", "x", "10", "K").is_err()
+        );
+        assert!(render_initial_config("p", "m", "file:///tmp/model", "1", "10", "K").is_err());
+    }
+
+    #[test]
+    fn workspace_root_requires_an_existing_directory_and_is_canonical() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = current_workspace_root(Some(temp.path())).unwrap();
+        assert_eq!(canonical.as_std_path(), temp.path().canonicalize().unwrap());
+        assert!(current_workspace_root(Some(&temp.path().join("missing"))).is_err());
+        let file = temp.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(current_workspace_root(Some(&file)).is_err());
     }
 }

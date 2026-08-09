@@ -897,17 +897,14 @@ make_task(
         "README.md": "# Demo Project\n\nThis is a demo repo used for the git eval task.\n",
         "src/main.py": "def main():\n    print(\"hello\")\n\nif __name__ == \"__main__\":\n    main()\n",
     },
-    "当前 repo 工作区被破坏：`src/main.py` 被删除、`README.md` 被改成\n了空文件、还有一个未跟踪的 `scratch.txt`。任务：把工作区恢复到\n最近一次提交的状态（已提交内容恢复、未跟踪文件清理），然后运行\n`python src/main.py` 应输出 hello。",
+    "当前 repo 的 HEAD 是一个故意破坏文件的提交：`src/main.py` 被删除、\n`README.md` 被清空，并加入了 `scratch.txt`。任务：把分支恢复到 HEAD\n的父提交（完好版本），保持工作区干净，然后运行 `python src/main.py`\n应输出 hello。",
     [bash_ok("python src/main.py", out="hello"),
      file_contains("README.md", "Demo Project"),
-     bash_ok("git status --porcelain", exit_code=0)],
+     bash_ok("test -z \"$(git status --porcelain)\"", exit_code=0)],
 )
 # git-task-001 特判：repo 两个 commit——A（完好，make_task 的 init）+ B（破坏现场）。
 # eval 前 reset 到 B，agent 需恢复到 A（验证 git status 干净）。
 _git_repo = os.path.join(ROOT, "git-task-001", "repo")
-_commit_b = subprocess.run(
-    ["git", "rev-parse", "HEAD"], cwd=_git_repo, capture_output=True, text=True
-).stdout.strip()
 os.remove(os.path.join(_git_repo, "src", "main.py"))
 with io.open(os.path.join(_git_repo, "README.md"), "w", encoding="utf-8") as f:
     f.write("")
@@ -916,7 +913,19 @@ with io.open(os.path.join(_git_repo, "scratch.txt"), "w", encoding="utf-8") as f
 git(_git_repo, "add", "-A")
 git(_git_repo, "-c", "user.name=eval", "-c", "user.email=eval@local",
     "commit", "-q", "-m", "broken")
-with io.open(os.path.join(ROOT, "git-task-001", "expected.toml"), "a", encoding="utf-8") as f:
-    f.write(f'base_commit = "{_commit_b}"\n')
+_commit_b = subprocess.run(
+    ["git", "rev-parse", "HEAD"], cwd=_git_repo, check=True,
+    capture_output=True, text=True,
+).stdout.strip()
+_expected_path = os.path.join(ROOT, "git-task-001", "expected.toml")
+with io.open(_expected_path, encoding="utf-8") as f:
+    _expected = f.read()
+_marker = "\n[[verify]]"
+if _marker not in _expected:
+    raise RuntimeError("git-task-001 expected.toml 缺少 [[verify]]")
+_expected = _expected.replace(
+    _marker, f'\nbase_commit = "{_commit_b}"\n\n[[verify]]', 1
+)
+w(_expected_path, _expected)
 
 print(f"\n共生成 {len([d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d))])} 个任务")

@@ -34,9 +34,10 @@ def main():
             expected = tomllib.load(f)
         total += 1
         # 先重置 repo（生成器已提交初始状态；重置以防现场被改）
-        subprocess.run(["git", "reset", "--hard", "-q"], cwd=repo, check=False,
+        target = expected.get("base_commit", "HEAD")
+        subprocess.run(["git", "reset", "--hard", "-q", target], cwd=repo, check=True,
                        stdout=subprocess.DEVNULL)
-        subprocess.run(["git", "clean", "-fdx", "-q"], cwd=repo, check=False,
+        subprocess.run(["git", "clean", "-fdx", "-q"], cwd=repo, check=True,
                        stdout=subprocess.DEVNULL)
         results = []
         for v in expected.get("verify", []):
@@ -44,7 +45,7 @@ def main():
                 # 文件断言：按存在/包含判断
                 path = os.path.join(repo, v["path"])
                 if v["type"] == "file_exists":
-                    passed = os.path.isfile(path)
+                    passed = os.path.exists(path)
                 else:
                     passed = False
                     try:

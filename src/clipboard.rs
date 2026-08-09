@@ -17,31 +17,38 @@ const CF_UNICODETEXT: u32 = 13;
 pub fn set_text(text: &str) -> bool {
     // 转 UTF-16（含结尾 NUL）。
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let Some(bytes) = wide.len().checked_mul(std::mem::size_of::<u16>()) else {
+        return false;
+    };
+
+    // 在清空用户现有剪贴板前完成所有可能失败的本地分配与复制。
+    let h = global_alloc(bytes);
+    if h.is_null() {
+        return false;
+    }
+    let lock = global_lock(h);
+    if lock.is_null() {
+        global_free(h);
+        return false;
+    }
+    // SAFETY: `lock` points to the `bytes`-sized allocation above and `wide`
+    // contains exactly `bytes` initialized bytes. The regions do not overlap.
+    unsafe {
+        ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), lock.cast::<u8>(), bytes);
+    }
+    global_unlock(h);
+
     if !open_clipboard() {
+        global_free(h);
         return false;
     }
     let ok = (|| {
         if !empty_clipboard() {
+            global_free(h);
             return false;
         }
         // GlobalAlloc(GMEM_MOVEABLE) 分配；仅 SetClipboardData 成功后所有权
         // 才转给系统。此前任一步失败都必须主动 GlobalFree。
-        let bytes = wide.len() * 2;
-        let h = global_alloc(bytes);
-        if h.is_null() {
-            return false;
-        }
-        let lock = global_lock(h);
-        if lock.is_null() {
-            global_free(h);
-            return false;
-        }
-        // SAFETY: `lock` points to the `bytes`-sized allocation above and `wide`
-        // contains exactly `bytes` initialized bytes. The regions do not overlap.
-        unsafe {
-            ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, lock as *mut u8, bytes);
-        }
-        global_unlock(h);
         if set_clipboard_data(h).is_null() {
             global_free(h);
             return false;

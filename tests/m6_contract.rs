@@ -176,9 +176,12 @@ fn auth_round_trip_when_keyring_available() {
     let provider = "tpi-test-provider";
     match tpi::auth::auth_set(provider, "test-token") {
         Ok(()) => {
-            assert_eq!(tpi::auth::auth_get(provider).as_deref(), Some("test-token"));
+            assert_eq!(
+                tpi::auth::auth_get(provider).unwrap().as_deref(),
+                Some("test-token")
+            );
             tpi::auth::auth_clear(provider).unwrap();
-            assert_eq!(tpi::auth::auth_get(provider), None);
+            assert_eq!(tpi::auth::auth_get(provider).unwrap(), None);
         }
         Err(error) => {
             // 无凭据服务（如 headless CI）时明确跳过并说明。

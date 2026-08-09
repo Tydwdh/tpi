@@ -10,19 +10,23 @@
 跳过 Git Bash 安装（已有 Git Bash 或用 WSL 时可选）。
 
 .PARAMETER BashVersion
-指定 Git 版本（如 2.49.0）；默认最新 release。
+指定完整 Git for Windows tag（如 v2.55.0.windows.3）；默认最新 release。
+
+.PARAMETER BashSha256
+PortableGit 资产的预期 SHA-256；GitHub API 不可用时可显式提供。
 
 .EXAMPLE
 .\scripts\install.ps1
 .EXAMPLE
 .\scripts\install.ps1 -SkipBash
 .EXAMPLE
-.\scripts\install.ps1 -BashVersion 2.49.0
+.\scripts\install.ps1 -BashVersion v2.55.0.windows.3
 #>
 [CmdletBinding()]
 param(
     [switch]$SkipBash,
-    [string]$BashVersion
+    [string]$BashVersion,
+    [string]$BashSha256
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,12 +55,10 @@ $binDir = Join-Path $cargoHome 'bin'
 
 Write-Host "== 2/2: 安装随包 Git Bash =="
 $bashScript = Join-Path $PSScriptRoot 'install-bash.ps1'
-# 数组 splatting 按位置绑定，不能用于命名参数；显式传参。
-if ($BashVersion) {
-    & $bashScript -InstallDir $binDir -Version $BashVersion
-} else {
-    & $bashScript -InstallDir $binDir
-}
+$bashArgs = @{ InstallDir = $binDir }
+if ($BashVersion) { $bashArgs.Version = $BashVersion }
+if ($BashSha256) { $bashArgs.Sha256 = $BashSha256 }
+& $bashScript @bashArgs
 if ($LASTEXITCODE -ne 0) { throw "install-bash.ps1 失败（exit $LASTEXITCODE）" }
 
 Write-Host ""
