@@ -1,9 +1,9 @@
-//! Session 持久层（文档 §14）。
+//! Session 持久层。
 //!
 //! [`SessionEvent`] 是 durable 事件的唯一集合：session log 是事实源，
-//! TUI transcript、上下文和统计都是 projection（§3.2 不变量 8）。
+//! TUI transcript、上下文和统计都是可重建的 projection。
 //!
-//! 文件布局（§14.1）：`~/.tpi/sessions/<workspace-id>/<session-id>.jsonl`。
+//! 文件布局：`~/.tpi/sessions/<workspace-id>/<session-id>.jsonl`。
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -121,7 +121,7 @@ pub enum InterruptCause {
     Other,
 }
 
-/// Durable session 事件（文档 §4.3 的完整枚举）。
+/// Durable session 事件的完整枚举。
 ///
 /// 只有已提交事实才能成为事件：私有 reasoning、未提交的流式增量
 /// 都不是长期事实来源（§3.2 不变量 10）。

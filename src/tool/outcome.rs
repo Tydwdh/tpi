@@ -1,4 +1,4 @@
-//! 统一工具结果协议（文档 §8.2/§8.3）。
+//! 模型、TUI 和 session 共享的统一工具结果协议。
 //!
 //! 三类 payload 不能混用：
 //! - `model_payload`：短、稳定、有预算；必须包含状态和下一步诊断所需字段。
@@ -127,7 +127,7 @@ impl StoredToolOutcome {
     }
 }
 
-/// 统一工具结果（文档 §8.2）。
+/// 统一工具结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutcome {
     pub status: ToolStatus,

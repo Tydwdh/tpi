@@ -1,12 +1,10 @@
-//! 内置工具（文档 §8）。
+//! 内置工具及其统一执行边界。
 //!
 //! 内建工具使用 `BuiltinTool` enum + `match` 静态分发；schema、参数类型、
-//! 访问声明和执行函数放在同一工具模块（§8.1）。v1 不创建动态 registry、
+//! 访问声明和执行函数放在同一工具模块。当前实现不创建动态 registry、
 //! 插件 ABI 或 `dyn Tool` 层。
 //!
-//! M1 范围（§21 M1）：`read`、`edit`、`write`。
-//! M2：`list`、`search`、`bash`。M4：`update_plan`。M6：`web_search`、`web_fetch`。
-//! §11（稳定化任务书）：ask_user 已移除——需要用户决定时模型直接输出问题并结束 run。
+//! `ask_user` 不是工具：需要用户决定时，模型直接输出问题并结束当前 run。
 
 pub mod command;
 pub mod edit;

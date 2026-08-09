@@ -1,4 +1,4 @@
-//! Revision-bound 可靠编辑（文档 §2.2、§10）。
+//! Revision-bound 可靠编辑与原子提交。
 //!
 //! - revision 对原始字节计算 BLAKE3，协议传完整 256 bit digest：`b3:<64-hex>`（§10.1）。
 //! - 内部使用 `logical_lf_text`（去 BOM、CRLF→LF）作为匹配空间，

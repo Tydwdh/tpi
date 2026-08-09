@@ -1,4 +1,4 @@
-//! `update_plan` 工具（文档 §13：Plan 是状态，不是调度器）。
+//! `update_plan` 工具：Plan 是短期状态，不是调度器。
 //!
 //! 原生同步控制操作：不进入普通工具调度队列（但仍返回标准 tool result、
 //! 计入 call budget 并记录 durable event）。所谓"隐藏"只是不在聊天

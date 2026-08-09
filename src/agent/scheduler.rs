@@ -1,4 +1,4 @@
-//! 工具调度（文档 §12）。
+//! 基于资源访问声明的工具调度。
 //!
 //! - §12.1 资源访问声明：read/list/search 生成 read lock；edit/write 生成 write lock；
 //!   run/bash 记为 `WorkspaceUnknown`（按源顺序串行）。

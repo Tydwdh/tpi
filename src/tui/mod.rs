@@ -1,17 +1,17 @@
-//! TUI 渲染层（文档 §16）。
+//! TUI 渲染层。
 //!
 //! 只有 renderer 可以调用 Crossterm/Ratatui 或写 stdout；Agent、provider、tool
-//! 和日志模块只能发送事件（§16.1、§3.2 不变量 11）。
+//! 和日志模块只能发送事件。
 //!
 //! 对标成熟终端 Agent（Claude Code/OpenCode 式）：
-//! - §16.1 inline viewport：保留终端 scrollback，闭合行经 `insert_before`
+//! - inline viewport 保留终端 scrollback，闭合行经 `insert_before`
 //!   提交到活动区上方，底部只重绘变化内容；不支持时降级为活动区内部滚动
 //!   （状态栏显示兼容模式说明）。
-//! - §16.2 信息层级：用户消息细紫红左 rail + `you` 标签；assistant 无填充卡片；
+//! - 信息层级：用户消息细紫红左 rail + `you` 标签；assistant 无填充卡片；
 //!   thinking dim italic 可折叠（Alt+T）；工具调用单行卡片
 //!   `icon name duration status`（运行中 spinner 动画，失败保留红色关键 tail）；
 //!   plan 独立紧凑区域；footer 展示 workspace/model/usage/状态；编辑器硬件光标。
-//! - §16.3 OMP 语义主题（theme.rs 与设计文档调色板逐项一致）。
+//! - OMP 语义主题集中在 `theme` 模块。
 //! - Markdown 渲染（pulldown-cmark）：assistant/用户消息的加粗、行内代码、
 //!   代码块、列表、引用、链接；按条目版本缓存渲染结果，流式增量只失效最后一条。
 

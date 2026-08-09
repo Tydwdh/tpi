@@ -1,4 +1,4 @@
-//! 命令执行工具（文档 §11）：`bash`（M2）是唯一执行通道。
+//! 命令执行工具：`bash` 是唯一执行通道。
 //!
 //! `bash` 通过随包/系统 Git Bash 执行（§11.1），wrapper 统一 `set -o pipefail`；
 //! 状态判定：exit_code==0 → succeeded，非零 → failed；stderr 只是一条输出流，

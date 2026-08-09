@@ -1,4 +1,4 @@
-//! Agent 状态机与执行循环（文档 §6）。
+//! Agent 状态机与模型—工具执行循环。
 //!
 //! §6.2 一轮的精确算法：接收用户消息 → append UserSubmitted → 构建 context →
 //! 发起一次 provider request → 消费规范化 stream → 原子提交 assistant message →

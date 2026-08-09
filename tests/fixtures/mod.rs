@@ -1,4 +1,4 @@
-//! 测试基础设施（M0/M1 交付项，§21）：fake provider 与 deterministic clock/ID。
+//! Integration-test fixtures shared by the contract suites.
 //!
 //! integration tests 通过 `mod fixtures;` 共享本目录。
 //! 夹具函数由不同测试文件按需使用，允许单文件编译单元内未引用。
@@ -7,7 +7,6 @@
     reason = "each integration-test crate consumes a different fixture subset"
 )]
 
-pub mod deterministic;
 pub mod fake_provider;
 
 use camino::Utf8PathBuf;

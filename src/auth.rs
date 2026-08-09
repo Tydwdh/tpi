@@ -1,4 +1,4 @@
-//! 凭据管理（文档 §18.4）。
+//! Windows Credential Manager 凭据边界。
 //!
 //! `tpi auth set <provider>` 将 token 写入 Windows Credential Manager；
 //! 配置只保存 credential label（§18.4）。环境变量可以作为显式覆盖。

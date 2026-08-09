@@ -1,4 +1,4 @@
-//! Run budgets 与 watchdog（文档 §12.4）。
+//! Run budgets 与 watchdog。
 //!
 //! 预算由 watchdog 实时检查，wall time 到达时主动取消，不是等下一次工具调用才发现；
 //! 接近预算时状态栏提示；达到硬限制后产生明确完成原因并保留可恢复 session。

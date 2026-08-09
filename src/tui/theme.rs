@@ -1,6 +1,6 @@
 //! OMP 语义主题（§16.3：语义 token 与颜色分离，组件引用语义角色）。
 //!
-//! 调色板与 TPI_DESIGN.md §16.3 完全一致：
+//! TUI semantic palette：
 //! background terminal/default、surface #211522、surface_subtle #1b1724、
 //! primary #cba6f7、accent #f38ba8、info #89dceb、success #a6e3a1、
 //! warning #f9e2af、error #f38ba8、text #cdd6f4、muted #7f849c。

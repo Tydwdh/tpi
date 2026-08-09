@@ -1,4 +1,4 @@
-//! 进程层（文档 §11）。
+//! Git Bash 子进程与 Windows Job Object 生命周期。
 //!
 //! M1：direct process（tokio Command）。
 //! M2：单二进制 process-host handshake + Job Object 进程树取消（§11.5）+ 受控 launcher。

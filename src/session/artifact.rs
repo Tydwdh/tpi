@@ -1,4 +1,4 @@
-//! Artifact 存储（文档 §14.3）。
+//! 有界 artifact 存储。
 //!
 //! Artifact record：opaque ID、MIME、byte length、digest、创建工具、保留策略和内部路径。
 //! UI 可直接展开文本 artifact；模型通过 `read(@artifact/...)` 有界读取（§8.4）。

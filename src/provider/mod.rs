@@ -1,4 +1,4 @@
-//! Provider 层（文档 §7）。
+//! 模型 provider 接口与共享协议类型。
 //!
 //! Adapter 的职责是吸收差异：SSE 分帧、tool argument 增量拼接、`reasoning_content`、
 //! finish reason 和 usage。Agent machine 不允许出现 provider-specific JSON 字段（§7.1）。

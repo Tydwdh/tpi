@@ -1,5 +1,5 @@
-//! Provider trace（TPI_STABILIZATION_TASK §8）：真实 provider 出问题时的
-//! 本地调试能力——`TPI_TRACE_PROVIDER=1` 时把每次请求的元数据写入
+//! Provider trace 是真实 provider 出问题时的本地调试能力：
+//! `TPI_TRACE_PROVIDER=1` 时把每次请求的元数据写入
 //! `~/.tpi/logs/provider-*.jsonl`。
 //!
 //! 记录：request_start / response_status / sse_event / tool_call_started /

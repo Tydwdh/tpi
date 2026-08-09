@@ -1,4 +1,4 @@
-//! 文件工具（文档 §10）：`read`（M1）；`list`/`search` 属 M2。
+//! 文件读取、写入和目录访问工具。
 //!
 //! `read` 结果必须分别给出 path、revision、returned_lines、total_lines、truncated
 //! 和正文（§10.2）。正文统一 LF，因此模型复制出的 `old_text` 与匹配空间一致。

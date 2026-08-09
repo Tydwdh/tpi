@@ -1,4 +1,4 @@
-//! TPI 入口（文档 §18.3 CLI）。
+//! TPI CLI 入口。
 //!
 //! ```text
 //! tpi                         # 当前目录进入交互会话
@@ -8,7 +8,7 @@
 //! tpi --resume <session-id>   # 恢复指定 session
 //! tpi --model <name>
 //! tpi --no-session
-//! tpi auth set <provider>     # 把 token 写入 Windows Credential Manager（§18.4）
+//! tpi auth set <provider>     # 把 token 写入 Windows Credential Manager
 //! tpi auth clear <provider>
 //! tpi auth status <provider>
 //! ```
@@ -39,8 +39,7 @@ struct Cli {
     #[arg(long)]
     no_session: bool,
     /// 继续当前 workspace 最近 session
-    // P0-6：设计文档/README 写的是 `--continue`；clap 默认按字段名生成
-    // `--continue-session`，显式指定 long 名对齐文档。
+    // 字段名会让 clap 生成 `--continue-session`；显式保持稳定的 `--continue` CLI。
     #[arg(long = "continue")]
     continue_session: bool,
     /// 恢复指定 session
@@ -49,7 +48,7 @@ struct Cli {
     /// 工作目录（默认当前目录）
     #[arg(long)]
     cwd: Option<PathBuf>,
-    /// 兼容模式：inline 视口（默认 fullscreen，§1.2）
+    /// 兼容模式：inline 视口（默认 fullscreen）
     #[arg(long)]
     inline: bool,
     #[command(subcommand)]
@@ -58,7 +57,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// 凭据管理（§18.4：写入 Windows Credential Manager，配置只保存 label）。
+    /// 凭据管理（写入 Windows Credential Manager，配置只保存 label）。
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -579,7 +578,7 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    /// P0-6 回归：设计文档/README 的 `--continue` 必须可解析。
+    /// 稳定 CLI：`--continue` 必须可解析。
     /// （此前 `#[arg(long)] continue_session` 只生成 `--continue-session`。）
     #[test]
     fn continue_flag_matches_design_doc() {
@@ -587,7 +586,7 @@ mod tests {
         assert!(cli.continue_session);
     }
 
-    /// P0-7 回归：`tpi auth set <provider>` 子命令形态（文档 §18.3/README）。
+    /// 稳定 CLI：`tpi auth set <provider>` 子命令形态。
     /// （此前是 `tpi auth <provider> --set`。）
     #[test]
     fn auth_set_subcommand_matches_design_doc() {

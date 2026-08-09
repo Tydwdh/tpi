@@ -1,4 +1,4 @@
-//! OpenAI-compatible Chat Completions adapter（文档 §7.1/§7.3）。
+//! OpenAI-compatible Chat Completions 流式适配器。
 //!
 //! 职责：SSE 分帧、tool argument 增量拼接、`reasoning_content`、finish reason、
 //! usage 归一化；重试只发生在流开始之前，流中出现 delta 后绝不自动重放（§7.3）。

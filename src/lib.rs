@@ -1,7 +1,7 @@
-//! TPI：个人终端 Coding Agent（实现契约见 TPI_DESIGN.md）。
+//! TPI：面向 Windows 的个人终端 coding agent。
 //!
-//! M1：Walking Skeleton——CLI/配置、SSE provider + fake、read/edit/write/run、
-//! 串行 tool-call loop、append-only session、write-ahead 与恢复、Ctrl-C 取消。
+//! 核心边界是 agent loop、provider adapter、durable session、内置工具和 TUI；
+//! 每个模块的所有权与验证入口见仓库 README。
 
 pub mod agent;
 pub mod app;
