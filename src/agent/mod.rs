@@ -59,6 +59,18 @@ pub struct AgentOutcome {
     pub assistant_text: String,
 }
 
+/// Inputs that describe one agent run independently of its provider, session,
+/// and immutable configuration dependencies.
+pub struct RunInput<'a> {
+    pub history: &'a [ChatMessage],
+    pub user_message: String,
+    pub ui: mpsc::Sender<RuntimeEvent>,
+    pub cancel: CancellationToken,
+    pub interactive: bool,
+    /// P1-10：手动 `/compact`——无条件在第一个完整边界执行一次压缩。
+    pub force_compaction: bool,
+}
+
 /// 不可恢复的 run 失败（§19.1）。
 #[derive(Debug, thiserror::Error)]
 pub enum RunFailure {
@@ -143,19 +155,20 @@ pub enum DeltaKind {
 }
 
 /// 执行一次完整 run（§6.2）。
-#[allow(clippy::too_many_arguments)]
 pub async fn run<P: Provider>(
     provider: &mut P,
     session: &mut SessionLog,
     config: &Config,
-    history: &[ChatMessage],
-    user_message: String,
-    ui: mpsc::Sender<RuntimeEvent>,
-    cancel: CancellationToken,
-    interactive: bool,
-    // P1-10：手动 `/compact`——无条件在第一个完整边界执行一次压缩。
-    force_compaction: bool,
+    input: RunInput<'_>,
 ) -> Result<AgentOutcome, RunFailure> {
+    let RunInput {
+        history,
+        user_message,
+        ui,
+        cancel,
+        interactive,
+        force_compaction,
+    } = input;
     let run_id = session.run_id();
     let request_id = RequestId::new_v7();
     let span = tracing::info_span!("agent.run", %run_id, %request_id);

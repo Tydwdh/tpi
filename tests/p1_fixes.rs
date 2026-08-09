@@ -66,12 +66,14 @@ async fn p1_1_cancel_keeps_history_consistent_with_session() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "hello".into(),
-        tx,
-        CancellationToken::new(),
-        false,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "hello".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run 以 Cancelled 正常结束");
@@ -129,12 +131,14 @@ async fn p1_2_max_tool_calls_has_own_reason() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "go".into(),
-        tx,
-        CancellationToken::new(),
-        false,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "go".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run 正常结束");
@@ -186,12 +190,14 @@ async fn p1_4_context_overflow_stops_run_cleanly() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "x".repeat(9000),
-        tx,
-        CancellationToken::new(),
-        false,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "x".repeat(9000),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run 正常结束");
@@ -277,12 +283,14 @@ async fn p1_10_manual_compaction_runs_at_next_boundary() {
         &mut provider,
         &mut session,
         &config,
-        &history,
-        "go".into(),
-        tx,
-        CancellationToken::new(),
-        false,
-        true, // P1-10：手动压缩
+        agent::RunInput {
+            history: &history,
+            user_message: "go".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: true,
+        },
     )
     .await
     .expect("run 成功");
@@ -348,12 +356,14 @@ async fn interrupted_attempt_records_partial_and_keeps_session_consistent() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "hello".into(),
-        tx,
-        CancellationToken::new(),
-        false,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "hello".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
     )
     .await
     .expect("interrupted run 以正常结果结束（非 Err）");
@@ -436,12 +446,14 @@ async fn unavailable_connect_fails_without_recorded_attempt() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "hello".into(),
-        tx,
-        CancellationToken::new(),
-        false,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "hello".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
     )
     .await;
     drain.abort();
@@ -557,12 +569,14 @@ async fn text_only_interrupt_auto_continues_and_merges() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "hello".into(),
-        tx,
-        CancellationToken::new(),
-        false,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "hello".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
     )
     .await
     .expect("自动续写后 run 必须正常结束");
@@ -637,12 +651,14 @@ async fn recovery_capped_after_one_attempt() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "hello".into(),
-        tx,
-        CancellationToken::new(),
-        false,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "hello".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run 以正常结果结束");
@@ -730,12 +746,14 @@ async fn tool_delta_interrupt_restarts_whole_turn() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "hello".into(),
-        tx,
-        CancellationToken::new(),
-        false,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "hello".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
     )
     .await
     .expect("restart 后 run 必须正常结束");
@@ -823,12 +841,14 @@ async fn tool_delta_restart_is_capped() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "hello".into(),
-        tx,
-        CancellationToken::new(),
-        false,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "hello".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run 以正常结果结束");
@@ -869,12 +889,14 @@ async fn retry_with_empty_user_message_does_not_repeat_submission() {
         &mut provider,
         &mut session,
         &config,
-        &history,
-        String::new(), // retry：空 user_message
-        tx,
-        CancellationToken::new(),
-        false,
-        false,
+        agent::RunInput {
+            history: &history,
+            user_message: String::new(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
     )
     .await
     .expect("retry run 必须正常结束");

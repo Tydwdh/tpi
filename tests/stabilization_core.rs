@@ -122,12 +122,14 @@ async fn p0_2_empty_text_tool_call_replays_legal_protocol() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "读取 probe.txt".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        tpi::agent::RunInput {
+            history: &[],
+            user_message: "读取 probe.txt".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run succeeds");
@@ -184,12 +186,14 @@ async fn p0_3_runtime_projection_matches_resume_projection() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "读取 probe.txt".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        tpi::agent::RunInput {
+            history: &[],
+            user_message: "读取 probe.txt".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run succeeds");
@@ -252,12 +256,14 @@ impl ReplayHarness {
             provider,
             &mut self.session,
             &self.config,
-            &[],
-            user_message.into(),
-            tx,
-            CancellationToken::new(),
-            true,
-            false,
+            tpi::agent::RunInput {
+                history: &[],
+                user_message: user_message.into(),
+                ui: tx,
+                cancel: CancellationToken::new(),
+                interactive: true,
+                force_compaction: false,
+            },
         )
         .await
         .expect("run succeeds");
@@ -469,12 +475,14 @@ async fn replay_cancelled_run_matches_runtime() {
         &mut provider,
         &mut h.session,
         &h.config,
-        &[],
-        "hi".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        tpi::agent::RunInput {
+            history: &[],
+            user_message: "hi".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("cancel 是正常结束");
@@ -531,12 +539,14 @@ async fn replay_after_compaction_matches_runtime() {
         &mut provider,
         &mut h.session,
         &h.config,
-        &[],
-        "反复读取 probe.txt 直到我说停".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        tpi::agent::RunInput {
+            history: &[],
+            user_message: "反复读取 probe.txt 直到我说停".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run succeeds");

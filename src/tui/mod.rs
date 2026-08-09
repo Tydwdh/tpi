@@ -243,11 +243,13 @@ impl Renderer {
                 frame,
                 view,
                 theme,
-                &mut cache,
-                &mut cache_width,
-                &mut committed,
-                scrollback,
-                mode,
+                RenderContext {
+                    markdown_cache: &mut cache,
+                    cache_width: &mut cache_width,
+                    committed: &mut committed,
+                    scrollback,
+                    mode,
+                },
             );
             overflow = frame_overflow;
             new_committed = committed_after;
@@ -323,17 +325,27 @@ impl Drop for Renderer {
 /// 布局并渲染一帧（Renderer 与测试后端共用；纯布局逻辑集中在 plan_window）。
 ///
 /// 自下而上：输入区（多行，≤4 行）→ footer（1 行）→ 计划条（0..4 行）→ 转录区。
-#[allow(clippy::too_many_arguments)]
+struct RenderContext<'a> {
+    markdown_cache: &'a mut HashMap<(u64, u16), Vec<Line<'static>>>,
+    cache_width: &'a mut u16,
+    committed: &'a mut usize,
+    scrollback: bool,
+    mode: terminal::ViewMode,
+}
+
 fn render_frame(
     frame: &mut ratatui::Frame,
     view: &mut ViewModel,
     theme: theme::Theme,
-    cache: &mut HashMap<(u64, u16), Vec<Line<'static>>>,
-    cache_width: &mut u16,
-    committed: &mut usize,
-    scrollback: bool,
-    mode: terminal::ViewMode,
+    context: RenderContext<'_>,
 ) -> FramePlan {
+    let RenderContext {
+        markdown_cache: cache,
+        cache_width,
+        committed,
+        scrollback,
+        mode,
+    } = context;
     let area = frame.area();
     // 宽度变化 → Markdown 渲染缓存失效，提交位置重置为当前窗口起点
     // （§16.1：已提交到 scrollback 的历史 immutable，resize 后只重排活动区）。
@@ -3031,11 +3043,13 @@ pub fn draw_to_test_backend_mode(
                 frame,
                 view,
                 theme,
-                &mut cache,
-                &mut cache_width,
-                &mut committed,
-                scrollback,
-                mode,
+                RenderContext {
+                    markdown_cache: &mut cache,
+                    cache_width: &mut cache_width,
+                    committed: &mut committed,
+                    scrollback,
+                    mode,
+                },
             );
         })
         .map_err(|error| {
@@ -3076,11 +3090,13 @@ pub fn draw_captured_bytes(view: &mut ViewModel) -> Vec<u8> {
                     frame,
                     view,
                     theme,
-                    &mut cache,
-                    &mut cache_width,
-                    &mut committed,
-                    true,
-                    terminal::ViewMode::Inline,
+                    RenderContext {
+                        markdown_cache: &mut cache,
+                        cache_width: &mut cache_width,
+                        committed: &mut committed,
+                        scrollback: true,
+                        mode: terminal::ViewMode::Inline,
+                    },
                 );
                 overflow = plan.overflow;
             })

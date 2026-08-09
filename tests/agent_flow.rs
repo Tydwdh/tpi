@@ -33,12 +33,14 @@ async fn finish_stop_without_tool_calls_completes_run_without_second_request() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "hi".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "hi".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run succeeds");
@@ -98,12 +100,14 @@ async fn tool_call_loop_terminates_and_reports_completion() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "read a file".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "read a file".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run succeeds");
@@ -154,12 +158,14 @@ async fn usage_accumulates_across_turns() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "hi".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "hi".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run succeeds");
@@ -202,12 +208,14 @@ async fn context_usage_event_sent_before_requests() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "hi".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "hi".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run succeeds");

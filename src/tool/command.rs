@@ -111,18 +111,18 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
             });
         }
     });
-    let result = crate::process::run_in_host(
-        &run_args,
-        &std::path::PathBuf::from(&run_args.program),
-        Some("git-bash"),
-        ctx.cancel.clone(),
+    let resolved_program = std::path::PathBuf::from(&run_args.program);
+    let result = crate::process::run_in_host(crate::process::HostRunRequest {
+        args: &run_args,
+        resolved_program: &resolved_program,
+        launcher: Some("git-bash"),
+        cancel: ctx.cancel.clone(),
         timeout,
-        &ctx.session_id,
-        artifact.as_mut(),
-        stream_sink
+        artifact: artifact.as_mut(),
+        stream_sink: stream_sink
             .as_ref()
             .map(|sink| sink as &(dyn Fn(u8, &[u8]) + Sync)),
-    )
+    })
     .await;
     let record = artifact.and_then(|writer| writer.finish().ok());
     let artifact_ref = record.map(|record| crate::tool::outcome::ArtifactRef {

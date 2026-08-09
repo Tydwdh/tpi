@@ -602,12 +602,14 @@ async fn invalid_tool_args_produce_observation_without_breaking_session() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "读 probe.txt".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        tpi::agent::RunInput {
+            history: &[],
+            user_message: "读 probe.txt".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run 必须继续（invalid args 是 expected failure，不是 run failure）");
@@ -751,7 +753,8 @@ async fn provider_failure_keeps_session_recoverable() {
 }
 
 #[allow(deprecated)]
-// SO_LINGER 是触发 RST 的标准手段；tokio 标记 deprecated（drop 可能阻塞线程）。`r`n/// 模拟 SSE 中途断开：返回头部 + 一个事件后以 RST（SO_LINGER=0）断开。
+// SO_LINGER 是触发 RST 的标准手段；tokio 标记 deprecated（drop 可能阻塞线程）。
+/// 模拟 SSE 中途断开：返回头部 + 一个事件后以 RST（SO_LINGER=0）断开。
 /// 最多接受 4 个连接（若客户端错误地重试，计数会 >1；修复后应恒为 1）。
 async fn mock_sse_server_rst_after_partial(
     partial: &'static str,

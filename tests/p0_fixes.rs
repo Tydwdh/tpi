@@ -139,12 +139,14 @@ async fn p0_2_compaction_survives_delta_flood() {
             &mut provider,
             &mut session,
             &config,
-            &[],
-            "x".repeat(9000),
-            ui_tx,
-            CancellationToken::new(),
-            false,
-            false,
+            agent::RunInput {
+                history: &[],
+                user_message: "x".repeat(9000),
+                ui: ui_tx,
+                cancel: CancellationToken::new(),
+                interactive: false,
+                force_compaction: false,
+            },
         ),
     )
     .await

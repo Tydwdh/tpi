@@ -78,17 +78,26 @@ pub struct IsolationError(pub String);
 /// 5. 取消/超时 → TerminateJobObject，host 与整棵进程树一起退出。
 ///
 /// 归组失败时返回 [`IsolationError`]，绝不静默降级为 unmanaged process（§11.5）。
-#[allow(clippy::too_many_arguments)]
-pub async fn run_in_host(
-    args: &RunArgs,
-    resolved_program: &PathBuf,
-    launcher: Option<&'static str>,
-    cancel: CancellationToken,
-    timeout: std::time::Duration,
-    _session_id: &str,
-    mut artifact: Option<&mut crate::session::artifact::ArtifactWriter>,
-    stream_sink: Option<&StreamSink>,
-) -> Result<HostRunOutput, String> {
+pub struct HostRunRequest<'a> {
+    pub args: &'a RunArgs,
+    pub resolved_program: &'a PathBuf,
+    pub launcher: Option<&'static str>,
+    pub cancel: CancellationToken,
+    pub timeout: std::time::Duration,
+    pub artifact: Option<&'a mut crate::session::artifact::ArtifactWriter>,
+    pub stream_sink: Option<&'a StreamSink>,
+}
+
+pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, String> {
+    let HostRunRequest {
+        args,
+        resolved_program,
+        launcher,
+        cancel,
+        timeout,
+        mut artifact,
+        stream_sink,
+    } = request;
     // 单二进制 process-host（§11.5）：默认用自身；测试用 TPI_PROCESS_HOST 指向真实 tpi.exe。
     let exe = std::env::var_os("TPI_PROCESS_HOST")
         .map(PathBuf::from)

@@ -105,12 +105,14 @@ async fn fake_provider_drives_full_read_edit_verify_loop() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "修复 sample.rs 中的两个 bug".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "修复 sample.rs 中的两个 bug".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("end-to-end run succeeds");

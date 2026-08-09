@@ -129,9 +129,6 @@ pub const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// （§20.1：fake provider → Agent loop 的 integration 测试是 M1 验收项），
 /// 因此这里不是为假想 provider 预留的抽象层（§7.1）。
 ///
-/// 使用 async fn in trait（§7.1 的代码形态）；TPI 单进程内使用，
-/// 不依赖 dyn 兼容或 Send future，因此关闭该 lint。
-#[allow(async_fn_in_trait)]
 pub trait Provider: Send {
     /// 当前 primary model 名称（session 记录与 UI 展示，§3.2 不变量 12）。
     fn model_name(&self) -> &str;
@@ -140,10 +137,10 @@ pub trait Provider: Send {
     ///
     /// 文本/reasoning/tool argument 增量通过 `events` 发送；
     /// 返回的 [`ProviderResponse`] 携带 finish reason、usage 与组装完成的 tool calls。
-    async fn stream(
+    fn stream(
         &mut self,
         request: ModelRequest,
         events: tokio::sync::mpsc::Sender<ProviderEvent>,
         cancel: CancellationToken,
-    ) -> Result<ProviderResponse, ProviderError>;
+    ) -> impl std::future::Future<Output = Result<ProviderResponse, ProviderError>> + Send;
 }

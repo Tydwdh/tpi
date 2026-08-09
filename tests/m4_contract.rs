@@ -346,12 +346,14 @@ async fn update_plan_and_compaction_integration() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "请修复并制定计划".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "请修复并制定计划".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run succeeds");
@@ -415,12 +417,14 @@ async fn repeated_failing_action_blocked_in_agent_loop() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "read it".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "read it".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run succeeds");

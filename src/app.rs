@@ -173,12 +173,14 @@ pub async fn run_prompt_once<P: Provider>(
         provider,
         session,
         config,
-        history,
-        message,
-        ui_tx,
-        cancel.clone(),
-        false,
-        false,
+        agent::RunInput {
+            history,
+            user_message: message,
+            ui: ui_tx,
+            cancel: cancel.clone(),
+            interactive: false,
+            force_compaction: false,
+        },
     )
     .await;
     *crate::util::lock_mutex(&current_cancel, "current_cancel") = None;
@@ -406,10 +408,12 @@ async fn interactive_loop<P: Provider>(
                     config,
                     history,
                     String::new(),
-                    &mut ui_state,
-                    &mut renderer,
-                    &mut key_rx,
-                    current_cancel.clone(),
+                    InteractiveIo {
+                        ui_state: &mut ui_state,
+                        renderer: &mut renderer,
+                        key_rx: &mut key_rx,
+                        current_cancel: current_cancel.clone(),
+                    },
                 )
                 .await
             };
@@ -733,10 +737,12 @@ workspace: {}
                     config,
                     history,
                     message.clone(),
-                    &mut ui_state,
-                    &mut renderer,
-                    &mut key_rx,
-                    current_cancel.clone(),
+                    InteractiveIo {
+                        ui_state: &mut ui_state,
+                        renderer: &mut renderer,
+                        key_rx: &mut key_rx,
+                        current_cancel: current_cancel.clone(),
+                    },
                 )
                 .await
             };
@@ -915,22 +921,31 @@ fn execute_ui_effect(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct InteractiveIo<'a> {
+    ui_state: &'a mut UiState,
+    renderer: &'a mut Renderer,
+    key_rx: &'a mut mpsc::Receiver<Event>,
+    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+}
+
 async fn run_interactive<P: Provider>(
     provider: &mut P,
     session: &mut SessionLog,
     config: &Config,
     history: &[ChatMessage],
     message: String,
-    ui_state: &mut UiState,
-    renderer: &mut Renderer,
-    key_rx: &mut mpsc::Receiver<Event>,
-    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    io: InteractiveIo<'_>,
 ) -> Result<agent::AgentOutcome, String> {
     use crate::tui::effect::UiEffect;
     use crate::tui::event::UiEvent;
     use crate::tui::model::LineKind;
     use ratatui::crossterm::event::KeyEventKind;
+    let InteractiveIo {
+        ui_state,
+        renderer,
+        key_rx,
+        current_cancel,
+    } = io;
     let cancel = CancellationToken::new();
     *crate::util::lock_mutex(&current_cancel, "current_cancel") = Some(cancel.clone());
     ui_state.view.status = StatusLine::Running {
@@ -949,12 +964,14 @@ async fn run_interactive<P: Provider>(
         provider,
         session,
         config,
-        history,
-        message.clone(),
-        ui_tx,
-        cancel.clone(),
-        true,
-        force,
+        agent::RunInput {
+            history,
+            user_message: message.clone(),
+            ui: ui_tx,
+            cancel: cancel.clone(),
+            interactive: true,
+            force_compaction: force,
+        },
     );
     tokio::pin!(run_future);
 

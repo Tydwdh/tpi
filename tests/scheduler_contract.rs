@@ -77,12 +77,14 @@ async fn run_with(
         provider,
         &mut session,
         config,
-        &[],
-        message.into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: message.into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("run succeeds");
@@ -422,12 +424,14 @@ async fn cancellation_during_parallel_bash_cancels_all() {
             &mut provider,
             &mut session,
             &config,
-            &[],
-            "并行跑两个命令".into(),
-            tx,
-            cancel_in_run,
-            true,
-            false,
+            agent::RunInput {
+                history: &[],
+                user_message: "并行跑两个命令".into(),
+                ui: tx,
+                cancel: cancel_in_run,
+                interactive: true,
+                force_compaction: false,
+            },
         )
         .await
     });

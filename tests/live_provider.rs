@@ -49,12 +49,14 @@ async fn live_provider_smoke_opt_in() {
         &mut provider,
         &mut session,
         &config,
-        &[],
-        "回复两个字：你好".into(),
-        tx,
-        CancellationToken::new(),
-        true,
-        false,
+        agent::RunInput {
+            history: &[],
+            user_message: "回复两个字：你好".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
     )
     .await
     .expect("live run succeeds");
@@ -112,12 +114,15 @@ async fn live_canary_2_real_tool_call_loop() {
             &mut provider,
             &mut session,
             &config,
-            &[],
-            "请使用 read 工具读取 probe.txt 文件，然后只回复文件中的标记内容。".into(),
-            tx,
-            CancellationToken::new(),
-            true,
-            false,
+            agent::RunInput {
+                history: &[],
+                user_message: "请使用 read 工具读取 probe.txt 文件，然后只回复文件中的标记内容。"
+                    .into(),
+                ui: tx,
+                cancel: CancellationToken::new(),
+                interactive: true,
+                force_compaction: false,
+            },
         ),
     )
     .await

@@ -395,12 +395,14 @@ pub async fn run_task(
             &mut provider,
             &mut session,
             &eval_config,
-            &[],
-            task.task_md.clone(),
-            ui_tx,
-            cancel,
-            false, // 非交互
-            false, // 不强制 compaction
+            agent::RunInput {
+                history: &[],
+                user_message: task.task_md.clone(),
+                ui: ui_tx,
+                cancel,
+                interactive: false,
+                force_compaction: false,
+            },
         ),
     )
     .await;
