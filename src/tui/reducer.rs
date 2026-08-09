@@ -312,12 +312,15 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             }
         }
         KeyCode::Char(c) => {
-            // Ctrl+C：应用内选择复制（§用户诉求）。有选区 → 复制到剪贴板
-            //（CopySelection，app 层执行）；无选区 → 静默忽略（不输入 'c'，
-            // 不取消/退出——取消统一用 Esc）。
+            // Ctrl+C 语义（§PointerHit 统一）：
+            // - 有选区：复制到剪贴板；
+            // - 运行中无选区：取消 run（与 Esc 一致）；
+            // - 空闲无选区：忽略（退出走 /quit 或独立 signal handler）。
             if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
                 if state.view.selection.is_some() {
                     effects.push(UiEffect::CopySelection);
+                } else if state.running {
+                    effects.push(UiEffect::CancelRun);
                 }
                 return effects;
             }

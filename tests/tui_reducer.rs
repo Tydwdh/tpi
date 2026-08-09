@@ -391,10 +391,9 @@ fn alt_up_down_jumps_between_user_turns() {
     assert_eq!(anchor.entry_id.0, 3);
 }
 
-/// §用户诉求：Ctrl-C 只用于复制——运行中到达应用的 Ctrl-C 静默忽略，
-/// 不取消 run（取消统一用 Esc）。
+/// §PointerHit：Ctrl-C 语义统一——运行中无选区取消 run；有选区复制。
 #[test]
-fn ctrl_c_running_is_ignored_for_copy() {
+fn ctrl_c_running_cancels_run_when_no_selection() {
     let mut s = state();
     s.running = true;
     let effects = reducer::update(
@@ -402,8 +401,8 @@ fn ctrl_c_running_is_ignored_for_copy() {
         UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
     );
     assert!(
-        !effects.contains(&UiEffect::CancelRun),
-        "运行中 Ctrl-C 不得取消 run（只用于复制）: {effects:?}"
+        effects.contains(&UiEffect::CancelRun),
+        "运行中 Ctrl-C 应取消 run（与 Esc 一致）: {effects:?}"
     );
     // 也不得输入 'c' 到 composer。
     assert!(s.view.input.is_empty(), "Ctrl-C 不得写入输入框");

@@ -1259,9 +1259,42 @@ impl ViewModel {
         if self.transcript.len() > 2000 {
             let keep = self.transcript.len() - 2000;
             let removed: Vec<EntryId> = self.transcript[..keep].iter().map(Entry::id).collect();
+            let removed_set: std::collections::HashSet<EntryId> = removed.iter().copied().collect();
             self.transcript.drain(..keep);
-            for id in removed {
-                self.entry_heights.remove(&id);
+            for id in &removed {
+                self.entry_heights.remove(id);
+            }
+            // §PointerHit：trim 后修复悬空的语义状态（selection / anchor /
+            // active_hit / search hits），避免跳顶或复制空。
+            if let Some(sel) = &mut self.selection
+                && (removed_set.contains(&sel.anchor.entry_id)
+                    || removed_set.contains(&sel.focus.entry_id))
+            {
+                self.selection = None;
+            }
+            if let ScrollMode::Locked(anchor) = &mut self.scroll_mode
+                && removed_set.contains(&anchor.entry_id)
+            {
+                // 锚点被删：回退到最早现存 entry（而非跳 0）。
+                if let Some(first) = self.transcript.first() {
+                    anchor.entry_id = first.id();
+                    anchor.row_in_entry = 0;
+                }
+            }
+            if let Some(hit) = &mut self.active_hit {
+                let valid = match hit {
+                    crate::tui::HitTarget::Reasoning(id) => !removed_set.contains(id),
+                    crate::tui::HitTarget::Tool(_) => true, // tool id 是字符串，非 EntryId
+                };
+                if !valid {
+                    self.active_hit = None;
+                }
+            }
+            if let Some(search) = &mut self.search {
+                search.hits.retain(|id| !removed_set.contains(id));
+                if search.index >= search.hits.len() {
+                    search.index = search.hits.len().saturating_sub(1);
+                }
             }
         }
     }
