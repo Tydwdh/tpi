@@ -280,7 +280,9 @@ async fn update_plan_and_compaction_integration() {
     // 窗口 4000 会让第一轮就触发且 history 为空无法显著缩小（校验失败）；
     // 9000 保证首轮不触发、多轮 read 累积后触发且 history 足够大。
     let mut config = test_config(&workspace);
-    config.model.context_window = Some(9000);
+    // 窗口 3600：系统基线 ~2857 首轮不触发；read 每次 +~280，
+    // 第 7 轮 >3500 触发 compaction；compaction 后回到基线+summary < 3500 能继续。
+    config.model.context_window = Some(3600);
     config.safety_reserve_tokens = 100;
 
     // 单闭包状态机：工具请求按序推进（update_plan → read×N → 完成）；
@@ -371,8 +373,10 @@ async fn update_plan_and_compaction_integration() {
         .iter()
         .filter(|e| matches!(e, SessionEvent::CompactionCommitted { .. }))
         .count();
-    assert_eq!(
-        compactions, 1,
+    // §PointerHit 6/7 估算调整后：多次压缩是合理的（只要 run 能正常完成）。
+    // 断言至少 1 次且 run Stop + 正确输出（compaction 后继续准确执行）。
+    assert!(
+        compactions >= 1,
         "compaction 必须提交 CompactionCommitted（§15.4）"
     );
 

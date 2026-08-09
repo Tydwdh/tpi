@@ -388,6 +388,7 @@ pub async fn run_task(
     let (ui_tx, mut ui_rx) = tokio::sync::mpsc::channel(128);
     tokio::spawn(async move { while ui_rx.recv().await.is_some() {} });
 
+    let cancel_run = cancel.clone();
     let run_result = tokio::time::timeout(
         std::time::Duration::from_secs(task.expected.timeout_sec),
         agent::run(
@@ -404,8 +405,18 @@ pub async fn run_task(
     )
     .await;
 
+    // §PointerHit 5：超时时显式 cancel token，再等 grace period——
+    // 否则 agent 内部 watchdog/provider task 未被明确取消（可能泄漏/残留）。
     let (success, reason, error) = match run_result {
-        Err(_) => (false, "timeout".to_string(), Some("评测超时".to_string())),
+        Err(_) => {
+            cancel_run.cancel();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                std::future::pending::<()>(),
+            )
+            .await;
+            (false, "timeout".to_string(), Some("评测超时".to_string()))
+        }
         Ok(Err(failure)) => (false, format!("error:{failure}"), Some(failure.to_string())),
         Ok(Ok(outcome)) => (
             outcome.reason == crate::session::CompletionReason::Stop,

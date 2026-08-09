@@ -11,9 +11,19 @@ use crate::provider::ChatMessage;
 /// token 保守估算（§15.4：tokenizer 不可用时）：
 /// `max(ceil(utf8_bytes / 3), unicode_scalar_count)`。
 pub fn estimate_tokens(text: &str) -> u64 {
-    let bytes = text.len() as u64;
     let scalars = text.chars().count() as u64;
-    bytes.div_ceil(3).max(scalars)
+    // §PointerHit 6：更贴近真实 tokenizer 的启发式——
+    // CJK（每字符多字节，常见 ~1 token/字）与 ASCII/code（~4 chars/token）分开算。
+    // 旧实现 `max(bytes/3, scalars)` 对 ASCII 给 1 char/token，过保守导致
+    // compaction 过早触发。
+    let cjk_count = text
+        .chars()
+        .filter(|c| matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3000}'..='\u{303F}'))
+        .count() as u64;
+    let ascii_scalars = scalars.saturating_sub(cjk_count);
+    // ASCII/code：~3 chars/token（比旧 1 char/token 合理，比 4 保守些，
+    // 避免过少导致 compaction 触发延迟）。
+    (cjk_count + ascii_scalars.div_ceil(3)).max(1)
 }
 
 /// 估算一组消息的 token 数。
@@ -189,9 +199,26 @@ pub fn parse_summary(text: &str) -> String {
     trimmed.to_string()
 }
 
-/// 明显缩小校验（§15.4 第 5 条：只有明显缩小才提交 CompactionCommitted）。
+/// Compaction summary 是否"足够缩小"值得提交（§15.4 第 5 条）。
+///
+/// §PointerHit 7：阈值随原文规模自适应，而非固定 4 倍。
+/// - 上下文越大，压缩空间越大，允许较小比例（2 倍）就够；
+/// - 小上下文要求更显著缩小（避免无意义压缩）；
+/// - 否则固定 4 倍会导致"只需压缩 20% 即可继续"的会话被 ContextOverflow。
 pub fn is_significant_shrink(original_tokens: u64, summary_tokens: u64) -> bool {
-    summary_tokens > 0 && summary_tokens * 4 < original_tokens.max(1)
+    if summary_tokens == 0 || summary_tokens >= original_tokens {
+        return false;
+    }
+    // 原文 ≥ 64k token：2 倍即可（大上下文压缩空间充裕）；
+    // 原文 16k~64k：3 倍；更小：4 倍（保守）。
+    let required_ratio = if original_tokens >= 64_000 {
+        2u64
+    } else if original_tokens >= 16_000 {
+        3u64
+    } else {
+        4u64
+    };
+    summary_tokens * required_ratio < original_tokens
 }
 
 #[cfg(test)]
@@ -214,7 +241,7 @@ mod tests {
             }),
         };
         let estimate = estimate_request(&system, &messages, std::slice::from_ref(&tool));
-        // system prompt（3000 字符 ≈ 1000 token）必须计入。
+        // system prompt（3000 ASCII 字符 ≈ 1000 token，§PointerHit 6 启发式）必须计入。
         assert!(
             estimate > estimate_messages(&messages),
             "system prompt 必须计入: {estimate}"

@@ -212,21 +212,49 @@ async fn read_bounded_bytes(response: reqwest::Response, limit: usize) -> Result
 /// 错误）时依次回退 Bing、Yahoo HTML 端点——不同网络环境下至少一个可用
 /// （本机实测 DDG/Bing 可能同时返回人机验证页，Yahoo 通常可用）。
 /// 全部引擎都失败时给出汇总错误，不产生乱码输出。
-pub async fn web_search(args: WebSearchArgs, _ctx: &ToolContext) -> ToolOutcome {
+pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
     let count = args.count.clamp(1, 20);
     let query = build_search_query(&args);
     let freshness = args.freshness.as_deref();
 
+    // §PointerHit 4：搜索前检查取消（用户 Esc 后不再发起新请求）。
+    if ctx.cancel.is_cancelled() {
+        return cancelled_outcome("web_search");
+    }
     match search_ddg(&query, freshness).await {
-        Ok(hits) => search_succeeded(&args, hits, count),
+        Ok(hits) => {
+            if ctx.cancel.is_cancelled() {
+                cancelled_outcome("web_search")
+            } else {
+                search_succeeded(&args, hits, count)
+            }
+        }
         Err(ddg_error) => {
             tracing::warn!(error = %ddg_error, "web_search: DDG 失败，回退 Bing");
+            if ctx.cancel.is_cancelled() {
+                return cancelled_outcome("web_search");
+            }
             match search_bing(&query, freshness).await {
-                Ok(hits) => search_succeeded(&args, hits, count),
+                Ok(hits) => {
+                    if ctx.cancel.is_cancelled() {
+                        cancelled_outcome("web_search")
+                    } else {
+                        search_succeeded(&args, hits, count)
+                    }
+                }
                 Err(bing_error) => {
                     tracing::warn!(error = %bing_error, "web_search: Bing 失败，回退 Yahoo");
+                    if ctx.cancel.is_cancelled() {
+                        return cancelled_outcome("web_search");
+                    }
                     match search_yahoo(&query, freshness).await {
-                        Ok(hits) => search_succeeded(&args, hits, count),
+                        Ok(hits) => {
+                            if ctx.cancel.is_cancelled() {
+                                cancelled_outcome("web_search")
+                            } else {
+                                search_succeeded(&args, hits, count)
+                            }
+                        }
                         Err(yahoo_error) => ToolOutcome::failed(
                             "web_search",
                             ModelPayload {
@@ -246,6 +274,27 @@ pub async fn web_search(args: WebSearchArgs, _ctx: &ToolContext) -> ToolOutcome 
             }
         }
     }
+}
+
+/// 取消的 web 工具结果（§PointerHit：Esc 后及时返回 Cancelled 而非继续等待）。
+fn cancelled_outcome(tool: &str) -> ToolOutcome {
+    ToolOutcome::failed(
+        tool,
+        ModelPayload {
+            status: ToolStatus::Cancelled,
+            program: None,
+            exit_code: None,
+            duration_ms: 0,
+            output: "status: cancelled
+tool: {tool}
+error: cancelled
+
+已取消。"
+                .replace("{tool}", tool),
+            effect: None,
+            artifact: None,
+        },
+    )
 }
 
 /// 拼接查询（原始 query + site: 域过滤）。
@@ -839,23 +888,31 @@ pub async fn web_fetch(args: WebFetchArgs, ctx: &ToolContext) -> ToolOutcome {
         // 解析失败（NXDOMAIN 等）由请求阶段报错，不在此拦截。
     }
 
-    let response = match client.get(&args.url).timeout(FETCH_TIMEOUT).send().await {
-        Ok(response) => response,
-        Err(error) => {
-            return ToolOutcome::failed(
-                "web_fetch",
-                ModelPayload {
-                    status: ToolStatus::Failed,
-                    program: None,
-                    exit_code: None,
-                    duration_ms: 0,
-                    output: format!(
-                        "status: failed\ntool: web_fetch\nerror: request_failed\n\n{error}"
-                    ),
-                    effect: None,
-                    artifact: None,
-                },
-            );
+    let send_request = client.get(&args.url).timeout(FETCH_TIMEOUT).send();
+    tokio::pin!(send_request);
+    let response = tokio::select! {
+        // §PointerHit 4：取消（Esc）时及时返回 Cancelled，不等到 15s 超时。
+        _ = ctx.cancel.cancelled() => {
+            return cancelled_outcome("web_fetch");
+        }
+        result = &mut send_request => match result {
+            Ok(response) => response,
+            Err(error) => {
+                return ToolOutcome::failed(
+                    "web_fetch",
+                    ModelPayload {
+                        status: ToolStatus::Failed,
+                        program: None,
+                        exit_code: None,
+                        duration_ms: 0,
+                        output: format!(
+                            "status: failed\ntool: web_fetch\nerror: request_failed\n\n{error}"
+                        ),
+                        effect: None,
+                        artifact: None,
+                    },
+                );
+            }
         }
     };
 

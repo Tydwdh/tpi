@@ -1111,16 +1111,21 @@ async fn run_interactive<P: Provider>(
     Ok(outcome)
 }
 
-/// 从 session 读取最近一次 edit 的结果（含 unified diff，§18.3 /diff）。
+/// 从 session 读取最近一次 run 内所有成功的 edit（含 unified diff，§18.3 /diff）。
 fn last_edit_diff(log: &SessionLog) -> String {
     use crate::session::read_events;
     let events = match read_events(log.path()) {
         Ok(events) => events,
         Err(_) => return "读取 session 失败".to_string(),
     };
-    // P2：/diff 聚合本 run 内所有成功的 edit（此前只返回最近一次）。
-    // 输出每个文件的 model output（含 unified diff 与 revision 信息）。
-    let diffs: Vec<String> = events
+    // §PointerHit 8：只聚合**最近一次 RunStarted 之后**的 edit（/diff = 本轮），
+    // 避免长会话/resume 后聚合全部历史 edit。
+    let recent_start = events
+        .iter()
+        .rposition(|e| matches!(e, SessionEvent::RunStarted { .. }))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let diffs: Vec<String> = events[recent_start..]
         .iter()
         .filter_map(|event| match event {
             SessionEvent::ToolCompleted { outcome, .. }
@@ -1136,11 +1141,16 @@ fn last_edit_diff(log: &SessionLog) -> String {
         return "本轮还没有成功的 edit（写文件请用 edit 工具）".to_string();
     }
     let mut out = String::new();
+    const MAX_DIFF_BYTES: usize = 48 * 1024;
     for (i, diff) in diffs.iter().enumerate() {
         if i > 0 {
             out.push_str("\n---\n\n");
         }
         out.push_str(diff);
+        if out.len() >= MAX_DIFF_BYTES {
+            out.push_str("\n…（diff 超过 48KiB 预算，已截断）");
+            break;
+        }
     }
     out
 }
@@ -1226,12 +1236,13 @@ fn resume_session(
         // call_id 是原 ToolRequested 的 id（recovery 记录）；解析失败时新生成
         //（理论上不会——它来自真实 call，仅防御）。
         let call_id = uuid::Uuid::parse_str(call_id)
-            .map(|u| crate::ids::ToolCallId(u))
+            .map(crate::ids::ToolCallId)
             .unwrap_or_else(|_| crate::ids::ToolCallId::new_v7());
         log.complete_tool(call_id, outcome)
             .map_err(|e| format!("持久化中断工具结果失败: {e}"))?;
     }
-    log.sync_data().map_err(|e| format!("同步 session 失败: {e}"))?;
+    log.sync_data()
+        .map_err(|e| format!("同步 session 失败: {e}"))?;
     let history = session::replay_messages(&path).map_err(|e| format!("重建历史失败: {e}"))?;
     Ok((Some(log), history))
 }

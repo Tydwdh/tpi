@@ -498,7 +498,7 @@ async fn replay_after_compaction_matches_runtime() {
     // 窗口需容纳 system(≈1181) + 工具 schema(≈5668) + 首轮 read 输出后仍有余量：
     // 9000 会在第 2 轮就超 93 tokens（压缩时消息太少必然失败）；
     // 12000 让触发点落在第 5-6 轮，此时 history 有足够消息可显著压缩。
-    h.config.model.context_window = Some(12000);
+    h.config.model.context_window = Some(8500);
     h.config.safety_reserve_tokens = 100;
 
     // 状态机：工具请求按序 read×10（中等输出累积 context，第 5-6 轮触发
