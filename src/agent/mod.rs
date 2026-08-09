@@ -1,4 +1,4 @@
-﻿//! Agent 状态机与执行循环（文档 §6）。
+//! Agent 状态机与执行循环（文档 §6）。
 //!
 //! §6.2 一轮的精确算法：接收用户消息 → append UserSubmitted → 构建 context →
 //! 发起一次 provider request → 消费规范化 stream → 原子提交 assistant message →
@@ -14,6 +14,8 @@ use crate::config::Config;
 
 pub mod limits;
 pub mod scheduler;
+mod tool_runtime;
+use self::tool_runtime::ToolRuntime;
 use crate::ids::{EventId, RequestId, ToolCallId};
 use crate::provider::{ChatMessage, ModelRequest, Provider, ProviderEvent, ToolCall};
 use crate::session::{
@@ -201,16 +203,13 @@ pub async fn run<P: Provider>(
     {
         tracing::warn!(error = %error, "manual compaction failed");
     }
-    // list/search 分页 snapshot（session 作用域，§8.4）。
-    let scan_snapshots: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, crate::tool::search::ScanSnapshot>>,
-    > = Default::default();
-    // §10.1：session-local bounded SnapshotStore。
-    let snapshot_store: std::sync::Arc<std::sync::Mutex<crate::tool::edit::SnapshotStore>> =
-        Default::default();
-    // §13：原子短计划（update_plan 原子替换；每次请求注入 snapshot）。
-    let current_plan: std::sync::Arc<std::sync::Mutex<Option<crate::tool::plan::Plan>>> =
-        Default::default();
+    // 工具共享状态与 ToolContext 构造由 run-scoped runtime 统一管理。
+    let tool_runtime = ToolRuntime::new(
+        config,
+        session.session_id().to_string(),
+        cancel.clone(),
+        interactive,
+    );
 
     let mut usage_total = Usage::default();
     let mut turn = 0u32;
@@ -271,22 +270,16 @@ pub async fn run<P: Provider>(
                 config.model.max_output_tokens.unwrap_or(0) as u64,
                 config.safety_reserve_tokens,
             );
-            let system_prompt = system_prompt_text(
-                config,
-                crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
-                None,
-            );
+            let plan = tool_runtime.plan_snapshot();
+            let system_prompt = system_prompt_text(config, plan.as_ref(), None);
             let projected = crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
             if crate::context::should_compact(projected, usable) && !compaction_failed {
                 match compact_turn(provider, &mut messages, session, config, &cancel).await {
                     Ok(()) => {
                         // P1-4：compaction 成功后若仍无法容纳（窗口过小），
                         // 不再发起普通请求（必然 length error），明确结束并提示用户。
-                        let system_prompt = system_prompt_text(
-                            config,
-                            crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
-                            None,
-                        );
+                        let plan = tool_runtime.plan_snapshot();
+                        let system_prompt = system_prompt_text(config, plan.as_ref(), None);
                         let after =
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
@@ -307,11 +300,8 @@ pub async fn run<P: Provider>(
                         // 确定性 prune 兜底（§15.3：只影响投影）。
                         messages = crate::context::prune_messages(messages);
                         // P1-4：prune 后仍超窗口（如 user 消息本身巨大）→ 明确结束。
-                        let system_prompt = system_prompt_text(
-                            config,
-                            crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
-                            None,
-                        );
+                        let plan = tool_runtime.plan_snapshot();
+                        let system_prompt = system_prompt_text(config, plan.as_ref(), None);
                         let after =
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
@@ -349,12 +339,13 @@ pub async fn run<P: Provider>(
             } else {
                 Some(STREAM_RECOVERY_INSTRUCTION.replace("{partial}", &content))
             };
+            let plan = tool_runtime.plan_snapshot();
             let request = ModelRequest {
                 model: config.model.name.clone(),
                 messages: build_context(
                     config,
                     &messages,
-                    crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
+                    plan.as_ref(),
                     ephemeral_system.as_deref(),
                 ),
                 tools: tool_defs.clone(),
@@ -369,11 +360,9 @@ pub async fn run<P: Provider>(
                     config.model.max_output_tokens.unwrap_or(0) as u64,
                     config.safety_reserve_tokens,
                 );
-                let system_prompt = system_prompt_text(
-                    config,
-                    crate::util::lock_mutex(&current_plan, "current_plan").as_ref(),
-                    ephemeral_system.as_deref(),
-                );
+                let plan = tool_runtime.plan_snapshot();
+                let system_prompt =
+                    system_prompt_text(config, plan.as_ref(), ephemeral_system.as_deref());
                 let projected =
                     crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                 let _ = ui
@@ -616,12 +605,8 @@ pub async fn run<P: Provider>(
                 session,
                 &mut messages,
                 &mut progress,
-                &scan_snapshots,
-                &snapshot_store,
-                &current_plan,
-                &cancel,
+                &tool_runtime,
                 &ui,
-                interactive,
             )
             .await?;
             if batch == BatchEnd::BudgetExceeded {
@@ -762,7 +747,6 @@ enum BatchEnd {
 /// 3. 同 wave 无冲突 Pure/Read 并行（受 `max_parallel_tools` 限制）；
 ///    Write / WorkspaceUnknown 按源顺序；
 /// 4. 结果无论完成先后都按原 call index 送回 provider（§12.2 第 6 条）。
-#[allow(clippy::too_many_arguments)]
 async fn execute_batch(
     calls: Vec<ToolCall>,
     tool_calls_total: &mut u32,
@@ -770,14 +754,8 @@ async fn execute_batch(
     session: &mut SessionLog,
     messages: &mut Vec<ChatMessage>,
     progress: &mut crate::agent::scheduler::ProgressTracker,
-    scan_snapshots: &std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, crate::tool::search::ScanSnapshot>>,
-    >,
-    snapshot_store: &std::sync::Arc<std::sync::Mutex<crate::tool::edit::SnapshotStore>>,
-    current_plan: &std::sync::Arc<std::sync::Mutex<Option<crate::tool::plan::Plan>>>,
-    cancel: &CancellationToken,
+    tool_runtime: &ToolRuntime,
     ui: &mpsc::Sender<RuntimeEvent>,
-    interactive: bool,
 ) -> Result<BatchEnd, RunFailure> {
     use crate::agent::scheduler::{
         PreparedCall, action_key, build_waves, stable_observation, state_stamp_from_ctx,
@@ -960,20 +938,7 @@ error: invalid_arguments
             let args = call.args.clone();
             let action_key = call.action_key.clone();
             let access = call.access.clone();
-            let ctx = tool::ToolContext {
-                workspace_root: config.workspace_root.clone(),
-                allow_outside_workspace: config.allow_outside_workspace,
-                cancel: cancel.clone(),
-                artifacts_root: config.artifacts_root.clone(),
-                session_id: session.session_id().to_string(),
-                call_id: calls[source_index].call_id,
-                output_tx: Some(output_tx.clone()),
-                scan_snapshots: scan_snapshots.clone(),
-                shell_path: config.shell_path.clone(),
-                snapshot_store: snapshot_store.clone(),
-                current_plan: current_plan.clone(),
-                interactive,
-            };
+            let ctx = tool_runtime.context(calls[source_index].call_id, Some(output_tx.clone()));
             // §12.3：StateStamp（access footprint revisions + workspace epoch）。
             let state_stamp = format!(
                 "{}|{}",
@@ -1025,20 +990,7 @@ error: invalid_arguments
                     .find(|p| p.source_index == index)
                     .map(|p| p.access.clone())
                     .unwrap_or(crate::agent::scheduler::ToolAccess::Pure);
-                let ctx = tool::ToolContext {
-                    workspace_root: config.workspace_root.clone(),
-                    allow_outside_workspace: config.allow_outside_workspace,
-                    cancel: cancel.clone(),
-                    artifacts_root: config.artifacts_root.clone(),
-                    session_id: session.session_id().to_string(),
-                    call_id: calls[index].call_id,
-                    output_tx: None,
-                    scan_snapshots: scan_snapshots.clone(),
-                    shell_path: config.shell_path.clone(),
-                    snapshot_store: snapshot_store.clone(),
-                    current_plan: current_plan.clone(),
-                    interactive,
-                };
+                let ctx = tool_runtime.context(calls[index].call_id, None);
                 format!(
                     "{}|{}",
                     state_stamp_from_ctx(&ctx, &access),
@@ -1054,7 +1006,7 @@ error: invalid_arguments
             progress.observe(&action_key, &observation, &state_stamp);
             // §13：update_plan 成功 → PlanReplaced durable event。
             if outcome.status == ToolStatus::Succeeded && calls[index].name == "update_plan" {
-                let plan = crate::util::lock_mutex(current_plan, "current_plan").clone();
+                let plan = tool_runtime.plan_snapshot();
                 if let Some(plan) = plan {
                     session
                         .append_event(&SessionEvent::PlanReplaced { plan: plan.clone() })
