@@ -915,9 +915,8 @@ fn execute_ui_effect(
             {
                 cancel.cancel();
             }
-            ui_state
-                .view
-                .push_line(LineKind::System, "已发送取消（Esc）；保留 session");
+            // §PointerHit：瞬时反馈用 footer hint，不污染 transcript。
+            ui_state.view.transient_hint = Some("已发送取消（Esc）；保留 session".into());
             false
         }
         // BUG-004：空闲 Ctrl-C 产生 Quit → app 层 break 主循环走正常退出（含终端 restore）。
@@ -930,10 +929,9 @@ fn execute_ui_effect(
             let text = ui_state.view.selected_text();
             if !text.is_empty() {
                 crate::clipboard::set_text(&text);
-                ui_state.view.push_line(
-                    LineKind::System,
-                    format!("已复制 {} 行到剪贴板", text.lines().count()),
-                );
+                // §PointerHit：复制反馈用 footer hint，不污染 transcript。
+                ui_state.view.transient_hint =
+                    Some(format!("已复制 {} 行到剪贴板", text.lines().count()));
             }
             // 复制后清除选区（高亮消失）。
             ui_state.view.selection_clear();
@@ -1016,23 +1014,19 @@ async fn run_interactive<P: Provider>(
                             match effect {
                                 UiEffect::CancelRun => {
                                     cancel.cancel();
-                                    ui_state.view.push_line(
-                                        LineKind::System,
-                                        "已发送取消（Esc）；保留 session",
-                                    );
+                                    // §PointerHit：瞬时反馈用 footer hint。
+                                    ui_state.view.transient_hint =
+                                        Some("已发送取消（Esc）；保留 session".into());
                                 }
                                 // §PointerHit：Ctrl+C 有选区时复制（run 中也可复制）。
                                 UiEffect::CopySelection => {
                                     let text = ui_state.view.selected_text();
                                     if !text.is_empty() {
                                         crate::clipboard::set_text(&text);
-                                        ui_state.view.push_line(
-                                            LineKind::System,
-                                            format!(
-                                                "已复制 {} 行到剪贴板",
-                                                text.lines().count()
-                                            ),
-                                        );
+                                        ui_state.view.transient_hint = Some(format!(
+                                            "已复制 {} 行到剪贴板",
+                                            text.lines().count()
+                                        ));
                                     }
                                     ui_state.view.selection_clear();
                                 }

@@ -2518,8 +2518,16 @@ fn draw_footer(
         && usable > 0
     {
         let ratio = projected as f64 / usable as f64;
-        let filled = ((ratio * 20.0) as usize).clamp(0, 20);
-        let bar: String = "█".repeat(filled) + &"░".repeat(20 - filled);
+        // §PointerHit 22：bar 长度随终端宽度变化（窄屏减小，避免占比过大）。
+        let bar_cells = if area.width >= 100 {
+            20
+        } else if area.width >= 80 {
+            14
+        } else {
+            8
+        };
+        let filled = ((ratio * bar_cells as f64) as usize).clamp(0, bar_cells);
+        let bar: String = "█".repeat(filled) + &"░".repeat(bar_cells - filled);
         let style = if ratio >= 0.9 {
             theme.error
         } else if ratio >= 0.7 {
@@ -2570,7 +2578,20 @@ fn draw_footer(
             Style::default().fg(theme.warning),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    // §PointerHit 21：footer 按可用宽度裁剪——保留前面高优先级（workspace/
+    // model/status），窄屏丢弃尾部（ctx bar/tokens/cost 等由拼序体现）。
+    let available = area.width as usize;
+    let mut clipped: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        let w = crate::tui::text::display_width(span.content.as_ref());
+        if used + w > available {
+            break;
+        }
+        clipped.push(span);
+        used += w;
+    }
+    frame.render_widget(Paragraph::new(Line::from(clipped)), area);
 }
 
 /// §24：全屏历史垂直 scrollbar——1 列，thumb 比例按 visual 行数（不是 entry 数）。

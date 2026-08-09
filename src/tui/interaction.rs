@@ -174,7 +174,8 @@ pub enum PointerGesture {
 }
 
 /// 拖动进入 selection 的最小位移（cells；Manhattan 距离）。
-const DRAG_THRESHOLD: i32 = 2;
+/// §PointerHit：3（原 2）——减少工具卡片主行「点击误判为拖选」的误触。
+const DRAG_THRESHOLD: i32 = 3;
 
 impl PointerGesture {
     /// 喂入一个指针事件，返回要发给 reducer 的语义事件。
@@ -393,15 +394,15 @@ mod tests {
         let action = PointerAction::Tool("c1".into());
         let origin = PointerHit::actionable(tp(1, 5), action);
         let _ = g.feed(down(5, 5, origin));
-        // 位移超过阈值（3 cells），拖入文本区域（动作与文本可共存）。
-        let events = g.feed(drag(8, 5, PointerHit::text_at(tp(1, 5))));
+        // 位移超过阈值（4 cells > 3），拖入文本区域（动作与文本可共存）。
+        let events = g.feed(drag(9, 5, PointerHit::text_at(tp(1, 5))));
         assert!(
             events.contains(&UiEvent::SelectionStart(tp(1, 5))),
             "拖动必须发 SelectionStart: {events:?}"
         );
         assert!(events.contains(&UiEvent::SelectionUpdate(tp(1, 5))));
         // 抬起：结束选择，不是 click。
-        let events = g.feed(up(8, 5, PointerHit::text_at(tp(1, 5))));
+        let events = g.feed(up(9, 5, PointerHit::text_at(tp(1, 5))));
         assert!(events.contains(&UiEvent::SelectionEnd));
         assert!(!events.contains(&UiEvent::ClickTool("c1".into())));
     }

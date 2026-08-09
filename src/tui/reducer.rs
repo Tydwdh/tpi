@@ -153,6 +153,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.editor.submit()
             };
             if !text.is_empty() {
+                // §PointerHit：运行中提交立即在 footer 提示（不写 transcript，
+                // 避免消费时重复显示；实际 User 消息在消费时入 transcript）。
+                if state.running {
+                    state.view.transient_hint = Some(format!("已排队：{text}"));
+                }
                 state.push_pending(text);
             }
             // 提交后 editor 已清空，必须同步 view.input，否则发送的文本仍显示在输入框。
