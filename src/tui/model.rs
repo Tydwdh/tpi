@@ -467,9 +467,6 @@ pub struct ViewModel {
     /// 鼠标点击命中的目标（工具卡片/reasoning 行；§24 高亮反馈）。
     /// Overlay 打开期间该行高亮；关闭 Overlay 后清除。
     pub active_hit: Option<crate::tui::HitTarget>,
-    /// §美化：鼠标悬停的工具卡片 id（hover 微高亮；移出/点其他区域清除）。
-    /// 与 `active_hit`（点击后的持久高亮）独立——hover 是瞬态提示。
-    pub hover_tool: Option<String>,
     /// 应用内选择复制（语义位置：entry + 逻辑文本偏移，不依赖屏幕坐标；
     /// resize/rewrap/滚动不改变选中内容）。`Some` = 正在选择或已有选区。
     pub selection: Option<crate::tui::interaction::TextSelection>,
@@ -523,7 +520,6 @@ impl Default for ViewModel {
             reasoning_visible: false,
             reasoning_expanded: std::collections::HashSet::new(),
             active_hit: None,
-            hover_tool: None,
             selection: None,
             input_tokens: 0,
             output_tokens: 0,
@@ -1336,6 +1332,10 @@ impl ViewModel {
         let ToolIdentity { id, name } = identity.into();
         let name = crate::tui::text::truncate_middle_utf8(&name, MAX_TOOL_NAME, "…");
         let tail = tail.into();
+        // §用户诉求：TUI 卡片只显示用户可见内容——剥离面向模型的 envelope
+        // 元数据头（status/revision/path/lines 等）。入库即净化：渲染与复制
+        // 共用同一文本，语义 offset 不漂移；模型上下文仍读完整 model_payload。
+        let tail = user_visible_output(&name, &tail);
         if let Some(mut tool) = self.live.tools.remove(&id) {
             tool.card.name = name;
             tool.card.state = ToolCardState::Done {
@@ -1676,6 +1676,82 @@ fn canonical_semantic_text(kind: LineKind, raw: &str) -> String {
     }
 }
 
+/// 用户视图净化：把工具结果的模型 envelope 转为用户可见正文
+/// （§用户诉求：「给用户看的信息去掉给 AI 看的信息」）。
+///
+/// 工具返回给模型的 `output` 以 `status:/[revision=]/path:/lines:` 等元数据
+/// 头开头，这些面向模型（下一步决策/重试定位），对终端用户是噪音。TUI 卡片
+/// 只展示正文与错误诊断；revision/path/lines/status/cursor 等 AI 元数据剥掉。
+/// 路径已在卡片主行 target 展示，错误码在卡片 meta（`· exit N`）展示。
+///
+/// 在 `finish_tool` 入库时调用一次——渲染与复制共用净化后文本，offset 不漂移。
+fn user_visible_output(name: &str, text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    // 面向模型的元数据行（按前缀识别，保留诊断行如 error:/exit_code:）。
+    let is_ai_meta = |l: &&str| {
+        l.starts_with("status:")
+            || l.starts_with("tool:")
+            || l.starts_with("[revision=")
+            || l.starts_with("path:")
+            || l.starts_with("lines:")
+            || l.starts_with("previous_revision:")
+            || l.starts_with("current_revision:")
+            || l.starts_with("revision:")
+            || l.starts_with("cursor:")
+    };
+    match name {
+        // bash/run：`…output: N bytes` 头之后才是实际输出（stdout/stderr 正文）。
+        "bash" | "run" => {
+            if let Some(idx) = lines.iter().position(|l| l.starts_with("output: ")) {
+                let body = lines[idx + 1..]
+                    .iter()
+                    .skip_while(|l| l.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>();
+                if !body.is_empty() {
+                    return body.join("\n");
+                }
+            }
+            // 无标准头（rejected/cancelled/…）→ 剥元数据行，保留错误诊断。
+            lines
+                .iter()
+                .filter(|l| !is_ai_meta(l))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        // read：`[revision]/path/lines` 头之后是文件内容。
+        "read" => {
+            if let Some(idx) = lines.iter().position(|l| l.is_empty()) {
+                let body = lines[idx + 1..]
+                    .iter()
+                    .skip_while(|l| l.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>();
+                if !body.is_empty() {
+                    return body.join("\n");
+                }
+            }
+            lines
+                .iter()
+                .filter(|l| !is_ai_meta(l))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        // 其余（edit/write/search/list/web_search/update_plan/…）：剥元数据行。
+        _ => lines
+            .iter()
+            .filter(|l| !is_ai_meta(l))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
 /// 工具卡片的语义文本（§PointerHit：copy 从内容提取，不反推渲染结果）。
 /// 主行必须与渲染的 `card_semantic_header` **完全一致**（name target meta）——
 /// §修复：此前漏了 meta，主行语义比渲染短，selected_text 的 offset 与
@@ -1733,6 +1809,42 @@ fn bound_output(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §用户诉求：TUI 卡片只显示用户可见正文——面向模型的 envelope 元数据头
+    /// （status/revision/path/lines/cursor 等）剥掉；错误诊断保留。
+    #[test]
+    fn user_visible_output_strips_ai_metadata() {
+        // bash：`output:` 头之后是实际输出。
+        let bash = "status: succeeded\nprogram: bash\nexit_code: 0\nduration_ms: 42\noutput: 11 bytes\n\nhello world";
+        assert_eq!(user_visible_output("bash", bash), "hello world");
+        // read：`[revision]/path/lines` 头之后是文件内容。
+        let read = "[revision=b3:abc]\npath: src/main.rs\nlines: 1-10 of 20\n\nfn main() {}";
+        assert_eq!(user_visible_output("read", read), "fn main() {}");
+        // edit：剥 revision 元数据，保留 applied 摘要（path 已在卡片 target）。
+        let edit = "status: succeeded\ntool: edit\npath: src/a.rs\napplied: replaced 2 of 2\nprevious_revision: b3:aaa\ncurrent_revision: b3:bbb";
+        assert_eq!(
+            user_visible_output("edit", edit),
+            "applied: replaced 2 of 2"
+        );
+        // search：剥 status，保留扫描统计与命中正文。
+        let search = "status: succeeded\nscanned_files: 42\nscanned_bytes: 12345\nelapsed_ms: 3\nstop_reason: complete\nitems: 2 shown of 2\n\na.txt:1: hit";
+        let out = user_visible_output("search", search);
+        assert!(
+            out.contains("scanned_files: 42") && out.contains("hit"),
+            "扫描统计与命中保留: {out:?}"
+        );
+        assert!(!out.contains("status:"), "status 头必须剥掉: {out:?}");
+        // 失败诊断保留（error 行不剥）。
+        let err = "status: failed\ntool: read\nerror: artifact_not_found";
+        let out = user_visible_output("read", err);
+        assert!(out.contains("error: artifact_not_found"), "{out:?}");
+        assert!(!out.contains("status:"));
+        // 无元数据的纯文本原样返回（只归一化末尾换行）。
+        assert_eq!(
+            user_visible_output("bash", "line-1\nline-2\n"),
+            "line-1\nline-2"
+        );
+    }
 
     #[test]
     fn streaming_chunks_form_one_logical_message() {
@@ -2014,8 +2126,9 @@ mod tests {
         let Entry::Tool { card, .. } = &view.transcript[0] else {
             panic!();
         };
-        // 成功也保留完整输出（此前被丢弃）。
-        assert_eq!(card.output.as_deref(), Some("line-1\nline-2\n"));
+        // 成功也保留完整输出（此前被丢弃）；净化只剥元数据头，正文原样
+        //（lines() 归一化会去掉末尾换行）。
+        assert_eq!(card.output.as_deref(), Some("line-1\nline-2"));
         assert_eq!(card.tail, None, "成功卡片折叠态不显示红色 tail");
         assert!(!card.expanded);
         // 展开切换。

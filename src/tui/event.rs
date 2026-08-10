@@ -17,11 +17,8 @@ pub enum UiEvent {
     MouseScrollUp,
     /// 滚轮向下（5 行）。
     MouseScrollDown,
-    /// 鼠标移动（§24 hover 高亮；命中可点击行时高亮显示）。
+    /// 鼠标移动（§用户诉求：移除 hover 悬浮高亮——事件保留为穷尽占位）。
     MouseMoved { column: u16, row: u16 },
-    /// 鼠标悬停在工具卡片上（§美化 hover 微高亮）：Some(id) = 悬停中，
-    /// None = 移出卡片/非卡片区域。仅悬停**变化**时由 reducer 更新状态。
-    HoverTool(Option<String>),
     /// 应用内选择复制（§用户诉求）：鼠标按下开始拖动选择。
     /// 携带**语义位置**（entry + 逻辑偏移），不依赖屏幕坐标。
     SelectionStart(TextPosition),

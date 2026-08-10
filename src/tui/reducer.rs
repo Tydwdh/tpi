@@ -546,15 +546,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             }
             Vec::new()
         }
-        // §美化：鼠标悬停 → 卡片 hover 微高亮。判重：状态未变化（悬停同一张
-        // 卡片 / 移出后仍在非卡片区）不重复渲染。
-        UiEvent::HoverTool(id) => {
-            if state.view.hover_tool != id {
-                state.view.hover_tool = id;
-            }
-            Vec::new()
-        }
-        // MouseMoved 保留为穷尽占位（hover 语义由 HoverTool 承载）。
+        // MouseMoved 保留为穷尽占位（§用户诉求：已移除 hover 悬浮高亮）。
         UiEvent::MouseMoved { .. } => Vec::new(),
         // §InteractionRefactor：语义选择事件由 reducer 直接写入 view（不再
         // 依赖 Renderer 坐标——TextPosition 指向内容）。SelectionEnd 保留选区。
@@ -574,8 +566,6 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new(); // 弹层打开时鼠标点击不得打开后台 overlay
             }
-            state.view.hover_tool = None;
-            // §用户诉求：点击工具卡片展开/收缩（diff 折叠态显示，展开看完整）。
             state.view.toggle_expand(id);
             Vec::new()
         }
@@ -583,7 +573,6 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new();
             }
-            state.view.hover_tool = None;
             // §PointerHit：live reasoning 折叠行点击 → 切换全局展开；
             // 历史 reasoning → 按条目展开（与 diff 一致）。
             let in_transcript = state.view.transcript.iter().any(|entry| entry.id() == id);
@@ -600,7 +589,6 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new();
             }
-            state.view.hover_tool = None;
             state.view.overlay = Some(crate::tui::model::OverlayState::for_link(&url));
             Vec::new()
         }

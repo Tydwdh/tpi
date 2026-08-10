@@ -1178,29 +1178,17 @@ fn semantic_text_cache_reused_across_copies() {
     assert_eq!(text1, text2, "重复提取结果一致");
 }
 
-/// §美化：HoverTool 事件更新 view.hover_tool；重复相同值不产生状态变化；
-/// 点击卡片清除 hover。
+/// §用户诉求：已移除 hover 悬浮高亮——鼠标移动不再更新任何状态；
+/// 点击卡片仍正常展开。
 #[test]
-fn hover_tool_updates_state_and_click_clears() {
+fn click_tool_expands_without_hover_state() {
     let mut s = state();
-    // 悬停卡片。
-    let effects = reducer::update(&mut s, UiEvent::HoverTool(Some("c1".into())));
-    assert!(effects.is_empty());
-    assert_eq!(s.view.hover_tool.as_deref(), Some("c1"));
-    // 移出 → 清除。
-    let _ = reducer::update(&mut s, UiEvent::HoverTool(None));
-    assert!(s.view.hover_tool.is_none());
-    // 再次悬停 → 点击卡片 → hover 清除（展开动作不受影响）。
-    let _ = reducer::update(&mut s, UiEvent::HoverTool(Some("c1".into())));
+    // 点击卡片 → 展开（不依赖任何 hover 状态）。
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
         .finish_tool(("c1", "bash"), ToolStatus::Failed, 1, Some(1), "err", None);
-    let _ = reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
-    assert!(
-        s.view.hover_tool.is_none(),
-        "点击卡片必须清除 hover（点击即离开 hover 态）"
-    );
-    // 展开切换生效（整卡可点：点击内容行同样展开——这里验证 toggle 语义）。
+    let effects = reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
+    assert!(effects.is_empty());
     let expanded = match &s.view.transcript[0] {
         tpi::tui::model::Entry::Tool { card, .. } => card.expanded,
         _ => false,

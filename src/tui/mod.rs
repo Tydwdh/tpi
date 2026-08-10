@@ -842,6 +842,12 @@ fn wrap_with_semantic(
         let semantic = semantic_lines.get(line_idx);
         let logical_links: &[LinkRange] = semantic.map(|s| s.links.as_slice()).unwrap_or(&[]);
         let decor = semantic.map(|s| s.decor_cells).unwrap_or(0);
+        // §用户诉求：逻辑行有视觉前缀（rail/icon）时，折行/换行后的续行
+        // 补同一前缀，最左竖线不中断。前缀 span 在语义文本之外（decor）。
+        let rail = semantic.and_then(|s| s.rail.clone());
+        let rail_w = rail.as_ref().map_or(0, |s| {
+            unicode_width::UnicodeWidthStr::width(s.content.as_ref())
+        });
         let line_start = entry_offset;
         let mut line_consumed = 0usize;
         // 逻辑行内 cell 位置（判断是否越过 decor；只在逻辑行首段有效）。
@@ -902,6 +908,12 @@ fn wrap_with_semantic(
                             line_start,
                             logical_links,
                         );
+                        // 续段补 rail（竖线连续；decor 仅 rail 宽，语义继续）。
+                        if let Some(rail_span) = &rail {
+                            cur.push(rail_span.clone());
+                            cur_w = rail_w;
+                            cur_decor = rail_w;
+                        }
                     } else {
                         out.push(WrappedRow {
                             line: Line::default(),
@@ -916,7 +928,7 @@ fn wrap_with_semantic(
                 }
                 let w = crate::tui::text::char_cell_width(ch);
                 let is_decor = is_line_start && line_cell < decor;
-                // 超宽折行：先 flush 当前视觉行。
+                // 超宽折行：先 flush 当前视觉行，续行补 rail。
                 if cur_w + w > width && !cur.is_empty() {
                     push_wrapped_row(
                         &mut out,
@@ -933,6 +945,11 @@ fn wrap_with_semantic(
                     cur_sem_start = None;
                     cur_hit = hit.clone();
                     is_line_start = false;
+                    if let Some(rail_span) = &rail {
+                        cur.push(rail_span.clone());
+                        cur_w = rail_w;
+                        cur_decor = rail_w;
+                    }
                 }
                 if !is_decor {
                     // 内容字符：推进语义累积。
@@ -1105,11 +1122,14 @@ pub type HitRange = (HitTarget, u16);
 ///   在视觉行中的起始 cell 列 = decor_cells；精确的 cell↔char 映射依赖它
 ///   （§PointerHit：`│ AI` 等前缀不参与语义偏移）。
 /// - `links`：该逻辑行内可点击链接（char 偏移基于语义文本；§成熟化）。
+/// - `rail`：该逻辑行的视觉前缀 span（rail/icon）。§用户诉求：长行换行后
+///   最左竖线被截断——wrap 折行时把该前缀补到续行，竖线连续不中断。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SemanticLine {
     text: String,
     decor_cells: usize,
     links: Vec<LinkRange>,
+    rail: Option<Span<'static>>,
 }
 
 /// 按 entry 分组的渲染结果：(EntryId, 逻辑行, 逐行 hits, 逐行语义信息)。
@@ -1152,22 +1172,6 @@ fn full_line_hit(target: HitTarget, width: u16) -> Option<HitRange> {
     Some((target, width))
 }
 
-/// RGB 颜色提亮（§美化 hover 微高亮：卡片 panel 底提亮一档，对应 opencode
-/// backgroundElement 递进）。非 RGB 色（终端默认等）原样返回。
-fn lighten(color: ratatui::style::Color) -> ratatui::style::Color {
-    if let ratatui::style::Color::Rgb(r, g, b) = color {
-        let step = |v: u8| -> u8 {
-            // 向 255 提亮 12%，最小 +8（保证可见差）。
-            let v = u16::from(v);
-            let lifted = v + ((255 - v) * 12) / 100;
-            u8::try_from(lifted.max(v + 8)).unwrap_or(255)
-        };
-        ratatui::style::Color::Rgb(step(r), step(g), step(b))
-    } else {
-        color
-    }
-}
-
 /// 把转录条目渲染为逻辑行（Message 按类型着色/加 rail；Tool 渲染为卡片）。
 ///
 /// 返回按 entry 分组的结果（含 live 哨兵组，§7.2）。
@@ -1199,12 +1203,20 @@ fn build_transcript_text(
         );
         let text_width = unicode_width::UnicodeWidthStr::width(semantic_text.as_str());
         let decor_cells = line_width.saturating_sub(text_width);
+        // 有装饰前缀（rail/icon）时记住首个 span：wrap 折行后续行补同一前缀
+        // （§用户诉求：换行竖线不截断）。纯装饰/空行（decor=0）无 rail。
+        let rail = if decor_cells > 0 {
+            line.spans.first().cloned()
+        } else {
+            None
+        };
         lines.push(line);
         hits.push(hit);
         semantic.push(SemanticLine {
             text: semantic_text,
             decor_cells,
             links,
+            rail,
         });
     };
     // 搜索命中集合（高亮用，§14）：只作用于 transcript，live 区不参与。
@@ -1520,36 +1532,6 @@ fn build_transcript_text(
                 .collect();
             out = highlighted;
         }
-        // §美化：鼠标悬停卡片 → 整卡微高亮（panel 背景提亮一档，opencode
-        // backgroundElement 手法）。只替换 panel 底（diff 红绿/其他状态色
-        // 保持主导）；补空格机制在 plan_window 按首个 bg span 生效，替换后
-        // 整行仍填满 hover 色。
-        if let Some(hover_id) = view.hover_tool.as_deref()
-            && let Entry::Tool { card, .. } = entry
-            && card.id == hover_id
-        {
-            let hover_bg = lighten(theme.panel);
-            let hovered = std::mem::take(&mut out)
-                .into_iter()
-                .map(|line| {
-                    Line::from(
-                        line.spans
-                            .into_iter()
-                            .map(|span| {
-                                // 只替换 panel 底（diff 红绿/状态色保持主导）。
-                                let style = span.style;
-                                if style.bg == Some(theme.panel) {
-                                    Span::styled(span.content, style.bg(hover_bg))
-                                } else {
-                                    Span::styled(span.content, style)
-                                }
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect();
-            out = hovered;
-        }
         // §美化：块间间隔一行（opencode marginTop=1 留白即分隔）。
         // User/Assistant/Reasoning 消息 + 工具卡片都间隔；System 提示与
         // 旧 Tool 文本行保持紧凑。
@@ -1569,6 +1551,7 @@ fn build_transcript_text(
                 text: String::new(),
                 decor_cells: 0,
                 links: Vec::new(),
+                rail: None,
             });
         }
         groups.push((
@@ -1629,7 +1612,7 @@ fn build_live_group(
             .add_modifier(Modifier::BOLD);
         if view.reasoning_visible {
             for s in msg.text.split('\n') {
-                out.push(Line::from(vec![
+                let line = Line::from(vec![
                     Span::styled("┃ ", rail_style),
                     Span::styled(
                         format!("◆ 思考 {s}"),
@@ -1638,12 +1621,15 @@ fn build_live_group(
                             .bg(theme.panel)
                             .add_modifier(Modifier::ITALIC),
                     ),
-                ]));
+                ]);
+                let rail = line.spans.first().cloned();
+                out.push(line);
                 hits.push(None);
                 semantic.push(SemanticLine {
                     text: s.to_string(),
                     decor_cells: 10, // "┃ ◆ 思考 " 前缀
                     links: Vec::new(),
+                    rail,
                 });
             }
         } else {
@@ -1664,6 +1650,7 @@ fn build_live_group(
                 text: String::new(),
                 decor_cells: 0,
                 links: Vec::new(),
+                rail: None,
             });
         }
         groups.push((
@@ -1714,12 +1701,14 @@ fn build_live_group(
                     .as_str(),
             );
             let text_width = unicode_width::UnicodeWidthStr::width(semantic_text.as_str());
+            let rail = line.spans.first().cloned();
             out.push(line);
             hits.push(None);
             semantic.push(SemanticLine {
                 text: semantic_text,
                 decor_cells: line_width.saturating_sub(text_width),
                 links: line_links.get(i).cloned().unwrap_or_default(),
+                rail,
             });
         }
         groups.push((
@@ -1754,12 +1743,14 @@ fn build_live_group(
                 };
                 let line_width = unicode_width::UnicodeWidthStr::width(raw_text.as_str());
                 let text_width = unicode_width::UnicodeWidthStr::width(semantic_text.as_str());
+                let rail = line.spans.first().cloned();
                 out.push(line);
                 hits.push(hit);
                 semantic.push(SemanticLine {
                     text: semantic_text,
                     decor_cells: line_width.saturating_sub(text_width),
                     links: Vec::new(),
+                    rail,
                 });
             }
             groups.push((
@@ -2972,7 +2963,8 @@ mod tests {
         );
     }
 
-    /// §用户诉求：unified diff 红绿背景（+ 绿底 / - 红底 / @@ 主色）。
+    /// §用户诉求：unified diff 只改文字色（+ 绿字 / - 红字 / @@ 主色），
+    /// 不改背景——深色面板底上的红绿文字，避免整行红绿底刺眼。
     #[test]
     fn diff_lines_render_with_add_remove_colors() {
         let theme = theme::Theme::omp();
@@ -2980,18 +2972,20 @@ mod tests {
         let lines = render_diff_lines(diff, theme);
         // 行数 = diff 行数（7 行：--- +++ @@ 上下文 - + 上下文）。
         assert_eq!(lines.len(), 7, "每行一个 Line: {lines:?}");
-        // - 行 → error 背景（红底）。
+        // - 行 → error 前景（红字），无背景。
         let minus = lines
             .iter()
             .find(|l| l.spans[0].content.starts_with("-    let x = 1;"))
             .expect("找到 - 行");
-        assert_eq!(minus.style.bg, Some(theme.error));
-        // + 行 → success 背景（绿底）。
+        assert_eq!(minus.style.fg, Some(theme.error));
+        assert_eq!(minus.style.bg, None, "diff 行不带背景（只改前景色）");
+        // + 行 → success 前景（绿字），无背景。
         let plus = lines
             .iter()
             .find(|l| l.spans[0].content.starts_with("+    let x = 2;"))
             .expect("找到 + 行");
-        assert_eq!(plus.style.bg, Some(theme.success));
+        assert_eq!(plus.style.fg, Some(theme.success));
+        assert_eq!(plus.style.bg, None, "diff 行不带背景（只改前景色）");
         // @@ 行 → primary 色。
         let hunk = lines
             .iter()
@@ -3031,17 +3025,19 @@ mod tests {
             text.contains("let x = 1") && text.contains("let x = 2"),
             "未展开时 diff 必须显示: {text:?}"
         );
-        // diff 行带红/绿背景。
+        // diff 行只改前景色（红/绿字），面板底统一由卡片承担。
         let minus = lines
             .iter()
             .find(|l| l.spans.iter().any(|s| s.content.contains("let x = 1")))
             .expect("找到 - 行");
-        assert_eq!(minus.style.bg, Some(theme.error), "删除行红底");
+        assert_eq!(minus.style.fg, Some(theme.error), "删除行红字");
+        assert_eq!(minus.style.bg, None, "diff 行不带红底");
         let plus = lines
             .iter()
             .find(|l| l.spans.iter().any(|s| s.content.contains("let x = 2")))
             .expect("找到 + 行");
-        assert_eq!(plus.style.bg, Some(theme.success), "新增行绿底");
+        assert_eq!(plus.style.fg, Some(theme.success), "新增行绿字");
+        assert_eq!(plus.style.bg, None, "diff 行不带绿底");
     }
 
     /// §用户诉求：diff 自动展开但限长——未展开时只显示前 N 行 + 折叠提示，
@@ -3761,6 +3757,7 @@ fn wrap_with_semantic_produces_exact_mapping() {
         text: "hello".to_string(),
         decor_cells: 7,
         links: Vec::new(),
+        rail: Some(Span::styled("│ ", Style::default())),
     };
     let rows = wrap_with_semantic(vec![line], vec![None], &[semantic], 80, entry_id);
     assert_eq!(rows.len(), 1, "短文本单行");
@@ -3774,7 +3771,7 @@ fn wrap_with_semantic_produces_exact_mapping() {
         "短文本首行 decor 必须是 rail 宽度（P0-2 修复）"
     );
 
-    // 长文本换行：语义行数 == 视觉行数，续行 decor=0。
+    // 长文本换行：语义行数 == 视觉行数，续行 decor=rail 宽、带竖线前缀。
     let long = "x".repeat(90); // 90 cell，宽 40 → 3 行。
     let line2 = Line::from(vec![
         Span::styled("│ ", Style::default()),
@@ -3785,18 +3782,38 @@ fn wrap_with_semantic_produces_exact_mapping() {
         text: long.clone(),
         decor_cells: 7,
         links: Vec::new(),
+        rail: Some(Span::styled("│ ", Style::default())),
     };
     let rows = wrap_with_semantic(vec![line2], vec![None], &[semantic2], 40, entry_id);
-    // 宽 40：首行内容容量 = 40-7 = 33 cell → "x"×33；续行 40 cell 各 40、17。
+    // 宽 40：首行内容容量 = 40-7 = 33 cell → "x"×33；续行带 rail（2）→
+    // 内容容量 38、19。
     assert_eq!(rows.len(), 3, "90 cell 内容宽 40 → 3 视觉行");
-    // 首行 decor=7，续行 decor=0。
+    // 首行 decor=7；续行 decor=rail 宽（2）——竖线前缀延续。
     assert_eq!(
         rows[0].semantic.as_ref().unwrap().decor,
         7,
         "首行 decor=rail"
     );
-    assert_eq!(rows[1].semantic.as_ref().unwrap().decor, 0, "续行 decor=0");
-    assert_eq!(rows[2].semantic.as_ref().unwrap().decor, 0, "末行 decor=0");
+    assert_eq!(
+        rows[1].semantic.as_ref().unwrap().decor,
+        2,
+        "续行 decor=rail 宽（竖线不截断）"
+    );
+    assert_eq!(
+        rows[2].semantic.as_ref().unwrap().decor,
+        2,
+        "末行 decor=rail 宽"
+    );
+    // 续行视觉行首 span 必须是竖线（§用户诉求：换行竖线连续）。
+    for (i, row) in rows.iter().enumerate().skip(1) {
+        let first = row
+            .line
+            .spans
+            .first()
+            .map(|s| s.content.as_ref())
+            .unwrap_or("");
+        assert_eq!(first, "│ ", "续行 {i} 首 span 必须是竖线前缀");
+    }
     // 语义文本拼接 = 原文。
     let joined: String = rows
         .iter()
@@ -3970,98 +3987,6 @@ fn highlighted_code_block_has_background() {
     }
 }
 
-/// §美化：hover 卡片 → panel 底提亮（diff 红绿保持主导）。
-#[test]
-fn hovered_card_brightens_panel_background() {
-    let mut view = ViewModel::default();
-    view.begin_tool("c1", "bash", Some("cmd".into()), None);
-    view.finish_tool(
-        ("c1", "bash"),
-        crate::tool::outcome::ToolStatus::Failed,
-        10,
-        Some(1),
-        "错误输出",
-        None,
-    );
-    view.hover_tool = Some("c1".to_string());
-    let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
-    let theme = theme::Theme::omp();
-    let hover_bg = lighten(theme.panel);
-    assert_ne!(hover_bg, theme.panel, "提亮必须产生可见差");
-    // 卡片所有行（主行 + 内容行）的 panel 底都替换为 hover 色；
-    // 跳过卡片后的留白空行（无 spans）。
-    for (i, line) in plan.window.iter().enumerate() {
-        if line.spans.is_empty() {
-            continue; // 留白空行（卡片间间隔）
-        }
-        let has_hover = line.spans.iter().any(|s| s.style.bg == Some(hover_bg));
-        assert!(
-            has_hover,
-            "hover 卡片行 {i} 必须带提亮背景: {:?}",
-            line.spans
-        );
-        assert!(
-            line.spans.iter().all(|s| s.style.bg != Some(theme.panel)),
-            "hover 时不得残留原 panel 底: {:?}",
-            line.spans
-        );
-    }
-}
-
-/// §美化：非 hover 卡片保持 panel 底（不高亮）。
-#[test]
-fn non_hovered_card_keeps_plain_panel() {
-    let mut view = ViewModel::default();
-    view.begin_tool("c1", "bash", Some("cmd".into()), None);
-    view.finish_tool(
-        ("c1", "bash"),
-        crate::tool::outcome::ToolStatus::Failed,
-        10,
-        Some(1),
-        "错误输出",
-        None,
-    );
-    // 无 hover 状态。
-    let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
-    let theme = theme::Theme::omp();
-    let first_row = &plan.window[0];
-    assert!(
-        first_row
-            .spans
-            .iter()
-            .any(|s| s.style.bg == Some(theme.panel)),
-        "卡片默认 panel 底保留"
-    );
-    assert!(
-        first_row
-            .spans
-            .iter()
-            .all(|s| s.style.bg != Some(lighten(theme.panel))),
-        "未悬停不得提亮"
-    );
-}
-
-/// §美化：lighten 对 RGB 提亮、对非 RGB 原样返回。
-#[test]
-fn lighten_lifts_rgb_only() {
-    let theme = theme::Theme::omp();
-    let lifted = lighten(theme.panel);
-    let ratatui::style::Color::Rgb(r, g, b) = lifted else {
-        panic!("RGB 输入必须产出 RGB");
-    };
-    let ratatui::style::Color::Rgb(pr, pg, pb) = theme.panel else {
-        unreachable!();
-    };
-    assert!(r > pr && g > pg && b > pb, "三通道都提亮");
-    // 非 RGB（终端默认）原样。
-    assert_eq!(
-        lighten(ratatui::style::Color::Reset),
-        ratatui::style::Color::Reset
-    );
-}
-
 /// BUG 回归：assistant 裸文本行含行内 code 时，行尾 padding 不得继承
 /// code 的 surface_subtle 背景（此前 find_map 抓到行内第一个 bg span）。
 #[test]
@@ -4101,10 +4026,10 @@ fn inline_code_bg_does_not_leak_into_trailing_padding() {
     }
 }
 
-/// BUG 回归：diff 行 padding 仍用 Line 级红绿底填充（行首 `│ ` 无 bg，
-/// fallback 到 line.style.bg）。
+/// §用户诉求：diff 行只改前景色——面板底统一由卡片承担，行尾 padding
+/// 用 panel 填满，绝不出现红/绿背景（也不再需要 Line 级红绿 fallback）。
 #[test]
-fn diff_line_padding_keeps_red_green_background() {
+fn diff_line_padding_keeps_panel_background() {
     let mut view = ViewModel::default();
     view.begin_tool("c1", "edit", Some("src/main.rs".into()), None);
     view.finish_tool(
@@ -4125,15 +4050,28 @@ fn diff_line_padding_keeps_red_green_background() {
         .position(|r| r.as_ref().is_some_and(|s| s.text.contains("let x = 1")))
         .expect("diff 删除行必须渲染");
     let line = &plan.window[row_idx];
-    // 该行存在全空格 padding span，且背景 = error（红）——Line 级红绿 fallback。
-    let has_red_pad = line.spans.iter().any(|s| {
+    // diff 行前景 = error（红字），背景统一 panel（无红/绿底）。
+    assert!(
+        line.spans.iter().any(|s| s.style.fg == Some(theme.error)),
+        "diff 删除行必须红字: {:?}",
+        line.spans
+    );
+    assert!(
+        line.spans
+            .iter()
+            .all(|s| s.style.bg != Some(theme.error) && s.style.bg != Some(theme.success)),
+        "diff 行不得带红/绿背景: {:?}",
+        line.spans
+    );
+    // 行尾 padding 用 panel 底填满（不是红/绿）。
+    let has_panel_pad = line.spans.iter().any(|s| {
         !s.content.is_empty()
             && s.content.chars().all(|c| c == ' ')
-            && s.style.bg == Some(theme.error)
+            && s.style.bg == Some(theme.panel)
     });
     assert!(
-        has_red_pad,
-        "diff 删除行尾必须用红色填充到满宽: {:?}",
+        has_panel_pad,
+        "diff 行尾必须用 panel 底填充到满宽: {:?}",
         line.spans
     );
 }

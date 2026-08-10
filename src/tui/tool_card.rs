@@ -1,6 +1,6 @@
 //! Tool-card rendering and semantic-text projection.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::model::{ToolCard, ToolCardState};
@@ -188,28 +188,32 @@ pub(super) fn tool_card_lines(
     };
     for l in shown {
         // §美化：内容行「前缀带 panel 背景」→ plan_window 整行填满 panel，
-        // 卡片主行+内容行同底成组（opencode 卡片"面"）。diff 行已自带
-        // 红绿背景——**必须落到每个 span**（wrap_with_semantic 逐字符重建
-        // Line 会丢 Line 级 style，红绿底将无法填充行尾 padding）。前缀
-        // 也带同 bg，让红绿主导整行；非 diff 行走 panel。
+        // 卡片主行+内容行同底成组（opencode 卡片"面"）。diff 行只带
+        // 前景色（§用户诉求：红绿文字、不改背景）——下方烙 span 时统一
+        // 用 panel 兜底，diff 的红绿 fg 与卡片面板共存；非 diff 行走 panel。
         let line_bg = l.style.bg;
         let prefix_style = match line_bg {
             Some(bg) => Style::default().fg(theme.muted).bg(bg),
             None => Style::default().fg(theme.muted).bg(theme.panel),
         };
         let mut spans = vec![Span::styled("│ ", prefix_style)];
-        // §修复：正文 span 烙背景——diff 行烙红绿，非 diff 行烙 panel
-        //（fill_bg 保留已有背景：inline code 等不被覆盖）。否则正文文字区
-        // 落到终端底色，与卡片面分离。
+        // §修复：正文 span 烙上 Line 级 style 的 fg/bg（diff 红绿、失败 tail
+        // 的 error 色等都在 Line 级——wrap_with_semantic 逐字符重建 span
+        // 只取 span 级 style，不烙就会丢失颜色）。已有 span 级 style 优先；
+        // 背景兜底 panel（卡片面），前景兜底 Line 级 fg。
         for s in &l.spans {
-            let style = match line_bg {
-                Some(bg) => s.style.bg(bg),
-                None => fill_bg(s.style, theme.panel),
-            };
+            let mut style = s.style;
+            if style.bg.is_none() {
+                style = style.bg(line_bg.unwrap_or(theme.panel));
+            }
+            if style.fg.is_none()
+                && let Some(fg) = l.style.fg
+            {
+                style = style.fg(fg);
+            }
             spans.push(Span::styled(s.content.clone(), style));
         }
-        // 非 diff 行保留 line fg（如失败 tail 的 error 色）；diff 行红绿已
-        // 落到 span，Line 级 style 仅供 render_diff_lines 单测断言使用。
+        // Line 级 style 保留（render_diff_lines 等单测按 line.style 断言）。
         lines.push(Line::from(spans).style(l.style));
     }
     // 统一折叠提示（opencode 式：溢出才显示，点击展开/收缩）。
@@ -229,16 +233,6 @@ pub(super) fn tool_card_lines(
         ));
     }
     lines
-}
-
-/// 给 span 烙上面板背景：span 已有背景（diff 红绿 / inline code 等）保留，
-/// 否则用 `bg` 填充。修复「正文文字区背景与卡片面不同」的三明治问题。
-fn fill_bg(style: Style, bg: Color) -> Style {
-    if style.bg.is_some() {
-        style
-    } else {
-        style.bg(bg)
-    }
 }
 
 /// 工具卡片主行的语义文本（复制源）：`name target  meta`。
@@ -308,18 +302,12 @@ pub(super) fn card_semantic_content(card: &ToolCard, index: usize, raw: &str) ->
     }
 }
 
-/// 渲染 unified diff 文本为红绿着色行（§16.2 增强：opencode 式 diff 展示）。
+/// 渲染 unified diff 文本为红绿着色行（§用户诉求：只改文字色、不改背景——
+/// 深色面板底上的红/绿文字，避免整行红绿背景刺眼）。
 ///
-/// 按行首判定（opencode 式红绿背景）：`+` → 绿底、`-` → 红底、`@@` → 主色、
-/// 文件头 → muted BOLD、上下文 → 默认。输入是 edit/write 的 unified diff。
+/// 按行首判定：`+` → 绿字、`-` → 红字、`@@` → 主色、文件头 → muted BOLD、
+/// 上下文 → 默认。背景统一由卡片 panel 底承担（tool_card_lines 烙 span）。
 pub(super) fn render_diff_lines(diff_text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
-    // 深色前景（绿/红底上的可读文字）。
-    let on_green = Style::default()
-        .bg(theme.success)
-        .fg(Color::Rgb(0x0d, 0x0f, 0x14));
-    let on_red = Style::default()
-        .bg(theme.error)
-        .fg(Color::Rgb(0x0d, 0x0f, 0x14));
     diff_text
         .lines()
         .map(|line| {
@@ -329,9 +317,10 @@ pub(super) fn render_diff_lines(diff_text: &str, theme: theme::Theme) -> Vec<Lin
                     .fg(theme.muted)
                     .add_modifier(Modifier::BOLD)
             } else if line.strip_prefix('+').is_some() {
-                on_green
+                // 仅前景色：成功色绿字，不带背景。
+                Style::default().fg(theme.success)
             } else if line.strip_prefix('-').is_some() {
-                on_red
+                Style::default().fg(theme.error)
             } else if line.starts_with("@@") {
                 Style::default()
                     .fg(theme.primary)

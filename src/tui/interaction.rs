@@ -286,13 +286,9 @@ impl PointerGesture {
                     }
                 }
             }
-            // §美化：悬停上报——命中文具卡片产出 HoverTool(Some(id))，
-            // 非卡片区域产出 HoverTool(None)（清除）。reducer 判重：
-            // 状态未变化时不重复渲染。
-            PointerInput::Move { hit, .. } => match hit.action {
-                Some(PointerAction::Tool(id)) => vec![UiEvent::HoverTool(Some(id))],
-                _ => vec![UiEvent::HoverTool(None)],
-            },
+            // §用户诉求：移除 hover 悬浮高亮——未按键移动不再上报悬停态，
+            // 卡片不做瞬态提亮（点击展开仍是唯一交互）。
+            PointerInput::Move { .. } => Vec::new(),
             PointerInput::ScrollUp => vec![UiEvent::MouseScrollUp],
             PointerInput::ScrollDown => vec![UiEvent::MouseScrollDown],
         }
@@ -618,9 +614,9 @@ mod tests {
         assert!(up_events.contains(&UiEvent::SelectionEnd));
     }
 
-    /// §美化：悬停工具卡片 → HoverTool(Some(id))；移出 → HoverTool(None)。
+    /// §用户诉求：移除 hover 悬浮高亮——未按键移动不产生任何事件。
     #[test]
-    fn move_over_tool_card_reports_hover() {
+    fn move_without_button_produces_no_events() {
         let mut g = PointerGesture::Idle;
         let action = PointerAction::Tool("c1".into());
         let hit = PointerHit::actionable(tp(1, 0), action);
@@ -630,19 +626,15 @@ mod tests {
             hit,
         });
         assert!(
-            events.contains(&UiEvent::HoverTool(Some("c1".into()))),
-            "悬停卡片必须上报 HoverTool: {events:?}"
+            events.is_empty(),
+            "移动不得上报 hover（已移除悬浮高亮）: {events:?}"
         );
-        // 移到空白/非卡片区域 → 清除。
         let events = g.feed(PointerInput::Move {
             column: 5,
             row: 5,
             hit: PointerHit::none(),
         });
-        assert!(
-            events.contains(&UiEvent::HoverTool(None)),
-            "移出卡片必须清除 hover: {events:?}"
-        );
+        assert!(events.is_empty(), "移出卡片同样不产生事件: {events:?}");
     }
 
     /// §InteractionRefactor：cell → char 映射必须按 cell 宽度而非字符数。
