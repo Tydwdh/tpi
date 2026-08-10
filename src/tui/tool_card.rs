@@ -73,20 +73,27 @@ pub(super) fn tool_card_lines(
     )];
     // 工具名按类别着色（§16.2 增强：bash=info、edit/write=success、
     // read/list/search=accent、其余=text），帮助快速识别工具种类。
-    spans.push(Span::styled(
-        name.clone(),
-        tool_name_style(&card.name, theme).add_modifier(Modifier::BOLD),
-    ));
+    // §修复：正文 span 也烙 panel——否则文字区落到终端底色，与卡片面分离。
+    let name_style = tool_name_style(&card.name, theme)
+        .add_modifier(Modifier::BOLD)
+        .bg(theme.panel);
+    spans.push(Span::styled(name.clone(), name_style));
     if !target.is_empty() {
-        spans.push(Span::raw(" "));
+        spans.push(Span::styled(" ", Style::default().bg(theme.panel)));
         spans.push(Span::styled(
             target,
-            Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(theme.muted)
+                .bg(theme.panel)
+                .add_modifier(Modifier::DIM),
         ));
     }
     if !meta.is_empty() {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(meta, Style::default().fg(theme.muted)));
+        spans.push(Span::styled(" ", Style::default().bg(theme.panel)));
+        spans.push(Span::styled(
+            meta,
+            Style::default().fg(theme.muted).bg(theme.panel),
+        ));
     }
     let mut lines = vec![Line::from(spans)];
 
@@ -191,11 +198,14 @@ pub(super) fn tool_card_lines(
             None => Style::default().fg(theme.muted).bg(theme.panel),
         };
         let mut spans = vec![Span::styled("│ ", prefix_style)];
+        // §修复：正文 span 烙背景——diff 行烙红绿，非 diff 行烙 panel
+        //（fill_bg 保留已有背景：inline code 等不被覆盖）。否则正文文字区
+        // 落到终端底色，与卡片面分离。
         for s in &l.spans {
-            let mut style = s.style;
-            if let Some(bg) = line_bg {
-                style = style.bg(bg);
-            }
+            let style = match line_bg {
+                Some(bg) => s.style.bg(bg),
+                None => fill_bg(s.style, theme.panel),
+            };
             spans.push(Span::styled(s.content.clone(), style));
         }
         // 非 diff 行保留 line fg（如失败 tail 的 error 色）；diff 行红绿已
@@ -219,6 +229,16 @@ pub(super) fn tool_card_lines(
         ));
     }
     lines
+}
+
+/// 给 span 烙上面板背景：span 已有背景（diff 红绿 / inline code 等）保留，
+/// 否则用 `bg` 填充。修复「正文文字区背景与卡片面不同」的三明治问题。
+fn fill_bg(style: Style, bg: Color) -> Style {
+    if style.bg.is_some() {
+        style
+    } else {
+        style.bg(bg)
+    }
 }
 
 /// 工具卡片主行的语义文本（复制源）：`name target  meta`。

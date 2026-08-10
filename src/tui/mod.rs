@@ -1235,7 +1235,22 @@ fn build_transcript_text(
                         } else {
                             spans.push(Span::styled("     ", rail_style));
                         }
-                        spans.extend(rendered_line.spans.iter().cloned());
+                        // §修复：正文 span 烙 panel 底（保留已有背景如 inline
+                        // code）——否则文字区落到终端底色，与用户消息面板分离。
+                        spans.extend(
+                            rendered_line
+                                .spans
+                                .iter()
+                                .map(|s| {
+                                    let style = if s.style.bg.is_some() {
+                                        s.style
+                                    } else {
+                                        s.style.bg(theme.panel)
+                                    };
+                                    Span::styled(s.content.clone(), style)
+                                })
+                                .collect::<Vec<_>>(),
+                        );
                         let semantic_text = rendered_line
                             .spans
                             .iter()
@@ -4066,5 +4081,89 @@ fn diff_line_padding_keeps_red_green_background() {
         has_red_pad,
         "diff 删除行尾必须用红色填充到满宽: {:?}",
         line.spans
+    );
+}
+
+/// §修复回归：卡片正文文字区背景与卡片面板一致（不落到终端底色）。
+/// 主行 name/内容行正文都烙 panel；inline code（surface_subtle）保留。
+#[test]
+fn tool_card_body_bg_matches_panel() {
+    let mut view = ViewModel::default();
+    view.begin_tool("c1", "bash", Some("cmd".into()), None);
+    view.finish_tool(
+        ("c1", "bash"),
+        crate::tool::outcome::ToolStatus::Succeeded,
+        10,
+        Some(0),
+        "第一行输出\n第二行输出",
+        None,
+    );
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    let theme = theme::Theme::omp();
+    // 主行 name span 带 panel（wrap 逐字符拆分，任一 "bash" 字符即可）。
+    let header_row = &plan.window[0];
+    assert!(
+        header_row
+            .spans
+            .iter()
+            .any(|s| s.content == "b" && s.style.bg == Some(theme.panel)),
+        "主行 name 必须烙 panel 底: {:?}",
+        header_row.spans
+    );
+    // 主行所有非空 span 不得残留无背景（含分隔空格）。
+    for span in &header_row.spans {
+        if !span.content.is_empty() {
+            assert!(
+                span.style.bg.is_some(),
+                "主行每段文字都带面板底: {:?}",
+                span
+            );
+        }
+    }
+    // 内容行正文（"第一行输出"）带 panel。
+    let body_row = plan
+        .window
+        .iter()
+        .find(|l| l.spans.iter().any(|s| s.content == "第"))
+        .expect("内容行必须渲染");
+    assert!(
+        body_row
+            .spans
+            .iter()
+            .any(|s| s.content == "一" && s.style.bg == Some(theme.panel)),
+        "内容行正文必须烙 panel 底: {:?}",
+        body_row.spans
+    );
+}
+
+/// §修复回归：User 消息正文背景与面板一致（inline code 保留自身背景）。
+#[test]
+fn user_message_body_bg_matches_panel() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::User, r"修复 `snake\src\main.rs`");
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
+    let theme = theme::Theme::omp();
+    let row = plan
+        .window
+        .iter()
+        .find(|l| l.spans.iter().any(|s| s.content == "修"))
+        .expect("用户消息必须渲染");
+    // 正文普通字符烙 panel。
+    assert!(
+        row.spans
+            .iter()
+            .any(|s| s.content == "修" && s.style.bg == Some(theme.panel)),
+        "用户消息正文必须烙 panel 底: {:?}",
+        row.spans
+    );
+    // inline code 保留 surface_subtle（不被 panel 覆盖）。
+    assert!(
+        row.spans
+            .iter()
+            .any(|s| s.content == "s" && s.style.bg == Some(theme.surface_subtle)),
+        "inline code 背景保留: {:?}",
+        row.spans
     );
 }
