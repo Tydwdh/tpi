@@ -15,6 +15,8 @@ use serde::Deserialize;
 /// `read` 默认模型预算（§8.4：200 行，最多 32 KiB）。
 pub const DEFAULT_READ_LINES: usize = 200;
 pub const DEFAULT_READ_MAX_BYTES: usize = 32 * 1024;
+/// `read` 单次最大行数（§工具改进：放开上限支持大文件分段，默认仍 200）。
+pub const MAX_READ_LINES: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct ReadArgs {
@@ -22,7 +24,9 @@ pub struct ReadArgs {
     /// 起始行号（1-indexed）。
     #[serde(default = "default_start_line")]
     pub start_line: usize,
-    /// 最多返回行数（默认 200）。
+    /// 最多返回行数（默认 200，最大 1000）。大文件用
+    /// `start_line`/`line_count` 分段读取，例如
+    /// `start_line=201 line_count=200` 读下一段。
     #[serde(default = "default_line_count")]
     pub line_count: usize,
 }
@@ -102,7 +106,7 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
         Ok(path) => path,
         Err(error) => return path_rejected_outcome("read", error),
     };
-    let line_count = args.line_count.clamp(1, DEFAULT_READ_LINES);
+    let line_count = args.line_count.clamp(1, MAX_READ_LINES);
     match edit::snapshot_file(&path) {
         Ok(snapshot) => {
             let window = edit::read_window_from_snapshot(&snapshot, args.start_line, line_count);
@@ -124,13 +128,33 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
                     window.start_line + window.returned_lines - 1
                 )
             };
-            let output = format!(
+            let mut output = format!(
                 "{revision_header}\npath: {}\nlines: {line_range} of {}{}\n\n{}",
                 display_path(&ctx.workspace_root, &path),
                 window.total_lines,
                 if truncated { " (truncated)" } else { "" },
                 text,
             );
+            // §工具改进：截断续读指引——不再让模型/用户反复猜。
+            // 行数截断（窗口超界）：提示用 start_line 续读下一段。
+            if window.truncated && window.total_lines > window.start_line + window.returned_lines {
+                output.push_str(&format!(
+                    "\n\n续读: read {} start_line={} line_count={}",
+                    display_path(&ctx.workspace_root, &path),
+                    window.start_line + window.returned_lines,
+                    (window.total_lines - (window.start_line + window.returned_lines))
+                        .min(MAX_READ_LINES),
+                ));
+            }
+            // 字节截断（>32 KiB）：提示分段读取（行数少但每行超长时）。
+            if text.len() >= DEFAULT_READ_MAX_BYTES
+                && window.total_lines > window.start_line + window.returned_lines
+            {
+                output.push_str(&format!(
+                    "\n内容超过 {} KiB 预算被截断，请用 start_line/line_count 分段读取。",
+                    DEFAULT_READ_MAX_BYTES / 1024
+                ));
+            }
             ToolOutcome::succeeded("read", output).with_metadata(ToolMetadata {
                 tool: "read".into(),
                 target: Some(display_path(&ctx.workspace_root, &path)),

@@ -56,6 +56,10 @@ pub struct SearchArgs {
     /// 上一页返回的 cursor。
     #[serde(default)]
     pub cursor: Option<String>,
+    /// 排除的路径片段/子目录（任一组件命中即跳过该文件，如 "tests"、"vendor"）。
+    /// 用于过滤 test/fixture/vendor 等噪音，src 等目标目录结果优先。
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// 一次扫描的有界有序结果 snapshot（§8.4：cursor 指向 snapshot + offset）。
@@ -237,6 +241,13 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
     let mut scanned_files = 0u64;
     let mut scanned_bytes = 0u64;
     let mut stop_reason = StopReason::Complete;
+    // §工具改进：exclude 片段归一化（小写）——路径任一组件命中即排除。
+    let exclude: Vec<String> = args
+        .exclude
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect();
 
     // 匹配预算（§8.4：100 matches、单行 300 chars、最多 32 KiB）。
     const MAX_MATCHES: usize = 100;
@@ -256,6 +267,19 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         let Ok(entry) = entry else { continue };
         if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
             continue;
+        }
+        // §工具改进：exclude 匹配（路径任一组件命中即跳过，如 tests/fixtures）。
+        if !exclude.is_empty() {
+            let rel = relative(&root, entry.path());
+            let rel_lower = rel.as_str().to_ascii_lowercase();
+            let excluded = exclude.iter().any(|pattern| {
+                rel_lower
+                    .split(['/', '\\'])
+                    .any(|component| component.contains(pattern.as_str()))
+            });
+            if excluded {
+                continue;
+            }
         }
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
@@ -343,7 +367,10 @@ fn finish_scan(
     stop_reason: StopReason,
     tool: &'static str,
 ) -> ToolOutcome {
-    items.sort_unstable();
+    // §工具改进：噪音目录后置排序——src/根目录源码优先露出，tests/fixtures/
+    // vendor 等噪音结果沉底（各自组内保持字典序），避免 100 条上限被
+    // 测试文件噪音淹没。
+    items.sort_unstable_by(|a, b| noise_rank(a).cmp(&noise_rank(b)).then_with(|| a.cmp(b)));
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let snapshot = ScanSnapshot {
         tool: tool.to_string(),
@@ -361,7 +388,37 @@ fn finish_scan(
         evict_oldest_snapshot(&mut store);
         store.insert(cursor.clone(), snapshot);
     }
-    page(&cursor, ctx)
+    let mut outcome = page(&cursor, ctx);
+    // §工具改进：命中结果上限（ResultLimit）时给出排除/收窄指引——
+    // 用户不必反复换 path 缩小范围。
+    if stop_reason == StopReason::ResultLimit {
+        outcome.model_payload.output.push_str(
+            "\n\n结果达上限。可加 exclude 排除目录（如 exclude=[\"tests\"]）或收窄 path 后重新搜索。",
+        );
+    }
+    outcome
+}
+
+/// 噪音目录排序等级：0 = 源码/根目录（优先），1 = 噪音（沉底）。
+/// 按路径片段匹配（`tests/`、`test/`、`testdata/`、`fixtures/`、`vendor/`、
+/// `node_modules/`、`migrations/`）。
+fn noise_rank(item: &str) -> u8 {
+    const NOISE: &[&str] = &[
+        "tests/",
+        "test/",
+        "testdata/",
+        "fixtures/",
+        "vendor/",
+        "node_modules/",
+        "migrations/",
+        ".github/",
+    ];
+    let lower = item.to_ascii_lowercase();
+    if NOISE.iter().any(|n| lower.contains(n)) {
+        1
+    } else {
+        0
+    }
 }
 
 /// P1-6：snapshot 有界淘汰——淘汰 cursor 字典序最小的一项。
@@ -755,6 +812,7 @@ mod tests {
                 pattern: "a".into(),
                 path: ".".into(),
                 cursor: None,
+                exclude: Vec::new(),
             },
             &ctx,
         );
@@ -776,6 +834,7 @@ mod tests {
                 pattern: "a".repeat(32 * 1024 + 1),
                 path: ".".into(),
                 cursor: None,
+                exclude: Vec::new(),
             },
             &ctx,
         );

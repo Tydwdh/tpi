@@ -178,6 +178,7 @@ async fn list_and_search_respect_budget_and_cursor() {
             pattern: "needle".into(),
             path: ".".into(),
             cursor: None,
+            exclude: Vec::new(),
         },
         &ctx,
     );
