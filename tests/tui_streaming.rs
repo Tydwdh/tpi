@@ -274,7 +274,7 @@ fn reasoning_can_be_folded() {
     let buffer = draw_to_test_backend(&mut view, 80, 12);
     let rendered = buffer_text(&buffer);
     assert!(
-        rendered.contains("点击展开思考"),
+        rendered.contains("点击展开"),
         "默认折叠显示提示行: {rendered:?}"
     );
     assert!(!rendered.contains("推理第9行"), "超 6 行的内容折叠不可见");

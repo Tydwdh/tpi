@@ -1677,7 +1677,9 @@ fn canonical_semantic_text(kind: LineKind, raw: &str) -> String {
 }
 
 /// 工具卡片的语义文本（§PointerHit：copy 从内容提取，不反推渲染结果）。
-/// 主行 `name target` + 内容（diff 优先，否则 output，否则 tail）。
+/// 主行必须与渲染的 `card_semantic_header` **完全一致**（name target meta）——
+/// §修复：此前漏了 meta，主行语义比渲染短，selected_text 的 offset 与
+/// 渲染 char_start 错位（卡片内选中会选错字符/整卡全选）。
 fn card_semantic_text(card: &ToolCard) -> String {
     let mut out = card.name.clone();
     if let Some(target) = &card.target
@@ -1685,6 +1687,22 @@ fn card_semantic_text(card: &ToolCard) -> String {
     {
         out.push(' ');
         out.push_str(target);
+    }
+    // 与 tool_card.rs 的 tool_card_meta 一致（duration · exit code）。
+    if let ToolCardState::Done {
+        status,
+        duration_ms,
+        exit_code,
+        ..
+    } = &card.state
+    {
+        out.push(' ');
+        out.push_str(&fmt_duration(*duration_ms));
+        if *status != ToolStatus::Succeeded
+            && let Some(code) = exit_code
+        {
+            out.push_str(&format!(" · exit {code}"));
+        }
     }
     let body = card
         .diff
@@ -2425,10 +2443,25 @@ mod p2_card_nav_tests {
         view.finish_tool(("c1", "bash"), ToolStatus::Succeeded, 10, None, "", None);
         let finalized = view.transcript.last().expect("finish 后必须提交").id();
         assert_eq!(finalized, live_id, "finish_tool 必须沿用 begin 的稳定 id");
+        // §修复：header 语义含 meta（与渲染 card_semantic_header 一致）。
+        // Running（无 meta）→ Done（+ " 10ms"）：header 从 16 chars 变 21，
+        // body 起始偏移后移——这是内容真实变化（meta 加入），选区 offset
+        // 不再指向旧位置。验证新 offset 正确落到 body："bash cargo test 10ms"
+        // (21 chars) + "running"。
         assert_eq!(
             view.selected_text(),
-            "running",
-            "finalize 后 tool 选区仍指向同一内容"
+            "10ms\nru",
+            "finalize 后 header 语义加入 meta，偏移指向新内容（预期变化）"
         );
+        // 用新 offset 重新选中 body 的 "running"：内容正确定位。
+        view.selection_start(TextPosition {
+            entry_id: live_id,
+            offset: 21,
+        });
+        view.selection_update(TextPosition {
+            entry_id: live_id,
+            offset: 28,
+        });
+        assert_eq!(view.selected_text(), "running", "body 内容不受 meta 影响");
     }
 }

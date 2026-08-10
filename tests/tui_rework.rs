@@ -128,11 +128,11 @@ fn reasoning_flood_collapses_to_one_line() {
     let text = buffer_text(&buffer);
     assert!(text.contains("思考"), "默认折叠（live 区）: {text}");
     assert!(!text.contains("reasoning"), "正文不进入 transcript: {text}");
-    // 折叠态整块 = 1 行（"◇ 思考" 行）。
+    // §美化：折叠态是 ◆ 图标的单行卡片（"◆ 思考 · 流式中…"）。
     let reasoning_rows = buffer
         .content()
         .chunks(buffer.area().width as usize)
-        .filter(|row| row.iter().any(|c| c.symbol() == "◇"))
+        .filter(|row| row.iter().any(|c| c.symbol() == "◆"))
         .count();
     assert_eq!(reasoning_rows, 1, "reasoning 只占 1 行");
 }

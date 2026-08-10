@@ -1000,14 +1000,18 @@ fn push_wrapped_row(
     if cur.is_empty() {
         return;
     }
-    let links = cur_sem_start.map(|start| {
+    // §修复：必须 take（消费）cur_sem_start——此前只 take 了 cur_sem_text，
+    // 残留的起始偏移泄漏到下一逻辑行（char_start 全变 0 → 卡片内选中
+    // 会误全选所有行）。take 保证每次 flush 后起始偏移归零重置。
+    let sem_start = cur_sem_start.take();
+    let links = sem_start.map(|start| {
         let lo = start.saturating_sub(line_start);
         slice_links(logical_links, lo, cur_sem_text.chars().count())
     });
     out.push(WrappedRow {
         line: Line::from(std::mem::take(cur)),
         hit: cur_hit.take(),
-        semantic: cur_sem_start.map(|start| RowSemantic {
+        semantic: sem_start.map(|start| RowSemantic {
             entry_id,
             char_start: start,
             text: std::mem::take(cur_sem_text),
@@ -1311,61 +1315,91 @@ fn build_transcript_text(
                 }
                 // §用户诉求：thinking 与工具统一折叠——未展开显示前 N 行 +
                 // "… 点击展开"，展开显示全文（点击行切换）。
+                // §美化：thinking 卡片化——与工具卡片统一视觉语言
+                // （panel 底 + 左竖线 + 整卡可点展开/折叠）。折叠态单行
+                // 摘要；展开态逐行显示；折叠提示行带 panel 底。
                 LineKind::Reasoning => {
                     const THINKING_COLLAPSED: usize = 6;
                     let all_lines: Vec<&str> = line.text.split('\n').collect();
                     let overflow = all_lines.len() > THINKING_COLLAPSED;
                     let expanded = view.is_reasoning_expanded(entry_id);
-                    let shown = if expanded || !overflow {
-                        &all_lines[..]
-                    } else {
-                        &all_lines[..THINKING_COLLAPSED]
-                    };
-                    let clickable = overflow; // 只有溢出才可点击展开
-                    for (i, s) in shown.iter().enumerate() {
-                        // §美化：thinking 加 ◆ 图标锚定（与正文/工具区分）；
-                        // 续行缩进对齐（`◆ 思考 ` = 7 cells）。
-                        let prefix = if i == 0 { "◆ 思考 " } else { "       " };
-                        let hit = if clickable && i == 0 {
-                            full_line_hit(HitTarget::Reasoning(entry_id), width as u16)
-                        } else {
-                            None
-                        };
+                    // 竖线 + 面板背景（与工具卡片主行同款 rail_style 结构）。
+                    let rail_style = Style::default()
+                        .fg(theme.accent)
+                        .bg(theme.panel)
+                        .add_modifier(Modifier::BOLD);
+                    if overflow && !expanded {
+                        // 折叠态：单行卡片「◆ 思考 · 共 N 行 · 点击展开」。
+                        let hint = format!("◆ 思考 · 共 {} 行 · 点击展开", all_lines.len());
                         push_hit(
                             &mut out,
                             &mut hits,
                             &mut semantic,
-                            Line::styled(
-                                format!("{prefix}{s}"),
-                                Style::default()
-                                    .fg(theme.muted)
-                                    .add_modifier(Modifier::ITALIC),
-                            ),
-                            hit,
-                            s.to_string(),
-                            Vec::new(),
-                        );
-                    }
-                    if overflow {
-                        let hint = if expanded {
-                            "思考 · 点击折叠".to_string()
-                        } else {
-                            format!("… 点击展开思考（共 {} 行）", all_lines.len())
-                        };
-                        push_hit(
-                            &mut out,
-                            &mut hits,
-                            &mut semantic,
-                            Line::styled(
-                                hint,
-                                Style::default()
-                                    .fg(theme.muted)
-                                    .add_modifier(Modifier::ITALIC),
-                            ),
+                            Line::from(vec![
+                                Span::styled("┃ ", rail_style),
+                                Span::styled(
+                                    hint,
+                                    Style::default()
+                                        .fg(theme.muted)
+                                        .bg(theme.panel)
+                                        .add_modifier(Modifier::ITALIC),
+                                ),
+                            ]),
+                            // 整行可点（end_col = 宽度，不再是 0）。
                             full_line_hit(HitTarget::Reasoning(entry_id), width as u16),
-                            String::new(), // 折叠提示不是可复制内容
+                            String::new(), // 折叠摘要不是可复制内容
                             Vec::new(),
                         );
+                    } else {
+                        // 展开态 / 未溢出：逐行显示（首行带 ◆ 图标，续行对齐）。
+                        let clickable = overflow; // 只有溢出才可点击折叠
+                        for (i, s) in all_lines.iter().enumerate() {
+                            let prefix = if i == 0 { "◆ 思考 " } else { "      " };
+                            let hit = if clickable {
+                                full_line_hit(HitTarget::Reasoning(entry_id), width as u16)
+                            } else {
+                                None
+                            };
+                            push_hit(
+                                &mut out,
+                                &mut hits,
+                                &mut semantic,
+                                Line::from(vec![
+                                    Span::styled("┃ ", rail_style),
+                                    Span::styled(
+                                        format!("{prefix}{s}"),
+                                        Style::default()
+                                            .fg(theme.muted)
+                                            .bg(theme.panel)
+                                            .add_modifier(Modifier::ITALIC),
+                                    ),
+                                ]),
+                                hit,
+                                s.to_string(),
+                                Vec::new(),
+                            );
+                        }
+                        if overflow {
+                            // 折叠提示行：带 panel 底（与工具卡片折叠提示一致）。
+                            push_hit(
+                                &mut out,
+                                &mut hits,
+                                &mut semantic,
+                                Line::from(vec![
+                                    Span::styled("┃ ", rail_style),
+                                    Span::styled(
+                                        "思考 · 点击折叠",
+                                        Style::default()
+                                            .fg(theme.muted)
+                                            .bg(theme.panel)
+                                            .add_modifier(Modifier::ITALIC),
+                                    ),
+                                ]),
+                                full_line_hit(HitTarget::Reasoning(entry_id), width as u16),
+                                String::new(),
+                                Vec::new(),
+                            );
+                        }
                     }
                 }
                 LineKind::Tool => {
@@ -1516,17 +1550,18 @@ fn build_transcript_text(
                 .collect();
             out = hovered;
         }
-        // §美化：User/Assistant 消息块之间插 1 空行（opencode marginTop=1
-        // 留白即分隔）；System/Tool 不插（工具连续紧凑、系统提示紧贴）。
-        // 空行语义为空、不可选（选中/复制不受影响）。
+        // §美化：块间间隔一行（opencode marginTop=1 留白即分隔）。
+        // User/Assistant/Reasoning 消息 + 工具卡片都间隔；System 提示与
+        // 旧 Tool 文本行保持紧凑。
         let message_kind = match entry {
             Entry::Message { line, .. } => Some(line.kind),
             Entry::Tool { .. } => None,
         };
-        let needs_gap = matches!(
-            message_kind,
-            Some(LineKind::User) | Some(LineKind::Assistant)
-        );
+        let needs_gap = match message_kind {
+            Some(LineKind::User | LineKind::Assistant | LineKind::Reasoning) => true,
+            None => true, // 工具卡片（Entry::Tool）
+            Some(_) => false,
+        };
         if needs_gap {
             out.push(Line::default());
             hits.push(None);
@@ -1582,39 +1617,49 @@ fn build_live_group(
     out.clear();
     hits.clear();
     semantic.clear();
-    // 流式 reasoning（折叠策略与历史一致：Alt+T 展开 / 点击打开 Overlay）。
+    // 流式 reasoning（折叠策略与历史一致：Alt+T 展开 / 点击查看）。
     // §PointerHit ⑤：reasoning 是独立 group（自己的稳定 EntryId）。
+    // §美化：与历史 thinking 卡片同构——panel 底 + 左竖线。
     if let Some(msg) = &live.reasoning
         && !msg.text.is_empty()
     {
+        let rail_style = Style::default()
+            .fg(theme.accent)
+            .bg(theme.panel)
+            .add_modifier(Modifier::BOLD);
         if view.reasoning_visible {
             for s in msg.text.split('\n') {
-                // §美化：与历史 thinking 同款 ◆ 图标（流式期间也锚定辨识）。
-                let rendered = format!("◆ 思考 {s}");
-                let decor = unicode_width::UnicodeWidthStr::width("◆ 思考 ");
-                out.push(Line::styled(
-                    rendered.clone(),
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::ITALIC),
-                ));
+                out.push(Line::from(vec![
+                    Span::styled("┃ ", rail_style),
+                    Span::styled(
+                        format!("◆ 思考 {s}"),
+                        Style::default()
+                            .fg(theme.muted)
+                            .bg(theme.panel)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
                 hits.push(None);
                 semantic.push(SemanticLine {
                     text: s.to_string(),
-                    decor_cells: decor,
+                    decor_cells: 10, // "┃ ◆ 思考 " 前缀
                     links: Vec::new(),
                 });
             }
         } else {
-            out.push(Line::styled(
-                "◇ 思考 · 流式中…（Alt+T 展开 · 点击查看）",
-                Style::default()
-                    .fg(theme.muted)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-            // §PointerHit：live reasoning 折叠行可点击（与历史一致），
-            // 打开 reasoning overlay（msg.entry_id 是稳定 id）。
-            hits.push(Some((HitTarget::Reasoning(msg.entry_id), 0)));
+            out.push(Line::from(vec![
+                Span::styled("┃ ", rail_style),
+                Span::styled(
+                    "◆ 思考 · 流式中…（点击展开）",
+                    Style::default()
+                        .fg(theme.muted)
+                        .bg(theme.panel)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+            // §修复：end_col 必须是行宽（此前 0 被 hit_target 判为不可点，
+            // live thinking 折叠行实际点不了）。
+            hits.push(Some((HitTarget::Reasoning(msg.entry_id), width as u16)));
             semantic.push(SemanticLine {
                 text: String::new(),
                 decor_cells: 0,
@@ -2595,17 +2640,22 @@ mod tests {
         let mut cache = HashMap::new();
         let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
         // §美化：整卡可点击——主行与内容行都带 Tool hit（轻点任意行展开；
-        // 拖选仍是文本选择，不冲突）。row_hits 与 window 等长。
+        // §美化：整卡可点击——主行与内容行都带 Tool hit；卡片后的留白
+        // 空行（间隔）不可点。row_hits 与 window 等长。
         assert!(plan.window.len() >= 2, "卡片含主行+正文: {:?}", plan.window);
         assert!(
             matches!(&plan.row_hits[0], Some((HitTarget::Tool(id), end)) if id == "c1" && *end > 0),
             "主行必须可点击: {:?}",
             plan.row_hits[0]
         );
-        for hit in plan.row_hits.iter() {
+        for (i, (line, hit)) in plan.window.iter().zip(plan.row_hits.iter()).enumerate() {
+            if line.spans.is_empty() {
+                // 留白空行（卡片间间隔）。
+                continue;
+            }
             assert!(
                 matches!(hit, Some((HitTarget::Tool(id), end)) if id == "c1" && *end > 0),
-                "整卡每行都可点击展开: {hit:?}"
+                "整卡每行（第 {i} 行）都可点击展开: {hit:?}"
             );
         }
     }
@@ -3939,8 +3989,12 @@ fn hovered_card_brightens_panel_background() {
     let theme = theme::Theme::omp();
     let hover_bg = lighten(theme.panel);
     assert_ne!(hover_bg, theme.panel, "提亮必须产生可见差");
-    // 卡片所有行（主行 + 内容行）的 panel 底都替换为 hover 色。
+    // 卡片所有行（主行 + 内容行）的 panel 底都替换为 hover 色；
+    // 跳过卡片后的留白空行（无 spans）。
     for (i, line) in plan.window.iter().enumerate() {
+        if line.spans.is_empty() {
+            continue; // 留白空行（卡片间间隔）
+        }
         let has_hover = line.spans.iter().any(|s| s.style.bg == Some(hover_bg));
         assert!(
             has_hover,
@@ -4166,4 +4220,161 @@ fn user_message_body_bg_matches_panel() {
         "inline code 背景保留: {:?}",
         row.spans
     );
+}
+
+/// §修复：thinking 卡片化——panel 底 + 左竖线 + 整卡可点展开。
+#[test]
+fn thinking_renders_as_panel_card() {
+    let mut view = ViewModel::default();
+    // 8 行 thinking → 折叠态（超过 6 行阈值）。
+    let mut text = String::new();
+    for i in 0..8 {
+        text.push_str(&format!("思考第{i}行\n"));
+    }
+    view.push_line(LineKind::Reasoning, text);
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    let theme = theme::Theme::omp();
+    // 折叠态单行：panel 底 + 整行可点（Reasoning hit）。
+    assert_eq!(plan.window.len(), 2, "折叠单行 + 留白空行");
+    let card_line = &plan.window[0];
+    assert!(
+        card_line
+            .spans
+            .iter()
+            .any(|s| s.style.bg == Some(theme.panel)),
+        "thinking 卡片带 panel 底: {:?}",
+        card_line.spans
+    );
+    let card_text: String = card_line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        card_text.contains("点击展开"),
+        "折叠态显示点击展开提示: {card_text:?}"
+    );
+    assert!(
+        matches!(
+            &plan.row_hits[0],
+            Some((HitTarget::Reasoning(id), end)) if *end > 0
+        ),
+        "thinking 折叠卡整行可点: {:?}",
+        plan.row_hits[0]
+    );
+    // 留白空行在卡片后（第 2 行）。
+    assert_eq!(plan.semantic_rows[1].as_ref().unwrap().text, "");
+}
+
+/// §修复：展开态 thinking 逐行 panel 底；折叠提示行带 panel 底。
+#[test]
+fn thinking_expanded_rows_keep_panel_and_toggle_hint() {
+    let mut view = ViewModel::default();
+    let mut text = String::new();
+    // 8 行（末尾不换行——split('\n') 才恰好 8 段，避免空尾段）。
+    for i in 0..7 {
+        text.push_str(&format!("思考第{i}行\n"));
+    }
+    text.push_str("思考第7行");
+    view.push_line(LineKind::Reasoning, text);
+    let entry_id = view.transcript[0].id();
+    view.toggle_reasoning_expanded(entry_id);
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    let theme = theme::Theme::omp();
+    // 展开态：8 行正文 + 1 折叠提示 + 1 留白 = 10 行。
+    assert_eq!(plan.window.len(), 10);
+    // 每行（含折叠提示）都带 panel 底。
+    for (i, line) in plan.window.iter().enumerate() {
+        if line.spans.is_empty() {
+            continue; // 留白
+        }
+        assert!(
+            line.spans.iter().any(|s| s.style.bg == Some(theme.panel)),
+            "展开行 {i} 必须带 panel 底: {:?}",
+            line.spans
+        );
+    }
+    // 折叠提示行（"点击折叠"）带 panel 底。
+    let hint_row = plan
+        .window
+        .iter()
+        .find(|l| {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            text.contains("点击折叠")
+        })
+        .expect("展开态必须有折叠提示");
+    assert!(
+        hint_row
+            .spans
+            .iter()
+            .any(|s| s.style.bg == Some(theme.panel)),
+        "折叠提示行带 panel 底"
+    );
+}
+
+/// §修复：卡片内选中一小段 → 只高亮该行（不得整卡全选），
+/// 且复制内容与高亮一致（offset 对齐）。
+#[test]
+fn selecting_part_of_tool_card_highlights_only_that_row() {
+    use crate::tui::interaction::TextPosition;
+    use crate::tui::scroll::EntryId;
+    let mut view = ViewModel::default();
+    view.begin_tool("c1", "bash", Some("cmd".into()), None);
+    view.finish_tool(
+        ("c1", "bash"),
+        crate::tool::outcome::ToolStatus::Succeeded,
+        10,
+        Some(0),
+        "第一行输出\n第二行输出\n第三行输出",
+        None,
+    );
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    // 定位内容行（含 "一" 的行）的语义 char_start。
+    let body_row = plan
+        .semantic_rows
+        .iter()
+        .enumerate()
+        .find(|(_, r)| r.as_ref().is_some_and(|s| s.text.starts_with("第一行输出")))
+        .map(|(i, r)| (i, r.as_ref().unwrap().char_start))
+        .expect("内容行必须有语义");
+    let (row_idx, char_start) = body_row;
+    // 选中该行前 2 个字符（"第一"）。
+    view.selection_start(TextPosition {
+        entry_id: EntryId(1),
+        offset: char_start,
+    });
+    view.selection_update(TextPosition {
+        entry_id: EntryId(1),
+        offset: char_start + 2,
+    });
+    view.selection_end();
+    let mut cache2 = HashMap::new();
+    let plan2 = plan_window(
+        &mut view,
+        theme::Theme::omp(),
+        80,
+        20,
+        0,
+        false,
+        &mut cache2,
+    );
+    // 统计带 REVERSED 高亮的行。
+    let has_reversed = |line: &Line<'static>| {
+        line.spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+    };
+    let highlighted: Vec<usize> = plan2
+        .window
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| has_reversed(l))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        highlighted.len() == 1 && highlighted[0] == row_idx,
+        "选中内容行中段只应高亮该行，实际 {:?}（目标行 {row_idx}）",
+        highlighted
+    );
+    // 复制内容 = "第一"（offset 对齐：渲染 char_start == selected_text 同 offset）。
+    assert_eq!(view.selected_text(), "第一", "复制内容必须与高亮一致");
 }
