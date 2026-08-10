@@ -69,10 +69,12 @@ fn fullscreen_transcript_gets_all_remaining_height() {
         "无常驻 header（信息并入 footer）: {:?}",
         texts.first()
     );
+    // §美化：消息块间插留白空行——首行可能是留白+scrollbar 轨道；
+    // 断言 transcript 区（前几行）有消息正文。
     assert!(
-        texts.first().map(|s| s.contains("第")).unwrap_or(false),
-        "transcript 从第 0 行开始: {:?}",
-        texts.first()
+        texts.iter().take(3).any(|s| s.contains("第")),
+        "transcript 区必须有消息内容: {:?}",
+        &texts[..3.min(texts.len())]
     );
     // 底部三行是 input 区与 footer：footer 含模型名。
     assert!(texts[texts.len() - 1].contains("fake-model"));
@@ -240,8 +242,11 @@ fn system_separator_fills_width_without_wrap() {
     view.push_line(LineKind::System, "─".repeat(40));
     let buf = draw_to_test_backend_mode(&mut view, 30, 12, ViewMode::Fullscreen);
     let texts = row_texts(&buf);
-    // 视觉瘦身：无常驻 header，transcript 内只有 1 条系统分隔线（铺满不折行）。
-    let rule_rows = texts
+    // 视觉瘦身：无常驻 header。§美化：底部新增 footer 分隔线（也铺满 ─）；
+    // 只统计 transcript 区（去掉底部 input/rule/footer 三行）——system 分隔线
+    // 必须单行铺满不折行。
+    let transcript_rows = &texts[..texts.len().saturating_sub(3)];
+    let rule_rows = transcript_rows
         .iter()
         .map(|s| {
             let s = s.trim_end_matches('│').trim(); // 去掉 scrollbar 列

@@ -75,7 +75,6 @@ fn event_sequence_is_replayable() {
     assert_eq!(s1.editor.text(), s2.editor.text());
     assert_eq!(s1.editor.cursor, s2.editor.cursor);
     assert_eq!(s1.view.input, s2.view.input);
-    assert_eq!(s1.view.transcript_scroll, s2.view.transcript_scroll);
     assert_eq!(s1.view.anim_tick, s2.view.anim_tick);
     assert_eq!(s1.view.context_usage, s2.view.context_usage);
     assert_eq!(s1.view.transcript.len(), s2.view.transcript.len());
@@ -728,7 +727,7 @@ fn paste_blocked_while_modal_or_overlay_open() {
 fn page_and_wheel_scroll_modal_when_open() {
     let mut s = state();
     s.view.open_modal("/help", "line1\nline2\nline3\nline4");
-    let before = s.view.transcript_scroll;
+    let scroll_before = s.view.scroll_mode;
     reducer::update(&mut s, key(KeyCode::PageDown));
     assert_eq!(
         s.view.modal.as_ref().unwrap().scroll,
@@ -746,7 +745,7 @@ fn page_and_wheel_scroll_modal_when_open() {
     reducer::update(&mut s, key(KeyCode::PageUp));
     assert_eq!(s.view.modal.as_ref().unwrap().scroll, 0);
     assert_eq!(
-        s.view.transcript_scroll, before,
+        s.view.scroll_mode, scroll_before,
         "scrolling while Modal is open must not move the transcript behind"
     );
 }
@@ -759,14 +758,12 @@ fn clicks_blocked_while_modal_open() {
     }
     s.view.scroll_up(20); // enter Locked so a scrollbar click would otherwise move the viewport
     let locked_before = s.view.scroll_mode;
-    let scroll_before = s.view.transcript_scroll;
     s.view.open_modal("/help", "content");
     reducer::update(&mut s, UiEvent::ScrollbarClick(5));
     assert_eq!(
         s.view.scroll_mode, locked_before,
         "scrollbar click must not scroll transcript while Modal is open"
     );
-    assert_eq!(s.view.transcript_scroll, scroll_before);
     // ClickTool must not expand a card behind the modal.
     s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
     s.view
@@ -792,10 +789,10 @@ fn clicks_blocked_while_overlay_open() {
         .finish_tool(("c1", "bash"), ToolStatus::Failed, 1, Some(1), "err", None);
     s.view.open_tool_overlay("c1");
     assert!(s.view.overlay.is_some());
-    let scroll_before = s.view.transcript_scroll;
+    let scroll_before = s.view.scroll_mode;
     reducer::update(&mut s, UiEvent::ScrollbarClick(5));
     assert_eq!(
-        s.view.transcript_scroll, scroll_before,
+        s.view.scroll_mode, scroll_before,
         "scrollbar click must not scroll transcript while Overlay is open"
     );
 }
@@ -1063,4 +1060,150 @@ fn selection_events_update_view_selection() {
     let effects = reducer::update(&mut s, UiEvent::SelectionEnd);
     assert!(effects.is_empty());
     assert!(s.view.selection.is_some(), "SelectionEnd 保留选区");
+}
+
+/// §成熟化：链接点击 → Link Overlay 打开；Enter 确认 → OpenUrl effect 并关闭。
+#[test]
+fn link_click_opens_overlay_and_enter_opens_url() {
+    let mut s = state();
+    let url = "https://example.com".to_string();
+    let effects = reducer::update(&mut s, UiEvent::ClickLink(url.clone()));
+    assert!(effects.is_empty());
+    let overlay = s.view.overlay.as_ref().expect("点击链接必须打开 Overlay");
+    assert_eq!(overlay.body, url, "Overlay 正文是 URL");
+    assert_eq!(overlay.kind, tpi::tui::model::OverlayKind::Link);
+    // Enter 确认打开：effect 返回 OpenUrl，Overlay 关闭。
+    let effects = reducer::update(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.contains(&UiEffect::OpenUrl(url.clone())),
+        "Link Overlay Enter 必须产生 OpenUrl: {effects:?}"
+    );
+    assert!(s.view.overlay.is_none(), "确认后 Overlay 关闭");
+}
+
+/// §成熟化：Link Overlay 内 `c` → CopyText effect 并关闭。
+#[test]
+fn link_overlay_c_copies_url() {
+    let mut s = state();
+    let url = "https://example.com".to_string();
+    let _ = reducer::update(&mut s, UiEvent::ClickLink(url.clone()));
+    let effects = reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+    );
+    assert!(
+        effects.contains(&UiEffect::CopyText(url)),
+        "Link Overlay c 必须产生 CopyText: {effects:?}"
+    );
+    assert!(s.view.overlay.is_none());
+}
+
+/// §成熟化：非链接 Overlay 打开时普通按键不得写入 composer（回归）。
+#[test]
+fn non_link_overlay_blocks_composer_keys() {
+    let mut s = state();
+    s.view.overlay = Some(tpi::tui::model::OverlayState::for_reasoning("思考内容"));
+    // 普通字符不进入输入框（blocking 分支丢弃）。
+    let effects = reducer::update(&mut s, key(KeyCode::Char('x')));
+    assert!(effects.is_empty());
+    assert!(s.editor.text().is_empty(), "弹层打开时普通按键不得进输入框");
+}
+
+/// §成熟化：搜索命中使用惰性小写缓存——条目构造后缓存就绪，命中正确。
+#[test]
+fn search_uses_entry_lowercase_cache() {
+    use tpi::tui::model::Entry;
+    let mut s = state();
+    s.view.push_line(LineKind::Assistant, "Hello World");
+    s.view.push_line(LineKind::Assistant, "nothing here");
+    // 缓存惰性填充（message 进入后不可变，只算一次）。
+    let e1 = s.view.transcript[0].search_lower();
+    assert_eq!(e1, "hello world");
+    // 大小写不敏感命中。
+    s.view.open_search();
+    s.view.update_search_query("WORLD");
+    assert_eq!(
+        s.view.search.as_ref().unwrap().hits.len(),
+        1,
+        "必须命中大小写不敏感的缓存扫描"
+    );
+    assert_eq!(
+        s.view.search.as_ref().unwrap().hits[0],
+        s.view.transcript[0].id(),
+        "命中的是 entry 1"
+    );
+    // 工具卡片同样可命中（name/target/tail 拼接）。
+    s.view
+        .begin_tool("c1", "read", Some("src/main.rs".into()), None);
+    s.view
+        .finish_tool(("c1", "read"), ToolStatus::Succeeded, 1, Some(0), "", None);
+    let tool_entry = &mut s.view.transcript[2];
+    assert!(matches!(tool_entry, Entry::Tool { .. }));
+    assert_eq!(tool_entry.search_lower(), "read src/main.rs");
+    s.view.update_search_query("main.rs");
+    assert_eq!(
+        s.view.search.as_ref().unwrap().hits.len(),
+        1,
+        "工具卡片 target 命中"
+    );
+}
+
+/// §成熟化：语义文本缓存——同一 entry 重复复制不重新渲染 markdown。
+#[test]
+fn semantic_text_cache_reused_across_copies() {
+    use tpi::tui::interaction::TextPosition;
+    let mut s = state();
+    s.view.push_line(LineKind::Assistant, "**加粗** 和 `code`");
+    // 选区覆盖整条消息 → selected_text 走缓存路径。
+    let id = s.view.transcript[0].id();
+    s.view.selection_start(TextPosition {
+        entry_id: id,
+        offset: 0,
+    });
+    let len = match &s.view.transcript[0] {
+        tpi::tui::model::Entry::Message { line, .. } => line.text.chars().count(),
+        _ => 0,
+    };
+    s.view.selection_update(TextPosition {
+        entry_id: id,
+        offset: len,
+    });
+    s.view.selection_end();
+    let text1 = s.view.selected_text();
+    assert!(
+        text1.contains("加粗") && text1.contains("code"),
+        "markdown 去样式后的语义文本: {text1:?}"
+    );
+    let text2 = s.view.selected_text();
+    assert_eq!(text1, text2, "重复提取结果一致");
+}
+
+/// §美化：HoverTool 事件更新 view.hover_tool；重复相同值不产生状态变化；
+/// 点击卡片清除 hover。
+#[test]
+fn hover_tool_updates_state_and_click_clears() {
+    let mut s = state();
+    // 悬停卡片。
+    let effects = reducer::update(&mut s, UiEvent::HoverTool(Some("c1".into())));
+    assert!(effects.is_empty());
+    assert_eq!(s.view.hover_tool.as_deref(), Some("c1"));
+    // 移出 → 清除。
+    let _ = reducer::update(&mut s, UiEvent::HoverTool(None));
+    assert!(s.view.hover_tool.is_none());
+    // 再次悬停 → 点击卡片 → hover 清除（展开动作不受影响）。
+    let _ = reducer::update(&mut s, UiEvent::HoverTool(Some("c1".into())));
+    s.view.begin_tool("c1", "bash", Some("cmd".into()), None);
+    s.view
+        .finish_tool(("c1", "bash"), ToolStatus::Failed, 1, Some(1), "err", None);
+    let _ = reducer::update(&mut s, UiEvent::ClickTool("c1".into()));
+    assert!(
+        s.view.hover_tool.is_none(),
+        "点击卡片必须清除 hover（点击即离开 hover 态）"
+    );
+    // 展开切换生效（整卡可点：点击内容行同样展开——这里验证 toggle 语义）。
+    let expanded = match &s.view.transcript[0] {
+        tpi::tui::model::Entry::Tool { card, .. } => card.expanded,
+        _ => false,
+    };
+    assert!(expanded, "点击卡片必须展开");
 }

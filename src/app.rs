@@ -250,7 +250,8 @@ async fn interactive_loop<P: Provider>(
     );
     // §26-27：UiState 是 UI 单一事实源；交互循环只做
     // event → reducer → effects → draw（T3）。
-    let mut ui_state = UiState::new(view);
+    // §成熟化：注入 `[ui.keymap]` 生效键位（未配置动作保持内建默认）。
+    let mut ui_state = UiState::with_keymap(view, config.ui_keymap.clone());
     // BUG-006：--continue/--resume 启动时把已加载的 history 重建到屏幕，
     // 避免“模型有历史、屏幕空白/显示旧内容”的不一致。
     if !conversation.history().is_empty() {
@@ -455,6 +456,11 @@ async fn interactive_loop<P: Provider>(
                         .as_ref()
                         .map(|p| p.to_string())
                         .unwrap_or_else(|| "未配置（自动查找 Git Bash）".to_string());
+                    // §成熟化：展示 [ui.keymap] 生效绑定（默认 + 自定义合并后）。
+                    let mut keymap_text = String::new();
+                    for (action, keys) in config.ui_keymap.display_bindings() {
+                        keymap_text.push_str(&format!("  {action}: {keys}\n"));
+                    }
                     ui_state.view.open_modal(
                         "/settings",
                         format!(
@@ -463,15 +469,20 @@ workspace: {}
 sessions: {}
 artifacts: {}
 shell: {shell}
+主题: {}（omp / dark / light / opencode）
 web_search: DuckDuckGo（免费，无需 API key）
 自动打开浏览器: {}
 保留 token: {}
 允许访问 workspace 外路径: {}
-模型单价: {}/百万输入 · {}/百万输出（未配置则不在 footer 显示花费）",
+模型单价: {}/百万输入 · {}/百万输出（未配置则不在 footer 显示花费）
+
+键位（[ui.keymap]，{}）:
+{keymap_text}",
                             config.source,
                             config.workspace_root,
                             config.sessions_root.display(),
                             config.artifacts_root.display(),
+                            config.ui_theme,
                             if config.auto_open_browser {
                                 "是"
                             } else {
@@ -485,6 +496,7 @@ web_search: DuckDuckGo（免费，无需 API key）
                             },
                             fmt_price(config.model.price_input),
                             fmt_price(config.model.price_output),
+                            "未配置时为内建默认",
                         ),
                     );
                     renderer
@@ -545,9 +557,13 @@ web_search: DuckDuckGo（免费，无需 API key）
                         "快捷键：Shift+Enter 换行 · ↑/↓ 多行/历史 · Tab 命令补全 ·
                         @文件 引用补全 · Alt+T 思考折叠 · Alt+E/Alt+O 工具详情 ·
                         Alt+[/] 切换工具 · Ctrl+F 搜索 · Ctrl+U 清空 ·
+                        Ctrl+Z 撤销 · Ctrl+Y 重做 ·
                         Ctrl+A/E 行首/行尾 · PgUp/PgDn 翻页 · 滚轮/滚动条滚动 ·
                         Ctrl+Home 顶部 · Ctrl+End 最新 · Modal ↑/↓ 滚动 ·
-                        点击工具卡片展开 · Esc 取消 run",
+                        点击工具卡片（任意行）展开 · 悬停卡片微高亮 ·
+                        点击链接打开 · 拖选自动滚动 ·
+                        Esc 取消 run
+                        键位可在配置 [ui.keymap] 中自定义（/settings 查看当前绑定）",
                     );
                     ui_state.view.open_modal("/help", text);
                     renderer
@@ -838,7 +854,9 @@ fn handle_mouse(
         MouseEventKind::ScrollDown => PointerInput::ScrollDown,
         _ => return Vec::new(),
     };
-    gesture.feed(input)
+    // §成熟化：拖选自动滚动——把转录区矩形传给指针状态机，
+    // Selecting 拖出视口上下边缘时自动滚动（选区跨越屏幕扩展）。
+    gesture.feed_in_viewport(input, renderer.transcript_rect())
 }
 
 /// §PointerHit：屏幕坐标 → 组合命中（文本 + 可选动作 + 区域）。
@@ -865,6 +883,9 @@ fn pointer_target(
             Some(crate::tui::HitTarget::Reasoning(id)) => Some(PointerAction::Reasoning(id)),
             None => None,
         };
+        // §成熟化：链接优先于文本选择区域判定——命中链接文本即 Link 动作
+        // （文本+动作可共存；链接文本上轻点 = 打开 Link Overlay）。
+        let action = action.or_else(|| renderer.link_at(column, row).map(PointerAction::Link));
         return PointerHit {
             text: Some(position),
             action,
@@ -907,6 +928,31 @@ fn execute_ui_effect(
         UiEffect::Quit => true,
         // ResumeSession 由交互主循环处理（/sessions 菜单）。
         UiEffect::ResumeSession(_) => false,
+        // §成熟化：Link Overlay Enter → 打开 URL。仅允许 http/https scheme
+        //（防 file:// 等危险协议）；显式用户动作，不违反"绝不自动打开浏览器"。
+        UiEffect::OpenUrl(url) => {
+            let lower = url.trim().to_ascii_lowercase();
+            if lower.starts_with("http://") || lower.starts_with("https://") {
+                open_url_external(&url);
+                ui_state.view.transient_hint = Some("已在默认浏览器打开".into());
+            } else {
+                ui_state.view.transient_hint = Some(format!(
+                    "仅支持 http/https 链接，已拒绝打开：{}",
+                    crate::tui::text::truncate_middle_utf8(&url, 40, "…")
+                ));
+            }
+            false
+        }
+        // §成熟化：Link Overlay `c` → 复制 URL 到剪贴板。
+        UiEffect::CopyText(url) => {
+            if crate::clipboard::set_text(&url) {
+                ui_state.view.transient_hint = Some("URL 已复制到剪贴板".into());
+            } else {
+                ui_state.view.transient_hint =
+                    Some("复制失败：剪贴板不可用（可能被占用或平台不支持）".into());
+            }
+            false
+        }
         // §PointerHit：复制选中文本到剪贴板。copy 从 ViewModel 语义文本提取
         //（不依赖当前 viewport 快照；Renderer 只负责几何映射）。
         UiEffect::CopySelection => {
@@ -926,6 +972,16 @@ fn execute_ui_effect(
             false
         }
     }
+}
+
+/// 在默认浏览器打开 URL（Windows：`cmd /c start`；显式用户动作才调用）。
+fn open_url_external(url: &str) {
+    use std::process::Command;
+    // `start` 是 cmd 内建命令，必须经 cmd 执行；url 已校验 http/https 前缀。
+    #[cfg(windows)]
+    let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    #[cfg(not(windows))]
+    let _ = Command::new("xdg-open").arg(url).spawn();
 }
 
 struct InteractiveIo<'a> {
@@ -1033,7 +1089,10 @@ async fn run_interactive<P: Provider>(
                                     }
                                     ui_state.view.selection_clear();
                                 }
-                                UiEffect::Quit | UiEffect::ResumeSession(_) => {
+                                UiEffect::Quit
+                                | UiEffect::ResumeSession(_)
+                                | UiEffect::OpenUrl(_)
+                                | UiEffect::CopyText(_) => {
                                     // run 中不会产生（reducer 仅空闲时产生）。
                                 }
                             }

@@ -43,6 +43,9 @@ pub struct UiFile {
     pub theme: Option<String>,
     /// 视口模式：fullscreen（默认）/ inline（兼容模式；§1.2）。
     pub mode: Option<String>,
+    /// 键位覆盖表：`{ action = "ctrl+enter" }` 或 `{ action = ["k", "ctrl+p"] }`。
+    /// 未配置的动作保持内建默认；workspace 的 keymap 逐 key 覆盖 home。
+    pub keymap: Option<toml::Table>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -133,6 +136,8 @@ pub struct Config {
     pub ui_theme: String,
     /// §1 [ui] mode：fullscreen（默认）/ inline（兼容模式）。
     pub ui_mode: crate::tui::terminal::ViewMode,
+    /// §成熟化 [ui] keymap：动作 → 按键覆盖（未配置动作保持内建默认）。
+    pub ui_keymap: crate::tui::keymap::Keymap,
     /// §9.1：文件工具（read/edit/write/list/search）是否允许访问 workspace 外路径。
     /// 默认 true（bash 本来就能自由访问，保持一致）；false 恢复严格沙箱。
     pub allow_outside_workspace: bool,
@@ -321,6 +326,7 @@ pub(crate) fn load_from_home(
             .as_deref()
             .map(crate::tui::terminal::ViewMode::parse)
             .unwrap_or_default(),
+        ui_keymap: crate::tui::keymap::Keymap::from_config(&merged.ui.keymap.unwrap_or_default()),
         allow_outside_workspace: merged.agent.allow_outside_workspace.unwrap_or(true),
     })
 }
@@ -359,8 +365,20 @@ fn merge(home: ConfigFile, workspace: ConfigFile) -> ConfigFile {
         ui: UiFile {
             theme: workspace.ui.theme.or(home.ui.theme),
             mode: workspace.ui.mode.or(home.ui.mode),
+            keymap: merge_keymap(home.ui.keymap, workspace.ui.keymap),
         },
     }
+}
+
+/// keymap 逐 key 合并（workspace 覆盖 home；字段级合并哲学 §18.1）。
+fn merge_keymap(home: Option<toml::Table>, workspace: Option<toml::Table>) -> Option<toml::Table> {
+    let mut out = home.unwrap_or_default();
+    if let Some(ws) = workspace {
+        for (key, value) in ws {
+            out.insert(key, value);
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// §18.1：配置合并是字段级，不是块级——workspace 只定义部分字段时，

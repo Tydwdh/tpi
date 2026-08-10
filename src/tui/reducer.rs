@@ -1,14 +1,17 @@
 //! Reducer（TPI_TUI_V2_TASK §26-27）：`update(state, event) -> Vec<UiEffect>`。
 //!
 //! 只修改状态，不运行 provider/bash，不写 stdout。跨边界动作
-//! （退出/取消 run/恢复 session）以 effect 返回，由 app 层执行。
+//! （退出/取消 run/恢复 session/打开链接/复制）以 effect 返回，由 app 层执行。
 //! 键盘路由优先级（§11）：Overlay > Menu > Composer > Transcript 导航。
+//! 键位来自 `[ui.keymap]`（成熟化）：按键 → KeyAction 的绑定表由 UiState 持有
+//! （app 启动时注入），未配置动作保持内建默认；状态可重放不变量不受影响。
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::agent::{DeltaKind, RuntimeEvent};
 use crate::tui::effect::UiEffect;
 use crate::tui::event::UiEvent;
+use crate::tui::keymap::KeyAction;
 use crate::tui::model::{LineKind, MenuKind, StatusLine};
 use crate::tui::state::UiState;
 
@@ -90,6 +93,7 @@ fn handle_search_key(
 
 /// 处理单个按键事件（空闲与运行中共用；行为与迁移前的 handle_key 一致）。
 /// 键盘路由优先级（§11）：Overlay > Modal > Search > Menu > Composer。
+/// 键位语义由 `state.keymap.action(key)` 解析（`[ui.keymap]` 可覆盖）。
 fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
     let mut effects = Vec::new();
     // 过渡提示下一次键盘操作清除（同一个键可重新设置）。
@@ -99,12 +103,29 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
     // Ctrl+C 由终端优先复制（不传给应用）；未选中时到达应用的 Ctrl+C 静默忽略，
     // 不取消/退出（取消统一用 Esc）。
     // 注意：raw mode 下 crossterm 把 Ctrl+C 读成 KeyEvent；若不做任何处理，
-    // 它会落到 `Char('c')` 分支变成输入 'c'，因此必须显式忽略。
+    // 它会落到 Char('c') 分支变成输入 'c'，因此必须显式忽略（默认 keymap 绑定）。
 
     // 弹层（Modal/Overlay）打开时：只响应导航/关闭/菜单键，普通按键不得写入 composer
     // （否则用户打字全进后台输入框，关弹层后输入框出现乱码）。
     let blocking = state.view.overlay.is_some() || state.view.modal.is_some();
     if blocking {
+        // §成熟化：Link Overlay 响应 Enter（打开 URL）与 c（复制 URL）。
+        if let Some(overlay) = &state.view.overlay
+            && overlay.kind == crate::tui::model::OverlayKind::Link
+        {
+            let url = overlay.body.clone();
+            match key.code {
+                KeyCode::Enter => {
+                    state.view.overlay = None;
+                    return vec![UiEffect::OpenUrl(url)];
+                }
+                KeyCode::Char('c') => {
+                    state.view.overlay = None;
+                    return vec![UiEffect::CopyText(url)];
+                }
+                _ => {}
+            }
+        }
         let allowed = matches!(
             key.code,
             KeyCode::Esc | KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
@@ -117,17 +138,16 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
     if state.view.overlay.is_none() && state.view.modal.is_none() && state.view.search.is_some() {
         return handle_search_key(state, key, &mut effects);
     }
-    match key.code {
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+    let Some(action) = state.keymap.action(key) else {
+        return effects;
+    };
+    match action {
+        // T6（§23）：Shift+Enter / Ctrl+J / Alt+Enter 换行。
+        KeyAction::InsertNewline => {
             state.editor.insert_char('\n');
             state.sync_input();
         }
-        // T6（§23）：Shift+Enter / Ctrl+J 换行（Alt+Enter 兼容保留）。
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            state.editor.insert_char('\n');
-            state.sync_input();
-        }
-        KeyCode::Enter => {
+        KeyAction::Submit => {
             // 命令菜单打开时先补全为选中命令（Claude Code 式菜单交互）。
             if state.view.menu.is_some()
                 && let Some((label, kind)) = state.view.selected_menu_item()
@@ -167,7 +187,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             state.sync_input();
             refresh_menus(state);
         }
-        KeyCode::Tab => {
+        KeyAction::MenuNext => {
             if state.view.menu.is_some() {
                 if let Some(menu) = state.view.menu.as_mut()
                     && menu.items.len() > 1
@@ -180,7 +200,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.sync_input();
             }
         }
-        KeyCode::Esc => {
+        KeyAction::Escape => {
             // §49：Esc 优先级 = overlay > modal > menu > run 取消。
             if state.view.overlay.is_some() {
                 state.view.close_overlay();
@@ -205,63 +225,61 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 refresh_menus(state);
             }
         }
-        KeyCode::Backspace => {
+        KeyAction::Backspace => {
             state.editor.backspace();
             state.sync_input();
             refresh_menus(state);
         }
-        KeyCode::Delete => {
+        KeyAction::Delete => {
             state.editor.delete();
             state.sync_input();
             refresh_menus(state);
         }
-        KeyCode::Left => {
-            if key.modifiers.contains(KeyModifiers::ALT) {
-                state.editor.move_word_left();
-            } else {
-                state.editor.move_left();
-            }
+        KeyAction::MoveLeft => {
+            state.editor.move_left();
             state.sync_input();
         }
-        KeyCode::Right => {
-            if key.modifiers.contains(KeyModifiers::ALT) {
-                state.editor.move_word_right();
-            } else {
-                state.editor.move_right();
-            }
+        KeyAction::MoveRight => {
+            state.editor.move_right();
             state.sync_input();
         }
-        KeyCode::Home => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                // §25：Ctrl+Home 跳到历史最顶部。
-                state.view.jump_to_top();
-            } else {
-                state.editor.home();
-                // Home 只改光标位置，必须同步投影，否则硬件光标停在旧位置。
-                state.sync_input();
-            }
+        KeyAction::MoveWordLeft => {
+            state.editor.move_word_left();
+            state.sync_input();
         }
-        KeyCode::End => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                // 整改 C：Ctrl+End 恢复 follow-tail（scroll lock 中）。
-                state.view.follow_tail();
-            } else {
-                state.editor.end();
-                state.sync_input();
-            }
+        KeyAction::MoveWordRight => {
+            state.editor.move_word_right();
+            state.sync_input();
         }
-        KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+        KeyAction::LineStart => {
+            state.editor.home();
+            // Home 只改光标位置，必须同步投影，否则硬件光标停在旧位置。
+            state.sync_input();
+        }
+        KeyAction::LineEnd => {
+            state.editor.end();
+            state.sync_input();
+        }
+        KeyAction::JumpTranscriptTop => {
+            // §25：Ctrl+Home 跳到历史最顶部。
+            state.view.jump_to_top();
+        }
+        KeyAction::FollowTail => {
+            // 整改 C：Ctrl+End 恢复 follow-tail（scroll lock 中）。
+            state.view.follow_tail();
+        }
+        KeyAction::JumpPrevUserTurn => {
             // §13：Alt+Up 跳到上一条 User entry（基于 EntryId 查找）。
             if !state.view.jump_to_user_turn(false) {
                 state.view.transient_hint = Some("没有用户消息可跳转".into());
             }
         }
-        KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+        KeyAction::JumpNextUserTurn => {
             if !state.view.jump_to_user_turn(true) {
                 state.view.transient_hint = Some("没有用户消息可跳转".into());
             }
         }
-        KeyCode::Up => {
+        KeyAction::MoveUp => {
             if state.view.menu.is_some() {
                 if let Some(menu) = state.view.menu.as_mut()
                     && !menu.items.is_empty()
@@ -281,7 +299,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             state.sync_input();
             refresh_menus(state);
         }
-        KeyCode::Down => {
+        KeyAction::MoveDown => {
             if state.view.menu.is_some() {
                 if let Some(menu) = state.view.menu.as_mut()
                     && !menu.items.is_empty()
@@ -301,7 +319,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             state.sync_input();
             refresh_menus(state);
         }
-        KeyCode::PageUp => {
+        KeyAction::PageUp => {
             if let Some(modal) = &mut state.view.modal {
                 modal.scroll = modal.scroll.saturating_sub(10);
             } else if let Some(overlay) = &mut state.view.overlay {
@@ -310,7 +328,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.view.scroll_up(8);
             }
         }
-        KeyCode::PageDown => {
+        KeyAction::PageDown => {
             if let Some(modal) = &mut state.view.modal {
                 modal.scroll = modal.scroll.saturating_add(10);
             } else if let Some(overlay) = &mut state.view.overlay {
@@ -319,84 +337,67 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.view.scroll_down(8);
             }
         }
-        KeyCode::Char(c) => {
+        KeyAction::CopyOrInterrupt => {
             // Ctrl+C 语义（§PointerHit 统一）：
             // - 有选区：复制到剪贴板；
             // - 运行中无选区：取消 run（与 Esc 一致）；
             // - 空闲无选区：忽略（退出走 /quit 或独立 signal handler）。
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
-                if state.view.selection.is_some() {
-                    effects.push(UiEffect::CopySelection);
-                } else if state.running {
-                    effects.push(UiEffect::CancelRun);
-                }
-                return effects;
+            if state.view.selection.is_some() {
+                effects.push(UiEffect::CopySelection);
+            } else if state.running {
+                effects.push(UiEffect::CancelRun);
             }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'u' {
-                state.editor.clear();
-                state.sync_input();
-                refresh_menus(state);
-                return effects;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'a' {
-                state.editor.home();
-                state.sync_input(); // Ctrl+A 同样要同步光标投影
-                return effects;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'e' {
-                state.editor.end();
-                state.sync_input();
-                return effects;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'w' {
-                state.editor.delete_word_back();
-                state.sync_input();
-                refresh_menus(state);
-                return effects;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'k' {
-                state.editor.delete_to_end();
-                state.sync_input();
-                refresh_menus(state);
-                return effects;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'j' {
-                // §23：Ctrl+J 换行（终端 LF 常映射为 Enter，此处兜底）。
-                state.editor.insert_char('\n');
-                state.sync_input();
-                return effects;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'f' {
-                // §14：Ctrl+F 打开转录搜索。
-                state.view.open_search();
-                return effects;
-            }
-            if key.modifiers.contains(KeyModifiers::ALT) && c == 't' {
-                state.view.reasoning_visible = !state.view.reasoning_visible;
-                return effects;
-            }
-            if key.modifiers.contains(KeyModifiers::ALT) && c == 'e' {
-                // 打开最近一张工具卡片的详情 Overlay（鼠标点击的键盘等价）。
-                state.view.open_last_tool_overlay();
-                return effects;
-            }
-            if key.modifiers.contains(KeyModifiers::ALT) && c == 'o' {
-                state.view.open_failed_tool_overlay();
-                return effects;
-            }
-            if key.modifiers.contains(KeyModifiers::ALT) && c == '[' {
-                state.view.cycle_tool_overlay(-1);
-                return effects;
-            }
-            if key.modifiers.contains(KeyModifiers::ALT) && c == ']' {
-                state.view.cycle_tool_overlay(1);
-                return effects;
-            }
+        }
+        KeyAction::ClearInput => {
+            state.editor.clear();
+            state.sync_input();
+            refresh_menus(state);
+        }
+        KeyAction::DeleteWordBack => {
+            state.editor.delete_word_back();
+            state.sync_input();
+            refresh_menus(state);
+        }
+        KeyAction::DeleteToLineEnd => {
+            state.editor.delete_to_end();
+            state.sync_input();
+            refresh_menus(state);
+        }
+        KeyAction::OpenSearch => {
+            // §14：Ctrl+F 打开转录搜索。
+            state.view.open_search();
+        }
+        KeyAction::ToggleReasoning => {
+            state.view.reasoning_visible = !state.view.reasoning_visible;
+        }
+        KeyAction::OpenLastTool => {
+            // 打开最近一张工具卡片的详情 Overlay（鼠标点击的键盘等价）。
+            state.view.open_last_tool_overlay();
+        }
+        KeyAction::OpenFailedTool => {
+            state.view.open_failed_tool_overlay();
+        }
+        KeyAction::CycleToolPrev => {
+            state.view.cycle_tool_overlay(-1);
+        }
+        KeyAction::CycleToolNext => {
+            state.view.cycle_tool_overlay(1);
+        }
+        KeyAction::Undo => {
+            state.editor.undo();
+            state.sync_input();
+            refresh_menus(state);
+        }
+        KeyAction::Redo => {
+            state.editor.redo();
+            state.sync_input();
+            refresh_menus(state);
+        }
+        KeyAction::TypedChar(c) => {
             state.editor.insert_char(c);
             state.sync_input();
             refresh_menus(state);
         }
-        _ => {}
     }
     effects
 }
@@ -480,7 +481,8 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
     }
 }
 
-/// 主入口：状态转换 + 效果（§26：reducer 只修改状态）。
+/// 主入口：状态转换 + 效果（§26：reducer 只修改状态；§成熟化：键位由
+/// UiState.keymap 注入（来自 `[ui.keymap]`），不破坏状态可重放性）。
 pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
     match event {
         UiEvent::Tick => {
@@ -544,7 +546,15 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             }
             Vec::new()
         }
-        // MouseMoved 保留为穷尽占位（hover 高亮已移除；移动事件不再影响状态）。
+        // §美化：鼠标悬停 → 卡片 hover 微高亮。判重：状态未变化（悬停同一张
+        // 卡片 / 移出后仍在非卡片区）不重复渲染。
+        UiEvent::HoverTool(id) => {
+            if state.view.hover_tool != id {
+                state.view.hover_tool = id;
+            }
+            Vec::new()
+        }
+        // MouseMoved 保留为穷尽占位（hover 语义由 HoverTool 承载）。
         UiEvent::MouseMoved { .. } => Vec::new(),
         // §InteractionRefactor：语义选择事件由 reducer 直接写入 view（不再
         // 依赖 Renderer 坐标——TextPosition 指向内容）。SelectionEnd 保留选区。
@@ -564,6 +574,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new(); // 弹层打开时鼠标点击不得打开后台 overlay
             }
+            state.view.hover_tool = None;
             // §用户诉求：点击工具卡片展开/收缩（diff 折叠态显示，展开看完整）。
             state.view.toggle_expand(id);
             Vec::new()
@@ -572,6 +583,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new();
             }
+            state.view.hover_tool = None;
             // §PointerHit：live reasoning 折叠行点击 → 切换全局展开；
             // 历史 reasoning → 按条目展开（与 diff 一致）。
             let in_transcript = state.view.transcript.iter().any(|entry| entry.id() == id);
@@ -580,6 +592,16 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             } else {
                 state.view.reasoning_visible = !state.view.reasoning_visible;
             }
+            Vec::new()
+        }
+        UiEvent::ClickLink(url) => {
+            // §成熟化：链接文本点击 → 打开 Link Overlay（确认后再打开/复制）。
+            // 仅接受 http/https（其他 scheme 提示不可用，不打开）。
+            if state.view.modal.is_some() || state.view.overlay.is_some() {
+                return Vec::new();
+            }
+            state.view.hover_tool = None;
+            state.view.overlay = Some(crate::tui::model::OverlayState::for_link(&url));
             Vec::new()
         }
         UiEvent::ScrollbarClick(row) => {

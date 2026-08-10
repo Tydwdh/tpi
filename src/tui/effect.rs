@@ -12,4 +12,8 @@ pub enum UiEffect {
     ResumeSession(String),
     /// 复制选中文本到剪贴板（§用户诉求：Ctrl+C 有选区时复制；无选区忽略）。
     CopySelection,
+    /// Link Overlay 内确认打开 URL（§成熟化：仅显式用户动作；app 层校验 scheme）。
+    OpenUrl(String),
+    /// 复制 URL 到剪贴板（§成熟化：Link Overlay 内 `c`）。
+    CopyText(String),
 }

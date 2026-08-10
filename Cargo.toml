@@ -37,6 +37,9 @@ camino = "1"
 ignore = "0.4"
 regex = "1"
 similar = "3"
+# 代码块语法高亮（纯 Rust：regex-fancy，无 oniguruma C 依赖；default-fancy
+# 含默认语法集与主题集）。
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_JobObjects",
   "Win32_System_Threading", "Win32_System_Console", "Win32_System_Pipes",

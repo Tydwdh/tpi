@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::tui::editor::Editor;
+use crate::tui::keymap::Keymap;
 use crate::tui::model::ViewModel;
 
 /// TUI 全部 UI 状态（app 层唯一持有的状态对象；reducer 只改它）。
@@ -8,6 +9,9 @@ use crate::tui::model::ViewModel;
 pub struct UiState {
     pub view: ViewModel,
     pub editor: Editor,
+    /// 生效键位（§成熟化 `[ui.keymap]`）：app 启动时注入，
+    /// reducer 按键语义统一经它解析；测试用默认绑定。
+    pub keymap: Keymap,
     /// 排队中的下一条消息（Enter 提交；slash 命令也在此，由 app 消费时解释）。
     ///
     /// BUG-005：单槽 Option 会被运行中第二次 Enter 覆盖（第一条消息丢失），
@@ -29,9 +33,15 @@ const PENDING_CAP: usize = 16;
 
 impl UiState {
     pub fn new(view: ViewModel) -> Self {
+        Self::with_keymap(view, Keymap::builtin())
+    }
+
+    /// 以指定键位创建状态（app 从 `[ui.keymap]` 构造；测试默认绑定）。
+    pub fn with_keymap(view: ViewModel, keymap: Keymap) -> Self {
         Self {
             view,
             editor: Editor::new(),
+            keymap,
             pending_messages: VecDeque::new(),
             pending_session: None,
             pending_retry: None,

@@ -51,6 +51,8 @@ pub enum PointerAction {
     Tool(String),
     /// 折叠的 reasoning 行。
     Reasoning(EntryId),
+    /// 链接文本（点击打开 Link Overlay；§成熟化）。
+    Link(String),
 }
 
 /// 命中区域类别（决定手势路由：scrollbar 拖拽 vs 文本选择 vs 无动作）。
@@ -179,7 +181,19 @@ const DRAG_THRESHOLD: i32 = 3;
 
 impl PointerGesture {
     /// 喂入一个指针事件，返回要发给 reducer 的语义事件。
+    /// （无视口边界：拖选不会触发自动滚动——测试与无视口场景。）
     pub fn feed(&mut self, input: PointerInput) -> Vec<UiEvent> {
+        self.feed_in_viewport(input, None)
+    }
+
+    /// 带视口矩形喂入（§成熟化：拖选自动滚动需要转录区边界）。
+    /// `Selecting` 状态下拖出视口上下边缘 → 附带 `MouseScrollUp/Down`
+    /// （视口滚动后选区继续扩展，拖选可跨越当前屏幕）。
+    pub fn feed_in_viewport(
+        &mut self,
+        input: PointerInput,
+        viewport: Option<ratatui::layout::Rect>,
+    ) -> Vec<UiEvent> {
         match input {
             PointerInput::Down { column, row, hit } => {
                 *self = PointerGesture::Pressed {
@@ -212,7 +226,16 @@ impl PointerGesture {
                             // （tool 主行同时是文本+动作——拖动即选择，不点动作。）
                             if let Some(anchor) = origin_hit.text {
                                 let current = hit;
-                                self.begin_selecting(anchor, current)
+                                let mut events = self.begin_selecting(anchor, current);
+                                // 首次超阈值拖动已越出视口边缘：一并自动滚动。
+                                if let Some(rect) = viewport {
+                                    if row < rect.y {
+                                        events.push(UiEvent::MouseScrollUp);
+                                    } else if row >= rect.y + rect.height {
+                                        events.push(UiEvent::MouseScrollDown);
+                                    }
+                                }
+                                events
                             } else {
                                 Vec::new()
                             }
@@ -220,7 +243,7 @@ impl PointerGesture {
                         PointerRegion::Other => Vec::new(),
                     }
                 }
-                _ => self.feed_drag(column, row, hit),
+                _ => self.feed_drag(column, row, hit, viewport),
             },
             PointerInput::Up { hit, .. } => {
                 let origin = match self {
@@ -252,24 +275,52 @@ impl PointerGesture {
                             ) if id == u => {
                                 vec![UiEvent::ClickReasoning(u)]
                             }
+                            (Some(PointerAction::Link(url)), Some(PointerAction::Link(u)))
+                                if url == u =>
+                            {
+                                // §成熟化：链接文本轻点 → 打开 Link Overlay。
+                                vec![UiEvent::ClickLink(u)]
+                            }
                             _ => Vec::new(),
                         }
                     }
                 }
             }
-            PointerInput::Move { .. } => Vec::new(),
+            // §美化：悬停上报——命中文具卡片产出 HoverTool(Some(id))，
+            // 非卡片区域产出 HoverTool(None)（清除）。reducer 判重：
+            // 状态未变化时不重复渲染。
+            PointerInput::Move { hit, .. } => match hit.action {
+                Some(PointerAction::Tool(id)) => vec![UiEvent::HoverTool(Some(id))],
+                _ => vec![UiEvent::HoverTool(None)],
+            },
             PointerInput::ScrollUp => vec![UiEvent::MouseScrollUp],
             PointerInput::ScrollDown => vec![UiEvent::MouseScrollDown],
         }
     }
 
     /// Selecting / DraggingScrollbar 状态下的拖动更新。
-    fn feed_drag(&mut self, _column: u16, row: u16, hit: PointerHit) -> Vec<UiEvent> {
+    fn feed_drag(
+        &mut self,
+        _column: u16,
+        row: u16,
+        hit: PointerHit,
+        viewport: Option<ratatui::layout::Rect>,
+    ) -> Vec<UiEvent> {
         match self {
             PointerGesture::Selecting { anchor, focus } => {
                 if let Some(pos) = hit.text {
                     *focus = pos;
-                    vec![UiEvent::SelectionUpdate(pos)]
+                    let mut events = vec![UiEvent::SelectionUpdate(pos)];
+                    // §成熟化：拖出视口上下边缘 → 自动滚动（选区持续扩展跨越屏幕）。
+                    // 每次越界滚一档；持续拖动持续滚。
+                    if let Some(rect) = viewport {
+                        if row < rect.y {
+                            events.push(UiEvent::MouseScrollUp);
+                        } else if row >= rect.y + rect.height {
+                            events.push(UiEvent::MouseScrollDown);
+                        }
+                    }
+                    events
                 } else {
                     let _ = anchor;
                     Vec::new()
@@ -487,6 +538,111 @@ mod tests {
         let _ = g.feed(text(5, 5, tp(1, 5)));
         let events = g.feed(up(5, 5, PointerHit::text_at(tp(1, 5))));
         assert!(events.is_empty());
+    }
+
+    /// §成熟化：Selecting 拖出视口下边缘 → 附带 MouseScrollDown（自动滚动）。
+    #[test]
+    fn drag_below_viewport_auto_scrolls_down() {
+        use ratatui::layout::Rect;
+        let mut g = PointerGesture::Idle;
+        let viewport = Rect::new(0, 0, 80, 20);
+        let _ = g.feed_in_viewport(down(5, 5, PointerHit::text_at(tp(1, 5))), Some(viewport));
+        // 超过阈值并拖到视口下方（row 25 ≥ y+height=20）。
+        let events =
+            g.feed_in_viewport(drag(9, 25, PointerHit::text_at(tp(1, 25))), Some(viewport));
+        assert!(
+            events.contains(&UiEvent::SelectionUpdate(tp(1, 25))),
+            "焦点仍更新: {events:?}"
+        );
+        assert!(
+            events.contains(&UiEvent::MouseScrollDown),
+            "拖出下边缘必须自动下滚: {events:?}"
+        );
+        assert!(!events.contains(&UiEvent::MouseScrollUp));
+    }
+
+    /// §成熟化：Selecting 拖出视口上边缘 → 附带 MouseScrollUp（向上看更早内容）。
+    #[test]
+    fn drag_above_viewport_auto_scrolls_up() {
+        use ratatui::layout::Rect;
+        let mut g = PointerGesture::Idle;
+        let viewport = Rect::new(0, 10, 80, 20);
+        let _ = g.feed_in_viewport(down(5, 15, PointerHit::text_at(tp(1, 15))), Some(viewport));
+        let events = g.feed_in_viewport(drag(9, 8, PointerHit::text_at(tp(1, 8))), Some(viewport));
+        assert!(events.contains(&UiEvent::SelectionUpdate(tp(1, 8))));
+        assert!(
+            events.contains(&UiEvent::MouseScrollUp),
+            "拖出上边缘必须自动上滚: {events:?}"
+        );
+        assert!(!events.contains(&UiEvent::MouseScrollDown));
+    }
+
+    /// §成熟化：视口内拖动不产生滚动事件（回归）。
+    #[test]
+    fn drag_inside_viewport_does_not_scroll() {
+        use ratatui::layout::Rect;
+        let mut g = PointerGesture::Idle;
+        let viewport = Rect::new(0, 0, 80, 20);
+        let _ = g.feed_in_viewport(down(5, 5, PointerHit::text_at(tp(1, 5))), Some(viewport));
+        let events =
+            g.feed_in_viewport(drag(9, 10, PointerHit::text_at(tp(1, 10))), Some(viewport));
+        assert!(events.contains(&UiEvent::SelectionUpdate(tp(1, 10))));
+        assert!(!events.contains(&UiEvent::MouseScrollUp));
+        assert!(!events.contains(&UiEvent::MouseScrollDown));
+    }
+
+    /// §成熟化：链接文本轻点 → ClickLink（按下/抬起 action 一致才触发）。
+    #[test]
+    fn tap_link_produces_click_link() {
+        let mut g = PointerGesture::Idle;
+        let action = PointerAction::Link("https://example.com".into());
+        let hit = PointerHit::actionable(tp(1, 3), action);
+        assert!(g.feed(down(5, 5, hit.clone())).is_empty());
+        let events = g.feed(up(5, 5, hit));
+        assert!(
+            events.contains(&UiEvent::ClickLink("https://example.com".into())),
+            "链接轻点必须产生 ClickLink: {events:?}"
+        );
+    }
+
+    /// §成熟化：链接文本上拖动（超阈值）→ 进入选择，不触发 ClickLink。
+    #[test]
+    fn drag_on_link_selects_and_does_not_click() {
+        let mut g = PointerGesture::Idle;
+        let action = PointerAction::Link("https://example.com".into());
+        let _ = g.feed(down(5, 5, PointerHit::actionable(tp(1, 5), action)));
+        let events = g.feed(drag(10, 5, PointerHit::text_at(tp(1, 10))));
+        assert!(events.contains(&UiEvent::SelectionStart(tp(1, 5))));
+        let up_events = g.feed(up(10, 5, PointerHit::text_at(tp(1, 10))));
+        assert!(!up_events.contains(&UiEvent::ClickLink("https://example.com".into())));
+        assert!(up_events.contains(&UiEvent::SelectionEnd));
+    }
+
+    /// §美化：悬停工具卡片 → HoverTool(Some(id))；移出 → HoverTool(None)。
+    #[test]
+    fn move_over_tool_card_reports_hover() {
+        let mut g = PointerGesture::Idle;
+        let action = PointerAction::Tool("c1".into());
+        let hit = PointerHit::actionable(tp(1, 0), action);
+        let events = g.feed(PointerInput::Move {
+            column: 5,
+            row: 5,
+            hit,
+        });
+        assert!(
+            events.contains(&UiEvent::HoverTool(Some("c1".into()))),
+            "悬停卡片必须上报 HoverTool: {events:?}"
+        );
+        // 移到空白/非卡片区域 → 清除。
+        let events = g.feed(PointerInput::Move {
+            column: 5,
+            row: 5,
+            hit: PointerHit::none(),
+        });
+        assert!(
+            events.contains(&UiEvent::HoverTool(None)),
+            "移出卡片必须清除 hover: {events:?}"
+        );
     }
 
     /// §InteractionRefactor：cell → char 映射必须按 cell 宽度而非字符数。

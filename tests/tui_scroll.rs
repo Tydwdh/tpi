@@ -24,14 +24,15 @@ fn layout(view: &mut ViewModel, width: u16, height: u16) -> (EntryId, usize) {
 
 #[test]
 fn scenario_a_append_does_not_move_locked_viewport() {
-    // 200 条 history → 滚到 entry 80 → 追加 100 条：视口仍锚定 entry 80。
+    // 200 条 history → 滚到 entry ~80 → 追加 100 条：视口仍锚定 entry 80。
     let mut view = ViewModel::default();
     messages(&mut view, 200);
-    // 布局（视口 20 行，Follow 顶部 = 行 180 附近 = 第 181 个 entry）。
-    layout(&mut view, 80, 24); // Inline 视口 = 24-2 = 22 行
-    // 向上翻 100 行（10 次 PageUp，每页 10 行）→ 锚定 entry ~80。
+    // §美化：每条消息后插留白空行 → 200 条 = 400 行。
+    // 布局（视口 21 行 = 24 - input1 - rule1 - footer1；Follow 顶部 = 379 = entry 189）。
+    layout(&mut view, 80, 24);
+    // 向上翻 220 行（10 次 PageUp，每页 22 行）→ 行 159 = entry 79。
     for _ in 0..10 {
-        view.scroll_up(10);
+        view.scroll_up(22);
     }
     let ScrollMode::Locked(anchor) = view.scroll_mode else {
         panic!("滚动后必须 Locked");
@@ -65,9 +66,10 @@ fn scenario_b_resize_keeps_anchor_semantic_position() {
             format!("msg {i} 内容 {}", "x".repeat(60)),
         );
     }
-    layout(&mut view, 120, 40); // 视口 = 40-2(footer+input) = 38；60 条×1 行 → 顶部行 22
-    for _ in 0..3 {
-        view.scroll_up(7); // 22 - 21 = 1 → EntryId(2)
+    // §美化：60 条消息 + 60 留白空行 = 120 行。
+    layout(&mut view, 120, 40); // 视口 = 40-2(footer+input) = 38；120 行 → 顶部行 82
+    for _ in 0..4 {
+        view.scroll_up(20); // 82 - 80 = 2 → EntryId(2) 消息行
     }
     let ScrollMode::Locked(anchor) = view.scroll_mode else {
         panic!("滚动后必须 Locked");
@@ -174,8 +176,9 @@ fn wheel_moves_anchor_by_three_rows() {
         .map(|id| view.entry_heights.get(id).copied().unwrap_or(1))
         .collect();
     let top_row = tpi::tui::scroll::row_of(&ids, &heights, anchor.entry_id, anchor.row_in_entry);
-    // 初始 Follow 视口顶部 = 30 - 22(视口：24-2 footer+input) = 行 8；上移 3 → 行 5。
-    assert_eq!(top_row, 5);
+    // §美化：30 条消息 + 30 留白空行 = 60 行；初始 Follow 视口顶部 =
+    // 60 - 21(视口：24 - input1 - footer-rule1 - footer1) = 行 39；上移 3 → 36。
+    assert_eq!(top_row, 36);
 }
 
 #[test]

@@ -97,6 +97,9 @@ const MAX_TOOL_NAME: usize = 256;
 const MAX_MODAL_BODY: usize = 256 * 1024;
 const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SEARCH_QUERY: usize = 4 * 1024;
+/// 搜索命中数上限（§成熟化：超大转录下防止命中集合无限膨胀；
+/// 跳转仍可循环，上限只是截断"最旧命中"）。
+const MAX_SEARCH_HITS: usize = 256;
 
 /// 耗时格式化（Overlay 标题与 ToolCard metadata 共用）。
 pub fn fmt_duration(ms: u64) -> String {
@@ -135,33 +138,23 @@ impl SearchState {
         Self::default()
     }
 
-    /// 重新计算命中（大小写不敏感）；返回是否无命中。
-    pub fn recompute(&mut self, transcript: &[Entry]) {
+    /// 重新计算命中（大小写不敏感；§成熟化：使用每条目的惰性小写缓存，
+    /// 不再每键全量 `to_lowercase`）。命中数上限 `MAX_SEARCH_HITS` 防超大
+    /// 转录下命中集合膨胀（跳转仍循环可用）。
+    pub fn recompute(&mut self, transcript: &mut [Entry]) {
         let query = self.query.to_lowercase();
         self.hits.clear();
         self.index = 0;
         if query.is_empty() {
             return;
         }
-        for entry in transcript {
-            let hit = match entry {
-                Entry::Message { line, .. } => line.text.to_lowercase().contains(&query),
-                Entry::Tool { card, .. } => {
-                    card.name.to_lowercase().contains(&query)
-                        || card
-                            .target
-                            .as_deref()
-                            .map(|t| t.to_lowercase().contains(&query))
-                            .unwrap_or(false)
-                        || card
-                            .tail
-                            .as_deref()
-                            .map(|t| t.to_lowercase().contains(&query))
-                            .unwrap_or(false)
-                }
-            };
-            if hit {
+        for entry in transcript.iter_mut() {
+            let haystack = entry.search_lower();
+            if haystack.contains(&query) {
                 self.hits.push(entry.id());
+                if self.hits.len() >= MAX_SEARCH_HITS {
+                    break;
+                }
             }
         }
     }
@@ -196,6 +189,17 @@ impl ModalState {
     }
 }
 
+/// 详情 Overlay 类型（§成熟化：tool / reasoning / link 三种渲染与交互差异）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayKind {
+    /// 工具卡片详情。
+    Tool,
+    /// 思考（reasoning）原文。
+    Reasoning,
+    /// 链接（确认打开 / 复制 URL）。
+    Link,
+}
+
 /// 详情 Overlay 状态（整改 B：历史/工具详情不重写 scrollback，覆盖显示）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayState {
@@ -211,6 +215,8 @@ pub struct OverlayState {
     pub scroll: usize,
     /// 对应工具卡 id（P2：Alt+[/Alt+] 卡片间切换用；reasoning overlay 为 None）。
     pub tool_id: Option<String>,
+    /// Overlay 类型（渲染提示与按键语义用）。
+    pub kind: OverlayKind,
 }
 
 impl OverlayState {
@@ -247,6 +253,7 @@ impl OverlayState {
             body,
             scroll: 0,
             tool_id: Some(card.id.clone()),
+            kind: OverlayKind::Tool,
         }
     }
 
@@ -259,6 +266,20 @@ impl OverlayState {
             body_truncated: false,
             scroll: 0,
             tool_id: None,
+            kind: OverlayKind::Reasoning,
+        }
+    }
+
+    /// 链接 overlay（§成熟化：点击链接文本打开；确认打开/复制由 app 执行 effect）。
+    pub fn for_link(url: &str) -> Self {
+        Self {
+            title: "链接".into(),
+            command: None,
+            body: url.to_string(),
+            body_truncated: false,
+            scroll: 0,
+            tool_id: None,
+            kind: OverlayKind::Link,
         }
     }
 }
@@ -267,10 +288,27 @@ impl OverlayState {
 ///
 /// 每个条目带稳定 [`EntryId`]（TUI v2 §4.1）：trim/折叠不会改变 id，
 /// 滚动锚点与搜索命中都基于它，而不是 Vec index。
+///
+/// 搜索/选区文本缓存（§成熟化）：转录条目进入后文本不可变（streaming 在
+/// live 区完成、finalize 时才创建条目），故缓存只需惰性计算一次；工具卡片
+/// 仅在防御性 re-finish 时变更，那里显式失效。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
-    Message { id: EntryId, line: TranscriptLine },
-    Tool { id: EntryId, card: ToolCard },
+    Message {
+        id: EntryId,
+        line: TranscriptLine,
+        /// 搜索用小写 haystack 缓存（惰性；§成熟化避免每键全量 to_lowercase）。
+        search_cache: Option<String>,
+        /// 选区文本用的语义文本缓存（键为 line.version；§成熟化避免每次
+        /// 复制都重新跑 markdown 渲染）。
+        semantic_cache: Option<(u64, String)>,
+    },
+    Tool {
+        id: EntryId,
+        card: ToolCard,
+        /// 搜索用小写 haystack 缓存（惰性；re-finish 时失效）。
+        search_cache: Option<String>,
+    },
 }
 
 impl Entry {
@@ -279,6 +317,50 @@ impl Entry {
             Entry::Message { id, .. } | Entry::Tool { id, .. } => *id,
         }
     }
+
+    /// 搜索 haystack（小写缓存；message 不可变，tool 由调用方失效）。
+    pub fn search_lower(&mut self) -> &str {
+        let cache = match self {
+            Entry::Message {
+                line, search_cache, ..
+            } => {
+                if search_cache.is_none() {
+                    *search_cache = Some(line.text.to_lowercase());
+                }
+                search_cache
+            }
+            Entry::Tool {
+                card, search_cache, ..
+            } => {
+                if search_cache.is_none() {
+                    *search_cache = Some(search_tool_haystack(card).to_lowercase());
+                }
+                search_cache
+            }
+        };
+        cache.as_deref().unwrap_or_default()
+    }
+
+    /// 工具卡片字段变更后失效搜索缓存（防御性 re-finish 路径）。
+    pub fn invalidate_search_cache(&mut self) {
+        if let Entry::Tool { search_cache, .. } = self {
+            *search_cache = None;
+        }
+    }
+}
+
+/// 工具卡片的搜索文本（name/target/tail；小字段，随卡片构造一次）。
+fn search_tool_haystack(card: &ToolCard) -> String {
+    let mut out = card.name.clone();
+    if let Some(target) = &card.target {
+        out.push(' ');
+        out.push_str(target);
+    }
+    if let Some(tail) = &card.tail {
+        out.push('\n');
+        out.push_str(tail);
+    }
+    out
 }
 
 /// 状态栏内容（§16.2）。
@@ -367,9 +449,6 @@ pub struct ViewModel {
     pub live: LiveTurnState,
     /// 滚动模式（TUI v2 §3）：Follow = 尾部；Locked = 锚定 EntryId + row。
     pub scroll_mode: ScrollMode,
-    /// 兼容字段：距转录末尾的逻辑行数（0 = 跟随）。TUI v2 起
-    /// Locked 的事实源是 [`scroll_mode`]，本字段仅保留给旧测试/旧语义。
-    pub transcript_scroll: u16,
     /// scroll lock 期间到达的新条目数（footer 提示；End/Ctrl+End 清空）。
     pub pending_below: u64,
     /// 最近一次布局的视口顶部行（renderer 写回；滚动操作的基础，§4）。
@@ -388,6 +467,9 @@ pub struct ViewModel {
     /// 鼠标点击命中的目标（工具卡片/reasoning 行；§24 高亮反馈）。
     /// Overlay 打开期间该行高亮；关闭 Overlay 后清除。
     pub active_hit: Option<crate::tui::HitTarget>,
+    /// §美化：鼠标悬停的工具卡片 id（hover 微高亮；移出/点其他区域清除）。
+    /// 与 `active_hit`（点击后的持久高亮）独立——hover 是瞬态提示。
+    pub hover_tool: Option<String>,
     /// 应用内选择复制（语义位置：entry + 逻辑文本偏移，不依赖屏幕坐标；
     /// resize/rewrap/滚动不改变选中内容）。`Some` = 正在选择或已有选区。
     pub selection: Option<crate::tui::interaction::TextSelection>,
@@ -433,7 +515,6 @@ impl Default for ViewModel {
             turn: 0,
             live: LiveTurnState::default(),
             scroll_mode: ScrollMode::Follow,
-            transcript_scroll: 0,
             pending_below: 0,
             layout_top: None,
             entry_heights: HashMap::new(),
@@ -442,6 +523,7 @@ impl Default for ViewModel {
             reasoning_visible: false,
             reasoning_expanded: std::collections::HashSet::new(),
             active_hit: None,
+            hover_tool: None,
             selection: None,
             input_tokens: 0,
             output_tokens: 0,
@@ -492,7 +574,6 @@ impl ViewModel {
         self.turn = 0;
         self.reasoning_expanded.clear();
         self.scroll_mode = ScrollMode::Follow;
-        self.transcript_scroll = 0;
         self.pending_below = 0;
         self.layout_top = None;
         self.entry_heights.clear();
@@ -546,6 +627,8 @@ impl ViewModel {
                 text: bound_message(&text.into()),
                 version,
             },
+            search_cache: None,
+            semantic_cache: None,
         });
         self.note_new_content();
         self.trim_transcript();
@@ -648,6 +731,8 @@ impl ViewModel {
                         text: msg.text,
                         version,
                     },
+                    search_cache: None,
+                    semantic_cache: None,
                 });
                 self.note_new_content();
             }
@@ -674,6 +759,7 @@ impl ViewModel {
                 self.transcript.push(Entry::Tool {
                     id: tool.entry_id,
                     card,
+                    search_cache: None,
                 });
                 self.note_new_content();
             }
@@ -694,6 +780,7 @@ impl ViewModel {
                 self.transcript.push(Entry::Tool {
                     id: tool.entry_id,
                     card: tool.card,
+                    search_cache: None,
                 });
                 self.note_new_content();
             }
@@ -706,12 +793,6 @@ impl ViewModel {
         if self.scroll_mode != ScrollMode::Follow {
             self.pending_below = self.pending_below.saturating_add(1);
         }
-        // 兼容投影：Locked 时保持非零（旧测试/旧渲染读 transcript_scroll）。
-        self.transcript_scroll = if self.scroll_mode == ScrollMode::Follow {
-            0
-        } else {
-            self.transcript_scroll.max(1)
-        };
     }
 
     /// §24：跳转到转录的绝对比例位置（scrollbar 点击/拖拽）。
@@ -754,7 +835,6 @@ impl ViewModel {
     /// 恢复 follow-tail（End/Ctrl+End，§3.1）：回到底部并清空新消息计数。
     pub fn follow_tail(&mut self) {
         self.scroll_mode = ScrollMode::Follow;
-        self.transcript_scroll = 0;
         self.pending_below = 0;
     }
 
@@ -769,7 +849,7 @@ impl ViewModel {
             return;
         };
         search.query = crate::tui::text::truncate_middle_utf8(query, MAX_SEARCH_QUERY, "…");
-        search.recompute(&self.transcript);
+        search.recompute(&mut self.transcript);
         if let Some(first) = search.hits.first().copied() {
             self.lock_to(first, 0);
         }
@@ -799,7 +879,7 @@ impl ViewModel {
             .transcript
             .iter()
             .filter_map(|entry| match entry {
-                Entry::Message { id, line } if line.kind == LineKind::User => Some(*id),
+                Entry::Message { id, line, .. } if line.kind == LineKind::User => Some(*id),
                 _ => None,
             })
             .collect();
@@ -842,7 +922,6 @@ impl ViewModel {
             entry_id: entry,
             row_in_entry,
         });
-        self.transcript_scroll = self.transcript_scroll.max(1);
     }
 
     /// 向历史滚动（§10：每步 delta 行）。
@@ -1103,7 +1182,7 @@ impl ViewModel {
     /// 打开 reasoning 原文 Overlay（点击折叠的 reasoning 行）。
     pub fn open_reasoning_overlay(&mut self, id: EntryId) {
         let Some(line) = self.transcript.iter().find_map(|entry| match entry {
-            Entry::Message { id: eid, line } if *eid == id => Some(line),
+            Entry::Message { id: eid, line, .. } if *eid == id => Some(line),
             _ => None,
         }) else {
             return;
@@ -1154,20 +1233,40 @@ impl ViewModel {
     /// 快照）。选区指向 (entry, offset)，这里从 transcript 的 entry 内容重建
     /// 语义文本——resize/滚动后仍精确。streaming 期间（live 区）同样可提取，
     /// finalize 后沿用同一稳定 id（§⑥）。
-    pub fn selected_text(&self) -> String {
+    ///
+    /// §成熟化：每条目的语义文本按 (kind, text, version) 缓存——entry 进入
+    /// transcript 后文本不可变，复制不再每次重新跑 markdown 渲染。
+    pub fn selected_text(&mut self) -> String {
         let Some(selection) = self.selection else {
             return String::new();
         };
         let (lo, hi) = selection.normalized();
         // 收集候选 (entry_id, text)：transcript + live 流式消息。
         let mut candidates: Vec<(EntryId, String)> = Vec::new();
-        for entry in &self.transcript {
+        for entry in &mut self.transcript {
             let entry_id = entry.id();
             let text = match entry {
-                Entry::Message { line, .. } => {
+                Entry::Message {
+                    line,
+                    semantic_cache,
+                    ..
+                } => {
                     // ③ Canonical Semantic Text：与 renderer hit 坐标系一致——
                     // 用渲染后纯文本（markdown 去样式），而非原始 markdown。
-                    canonical_semantic_text(line.kind, &line.text)
+                    // 缓存键 = line.version（文本变化 → 缓存失效）。
+                    if let Some((version, cached)) = semantic_cache {
+                        if *version == line.version {
+                            cached.clone()
+                        } else {
+                            let fresh = canonical_semantic_text(line.kind, &line.text);
+                            *semantic_cache = Some((line.version, fresh.clone()));
+                            fresh
+                        }
+                    } else {
+                        let fresh = canonical_semantic_text(line.kind, &line.text);
+                        *semantic_cache = Some((line.version, fresh.clone()));
+                        fresh
+                    }
                 }
                 Entry::Tool { card, .. } => card_semantic_text(card),
             };
@@ -1261,6 +1360,7 @@ impl ViewModel {
             self.transcript.push(Entry::Tool {
                 id: entry_id,
                 card: tool.card,
+                search_cache: None,
             });
             self.note_new_content();
             self.trim_transcript();
@@ -1287,6 +1387,8 @@ impl ViewModel {
                 if status != ToolStatus::Succeeded && !tail.is_empty() {
                     card.tail = Some(bound_tail(&tail));
                 }
+                // §成熟化：卡片字段变更 → 搜索缓存失效。
+                entry.invalidate_search_cache();
                 return;
             }
         }
@@ -1294,6 +1396,7 @@ impl ViewModel {
         let entry_id = self.alloc_entry_id();
         self.transcript.push(Entry::Tool {
             id: entry_id,
+            search_cache: None,
             card: ToolCard {
                 id,
                 name,
@@ -1686,13 +1789,11 @@ mod tests {
             }),
             "scroll lock 保持（锚定最早行）"
         );
-        assert_eq!(view.transcript_scroll, 1, "兼容投影：Locked 非零");
         view.push_line(LineKind::Assistant, "new");
         assert_eq!(view.pending_below, 1, "新条目计数");
         // Ctrl+End 恢复跟随并清空计数。
         view.follow_tail();
         assert_eq!(view.scroll_mode, ScrollMode::Follow);
-        assert_eq!(view.transcript_scroll, 0);
         assert_eq!(view.pending_below, 0);
     }
 

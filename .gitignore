@@ -10,3 +10,5 @@ Thumbs.db
 .tpi-test-sessions/
 .tpi-test-artifacts/
 evals/*/repo/
+
+.zcode/

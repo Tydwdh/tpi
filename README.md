@@ -41,11 +41,31 @@ tpi --resume <session-id>
 | `session` | append-only 事件日志、恢复、投影和 artifact 生命周期 |
 | `tool` | 静态工具集合、参数校验、路径边界和统一结果协议 |
 | `process` | Git Bash 子进程、Windows Job Object 和进程树取消 |
-| `tui` | 终端所有权、事件 reducer、视图状态和渲染 |
+| `tui` | 终端所有权、事件 reducer、视图状态和渲染（可配置键位、链接交互、语法高亮） |
 
 关键不变量：session 事件日志是持久事实源；`Conversation` 同时拥有日志和可 replay
 的模型历史；工具 schema、参数解析、访问声明和执行语义集中在工具层；只有 TUI
 renderer 可以写终端；生产 `web_fetch` 始终拒绝 loopback、私网和链路本地目标。
+
+## TUI 能力（成熟化）
+
+- **可配置键位**：`[ui.keymap]` 可覆盖任意动作（`submit = "ctrl+enter"` 或数组
+  `move_up = ["k", "ctrl+p"]`）；未配置动作保持内建默认，覆盖后原默认键一并移除。
+  `/settings` 展示当前生效绑定；workspace 配置逐 key 覆盖 home。
+- **编辑器**：多行输入（Shift+Enter）、Ctrl+Z/Ctrl+Y 撤销重做（连续打字/退格合并为
+  同一撤销单元）、词级移动/删除、输入历史。
+- **鼠标**：拖选自动滚动（拖出视口边缘选区跨越屏幕扩展）、点击链接打开 Link Overlay
+  （Enter 确认用默认浏览器打开 / `c` 复制 URL；仅 http/https，显式用户动作）、
+  **工具卡片整卡可点击展开**（轻点任意行展开/收缩）+ **hover 微高亮**（悬停时卡片
+  面板背景提亮一档）、滚动条点击/拖拽。
+- **渲染**：代码块语法高亮（syntect，rust/python/bash/json 等按 fence 语言识别，
+  未知语言回退纯文本）、markdown 图片占位（可点开原图）、表格/列表/引用/标题。
+- **层次感（opencode 式）**：User 消息 = 左竖线 `┃` + 面板背景块；Assistant 保持
+  裸文本 rail —— 用户有底、助手无底的层级对比。消息块间留白、工具卡片/plan/输入区
+  面板化（panel 背景）、footer 独立分隔线、thinking 带 `◆` 图标。
+  主题 `[ui] theme` 支持 `omp`（默认）/`dark`/`light`/**`opencode`**（近黑底 +
+  灰阶层 + 暖橙强调，opencode 原版观感）。
+- **性能**：搜索命中与选区语义文本按条目惰性缓存（长转录下复制与搜索不重复渲染）。
 
 ## 开发与验证
 

@@ -66,13 +66,15 @@ impl TerminalDriver {
             }
             execute!(std::io::stdout(), EnableBracketedPaste)?;
             // §PointerHit：App-managed mouse 模式（单一选择）——启用点击/拖动
-            // 捕获（?1000h ?1002h ?1006h），禁用 any-event（?1003h，不报告
-            // 未按键的 hover）。注意：启用 1002 后**拖动由应用接收**，终端
-            // 不会同时做原生文本选择——这是有意为之的单一选择归属，不依赖
-            // "终端同时拖选"的假设。应用内拖选 + Ctrl+C 复制负责文本选择。
+            // 捕获（?1000h ?1002h ?1006h）+ hover 上报（?1003h，未按键移动
+            // 也上报，卡片 hover 微高亮；成熟 TUI 标准行为）。
+            // 注意：启用 1002 后**拖动由应用接收**，终端不会同时做原生文本
+            // 选择——这是有意为之的单一选择归属，不依赖"终端同时拖选"的
+            // 假设。应用内拖选 + Ctrl+C 复制负责文本选择。1003 只在现代终端
+            // 生效，不支持时静默无 hover（不影响点击/拖动）。
             let _ = std::io::Write::write_all(
                 &mut std::io::stdout(),
-                b"\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h",
+                b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h",
             );
             let (_, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
             let height = inline_activity_height(rows);
@@ -149,6 +151,12 @@ impl TerminalDriver {
     /// DisableBracketedPaste → LeaveAlternateScreen → disable_raw_mode。
     pub fn restore(&mut self) -> std::io::Result<()> {
         let mut first_error = self.terminal.show_cursor().err();
+        // §美化：显式关闭 ?1003h（DisableMouseCapture 只发 ?1000l，不关 any-event）。
+        if let Err(error) = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1003l")
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
         if let Err(error) = execute!(
             std::io::stdout(),
             DisableMouseCapture,
@@ -182,6 +190,8 @@ impl TerminalDriver {
     /// 尽力恢复全局终端状态（不依赖实例；panic hook 与初始化失败路径用）。
     pub fn restore_global() {
         use std::io::Write;
+        // §美化：显式关 ?1003h（与 restore 对称）。
+        let _ = std::io::stdout().write_all(b"\x1b[?1003l");
         let _ = execute!(
             std::io::stdout(),
             ratatui::crossterm::cursor::Show,

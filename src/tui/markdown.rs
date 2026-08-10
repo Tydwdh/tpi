@@ -3,27 +3,56 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::highlight;
 use super::theme;
+
+/// 渲染行内的一段链接范围（TPI 成熟化：链接可点）。
+///
+/// `start`/`end` 是该**渲染行文本**内的 char 偏移（`[start, end)`，
+/// 行内 char 坐标，与语义文本的 char 坐标一致）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkRange {
+    pub start: usize,
+    pub end: usize,
+    pub url: String,
+}
+
+/// Markdown 渲染结果：带样式行 + 逐行链接范围（与 `lines` 等长）。
+pub(crate) struct RenderedMarkdown {
+    pub lines: Vec<Line<'static>>,
+    pub links: Vec<Vec<LinkRange>>,
+}
 
 /// Markdown → 带样式的逻辑行（pulldown-cmark；流式增量下对不完整输入友好）。
 ///
-/// 支持的子集：段落、加粗/斜体/删除线、行内代码、围栏代码块、
-/// 无序/有序列表、块引用、链接（附 URL）、分隔线。
-/// 标题在本实现中渲染为普通文本（样式化标题留待 API 确认后跟进）。
-/// `pub(crate)`：model 的 canonical semantic text 生成也用它（③ 统一坐标系）。
+/// 支持的子集：段落、加粗/斜体/删除线、行内代码、围栏代码块（syntect
+/// 语法高亮）、无序/有序列表、块引用、链接（附 URL，可点）、图片占位、
+/// 分隔线。`pub(crate)`：model 的 canonical semantic text 生成也用它（③ 统一坐标系）。
 pub(crate) fn render_markdown(
     text: &str,
     theme: theme::Theme,
     width: Option<usize>,
 ) -> Vec<Line<'static>> {
-    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    render_markdown_detailed(text, theme, width).lines
+}
+
+/// 带链接范围（renderer 语义行用；链接坐标基于渲染行文本）。
+pub(crate) fn render_markdown_detailed(
+    text: &str,
+    theme: theme::Theme,
+    width: Option<usize>,
+) -> RenderedMarkdown {
+    use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
     let parser = Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES);
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut out_links: Vec<Vec<LinkRange>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Modifier> = Vec::new();
     let mut link_urls: Vec<String> = Vec::new();
     let mut in_code_block = false;
+    let mut code_lang: Option<String> = None;
+    let mut code_buffer: String = String::new();
     let mut list_ordered: Option<u64> = None;
     let mut item_count: u64 = 1;
     let mut item_pending = false;
@@ -31,59 +60,81 @@ pub(crate) fn render_markdown(
     // 标题层级（§16.2 增强）：Start(Heading) 时记录，End(Heading) flush 后
     // 对整行应用标题样式（h1-h3 分色，h4+ 归一）。
     let mut heading_level: Option<u8> = None;
+    // 当前行已累计文本的 char 数（链接范围坐标基准）。
+    let mut line_chars: usize = 0;
+    let mut line_links: Vec<LinkRange> = Vec::new();
+    // 当前正在打开的链接（Tag::Link 时记起点，TagEnd::Link 结算）。
+    let mut link_open: Option<usize> = None;
+    // 图片占位已渲染：其后的 alt Text 事件应被吞掉（否则 "🖼 [图片]截图"）。
+    let mut in_image = false;
     // 表格状态（§16.2 增强）：收集到完整表格后在 End(Table) 一次性渲染
     //（带边框 + 列宽对齐；流式下表格到达时才渲染，无逐 cell 闪烁）。
     let mut table: Option<TableState> = None;
 
+    // 给当前行追加一个 span 并推进 char 计数。
+    let push_span =
+        |current: &mut Vec<Span<'static>>, line_chars: &mut usize, span: Span<'static>| {
+            *line_chars += span.content.chars().count();
+            current.push(span);
+        };
+
     for event in parser {
         match event {
             Event::Text(t) => {
+                if in_image {
+                    // 图片占位已渲染，alt 文本不再重复显示。
+                    continue;
+                }
                 if table.is_some() {
                     // 表格内：文本进当前 cell（不参与普通 current 渲染）。
                     table_push_text(&mut table, &t);
                     continue;
                 }
                 if in_code_block {
-                    flush_line(&mut out, &mut current);
-                    let content = t.trim_end_matches('\n');
-                    out.push(Line::styled(
-                        content.to_string(),
-                        Style::default().fg(theme.muted).bg(theme.surface_subtle),
-                    ));
-                } else {
-                    if item_pending {
-                        item_pending = false;
-                        let marker = match list_ordered {
-                            Some(_) => {
-                                let m = format!("{item_count}. ");
-                                item_count += 1;
-                                m
-                            }
-                            None => "• ".to_string(),
-                        };
-                        current.push(Span::styled(marker, Style::default().fg(theme.accent)));
-                    }
-                    if quote_depth > 0 && current.is_empty() {
-                        current.push(Span::styled(
-                            "│ ".repeat(quote_depth),
-                            Style::default().fg(theme.muted),
-                        ));
-                    }
-                    let modifier = style_stack
-                        .iter()
-                        .copied()
-                        .fold(Modifier::empty(), |acc, m| acc | m);
-                    let mut style = if link_urls.is_empty() {
-                        Style::default().fg(theme.text)
-                    } else {
-                        Style::default().fg(theme.info)
-                    }
-                    .add_modifier(modifier);
-                    if !link_urls.is_empty() {
-                        style = style.add_modifier(Modifier::UNDERLINED);
-                    }
-                    current.push(Span::styled(t.to_string(), style));
+                    code_buffer.push_str(&t);
+                    continue;
                 }
+                if item_pending {
+                    item_pending = false;
+                    let marker = match list_ordered {
+                        Some(_) => {
+                            let m = format!("{item_count}. ");
+                            item_count += 1;
+                            m
+                        }
+                        None => "• ".to_string(),
+                    };
+                    push_span(
+                        &mut current,
+                        &mut line_chars,
+                        Span::styled(marker, Style::default().fg(theme.accent)),
+                    );
+                }
+                if quote_depth > 0 && current.is_empty() {
+                    push_span(
+                        &mut current,
+                        &mut line_chars,
+                        Span::styled("│ ".repeat(quote_depth), Style::default().fg(theme.muted)),
+                    );
+                }
+                let modifier = style_stack
+                    .iter()
+                    .copied()
+                    .fold(Modifier::empty(), |acc, m| acc | m);
+                let mut style = if link_urls.is_empty() {
+                    Style::default().fg(theme.text)
+                } else {
+                    Style::default().fg(theme.info)
+                }
+                .add_modifier(modifier);
+                if !link_urls.is_empty() {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                push_span(
+                    &mut current,
+                    &mut line_chars,
+                    Span::styled(t.to_string(), style),
+                );
             }
             Event::Code(t) => {
                 if table.is_some() {
@@ -91,15 +142,32 @@ pub(crate) fn render_markdown(
                     table_push_text(&mut table, &t);
                     continue;
                 }
-                current.push(Span::styled(
-                    t.to_string(),
-                    Style::default().fg(theme.primary).bg(theme.surface_subtle),
-                ));
+                push_span(
+                    &mut current,
+                    &mut line_chars,
+                    Span::styled(
+                        t.to_string(),
+                        Style::default().fg(theme.primary).bg(theme.surface_subtle),
+                    ),
+                );
             }
-            Event::SoftBreak | Event::HardBreak => flush_line(&mut out, &mut current),
+            Event::SoftBreak | Event::HardBreak => flush_line(
+                &mut out,
+                &mut out_links,
+                &mut current,
+                &mut line_chars,
+                &mut line_links,
+            ),
             Event::Rule => {
-                flush_line(&mut out, &mut current);
+                flush_line(
+                    &mut out,
+                    &mut out_links,
+                    &mut current,
+                    &mut line_chars,
+                    &mut line_links,
+                );
                 out.push(Line::styled("──", Style::default().fg(theme.muted)));
+                out_links.push(Vec::new());
             }
             Event::Start(tag) => match tag {
                 Tag::Emphasis => style_stack.push(Modifier::ITALIC),
@@ -107,11 +175,34 @@ pub(crate) fn render_markdown(
                 Tag::Strikethrough => style_stack.push(Modifier::CROSSED_OUT),
                 Tag::Heading { level, .. } => {
                     heading_level = Some(level as u8);
-                    flush_line(&mut out, &mut current);
+                    flush_line(
+                        &mut out,
+                        &mut out_links,
+                        &mut current,
+                        &mut line_chars,
+                        &mut line_links,
+                    );
                 }
-                Tag::CodeBlock(_) => {
-                    flush_line(&mut out, &mut current);
+                Tag::CodeBlock(kind) => {
+                    flush_line(
+                        &mut out,
+                        &mut out_links,
+                        &mut current,
+                        &mut line_chars,
+                        &mut line_links,
+                    );
                     in_code_block = true;
+                    code_buffer.clear();
+                    code_lang = match kind {
+                        CodeBlockKind::Fenced(info) => {
+                            // fence 信息可能是 `rust` 或 `rust,title=x`；取首个 token。
+                            info.split_whitespace()
+                                .next()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                        }
+                        CodeBlockKind::Indented => None,
+                    };
                 }
                 Tag::List(start) => {
                     list_ordered = start;
@@ -121,11 +212,42 @@ pub(crate) fn render_markdown(
                 Tag::Link { dest_url, .. } => {
                     link_urls.push(dest_url.to_string());
                     style_stack.push(Modifier::UNDERLINED);
+                    link_open = Some(line_chars);
+                }
+                Tag::Image { dest_url, .. } => {
+                    // 图片：占位行内元素（链接机制可点开原图 URL）。
+                    // alt 文本不依赖 Tag::Image 字段（pulldown 以子 Text 事件
+                    // 提供，in_image 期间吞掉），占位统一为 "🖼 [图片]"。
+                    in_image = true;
+                    let url = dest_url.to_string();
+                    let start = line_chars;
+                    let span_text = "🖼 [图片]";
+                    push_span(
+                        &mut current,
+                        &mut line_chars,
+                        Span::styled(
+                            span_text,
+                            Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+                        ),
+                    );
+                    if !url.is_empty() {
+                        line_links.push(LinkRange {
+                            start,
+                            end: line_chars,
+                            url,
+                        });
+                    }
                 }
                 Tag::BlockQuote(_) => quote_depth += 1,
                 Tag::Table(alignments) => {
                     // 表格开始：flush 当前行，初始化表格收集状态。
-                    flush_line(&mut out, &mut current);
+                    flush_line(
+                        &mut out,
+                        &mut out_links,
+                        &mut current,
+                        &mut line_chars,
+                        &mut line_links,
+                    );
                     let mut t = TableState::new();
                     t.alignments = alignments;
                     table = Some(t);
@@ -160,32 +282,88 @@ pub(crate) fn render_markdown(
                             .map(|span| Span::styled(span.content, style))
                             .collect();
                         out.push(Line::from(spans));
+                        out_links.push(std::mem::take(&mut line_links));
+                        line_chars = 0;
                     } else {
-                        flush_line(&mut out, &mut current);
+                        flush_line(
+                            &mut out,
+                            &mut out_links,
+                            &mut current,
+                            &mut line_chars,
+                            &mut line_links,
+                        );
                     }
                 }
                 TagEnd::Link => {
                     style_stack.pop();
                     if let Some(url) = link_urls.pop() {
-                        current.push(Span::styled(
-                            format!(" ({url})"),
-                            Style::default().fg(theme.muted),
-                        ));
+                        // 结算链接范围：从 link_open 到当前行 char 位置（含 URL 后缀）。
+                        if let Some(start) = link_open.take() {
+                            let end = line_chars;
+                            if start < end {
+                                line_links.push(LinkRange {
+                                    start,
+                                    end,
+                                    url: url.clone(),
+                                });
+                            }
+                        }
+                        push_span(
+                            &mut current,
+                            &mut line_chars,
+                            Span::styled(format!(" ({url})"), Style::default().fg(theme.muted)),
+                        );
                     }
+                }
+                TagEnd::Image => {
+                    in_image = false;
                 }
                 TagEnd::CodeBlock => {
                     in_code_block = false;
-                    flush_line(&mut out, &mut current);
+                    // 代码块整体渲染（syntect 语法高亮；失败回退纯文本）。
+                    let lines =
+                        highlight_code_or_fallback(&code_buffer, code_lang.as_deref(), theme);
+                    for line in lines {
+                        out.push(line);
+                        out_links.push(Vec::new());
+                    }
+                    code_buffer.clear();
+                    code_lang = None;
+                    flush_line(
+                        &mut out,
+                        &mut out_links,
+                        &mut current,
+                        &mut line_chars,
+                        &mut line_links,
+                    );
                 }
-                TagEnd::Item => flush_line(&mut out, &mut current),
+                TagEnd::Item => flush_line(
+                    &mut out,
+                    &mut out_links,
+                    &mut current,
+                    &mut line_chars,
+                    &mut line_links,
+                ),
                 TagEnd::List(_) => {
                     list_ordered = None;
                     item_count = 1;
-                    flush_line(&mut out, &mut current);
+                    flush_line(
+                        &mut out,
+                        &mut out_links,
+                        &mut current,
+                        &mut line_chars,
+                        &mut line_links,
+                    );
                 }
                 TagEnd::BlockQuote(_) => {
                     quote_depth = quote_depth.saturating_sub(1);
-                    flush_line(&mut out, &mut current);
+                    flush_line(
+                        &mut out,
+                        &mut out_links,
+                        &mut current,
+                        &mut line_chars,
+                        &mut line_links,
+                    );
                 }
                 TagEnd::TableCell => {
                     // 完成当前 cell：取走内容，push 进当前行。
@@ -216,24 +394,82 @@ pub(crate) fn render_markdown(
                 TagEnd::Table => {
                     // 表格结束：一次性渲染（§codex：width-aware 列分配 + cell 换行）。
                     if let Some(t) = table.take() {
-                        out.extend(render_table(&t, theme, width));
+                        let rendered = render_table(&t, theme, width);
+                        for _ in &rendered {
+                            out_links.push(Vec::new());
+                        }
+                        out.extend(rendered);
                     }
-                    flush_line(&mut out, &mut current);
+                    flush_line(
+                        &mut out,
+                        &mut out_links,
+                        &mut current,
+                        &mut line_chars,
+                        &mut line_links,
+                    );
                 }
-                TagEnd::Paragraph => flush_line(&mut out, &mut current),
+                TagEnd::Paragraph => flush_line(
+                    &mut out,
+                    &mut out_links,
+                    &mut current,
+                    &mut line_chars,
+                    &mut line_links,
+                ),
                 _ => {}
             },
             _ => {}
         }
     }
-    flush_line(&mut out, &mut current);
-    out
+    flush_line(
+        &mut out,
+        &mut out_links,
+        &mut current,
+        &mut line_chars,
+        &mut line_links,
+    );
+    RenderedMarkdown {
+        lines: out,
+        links: out_links,
+    }
 }
 
-fn flush_line(out: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>) {
+/// 代码块高亮（syntect；未知语言/解析失败回退纯文本 muted 样式）。
+fn highlight_code_or_fallback(
+    code: &str,
+    language: Option<&str>,
+    theme: theme::Theme,
+) -> Vec<Line<'static>> {
+    // 末尾换行不产生空尾行（`fn main() {}\n` 渲染为一行）；块内空行保留。
+    let code = code.trim_end_matches('\n');
+    match highlight::highlight_code_block(code, language, theme) {
+        Ok(lines) if !lines.is_empty() => lines,
+        Ok(_) | Err(_) => code
+            .split('\n')
+            .map(|line| {
+                Line::styled(
+                    line.to_string(),
+                    Style::default().fg(theme.muted).bg(theme.surface_subtle),
+                )
+            })
+            .collect(),
+    }
+}
+
+/// flush 当前行：空行只清 links；非空行 push 行 + links，并重置 char 计数。
+fn flush_line(
+    out: &mut Vec<Line<'static>>,
+    out_links: &mut Vec<Vec<LinkRange>>,
+    current: &mut Vec<Span<'static>>,
+    line_chars: &mut usize,
+    line_links: &mut Vec<LinkRange>,
+) {
     if !current.is_empty() {
         out.push(Line::from(std::mem::take(current)));
+        out_links.push(std::mem::take(line_links));
+    } else {
+        line_links.clear();
     }
+    *line_chars = 0;
 }
 
 /// 表格收集状态（§16.2 增强）：`rows[0]` 是表头行，其余为数据行。
@@ -604,4 +840,101 @@ fn heading_style(level: u8, theme: theme::Theme) -> Style {
         _ => theme.text,
     };
     Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §成熟化：链接渲染带逐行范围，坐标基于渲染行文本（含 `(url)` 后缀）。
+    #[test]
+    fn link_ranges_cover_link_and_url_suffix() {
+        let theme = theme::Theme::omp();
+        let rendered = render_markdown_detailed("[文档](https://example.com)", theme, None);
+        assert_eq!(rendered.lines.len(), 1);
+        assert_eq!(rendered.links.len(), 1);
+        let text: String = rendered.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "文档 (https://example.com)");
+        let links = &rendered.links[0];
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "https://example.com");
+        // char 范围落在链接文本上（可点击区域 = 链接文字）。
+        assert!(links[0].start < links[0].end && links[0].end <= text.chars().count());
+        let link_text: String = text
+            .chars()
+            .skip(links[0].start)
+            .take(links[0].end - links[0].start)
+            .collect();
+        assert_eq!(link_text, "文档");
+    }
+
+    /// §成熟化：无链接行 links 为空；多链接每行独立记录。
+    #[test]
+    fn link_ranges_are_per_line() {
+        let theme = theme::Theme::omp();
+        let rendered =
+            render_markdown_detailed("[A](https://a.com)\n\n[b](https://b.com)", theme, None);
+        assert_eq!(rendered.links.len(), 2);
+        assert_eq!(rendered.links[0].len(), 1);
+        assert_eq!(rendered.links[0][0].url, "https://a.com");
+        assert_eq!(rendered.links[1].len(), 1);
+        assert_eq!(rendered.links[1][0].url, "https://b.com");
+    }
+
+    /// §成熟化：图片渲染为占位行内元素，URL 挂到链接范围（可点开原图）。
+    #[test]
+    fn image_renders_placeholder_with_link() {
+        let theme = theme::Theme::omp();
+        let rendered =
+            render_markdown_detailed("![截图](https://img.example.com/x.png)", theme, None);
+        let text: String = rendered.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("[图片]"), "图片占位可见: {text:?}");
+        let links = &rendered.links[0];
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "https://img.example.com/x.png");
+        let link_text: String = text
+            .chars()
+            .skip(links[0].start)
+            .take(links[0].end - links[0].start)
+            .collect();
+        assert_eq!(link_text, "🖼 [图片]");
+    }
+
+    /// §成熟化：rust 代码块 tokenize 为多 span 且带语义色（keyword 等）。
+    #[test]
+    fn code_block_highlighting_tokenizes_rust() {
+        let theme = theme::Theme::omp();
+        let lines =
+            highlight::highlight_code_block("fn main() { let x: u32 = 42; }", Some("rust"), theme)
+                .expect("rust 语法必须可解析");
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "fn main() { let x: u32 = 42; }", "高亮不丢字");
+        let styled = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.fg.is_some() && s.style.fg != Some(theme.muted))
+            .count();
+        assert!(styled >= 2, "关键字/类型/数字应着色: {:?}", lines[0].spans);
+    }
+
+    /// §成熟化：未知语言回退纯文本（muted + 背景，不 panic）。
+    #[test]
+    fn code_block_unknown_language_falls_back() {
+        let theme = theme::Theme::omp();
+        let lines = render_markdown("```nosuchlang\nhello world\n```", theme, None);
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert_eq!(line.spans.len(), 1, "回退为单个 span");
+        assert_eq!(line.spans[0].content, "hello world");
+        assert_eq!(line.spans[0].style.fg, Some(theme.muted));
+    }
 }

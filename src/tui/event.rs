@@ -19,6 +19,9 @@ pub enum UiEvent {
     MouseScrollDown,
     /// 鼠标移动（§24 hover 高亮；命中可点击行时高亮显示）。
     MouseMoved { column: u16, row: u16 },
+    /// 鼠标悬停在工具卡片上（§美化 hover 微高亮）：Some(id) = 悬停中，
+    /// None = 移出卡片/非卡片区域。仅悬停**变化**时由 reducer 更新状态。
+    HoverTool(Option<String>),
     /// 应用内选择复制（§用户诉求）：鼠标按下开始拖动选择。
     /// 携带**语义位置**（entry + 逻辑偏移），不依赖屏幕坐标。
     SelectionStart(TextPosition),
@@ -30,6 +33,8 @@ pub enum UiEvent {
     ClickTool(String),
     /// 鼠标点击命中折叠的 reasoning 行（Renderer hit-test 后；EntryId §4.1）。
     ClickReasoning(crate::tui::scroll::EntryId),
+    /// 鼠标点击命中链接文本（§成熟化；Renderer hit-test 后，参数是 URL）。
+    ClickLink(String),
     /// 点击/拖拽垂直 scrollbar（§24）：参数是点击行在转录区内的偏移（0-based）。
     ScrollbarClick(u16),
     /// bracketed paste 文本。

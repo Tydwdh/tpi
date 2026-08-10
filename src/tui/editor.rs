@@ -18,10 +18,36 @@ pub struct Editor {
     history_pos: Option<usize>,
     /// Draft saved when entering history browsing; restored when returning to newest.
     draft: Option<String>,
+    /// 撤销栈（成熟化：Ctrl+Z / Ctrl+Y）。快照是 (text, cursor)；同类
+    /// 连续编辑（打字 / 连续退格）合并为同一 undo 单元，光标移动不产生单元。
+    undo_stack: Vec<EditSnapshot>,
+    redo_stack: Vec<EditSnapshot>,
+    /// 上一编辑操作类别（连续同类编辑合并为一个 undo 单元）。
+    last_op: Option<EditOp>,
+}
+
+/// 一次编辑前的完整快照（undo/redo 单元）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditSnapshot {
+    text: String,
+    cursor: usize,
+}
+
+/// 编辑操作类别（决定 undo 单元合并边界）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditOp {
+    /// 字符/文本插入（连续打字合并）。
+    Insert,
+    /// 字符删除（连续退格/删除合并）。
+    Delete,
+    /// 词/行级删除（每次独立 undo 单元）。
+    Discrete,
 }
 
 /// 历史条数上限（防长会话内存增长）。
 const HISTORY_CAP: usize = 100;
+/// undo/redo 栈深度上限（每条快照 ≤256 KiB 输入，栈有界防长会话内存增长）。
+const EDIT_HISTORY_CAP: usize = 200;
 pub const MAX_INPUT_BYTES: usize = 256 * 1024;
 
 impl Editor {
@@ -29,19 +55,83 @@ impl Editor {
         Self::default()
     }
 
+    /// 记录当前状态为 undo 快照（去重：与栈顶相同则不压栈）。
+    fn push_undo_snapshot(&mut self) {
+        let snap = EditSnapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+        };
+        if self.undo_stack.last() != Some(&snap) {
+            self.undo_stack.push(snap);
+            if self.undo_stack.len() > EDIT_HISTORY_CAP {
+                let drop = self.undo_stack.len() - EDIT_HISTORY_CAP;
+                self.undo_stack.drain(..drop);
+            }
+        }
+        // 新编辑使 redo 分支失效。
+        self.redo_stack.clear();
+    }
+
+    /// 文本修改的统一入口：同类连续编辑只记一次快照（打字/退格 run），
+    /// 换类、Discrete 或非编辑操作后下一次修改必记快照。
+    fn edit(&mut self, op: EditOp, apply: impl FnOnce(&mut Self)) {
+        if op == EditOp::Discrete || self.last_op != Some(op) {
+            self.push_undo_snapshot();
+        }
+        apply(self);
+        self.last_op = Some(op);
+    }
+
+    /// 光标移动/历史/整行替换等非编辑操作：打断 undo 合并 run。
+    fn break_undo_run(&mut self) {
+        self.last_op = None;
+    }
+
     pub fn insert_char(&mut self, c: char) {
         if self.text.len().saturating_add(c.len_utf8()) > MAX_INPUT_BYTES {
             return;
         }
-        self.text.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
+        self.edit(EditOp::Insert, |editor| {
+            editor.text.insert(editor.cursor, c);
+            editor.cursor += c.len_utf8();
+        });
     }
 
     pub fn insert_str(&mut self, s: &str) {
         let room = MAX_INPUT_BYTES.saturating_sub(self.text.len());
         let keep = crate::tui::text::floor_char_boundary(s, room.min(s.len()));
-        self.text.insert_str(self.cursor, &s[..keep]);
-        self.cursor += keep;
+        self.edit(EditOp::Insert, |editor| {
+            editor.text.insert_str(editor.cursor, &s[..keep]);
+            editor.cursor += keep;
+        });
+    }
+
+    /// 撤销上一次编辑（Ctrl+Z）。无可撤销历史时静默无操作。
+    pub fn undo(&mut self) {
+        if let Some(snap) = self.undo_stack.pop() {
+            self.redo_stack.push(EditSnapshot {
+                text: self.text.clone(),
+                cursor: self.cursor,
+            });
+            self.text = snap.text;
+            self.cursor = snap.cursor;
+            self.preferred_column = None;
+            self.last_op = None;
+        }
+    }
+
+    /// 重做被撤销的编辑（Ctrl+Y）。
+    pub fn redo(&mut self) {
+        if let Some(snap) = self.redo_stack.pop() {
+            self.undo_stack.push(EditSnapshot {
+                text: self.text.clone(),
+                cursor: self.cursor,
+            });
+            self.text = snap.text;
+            self.cursor = snap.cursor;
+            self.preferred_column = None;
+            self.last_op = None;
+        }
     }
 
     /// 光标所在 logical line 的字节范围（[start, end)，不含换行符；§22）。
@@ -77,6 +167,7 @@ impl Editor {
     /// 上移一个 logical line（§22、§12：多行 cursor 优先）。
     /// 返回 false 表示已在第一行——调用方此时进入 prompt history。
     pub fn move_up(&mut self) -> bool {
+        self.break_undo_run();
         let (start, _) = self.logical_line_bounds();
         if start == 0 {
             self.preferred_column = None;
@@ -95,6 +186,7 @@ impl Editor {
 
     /// 下移一个 logical line（§22）。返回 false 表示已在最后一行。
     pub fn move_down(&mut self) -> bool {
+        self.break_undo_run();
         let (_, end) = self.logical_line_bounds();
         if end == self.text.len() {
             self.preferred_column = None;
@@ -113,6 +205,7 @@ impl Editor {
 
     /// 光标所在 logical line 的起始（§22：Home/Ctrl+A 不再是全文开头）。
     pub fn home(&mut self) {
+        self.break_undo_run();
         let (start, _) = self.logical_line_bounds();
         self.cursor = start;
         self.preferred_column = None;
@@ -120,6 +213,7 @@ impl Editor {
 
     /// 光标所在 logical line 的末尾（§22：End/Ctrl+E）。
     pub fn end(&mut self) {
+        self.break_undo_run();
         let (_, end) = self.logical_line_bounds();
         self.cursor = end;
         self.preferred_column = None;
@@ -133,8 +227,10 @@ impl Editor {
                 .next_back()
                 .map(|(i, _)| i)
                 .unwrap_or(0);
-            self.text.drain(prev..self.cursor);
-            self.cursor = prev;
+            self.edit(EditOp::Delete, |editor| {
+                editor.text.drain(prev..editor.cursor);
+                editor.cursor = prev;
+            });
         }
     }
 
@@ -145,11 +241,14 @@ impl Editor {
                 .nth(1)
                 .map(|(i, _)| self.cursor + i)
                 .unwrap_or(self.text.len());
-            self.text.drain(self.cursor..next);
+            self.edit(EditOp::Delete, |editor| {
+                editor.text.drain(editor.cursor..next);
+            });
         }
     }
 
     pub fn move_left(&mut self) {
+        self.break_undo_run();
         if self.cursor > 0 {
             let prev = self.text[..self.cursor]
                 .char_indices()
@@ -161,6 +260,7 @@ impl Editor {
     }
 
     pub fn move_right(&mut self) {
+        self.break_undo_run();
         if self.cursor < self.text.len() {
             let next = self.text[self.cursor..]
                 .char_indices()
@@ -185,8 +285,10 @@ impl Editor {
             end -= 1;
         }
         let new_cursor = chars.get(end).map(|(i, _)| *i).unwrap_or(0);
-        self.text.drain(new_cursor..self.cursor);
-        self.cursor = new_cursor;
+        self.edit(EditOp::Discrete, |editor| {
+            editor.text.drain(new_cursor..editor.cursor);
+            editor.cursor = new_cursor;
+        });
     }
 
     /// P2（编辑器增强）：删除光标到行尾。
@@ -194,11 +296,14 @@ impl Editor {
         // §PointerHit：多行输入时删到当前逻辑行尾（Ctrl+K 语义），
         // 不是删到整个输入末尾。
         let (_, end) = self.logical_line_bounds();
-        self.text.drain(self.cursor..end);
+        self.edit(EditOp::Discrete, |editor| {
+            editor.text.drain(editor.cursor..end);
+        });
     }
 
     /// P2（编辑器增强）：按“词”向左移动（跳过词间空白，停在词首）。
     pub fn move_word_left(&mut self) {
+        self.break_undo_run();
         let before = &self.text[..self.cursor];
         let chars: Vec<(usize, char)> = before.char_indices().collect();
         let mut i = chars.len();
@@ -213,6 +318,7 @@ impl Editor {
 
     /// P2（编辑器增强）：按“词”向右移动（停在下一个词首）。
     pub fn move_word_right(&mut self) {
+        self.break_undo_run();
         let after = &self.text[self.cursor..];
         let chars: Vec<(usize, char)> = after.char_indices().collect();
         let mut i = 0;
@@ -229,6 +335,7 @@ impl Editor {
 
     /// 整行替换（历史浏览、命令补全用）；光标移到末尾。
     pub fn set_text(&mut self, text: String) {
+        self.break_undo_run();
         self.text = if text.len() <= MAX_INPUT_BYTES {
             text
         } else {
@@ -244,6 +351,7 @@ impl Editor {
 
     /// 清空输入。
     pub fn clear(&mut self) {
+        self.break_undo_run();
         self.text.clear();
         self.cursor = 0;
         self.preferred_column = None;
@@ -252,6 +360,7 @@ impl Editor {
 
     /// 提交当前输入：trim 后返回，清空编辑区并入历史（去重）。
     pub fn submit(&mut self) -> String {
+        self.break_undo_run();
         let text = self.text.trim().to_string();
         self.clear();
         self.history_pos = None;
@@ -268,6 +377,7 @@ impl Editor {
 
     /// 历史向上浏览（更旧的一条）。
     pub fn history_up(&mut self) {
+        self.break_undo_run();
         if self.history.is_empty() {
             return;
         }
@@ -289,6 +399,7 @@ impl Editor {
 
     /// 历史向下浏览（更新的一条；到底后恢复进入历史前的草稿）。
     pub fn history_down(&mut self) {
+        self.break_undo_run();
         let next = match self.history_pos {
             None => return, // Not browsing history: Down must not clear the input.
             Some(i) if i + 1 < self.history.len() => Some(i + 1),
@@ -512,6 +623,80 @@ fn history_browsing_preserves_draft() {
     // Returning to the newest slot restores the draft.
     editor.history_down();
     assert_eq!(editor.text, "my draft");
+}
+
+#[test]
+fn undo_restores_previous_text_and_cursor() {
+    let mut editor = Editor::new();
+    editor.insert_str("你好");
+    editor.insert_char('世');
+    editor.insert_char('界');
+    assert_eq!(editor.text, "你好世界");
+    // 连续打字合并为一个 undo 单元：一次 undo 回到输入前（空）。
+    editor.undo();
+    assert!(editor.text.is_empty(), "连续打字合并为一个 undo 单元");
+    editor.redo();
+    assert_eq!(editor.text, "你好世界");
+    editor.undo();
+    editor.undo();
+    assert!(editor.text.is_empty(), "undo 到初始空输入");
+    editor.undo();
+    assert!(editor.text.is_empty(), "无可撤销历史时静默无操作");
+}
+
+#[test]
+fn cursor_moves_break_typing_run() {
+    let mut editor = Editor::new();
+    editor.insert_str("ab");
+    editor.move_left();
+    editor.insert_char('X');
+    assert_eq!(editor.text, "aXb");
+    // 光标移动后插入是新单元：undo 一次回到 "ab"，再 undo 回到 ""。
+    editor.undo();
+    assert_eq!(editor.text, "ab", "光标移动打断 typing run");
+    editor.undo();
+    assert!(editor.text.is_empty());
+}
+
+#[test]
+fn backspace_run_undoes_as_one_unit() {
+    let mut editor = Editor::new();
+    editor.insert_str("abcd");
+    editor.backspace();
+    editor.backspace();
+    assert_eq!(editor.text, "ab");
+    editor.undo();
+    assert_eq!(editor.text, "abcd", "连续退格合并为一个 undo 单元");
+}
+
+#[test]
+fn new_edit_clears_redo_branch() {
+    let mut editor = Editor::new();
+    editor.insert_str("abc");
+    editor.undo();
+    assert_eq!(editor.text, "");
+    editor.insert_char('z');
+    editor.redo();
+    assert_eq!(editor.text, "z", "新编辑使 redo 分支失效");
+}
+
+#[test]
+fn word_and_line_deletes_are_discrete_undo_units() {
+    let mut editor = Editor::new();
+    editor.insert_str("hello world");
+    editor.delete_word_back();
+    assert_eq!(editor.text, "hello ");
+    // 光标定位到词中（pub 字段）再删到行尾——每次离散删除独立 undo 单元。
+    editor.cursor = 2;
+    editor.delete_to_end();
+    assert_eq!(editor.text, "he");
+    editor.undo();
+    assert_eq!(editor.text, "hello ", "delete_to_end 独立 undo 单元");
+    editor.undo();
+    assert_eq!(
+        editor.text, "hello world",
+        "delete_word_back 独立 undo 单元"
+    );
 }
 
 #[test]

@@ -18,7 +18,9 @@
 pub mod editor;
 pub mod effect;
 pub mod event;
+pub mod highlight;
 pub mod interaction;
+pub mod keymap;
 mod markdown;
 pub mod model;
 pub mod reducer;
@@ -38,8 +40,8 @@ use ratatui::widgets::{Paragraph, Widget, Wrap};
 use std::collections::HashMap;
 use std::time::Instant;
 
-use markdown::render_markdown;
-use model::{Entry, LineKind, StatusLine, TranscriptLine, ViewModel};
+use markdown::{LinkRange, RenderedMarkdown, render_markdown, render_markdown_detailed};
+use model::{Entry, LineKind, StatusLine, ViewModel};
 #[cfg(test)]
 use model::{ToolCard, ToolCardState};
 use scroll::{EntryId, ScrollMode};
@@ -114,10 +116,9 @@ struct FramePlan {
     window_start: usize,
     /// 内容总 visual 行数（scrollbar 比例用，§24）。
     total_rows: usize,
-    /// 窗口内每行的语义文本（复制源；与 window 等长）。§InteractionRefactor：
-    /// copy 从语义文本提取，不反推渲染结果。每行记录 (entry, 该行在 entry
-    /// 语义流中的起始 char 偏移, 语义文本)——hit-test 与复制共用。
-    semantic_rows: Vec<Option<(EntryId, usize, String, usize)>>,
+    /// 窗口内每行的语义信息（复制源；与 window 等长）。§InteractionRefactor：
+    /// copy 从语义文本提取，不反推渲染结果（§成熟化：含可点击链接范围）。
+    semantic_rows: Vec<Option<RowSemantic>>,
     overflow: Vec<Line<'static>>,
     committed_after: usize,
 }
@@ -132,8 +133,8 @@ pub struct Renderer {
     scrollback: bool,
     /// 已提交到 scrollback 的（折行后）行数（inline 专用）。
     committed_lines: usize,
-    /// Markdown 渲染缓存：条目 version → 渲染后的逻辑行。
-    md_cache: HashMap<(u64, u16), Vec<Line<'static>>>,
+    /// Markdown 渲染缓存：条目 version → 渲染结果（行 + 链接范围）。
+    md_cache: HashMap<(u64, u16), RenderedMarkdown>,
     /// 缓存有效时的终端宽度；宽度变化清空缓存并重置提交位置（§16.1）。
     cache_width: u16,
     /// 最近一帧的转录区矩形（鼠标 hit-test 用）。
@@ -145,10 +146,10 @@ pub struct Renderer {
     hits_valid: bool,
     /// 最近一帧 scrollbar 矩形（§24 鼠标点击/拖拽 hit-test）。
     last_scrollbar_rect: Option<Rect>,
-    /// 最近一帧窗口内每行的语义文本（§InteractionRefactor：Ctrl+C 复制源，
-    /// 从语义文本提取，不反推渲染结果）。与窗口行一一对应；每行记录
-    /// (entry, 起始 char 偏移, 语义文本)（语义位置 hit-test 用）。
-    semantic_rows: Vec<Option<(EntryId, usize, String, usize)>>,
+    /// 最近一帧窗口内每行的语义信息（§InteractionRefactor：Ctrl+C 复制源，
+    /// 从语义文本提取，不反推渲染结果）。与窗口行一一对应（§成熟化：
+    /// 含可点击链接范围）。
+    semantic_rows: Vec<Option<RowSemantic>>,
 }
 impl Renderer {
     /// 初始化终端（§29-30：raw mode + alternate screen（fullscreen）+ bracketed
@@ -211,16 +212,45 @@ impl Renderer {
             return None;
         }
         let index = (row - rect.y) as usize;
-        let (entry_id, char_start, text, decor) = self.semantic_rows.get(index)?.as_ref()?;
+        let row_semantic = self.semantic_rows.get(index)?.as_ref()?;
         // 屏幕列 → 语义内 cell 列：先扣 rail/icon 前缀宽度（§PointerHit：`│ AI`
         // 等前缀不参与语义偏移），再按 cell 宽度映射 char（CJK/emoji 精确）。
         let col = column.saturating_sub(rect.x) as usize;
-        let semantic_col = col.saturating_sub(*decor);
-        let char_off = crate::tui::interaction::cell_to_char(text, semantic_col);
+        let semantic_col = col.saturating_sub(row_semantic.decor);
+        let char_off = crate::tui::interaction::cell_to_char(&row_semantic.text, semantic_col);
         Some(crate::tui::interaction::TextPosition {
-            entry_id: *entry_id,
-            offset: *char_start + char_off,
+            entry_id: row_semantic.entry_id,
+            offset: row_semantic.char_start + char_off,
         })
+    }
+
+    /// §成熟化：屏幕坐标 → 可点击链接（点击链接文本区域返回 URL）。
+    /// 命中优先级：文本位置 → 链接范围（char 坐标基于语义文本）。
+    pub fn link_at(&self, column: u16, row: u16) -> Option<String> {
+        let rect = self.last_transcript_rect?;
+        if column < rect.x || row < rect.y || row >= rect.y + rect.height {
+            return None;
+        }
+        let index = (row - rect.y) as usize;
+        let row_semantic = self.semantic_rows.get(index)?.as_ref()?;
+        if row_semantic.links.is_empty() {
+            return None;
+        }
+        // 屏幕列 → 语义内 char 偏移（与 hit_text 同一映射）。
+        let col = column.saturating_sub(rect.x) as usize;
+        let semantic_col = col.saturating_sub(row_semantic.decor);
+        let char_off = crate::tui::interaction::cell_to_char(&row_semantic.text, semantic_col);
+        let links = &row_semantic.links;
+        // 命中 char 落在 [start, end) 即命中；列落在链接文本后半格（2-cell 字符
+        // 右半）也命中该链接（cell_to_char 已归一到前一 char）。
+        let char_off_hi = char_off.saturating_add(1);
+        links
+            .iter()
+            .find(|l| {
+                (char_off >= l.start && char_off < l.end)
+                    || (char_off_hi > l.start && char_off_hi <= l.end)
+            })
+            .map(|l| l.url.clone())
     }
 
     /// 距上次 draw 是否已过帧间隔（§16.1：16 ms 合并）。
@@ -344,7 +374,7 @@ impl Drop for Renderer {
 ///
 /// 自下而上：输入区（多行，≤4 行）→ footer（1 行）→ 计划条（0..4 行）→ 转录区。
 struct RenderContext<'a> {
-    markdown_cache: &'a mut HashMap<(u64, u16), Vec<Line<'static>>>,
+    markdown_cache: &'a mut HashMap<(u64, u16), RenderedMarkdown>,
     cache_width: &'a mut u16,
     committed: &'a mut usize,
     scrollback: bool,
@@ -383,6 +413,8 @@ fn render_frame(
         constraints.push(Constraint::Length(plan_rows));
     }
     constraints.push(Constraint::Length(input_rows));
+    // §美化：footer 上方 1-cell 分隔线，把底部状态栏锚定成独立区域。
+    constraints.push(Constraint::Length(1)); // footer 分隔线
     constraints.push(Constraint::Length(1)); // footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -400,6 +432,8 @@ fn render_frame(
     };
     let input_area = chunks[idx];
     idx += 1;
+    let footer_rule_area = chunks[idx];
+    idx += 1;
     let footer_area = chunks[idx];
 
     // §视觉瘦身：scrollbar 预留 1 列（inline 兼容模式不预留）。
@@ -413,6 +447,14 @@ fn render_frame(
     if let Some(pa) = plan_area {
         draw_plan(frame, pa, view, theme);
     }
+    // footer 分隔线（muted 横线；与左竖线语言一致，只作锚定不喧宾）。
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(footer_rule_area.width as usize),
+            Style::default().fg(theme.border),
+        )),
+        footer_rule_area,
+    );
     draw_footer(frame, footer_area, view, theme, scrollback, mode);
 
     let plan = plan_window(
@@ -522,7 +564,7 @@ fn plan_window(
     area_h: u16,
     committed: usize,
     reset_committed: bool,
-    cache: &mut HashMap<(u64, u16), Vec<Line<'static>>>,
+    cache: &mut HashMap<(u64, u16), RenderedMarkdown>,
 ) -> FramePlan {
     let width = width.max(1) as usize;
     // 按 entry 构建逻辑行（entry → wrapped 行 + hits + 语义文本）。
@@ -572,7 +614,7 @@ fn plan_window(
     let mut row_hits: Vec<Option<HitRange>> = Vec::new();
     // 每窗口行对应的语义信息（复制源；与 window 等长）。§PointerHit：
     // 一次 layout 同步折行语义（wrap_with_semantic 已产出），直接收集。
-    let mut semantic_rows: Vec<Option<(EntryId, usize, String, usize)>> = Vec::new();
+    let mut semantic_rows: Vec<Option<RowSemantic>> = Vec::new();
     let mut cursor = 0usize;
     for (_entry_id, rows) in &wrapped_by_entry {
         let start = cursor;
@@ -639,12 +681,12 @@ fn plan_window(
             .add_modifier(Modifier::REVERSED);
         let (lo, hi) = sel.normalized();
         for (i, row) in semantic_rows.iter().enumerate() {
-            let Some((entry_id, char_start, text, decor)) = row else {
+            let Some(row) = row else {
                 continue;
             };
-            let row_lo = *char_start;
-            let row_hi = *char_start + text.chars().count();
-            let row_entry = *entry_id;
+            let row_lo = row.char_start;
+            let row_hi = row.char_start + row.text.chars().count();
+            let row_entry = row.entry_id;
             if row_entry < lo.entry_id || row_entry > hi.entry_id {
                 continue;
             }
@@ -666,8 +708,9 @@ fn plan_window(
             // char 交集 → 语义 cell 范围 → 加装饰前缀得到视觉 cell 范围。
             let from_sel = from_char - row_lo;
             let to_sel = to_char - row_lo;
-            let cell_from = crate::tui::interaction::chars_to_cells(text, from_sel) + *decor;
-            let cell_to = crate::tui::interaction::chars_to_cells(text, to_sel) + *decor;
+            let cell_from =
+                crate::tui::interaction::chars_to_cells(&row.text, from_sel) + row.decor;
+            let cell_to = crate::tui::interaction::chars_to_cells(&row.text, to_sel) + row.decor;
             if let Some(line) = window.get_mut(i) {
                 // §PointerHit invariant：selection 只能改 style，绝不能改文本/
                 // 宽度/换行/hit 区域/semantic mapping。逐 span 拆三段
@@ -733,6 +776,21 @@ fn plan_window(
     }
 }
 
+/// 每窗口行的语义信息（复制源；hit-test 与复制共用，§InteractionRefactor）。
+/// `links` 为该视觉行内可点击链接（char 偏移基于 `text`；§成熟化）。
+#[derive(Debug, Clone)]
+struct RowSemantic {
+    entry_id: EntryId,
+    /// 该行在 entry 语义流中的起始 char 偏移。
+    char_start: usize,
+    /// 该行无装饰语义文本。
+    text: String,
+    /// 视觉渲染中前缀装饰占用的 cell 宽度。
+    decor: usize,
+    /// 可点击链接（char 范围基于 `text`）。
+    links: Vec<LinkRange>,
+}
+
 /// 一次 wrap 的视觉行：line + hit + 语义映射（§PointerHit：视觉换行处
 /// 即语义映射断点，不再进行第二次 semantic wrap）。
 #[derive(Debug, Clone)]
@@ -740,7 +798,7 @@ struct WrappedRow {
     line: Line<'static>,
     hit: Option<HitRange>,
     /// 该视觉行的语义信息：None = 纯装饰/空行（不可选）。
-    semantic: Option<(EntryId, usize, String, usize)>,
+    semantic: Option<RowSemantic>,
 }
 
 /// 一次折行：视觉行 + 语义映射同步产出（§PointerHit ④）。
@@ -774,6 +832,7 @@ fn wrap_with_semantic(
     for (line_idx, line) in lines.into_iter().enumerate() {
         let hit = hit_iter.next().flatten();
         let semantic = semantic_lines.get(line_idx);
+        let logical_links: &[LinkRange] = semantic.map(|s| s.links.as_slice()).unwrap_or(&[]);
         let decor = semantic.map(|s| s.decor_cells).unwrap_or(0);
         let line_start = entry_offset;
         let mut line_consumed = 0usize;
@@ -785,24 +844,29 @@ fn wrap_with_semantic(
         if line.spans.is_empty() {
             // 空行：不进入 cur，直接产出一行。
             if !cur.is_empty() {
-                out.push(WrappedRow {
-                    line: Line::from(std::mem::take(&mut cur)),
-                    hit: cur_hit.take(),
-                    semantic: cur_sem_start.map(|start| {
-                        (
-                            entry_id,
-                            start,
-                            std::mem::take(&mut cur_sem_text),
-                            cur_decor,
-                        )
-                    }),
-                });
-                cur_w = 0;
+                push_wrapped_row(
+                    &mut out,
+                    &mut cur,
+                    &mut cur_hit,
+                    &mut cur_sem_start,
+                    &mut cur_sem_text,
+                    &mut cur_decor,
+                    &mut cur_w,
+                    entry_id,
+                    line_start,
+                    logical_links,
+                );
             }
             out.push(WrappedRow {
                 line: Line::default(),
                 hit,
-                semantic: semantic.map(|s| (entry_id, line_start, s.text.clone(), decor)),
+                semantic: semantic.map(|s| RowSemantic {
+                    entry_id,
+                    char_start: line_start,
+                    text: s.text.clone(),
+                    decor,
+                    links: Vec::new(),
+                }),
             });
             entry_offset += 1;
             continue;
@@ -818,20 +882,18 @@ fn wrap_with_semantic(
                 if ch == '\n' {
                     // 显式换行结束当前视觉行。
                     if !cur.is_empty() {
-                        out.push(WrappedRow {
-                            line: Line::from(std::mem::take(&mut cur)),
-                            hit: cur_hit.take(),
-                            semantic: cur_sem_start.map(|start| {
-                                (
-                                    entry_id,
-                                    start,
-                                    std::mem::take(&mut cur_sem_text),
-                                    cur_decor,
-                                )
-                            }),
-                        });
-                        cur_w = 0;
-                        cur_decor = 0;
+                        push_wrapped_row(
+                            &mut out,
+                            &mut cur,
+                            &mut cur_hit,
+                            &mut cur_sem_start,
+                            &mut cur_sem_text,
+                            &mut cur_decor,
+                            &mut cur_w,
+                            entry_id,
+                            line_start,
+                            logical_links,
+                        );
                     } else {
                         out.push(WrappedRow {
                             line: Line::default(),
@@ -848,21 +910,19 @@ fn wrap_with_semantic(
                 let is_decor = is_line_start && line_cell < decor;
                 // 超宽折行：先 flush 当前视觉行。
                 if cur_w + w > width && !cur.is_empty() {
-                    out.push(WrappedRow {
-                        line: Line::from(std::mem::take(&mut cur)),
-                        hit: cur_hit.take(),
-                        semantic: cur_sem_start.map(|start| {
-                            (
-                                entry_id,
-                                start,
-                                std::mem::take(&mut cur_sem_text),
-                                cur_decor,
-                            )
-                        }),
-                    });
-                    cur_w = 0;
+                    push_wrapped_row(
+                        &mut out,
+                        &mut cur,
+                        &mut cur_hit,
+                        &mut cur_sem_start,
+                        &mut cur_sem_text,
+                        &mut cur_decor,
+                        &mut cur_w,
+                        entry_id,
+                        line_start,
+                        logical_links,
+                    );
                     cur_sem_start = None;
-                    cur_decor = 0; // 续行无 decor
                     cur_hit = hit.clone();
                     is_line_start = false;
                 }
@@ -883,40 +943,92 @@ fn wrap_with_semantic(
                 line_cell += w;
             }
         }
-        if !cur.is_empty() {
-            out.push(WrappedRow {
-                line: Line::from(std::mem::take(&mut cur)),
-                hit: cur_hit.take(),
-                semantic: cur_sem_start.map(|start| {
-                    (
-                        entry_id,
-                        start,
-                        std::mem::take(&mut cur_sem_text),
-                        cur_decor,
-                    )
-                }),
-            });
-            cur_w = 0;
-            cur_sem_start = None;
-        }
+        push_wrapped_row(
+            &mut out,
+            &mut cur,
+            &mut cur_hit,
+            &mut cur_sem_start,
+            &mut cur_sem_text,
+            &mut cur_decor,
+            &mut cur_w,
+            entry_id,
+            line_start,
+            logical_links,
+        );
         // 逻辑行结束：entry 语义流推进 = 内容字符数 + 换行位。
         entry_offset += line_consumed + 1;
     }
-    if !cur.is_empty() {
-        out.push(WrappedRow {
-            line: Line::from(std::mem::take(&mut cur)),
-            hit: cur_hit.take(),
-            semantic: cur_sem_start.map(|start| {
-                (
-                    entry_id,
-                    start,
-                    std::mem::take(&mut cur_sem_text),
-                    cur_decor,
-                )
-            }),
-        });
-    }
+    push_wrapped_row(
+        &mut out,
+        &mut cur,
+        &mut cur_hit,
+        &mut cur_sem_start,
+        &mut cur_sem_text,
+        &mut cur_decor,
+        &mut cur_w,
+        entry_id,
+        entry_offset,
+        &[],
+    );
     out
+}
+
+/// flush 当前视觉行：把累积的 span/semantic/links 打包成 WrappedRow。
+/// `line_start` 是当前逻辑行在 entry 语义流的起始偏移；链接按该行内
+/// 内容偏移切分（视觉行内 char 偏移归零）。
+#[allow(clippy::too_many_arguments)]
+fn push_wrapped_row(
+    out: &mut Vec<WrappedRow>,
+    cur: &mut Vec<Span<'static>>,
+    cur_hit: &mut Option<HitRange>,
+    cur_sem_start: &mut Option<usize>,
+    cur_sem_text: &mut String,
+    cur_decor: &mut usize,
+    cur_w: &mut usize,
+    entry_id: EntryId,
+    line_start: usize,
+    logical_links: &[LinkRange],
+) {
+    if cur.is_empty() {
+        return;
+    }
+    let links = cur_sem_start.map(|start| {
+        let lo = start.saturating_sub(line_start);
+        slice_links(logical_links, lo, cur_sem_text.chars().count())
+    });
+    out.push(WrappedRow {
+        line: Line::from(std::mem::take(cur)),
+        hit: cur_hit.take(),
+        semantic: cur_sem_start.map(|start| RowSemantic {
+            entry_id,
+            char_start: start,
+            text: std::mem::take(cur_sem_text),
+            decor: *cur_decor,
+            links: links.unwrap_or_default(),
+        }),
+    });
+    *cur_w = 0;
+    *cur_decor = 0;
+}
+
+/// 逻辑行链接 → 视觉行链接：取 `[start, start+len)` 交集，偏移归零到视觉行。
+fn slice_links(links: &[LinkRange], start: usize, len: usize) -> Vec<LinkRange> {
+    links
+        .iter()
+        .filter_map(|l| {
+            let lo = l.start.max(start);
+            let hi = l.end.min(start.saturating_add(len));
+            if lo < hi {
+                Some(LinkRange {
+                    start: lo - start,
+                    end: hi - start,
+                    url: l.url.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// 把逻辑行按 width 折行（替代 ratatui 新版 `Text::wrap`；逐 span 保持样式）。
@@ -980,10 +1092,12 @@ pub type HitRange = (HitTarget, u16);
 /// - `decor_cells`：该逻辑行视觉渲染中前缀装饰占用的 cell 宽度。语义文本
 ///   在视觉行中的起始 cell 列 = decor_cells；精确的 cell↔char 映射依赖它
 ///   （§PointerHit：`│ AI` 等前缀不参与语义偏移）。
+/// - `links`：该逻辑行内可点击链接（char 偏移基于语义文本；§成熟化）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SemanticLine {
     text: String,
     decor_cells: usize,
+    links: Vec<LinkRange>,
 }
 
 /// 按 entry 分组的渲染结果：(EntryId, 逻辑行, 逐行 hits, 逐行语义信息)。
@@ -1026,13 +1140,29 @@ fn full_line_hit(target: HitTarget, width: u16) -> Option<HitRange> {
     Some((target, width))
 }
 
+/// RGB 颜色提亮（§美化 hover 微高亮：卡片 panel 底提亮一档，对应 opencode
+/// backgroundElement 递进）。非 RGB 色（终端默认等）原样返回。
+fn lighten(color: ratatui::style::Color) -> ratatui::style::Color {
+    if let ratatui::style::Color::Rgb(r, g, b) = color {
+        let step = |v: u8| -> u8 {
+            // 向 255 提亮 12%，最小 +8（保证可见差）。
+            let v = u16::from(v);
+            let lifted = v + ((255 - v) * 12) / 100;
+            u8::try_from(lifted.max(v + 8)).unwrap_or(255)
+        };
+        ratatui::style::Color::Rgb(step(r), step(g), step(b))
+    } else {
+        color
+    }
+}
+
 /// 把转录条目渲染为逻辑行（Message 按类型着色/加 rail；Tool 渲染为卡片）。
 ///
 /// 返回按 entry 分组的结果（含 live 哨兵组，§7.2）。
 fn build_transcript_text(
     view: &ViewModel,
     theme: theme::Theme,
-    cache: &mut HashMap<(u64, u16), Vec<Line<'static>>>,
+    cache: &mut HashMap<(u64, u16), RenderedMarkdown>,
     width: usize,
 ) -> Vec<EntryGroup> {
     let mut groups: Vec<EntryGroup> = Vec::with_capacity(view.transcript.len());
@@ -1044,7 +1174,8 @@ fn build_transcript_text(
                     semantic: &mut Vec<SemanticLine>,
                     line: Line<'static>,
                     hit: Option<HitRange>,
-                    semantic_text: String| {
+                    semantic_text: String,
+                    links: Vec<LinkRange>| {
         // decor_cells = 视觉行总宽 - 语义正文宽（rail/icon 前缀占位）。
         // 语义文本是纯内容，视觉行含装饰前缀；差值即前缀 cell 宽度。
         let line_width = unicode_width::UnicodeWidthStr::width(
@@ -1061,6 +1192,7 @@ fn build_transcript_text(
         semantic.push(SemanticLine {
             text: semantic_text,
             decor_cells,
+            links,
         });
     };
     // 搜索命中集合（高亮用，§14）：只作用于 transcript，live 区不参与。
@@ -1075,27 +1207,25 @@ fn build_transcript_text(
         hits.clear();
         match entry {
             Entry::Message { line, .. } => match line.kind {
-                // §16.2：用户消息细紫红左 rail + 小型 `you` 标签。
+                // §16.2 + §美化：用户消息 = opencode 式"左竖线 + 面板背景块"。
+                // 竖线与 `you` 标签带 panel 背景（成为行内首个 bg span），
+                // plan_window 的补空格机制把整行填满 panel → 形成"用户有底"，
+                // 与 Assistant 的裸文本形成强烈角色层次。
                 LineKind::User => {
                     // §codex：表格在 rail 前缀之后的内容宽度内布局（防止加 rail 后超宽）。
                     let content_width = width.saturating_sub(RAIL_WIDTH);
-                    let rendered = cached_markdown(cache, line, theme, content_width);
+                    let (rendered, line_links) =
+                        cached_markdown(cache, line.version, &line.text, theme, content_width);
+                    let rail_style = Style::default()
+                        .fg(theme.accent)
+                        .bg(theme.panel)
+                        .add_modifier(Modifier::BOLD);
                     for (i, rendered_line) in rendered.iter().enumerate() {
-                        let mut spans = vec![Span::styled(
-                            "│ ",
-                            Style::default()
-                                .fg(theme.accent)
-                                .add_modifier(Modifier::BOLD),
-                        )];
+                        let mut spans = vec![Span::styled("┃ ", rail_style)];
                         if i == 0 {
-                            spans.push(Span::styled(
-                                "you  ",
-                                Style::default()
-                                    .fg(theme.accent)
-                                    .add_modifier(Modifier::BOLD),
-                            ));
+                            spans.push(Span::styled("you  ", rail_style));
                         } else {
-                            spans.push(Span::raw("     "));
+                            spans.push(Span::styled("     ", rail_style));
                         }
                         spans.extend(rendered_line.spans.iter().cloned());
                         let semantic_text = rendered_line
@@ -1110,15 +1240,18 @@ fn build_transcript_text(
                             Line::from(spans),
                             None,
                             semantic_text,
+                            line_links.get(i).cloned().unwrap_or_default(),
                         );
                     }
                 }
                 // §16.2：assistant 消息带左 rail + `AI` 标签（与用户消息呼应，
-                // 形成清晰的双角色层次；正文 Markdown 渲染）。
+                // 形成清晰的双角色层次；正文 Markdown 渲染）。§美化：保持
+                // 无背景裸文本（opencode：user 有底、assistant 裸文本对比）。
                 LineKind::Assistant => {
                     // §codex：表格在 rail 前缀之后的内容宽度内布局。
                     let content_width = width.saturating_sub(RAIL_WIDTH);
-                    let rendered = cached_markdown(cache, line, theme, content_width);
+                    let (rendered, line_links) =
+                        cached_markdown(cache, line.version, &line.text, theme, content_width);
                     for (i, rendered_line) in rendered.iter().enumerate() {
                         let mut spans = vec![Span::styled(
                             "│ ",
@@ -1149,6 +1282,7 @@ fn build_transcript_text(
                             Line::from(spans),
                             None,
                             semantic_text,
+                            line_links.get(i).cloned().unwrap_or_default(),
                         );
                     }
                 }
@@ -1166,7 +1300,9 @@ fn build_transcript_text(
                     };
                     let clickable = overflow; // 只有溢出才可点击展开
                     for (i, s) in shown.iter().enumerate() {
-                        let prefix = if i == 0 { "思考 " } else { "    " };
+                        // §美化：thinking 加 ◆ 图标锚定（与正文/工具区分）；
+                        // 续行缩进对齐（`◆ 思考 ` = 7 cells）。
+                        let prefix = if i == 0 { "◆ 思考 " } else { "       " };
                         let hit = if clickable && i == 0 {
                             full_line_hit(HitTarget::Reasoning(entry_id), width as u16)
                         } else {
@@ -1184,6 +1320,7 @@ fn build_transcript_text(
                             ),
                             hit,
                             s.to_string(),
+                            Vec::new(),
                         );
                     }
                     if overflow {
@@ -1204,6 +1341,7 @@ fn build_transcript_text(
                             ),
                             full_line_hit(HitTarget::Reasoning(entry_id), width as u16),
                             String::new(), // 折叠提示不是可复制内容
+                            Vec::new(),
                         );
                     }
                 }
@@ -1217,6 +1355,7 @@ fn build_transcript_text(
                             Line::styled(format!("{prefix}{s}"), Style::default().fg(theme.info)),
                             None,
                             s.to_string(),
+                            Vec::new(),
                         );
                     }
                 }
@@ -1230,6 +1369,7 @@ fn build_transcript_text(
                             Line::styled("─".repeat(width), Style::default().fg(theme.warning)),
                             None,
                             String::new(), // 分隔线不是可复制内容
+                            Vec::new(),
                         );
                     } else {
                         for (i, s) in line.text.split('\n').enumerate() {
@@ -1244,6 +1384,7 @@ fn build_transcript_text(
                                 ),
                                 None,
                                 s.to_string(),
+                                Vec::new(),
                             );
                         }
                     }
@@ -1252,13 +1393,11 @@ fn build_transcript_text(
             Entry::Tool { card, .. } => {
                 let card_id = card.id.clone();
                 let card_lines = tool_card_lines(card, view.anim_tick, theme, width);
+                // §美化：整卡可点击——主行与内容行都带 Tool hit（轻点任意行
+                // 展开/收缩；拖选仍是文本选择，不冲突）。内容行如有链接，
+                // pointer_target 里链接优先于工具命中。
                 for (i, line) in card_lines.into_iter().enumerate() {
-                    // §视觉瘦身：只主行可点击（icon+name 区域），内容行留给文本选择。
-                    let hit = if i == 0 {
-                        Some((HitTarget::Tool(card_id.clone()), width as u16))
-                    } else {
-                        None
-                    };
+                    let hit = Some((HitTarget::Tool(card_id.clone()), width as u16));
                     // 语义文本：主行去 icon 前缀（首个 "✓ " 等），内容行原样。
                     let semantic_text = if i == 0 {
                         card_semantic_header(card)
@@ -1270,8 +1409,15 @@ fn build_transcript_text(
                             .collect::<String>();
                         card_semantic_content(card, i, &raw)
                     };
-                    // §视觉瘦身：卡片扁平化——无 surface 背景；diff 行本身红绿。
-                    push_hit(&mut out, &mut hits, &mut semantic, line, hit, semantic_text);
+                    push_hit(
+                        &mut out,
+                        &mut hits,
+                        &mut semantic,
+                        line,
+                        hit,
+                        semantic_text,
+                        Vec::new(),
+                    );
                 }
             }
         }
@@ -1317,6 +1463,56 @@ fn build_transcript_text(
                 .collect();
             out = highlighted;
         }
+        // §美化：鼠标悬停卡片 → 整卡微高亮（panel 背景提亮一档，opencode
+        // backgroundElement 手法）。只替换 panel 底（diff 红绿/其他状态色
+        // 保持主导）；补空格机制在 plan_window 按首个 bg span 生效，替换后
+        // 整行仍填满 hover 色。
+        if let Some(hover_id) = view.hover_tool.as_deref()
+            && let Entry::Tool { card, .. } = entry
+            && card.id == hover_id
+        {
+            let hover_bg = lighten(theme.panel);
+            let hovered = std::mem::take(&mut out)
+                .into_iter()
+                .map(|line| {
+                    Line::from(
+                        line.spans
+                            .into_iter()
+                            .map(|span| {
+                                // 只替换 panel 底（diff 红绿/状态色保持主导）。
+                                let style = span.style;
+                                if style.bg == Some(theme.panel) {
+                                    Span::styled(span.content, style.bg(hover_bg))
+                                } else {
+                                    Span::styled(span.content, style)
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            out = hovered;
+        }
+        // §美化：User/Assistant 消息块之间插 1 空行（opencode marginTop=1
+        // 留白即分隔）；System/Tool 不插（工具连续紧凑、系统提示紧贴）。
+        // 空行语义为空、不可选（选中/复制不受影响）。
+        let message_kind = match entry {
+            Entry::Message { line, .. } => Some(line.kind),
+            Entry::Tool { .. } => None,
+        };
+        let needs_gap = matches!(
+            message_kind,
+            Some(LineKind::User) | Some(LineKind::Assistant)
+        );
+        if needs_gap {
+            out.push(Line::default());
+            hits.push(None);
+            semantic.push(SemanticLine {
+                text: String::new(),
+                decor_cells: 0,
+                links: Vec::new(),
+            });
+        }
         groups.push((
             entry_id,
             std::mem::take(&mut out),
@@ -1346,7 +1542,7 @@ fn build_transcript_text(
 fn build_live_group(
     view: &ViewModel,
     theme: theme::Theme,
-    cache: &mut HashMap<(u64, u16), Vec<Line<'static>>>,
+    cache: &mut HashMap<(u64, u16), RenderedMarkdown>,
     width: usize,
     buffers: GroupBuffers<'_>,
 ) {
@@ -1370,8 +1566,9 @@ fn build_live_group(
     {
         if view.reasoning_visible {
             for s in msg.text.split('\n') {
-                let rendered = format!("思考 {s}");
-                let decor = unicode_width::UnicodeWidthStr::width("思考 ");
+                // §美化：与历史 thinking 同款 ◆ 图标（流式期间也锚定辨识）。
+                let rendered = format!("◆ 思考 {s}");
+                let decor = unicode_width::UnicodeWidthStr::width("◆ 思考 ");
                 out.push(Line::styled(
                     rendered.clone(),
                     Style::default()
@@ -1382,6 +1579,7 @@ fn build_live_group(
                 semantic.push(SemanticLine {
                     text: s.to_string(),
                     decor_cells: decor,
+                    links: Vec::new(),
                 });
             }
         } else {
@@ -1397,6 +1595,7 @@ fn build_live_group(
             semantic.push(SemanticLine {
                 text: String::new(),
                 decor_cells: 0,
+                links: Vec::new(),
             });
         }
         groups.push((
@@ -1414,16 +1613,7 @@ fn build_live_group(
     if let Some(msg) = &live.assistant
         && !msg.text.is_empty()
     {
-        let rendered = if let Some(lines) = cache.get(&(msg.version, width as u16)) {
-            lines.clone()
-        } else {
-            let lines = render_markdown(&msg.text, theme, Some(width));
-            if cache.len() > 2048 {
-                cache.clear();
-            }
-            cache.insert((msg.version, width as u16), lines);
-            cache[&(msg.version, width as u16)].clone()
-        };
+        let (rendered, line_links) = cached_markdown(cache, msg.version, &msg.text, theme, width);
         for (i, rendered_line) in rendered.iter().enumerate() {
             let mut spans = vec![Span::styled(
                 "│ ",
@@ -1461,6 +1651,7 @@ fn build_live_group(
             semantic.push(SemanticLine {
                 text: semantic_text,
                 decor_cells: line_width.saturating_sub(text_width),
+                links: line_links.get(i).cloned().unwrap_or_default(),
             });
         }
         groups.push((
@@ -1480,13 +1671,9 @@ fn build_live_group(
             let card_id = card.id.clone();
             let card_lines = tool_card_lines(card, view.anim_tick, theme, width);
             for (i, line) in card_lines.into_iter().enumerate() {
-                // §24：只有主行可点击（图标+工具名区域），正文行不可点。
-                let hit = if i == 0 {
-                    Some((HitTarget::Tool(card_id.clone()), line.width() as u16))
-                } else {
-                    None
-                };
-                // §视觉瘦身：卡片扁平化——主行无 surface 背景；diff 行保留红绿。
+                // §美化：整卡可点击（与历史卡片一致）——主行与内容行都带
+                // Tool hit；拖选仍是文本选择。
+                let hit = Some((HitTarget::Tool(card_id.clone()), line.width() as u16));
                 let raw_text = line
                     .spans
                     .iter()
@@ -1504,6 +1691,7 @@ fn build_live_group(
                 semantic.push(SemanticLine {
                     text: semantic_text,
                     decor_cells: line_width.saturating_sub(text_width),
+                    links: Vec::new(),
                 });
             }
             groups.push((
@@ -1524,22 +1712,26 @@ fn build_live_group(
 const RAIL_WIDTH: usize = 7;
 
 /// 按条目版本缓存 Markdown 渲染（流式增量只重渲染变化条目，§16.1）。
+/// 返回缓存结果的行与链接（链接范围基于渲染行文本；§成熟化）。
 fn cached_markdown(
-    cache: &mut HashMap<(u64, u16), Vec<Line<'static>>>,
-    line: &TranscriptLine,
+    cache: &mut HashMap<(u64, u16), RenderedMarkdown>,
+    version: u64,
+    text: &str,
     theme: theme::Theme,
     width: usize,
-) -> Vec<Line<'static>> {
-    let key = (line.version, width as u16);
-    if let Some(lines) = cache.get(&key) {
-        return lines.clone();
+) -> (Vec<Line<'static>>, Vec<Vec<LinkRange>>) {
+    let key = (version, width as u16);
+    if let Some(entry) = cache.get(&key) {
+        return (entry.lines.clone(), entry.links.clone());
     }
-    let lines = render_markdown(&line.text, theme, Some(width));
+    let rendered = render_markdown_detailed(text, theme, Some(width));
     if cache.len() > 2048 {
         cache.clear();
     }
-    cache.insert(key, lines);
-    cache[&key].clone()
+    let lines = rendered.lines.clone();
+    let links = rendered.links.clone();
+    cache.insert(key, rendered);
+    (lines, links)
 }
 
 /// 计划条（§16.2：编辑器上方独立紧凑区域，不出现在 transcript）。
@@ -1554,24 +1746,59 @@ fn draw_plan(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: th
     let Some(plan) = &view.plan else {
         return;
     };
-    let mut lines = vec![Line::styled(
-        "计划",
-        Style::default()
-            .fg(theme.primary)
-            .add_modifier(Modifier::BOLD),
-    )];
+    // §美化：plan 面板化——左竖线 + panel 背景 + 补空格到满宽（独立面板）。
+    let rail = Style::default()
+        .fg(theme.accent)
+        .bg(theme.panel)
+        .add_modifier(Modifier::BOLD);
+    let mut lines = vec![Line::from(vec![
+        Span::styled("┃ ", rail),
+        Span::styled(
+            "计划",
+            Style::default()
+                .fg(theme.primary)
+                .bg(theme.panel)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])];
     for item in plan.items.iter().take(3) {
         let (marker, style) = match item.status {
             crate::tool::plan::PlanStatus::Completed => (
                 "[x]",
-                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(theme.muted)
+                    .bg(theme.panel)
+                    .add_modifier(Modifier::DIM),
             ),
             crate::tool::plan::PlanStatus::InProgress => {
-                ("[>]", Style::default().fg(theme.warning))
+                ("[>]", Style::default().fg(theme.warning).bg(theme.panel))
             }
-            crate::tool::plan::PlanStatus::Pending => ("[ ]", Style::default().fg(theme.muted)),
+            crate::tool::plan::PlanStatus::Pending => {
+                ("[ ]", Style::default().fg(theme.muted).bg(theme.panel))
+            }
         };
-        lines.push(Line::styled(format!("{marker} {}", item.text), style));
+        lines.push(Line::from(vec![
+            Span::styled("   ", Style::default().bg(theme.panel)),
+            Span::styled(format!("{marker} {}", item.text), style),
+        ]));
+    }
+    // 补空格到满宽（与 plan_window 的补空格逻辑一致）。
+    let width = area.width as usize;
+    for line in lines.iter_mut() {
+        let cur = unicode_width::UnicodeWidthStr::width(
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .as_str(),
+        );
+        if cur < width {
+            let pad = width - cur;
+            line.spans.push(Span::styled(
+                " ".repeat(pad),
+                Style::default().bg(theme.panel),
+            ));
+        }
     }
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
@@ -1773,12 +2000,39 @@ fn draw_scrollbar(
 /// 输入区（§16.2：硬件 cursor 放在真实输入位置，优先保证中文 IME）。
 ///
 /// 支持多行（Alt+Enter）；行数与光标位置按 display width 折行计算。
+/// §美化：输入区面板化——`❯ ` prompt 带 panel 背景 + 整行补空格，
+/// 输入区成为独立盒子（opencode Prompt 盒子；光标计算不受 bg 影响）。
 fn draw_input(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: theme::Theme) {
     let line = Line::from(vec![
-        Span::styled("❯ ", Style::default().fg(theme.accent)),
-        Span::raw(view.input.clone()),
+        Span::styled(
+            "❯ ",
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.panel)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(view.input.clone(), Style::default().bg(theme.panel)),
     ]);
-    let wrapped = wrap_lines(vec![line], area.width as usize);
+    let mut wrapped = wrap_lines(vec![line], area.width as usize);
+    // 整行补空格到满宽（面板底连续）。
+    for wrapped_line in wrapped.iter_mut() {
+        let cur = unicode_width::UnicodeWidthStr::width(
+            wrapped_line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .as_str(),
+        );
+        let width = area.width as usize;
+        if cur < width {
+            let pad = width - cur;
+            wrapped_line.spans.push(Span::styled(
+                " ".repeat(pad),
+                Style::default().bg(theme.panel),
+            ));
+        }
+    }
     let rows = wrapped.len().max(1) as u16;
     let (cursor_row, cursor_col) = input_cursor_cell(&view.input, view.input_cursor, area.width);
     // BUG-008：滚动基准必须是可见区域高度（area.height），而不是全部折行行数
@@ -1963,7 +2217,17 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
         }
         content.push(Line::default());
     }
-    if !overlay.body.is_empty() {
+    // §成熟化：Link Overlay 正文显示 URL（info 色可读）。
+    if overlay.kind == model::OverlayKind::Link {
+        for line in overlay.body.split('\n') {
+            content.push(Line::styled(
+                line.to_string(),
+                Style::default()
+                    .fg(theme.info)
+                    .add_modifier(Modifier::UNDERLINED),
+            ));
+        }
+    } else if !overlay.body.is_empty() {
         content.push(Line::styled(
             "Output",
             Style::default()
@@ -1986,8 +2250,12 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
         ));
     }
     content.push(Line::default());
+    let hint = match overlay.kind {
+        model::OverlayKind::Link => "[Enter] 打开 · [c] 复制 · [Esc] 关闭",
+        _ => "[Esc] 关闭 · [PgUp/PgDn] 滚动",
+    };
     content.push(Line::styled(
-        "[Esc] 关闭 · [PgUp/PgDn] 滚动",
+        hint,
         Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
     ));
 
@@ -2000,11 +2268,11 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
     let end = (start + inner_h).min(wrapped.len());
     let window = wrapped[start..end].to_vec();
 
-    // Border title follows overlay type: tool details vs thinking (reasoning) window.
-    let border_title = if overlay.tool_id.is_some() {
-        " Tool details "
-    } else {
-        " 思考（reasoning） "
+    // Border title follows overlay kind: tool details vs thinking (reasoning) vs link.
+    let border_title = match overlay.kind {
+        model::OverlayKind::Tool => " Tool details ",
+        model::OverlayKind::Reasoning => " 思考（reasoning） ",
+        model::OverlayKind::Link => " 链接 ",
     };
     let block = ratatui::widgets::Block::default()
         .borders(ratatui::widgets::Borders::ALL)
@@ -2120,7 +2388,7 @@ pub fn draw_to_test_backend_mode(
         }
     };
     let theme = theme::Theme::omp();
-    let mut cache: HashMap<(u64, u16), Vec<Line<'static>>> = HashMap::new();
+    let mut cache: HashMap<(u64, u16), RenderedMarkdown> = HashMap::new();
     let mut cache_width = 0u16;
     let mut committed = 0usize;
     let scrollback = mode == terminal::ViewMode::Inline;
@@ -2167,7 +2435,7 @@ pub fn draw_captured_bytes(view: &mut ViewModel) -> Vec<u8> {
             }
         };
         let theme = theme::Theme::omp();
-        let mut cache: HashMap<(u64, u16), Vec<Line<'static>>> = HashMap::new();
+        let mut cache: HashMap<(u64, u16), RenderedMarkdown> = HashMap::new();
         let mut cache_width = 0u16;
         let mut committed = 0usize;
         let mut overflow: Vec<Line<'static>> = Vec::new();
@@ -2221,10 +2489,11 @@ mod tests {
         }
         let mut cache = HashMap::new();
         let plan = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
-        // 跟随模式：窗口是最后 4 行，前 6 行提交到 scrollback。
+        // §美化：每条 Assistant 消息后插 1 空行 → 10 条 = 20 行。
+        // 跟随模式：窗口是最后 4 行，前 16 行提交到 scrollback。
         assert_eq!(plan.window.len(), 4);
-        assert_eq!(plan.overflow.len(), 6);
-        assert_eq!(plan.committed_after, 6);
+        assert_eq!(plan.overflow.len(), 16);
+        assert_eq!(plan.committed_after, 16);
         let window_text: String = plan
             .window
             .iter()
@@ -2244,7 +2513,7 @@ mod tests {
             &mut cache,
         );
         assert!(plan2.overflow.is_empty());
-        assert_eq!(plan2.committed_after, 6);
+        assert_eq!(plan2.committed_after, 16);
     }
 
     #[test]
@@ -2256,7 +2525,8 @@ mod tests {
         let mut cache = HashMap::new();
         // 先布局一次（Follow 建立 layout_top = 视口顶部行）。
         let _ = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
-        // TUI v2：翻页 = 锚点（视口顶部）上移 2 行 → 窗口 [4, 8)。
+        // §美化：10 条消息 = 20 行；Follow 顶部行 = 16。
+        // TUI v2：翻页 = 锚点（视口顶部）上移 2 行 → 窗口 [14, 18)。
         view.scroll_up(2);
         let plan = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         // Locked：不提交到 scrollback。
@@ -2268,7 +2538,8 @@ mod tests {
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(window_text.contains("line 5") && window_text.contains("line 7"));
+        // 行 14 = m7，行 16 = m8（m_i 在行 2i，空行在 2i+1）。
+        assert!(window_text.contains("line 7") && window_text.contains("line 8"));
         assert!(!window_text.contains("line 9"));
         // Locked 保持：新内容不移动视口（§58 场景 A）。
         view.push_line(LineKind::Assistant, "line 10 new".to_string());
@@ -2300,15 +2571,19 @@ mod tests {
         );
         let mut cache = HashMap::new();
         let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
-        // row_hits 与 window 等长；只有第 0 行（主行）可点击，正文行为 None。
+        // §美化：整卡可点击——主行与内容行都带 Tool hit（轻点任意行展开；
+        // 拖选仍是文本选择，不冲突）。row_hits 与 window 等长。
         assert!(plan.window.len() >= 2, "卡片含主行+正文: {:?}", plan.window);
         assert!(
             matches!(&plan.row_hits[0], Some((HitTarget::Tool(id), end)) if id == "c1" && *end > 0),
             "主行必须可点击: {:?}",
             plan.row_hits[0]
         );
-        for hit in plan.row_hits.iter().skip(1) {
-            assert!(hit.is_none(), "正文行不可点击（留给文本选择）: {hit:?}");
+        for hit in plan.row_hits.iter() {
+            assert!(
+                matches!(hit, Some((HitTarget::Tool(id), end)) if id == "c1" && *end > 0),
+                "整卡每行都可点击展开: {hit:?}"
+            );
         }
     }
 
@@ -2323,9 +2598,9 @@ mod tests {
             view.push_line(LineKind::Assistant, format!("line {i}"));
         }
         let mut cache = HashMap::new();
-        // 先提交 6 行。
+        // §美化：10 条消息 = 20 行；先提交 16 行（含每条消息后的留白空行）。
         let plan = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
-        assert_eq!(plan.committed_after, 6);
+        assert_eq!(plan.committed_after, 16);
         // resize：不产生 overflow，提交位置重置为窗口起点。
         let plan2 = plan_window(
             &mut view,
@@ -2338,7 +2613,7 @@ mod tests {
         );
         assert!(plan2.overflow.is_empty());
         // 40 宽度下每行不折行（"line N" 很短），窗口仍是最后 4 行。
-        assert_eq!(plan2.committed_after, 6);
+        assert_eq!(plan2.committed_after, 16);
     }
 
     /// §58 回归：Follow → PgUp（进 Locked）→ PgDn 到底 → 新内容 → 再 PgDn 必须能滚到底。
@@ -2448,7 +2723,20 @@ mod tests {
 
         let lines = render_markdown("```rust\nfn main() {}\n```", theme, None);
         assert_eq!(lines.len(), 1, "代码块渲染为一行");
-        assert_eq!(lines[0].spans[0].content, "fn main() {}");
+        // §成熟化：rust 代码块经 syntect 高亮，行被 tokenize 为多个 span；
+        // 断言整行文本（而非 spans[0]，后者是首 token）。
+        let line_text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(line_text, "fn main() {}");
+        // 语法高亮生效：至少一个 token 使用语义色（keyword 等），非纯 muted。
+        let has_semantic = lines[0]
+            .spans
+            .iter()
+            .any(|s| s.style.fg.is_some() && s.style.fg != Some(theme.muted));
+        assert!(
+            has_semantic,
+            "rust 代码块必须有语法高亮: {:?}",
+            lines[0].spans
+        );
     }
 
     #[test]
@@ -3014,9 +3302,11 @@ fn overlay_clears_background_before_rendering() {
     );
     view.open_tool_overlay(String::from("c"));
     let buf = draw_to_test_backend(&mut view, 80, 24);
-    // overlay 居中 (2,1,76,20)；内部底部行 (40,19) 不在内容上 → 必须被清空为空格。
+    // §美化：footer 上方加了分隔线 → trans_area 高度 = 24-1(input)-1(rule)-1(footer)=21，
+    // overlay 居中 (2,1,76,19)，底边框在行 19。内部未覆盖区域取行 18
+    //（边框上方内部行）→ 必须被清空为空格。
     assert_eq!(
-        buf[(40, 19)].symbol(),
+        buf[(40, 18)].symbol(),
         " ",
         "Overlay 内部未覆盖区域必须清空，不得透出背景文字"
     );
@@ -3281,17 +3571,32 @@ fn selection_highlights_selected_window_rows() {
     });
     view.selection_end();
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 6, 0, false, &mut cache);
-    // 每行 1 个 visual row；行 0..5 对应 window[0..6]。
-    assert_eq!(plan.window.len(), 6, "6 条消息各一行: {:?}", plan.window);
+    // §美化：6 条消息 + 6 留白空行 = 12 行；视口 12 容纳全部。
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 12, 0, false, &mut cache);
+    assert_eq!(
+        plan.window.len(),
+        12,
+        "6 条消息 + 6 留白各一行: {:?}",
+        plan.window
+    );
     let has_reversed = |idx: usize| {
         plan.window[idx]
             .spans
             .iter()
             .any(|s| s.style.add_modifier.contains(Modifier::REVERSED))
     };
-    assert!(has_reversed(1) && has_reversed(2), "选中行 1-2 必须高亮");
-    assert!(!has_reversed(0) && !has_reversed(3), "未选中行不高亮");
+    // 正文行布局：entry_id 从 1 起，entry_i 正文在行 2*(i-1)、留白在 2*(i-1)+1。
+    // 选中 entry2/3 正文 → window 行 2、4 高亮；留白行 3、5 与未选行不高亮。
+    assert!(
+        has_reversed(2) && has_reversed(4),
+        "选中 entry2/3 正文必须高亮"
+    );
+    assert!(!has_reversed(3), "留白空行不得高亮");
+    assert!(!has_reversed(5), "留白空行不得高亮");
+    assert!(
+        !has_reversed(0) && !has_reversed(1) && !has_reversed(11),
+        "未选中行不高亮"
+    );
 }
 
 /// §InteractionRefactor：plan_window 的语义映射与视觉行必须对齐——
@@ -3311,23 +3616,32 @@ fn semantic_rows_align_with_window_and_map_text() {
         "semantic_rows 必须与 window 等长"
     );
     assert!(!plan.semantic_rows.is_empty());
-    // 每行都带 entry 归属；语义文本 = 消息正文（无 rail 前缀）。
+    // §美化：消息块间有留白空行（text 为空、不可选）；非空行断言正文语义。
     for row in plan.semantic_rows.iter() {
-        let (entry_id, _start, text, _decor) = row.as_ref().expect("窗口行必须有语义映射");
+        let row = row.as_ref().expect("窗口行必须有语义映射");
         assert!(
-            *entry_id == EntryId(1) || *entry_id == EntryId(2),
-            "归属错误 entry: {entry_id:?}"
+            row.entry_id == EntryId(1) || row.entry_id == EntryId(2),
+            "归属错误 entry: {:?}",
+            row.entry_id
         );
-        assert!(!text.starts_with("│"), "语义文本不得含 rail 前缀: {text:?}");
-        assert!(!text.is_empty(), "正文行语义文本不得为空");
+        if row.text.is_empty() {
+            // 留白空行：合法分隔（不可选），跳过 rail/非空断言。
+            continue;
+        }
+        assert!(
+            !row.text.starts_with('│'),
+            "语义文本不得含 rail 前缀: {:?}",
+            row.text
+        );
+        assert!(!row.text.is_empty(), "正文行语义文本不得为空");
     }
     // 语义文本必须能被定位：entry 1 的语义文本就是 "hello world"（markdown 渲染无装饰）。
     let e1_text = plan
         .semantic_rows
         .iter()
         .find_map(|r| {
-            let (id, _, t, _) = r.as_ref()?;
-            (*id == EntryId(1)).then(|| t.clone())
+            let row = r.as_ref()?;
+            (row.entry_id == EntryId(1)).then(|| row.text.clone())
         })
         .expect("entry 1 必须有语义行");
     assert!(
@@ -3373,15 +3687,19 @@ fn wrap_with_semantic_produces_exact_mapping() {
     let semantic = SemanticLine {
         text: "hello".to_string(),
         decor_cells: 7,
+        links: Vec::new(),
     };
     let rows = wrap_with_semantic(vec![line], vec![None], &[semantic], 80, entry_id);
     assert_eq!(rows.len(), 1, "短文本单行");
     let row = &rows[0];
-    let (eid, char_start, text, decor) = row.semantic.as_ref().expect("必须有语义映射");
-    assert_eq!(*eid, entry_id);
-    assert_eq!(*char_start, 0, "首行语义从 entry 偏移 0 开始");
-    assert_eq!(text, "hello");
-    assert_eq!(*decor, 7, "短文本首行 decor 必须是 rail 宽度（P0-2 修复）");
+    let row_sem = row.semantic.as_ref().expect("必须有语义映射");
+    assert_eq!(row_sem.entry_id, entry_id);
+    assert_eq!(row_sem.char_start, 0, "首行语义从 entry 偏移 0 开始");
+    assert_eq!(row_sem.text, "hello");
+    assert_eq!(
+        row_sem.decor, 7,
+        "短文本首行 decor 必须是 rail 宽度（P0-2 修复）"
+    );
 
     // 长文本换行：语义行数 == 视觉行数，续行 decor=0。
     let long = "x".repeat(90); // 90 cell，宽 40 → 3 行。
@@ -3393,18 +3711,23 @@ fn wrap_with_semantic_produces_exact_mapping() {
     let semantic2 = SemanticLine {
         text: long.clone(),
         decor_cells: 7,
+        links: Vec::new(),
     };
     let rows = wrap_with_semantic(vec![line2], vec![None], &[semantic2], 40, entry_id);
     // 宽 40：首行内容容量 = 40-7 = 33 cell → "x"×33；续行 40 cell 各 40、17。
     assert_eq!(rows.len(), 3, "90 cell 内容宽 40 → 3 视觉行");
     // 首行 decor=7，续行 decor=0。
-    assert_eq!(rows[0].semantic.as_ref().unwrap().3, 7, "首行 decor=rail");
-    assert_eq!(rows[1].semantic.as_ref().unwrap().3, 0, "续行 decor=0");
-    assert_eq!(rows[2].semantic.as_ref().unwrap().3, 0, "末行 decor=0");
+    assert_eq!(
+        rows[0].semantic.as_ref().unwrap().decor,
+        7,
+        "首行 decor=rail"
+    );
+    assert_eq!(rows[1].semantic.as_ref().unwrap().decor, 0, "续行 decor=0");
+    assert_eq!(rows[2].semantic.as_ref().unwrap().decor, 0, "末行 decor=0");
     // 语义文本拼接 = 原文。
     let joined: String = rows
         .iter()
-        .filter_map(|r| r.semantic.as_ref().map(|(_, _, t, _)| t.as_str()))
+        .filter_map(|r| r.semantic.as_ref().map(|s| s.text.as_str()))
         .collect();
     assert_eq!(joined, long, "语义拼接必须等于原文（不丢字）");
 }
@@ -3420,32 +3743,36 @@ fn arbitrary_char_selection_is_char_precise() {
     view.push_line(LineKind::Assistant, "hello world");
     let mut cache = HashMap::new();
     let plan = plan_window(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
-    let (entry_id, char_start, text, decor) = plan.semantic_rows[0]
+    let first = plan.semantic_rows[0]
         .as_ref()
         .expect("第一行必须有语义映射");
+    let text = first.text.as_str();
+    let char_start = first.char_start;
+    let decor = first.decor;
     assert_eq!(text, "hello world");
     // 模拟 hit_text：视觉 cell 列 → 语义 offset。
     // 屏幕列 = rect.x + decor + 目标字符前的 cell 宽度。
     let to_offset = |screen_col: usize| -> usize {
-        let semantic_col = screen_col.saturating_sub(*decor);
-        cell_to_char(text, semantic_col) + *char_start
+        let semantic_col = screen_col.saturating_sub(decor);
+        cell_to_char(text, semantic_col) + char_start
     };
     // 屏幕列指向 "world" 的开头（decor + "hello " = 7 + 6 = 13 cell 列）。
-    let w_col = *decor + chars_to_cells("hello ", 6);
+    let w_col = decor + chars_to_cells("hello ", 6);
     let w_offset = to_offset(w_col);
     assert_eq!(w_offset, 6, "w 的 offset 应为 6");
     // 选中 "wor"（offset 6..9）。
     view.selection_start(TextPosition {
-        entry_id: *entry_id,
+        entry_id: first.entry_id,
         offset: w_offset,
     });
     view.selection_update(TextPosition {
-        entry_id: *entry_id,
+        entry_id: first.entry_id,
         offset: w_offset + 3,
     });
     view.selection_end();
     assert_eq!(view.selected_text(), "wor", "必须精确选中 3 个字符，非整行");
-    // CJK：选中 2 个汉字。
+    // CJK：选中 2 个汉字。§美化：entry2 前有留白空行，按 entry 定位
+    //（不用固定 index——留白行 text 为空）。
     view.push_line(LineKind::Assistant, "你好世界");
     let mut cache2 = HashMap::new();
     let plan2 = plan_window(
@@ -3457,19 +3784,203 @@ fn arbitrary_char_selection_is_char_precise() {
         false,
         &mut cache2,
     );
-    let (_, _, text2, _) = plan2.semantic_rows[1]
-        .as_ref()
-        .expect("第二行必须有语义映射");
-    let (e2, _, _, _) = plan2.semantic_rows[1].as_ref().unwrap();
-    assert_eq!(text2, "你好世界");
+    let second = plan2
+        .semantic_rows
+        .iter()
+        .find_map(|r| {
+            let row = r.as_ref()?;
+            (row.entry_id == EntryId(2)).then_some(row)
+        })
+        .expect("entry 2 必须有语义映射");
+    assert_eq!(second.text, "你好世界");
     view.selection_start(TextPosition {
-        entry_id: *e2,
+        entry_id: second.entry_id,
         offset: 1,
     });
     view.selection_update(TextPosition {
-        entry_id: *e2,
+        entry_id: second.entry_id,
         offset: 3,
     });
     view.selection_end();
     assert_eq!(view.selected_text(), "好世", "CJK 按 char 精确选中");
+}
+
+/// §美化：User 消息 = 左竖线(┃) + panel 背景块（行内首个 span 带 bg），
+/// Assistant 保持无背景 rail —— 形成"用户有底、助手裸文本"层次。
+#[test]
+fn user_message_gets_panel_background_assistant_stays_plain() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::User, "帮我修复");
+    view.push_line(LineKind::Assistant, "好的");
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 12, 0, false, &mut cache);
+    let theme = theme::Theme::omp();
+    // 通过语义行定位正文行索引（wrap 后 span 逐字符拆分，不能直接按文本找）。
+    let find_row = |target: &str| -> usize {
+        plan.semantic_rows
+            .iter()
+            .position(|r| r.as_ref().is_some_and(|row| row.text == target))
+            .expect("目标消息必须渲染")
+    };
+    let user_row = find_row("帮我修复");
+    assert!(
+        plan.window[user_row]
+            .spans
+            .iter()
+            .any(|s| s.style.bg == Some(theme.panel)),
+        "用户消息行首 span 必须带 panel 背景: {:?}",
+        plan.window[user_row].spans
+    );
+    let assistant_row = find_row("好的");
+    assert!(
+        plan.window[assistant_row]
+            .spans
+            .iter()
+            .all(|s| s.style.bg.is_none()),
+        "assistant 消息保持裸文本（无背景）: {:?}",
+        plan.window[assistant_row].spans
+    );
+}
+
+/// §美化：消息块间插留白空行（text 为空、不可选）。
+#[test]
+fn message_blocks_are_separated_by_gap_rows() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::Assistant, "line a");
+    view.push_line(LineKind::Assistant, "line b");
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
+    // 每条消息 1 正文 + 1 留白 = 4 行（无折行）。
+    assert_eq!(plan.window.len(), 4);
+    // 第 1、3 行是留白空行（语义为空，不可选）。
+    assert_eq!(plan.semantic_rows[1].as_ref().unwrap().text, "");
+    assert_eq!(plan.semantic_rows[3].as_ref().unwrap().text, "");
+    // 正文行语义非空。
+    assert_eq!(plan.semantic_rows[0].as_ref().unwrap().text, "line a");
+    assert_eq!(plan.semantic_rows[2].as_ref().unwrap().text, "line b");
+}
+
+/// §美化：thinking 加 ◆ 图标前缀（与正文/工具区分）。
+#[test]
+fn thinking_lines_carry_icon_prefix() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::Reasoning, "先分析再动手");
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 12, 0, false, &mut cache);
+    // 首行是 thinking（◆ 前缀 + 正文）；语义文本不含前缀。
+    let first = &plan.window[0];
+    let text: String = first.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        text.contains("◆ 思考"),
+        "thinking 行带 ◆ 图标前缀: {text:?}"
+    );
+    assert!(text.contains("先分析再动手"), "正文保留: {text:?}");
+    // 语义文本是纯正文（无前缀，不可复制前缀）。
+    let semantic = plan.semantic_rows[0].as_ref().unwrap();
+    assert_eq!(semantic.text, "先分析再动手");
+}
+
+/// §美化：代码块语法高亮路径统一 surface_subtle 背景（与 fallback 一致）。
+#[test]
+fn highlighted_code_block_has_background() {
+    let theme = theme::Theme::omp();
+    let lines = highlight::highlight_code_block("fn main() { let x = 1; }", Some("rust"), theme)
+        .expect("rust 可解析");
+    assert_eq!(lines.len(), 1);
+    for span in &lines[0].spans {
+        assert_eq!(
+            span.style.bg,
+            Some(theme.surface_subtle),
+            "语法高亮 span 必须带 surface_subtle 背景: {:?}",
+            span
+        );
+    }
+}
+
+/// §美化：hover 卡片 → panel 底提亮（diff 红绿保持主导）。
+#[test]
+fn hovered_card_brightens_panel_background() {
+    let mut view = ViewModel::default();
+    view.begin_tool("c1", "bash", Some("cmd".into()), None);
+    view.finish_tool(
+        ("c1", "bash"),
+        crate::tool::outcome::ToolStatus::Failed,
+        10,
+        Some(1),
+        "错误输出",
+        None,
+    );
+    view.hover_tool = Some("c1".to_string());
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    let theme = theme::Theme::omp();
+    let hover_bg = lighten(theme.panel);
+    assert_ne!(hover_bg, theme.panel, "提亮必须产生可见差");
+    // 卡片所有行（主行 + 内容行）的 panel 底都替换为 hover 色。
+    for (i, line) in plan.window.iter().enumerate() {
+        let has_hover = line.spans.iter().any(|s| s.style.bg == Some(hover_bg));
+        assert!(
+            has_hover,
+            "hover 卡片行 {i} 必须带提亮背景: {:?}",
+            line.spans
+        );
+        assert!(
+            line.spans.iter().all(|s| s.style.bg != Some(theme.panel)),
+            "hover 时不得残留原 panel 底: {:?}",
+            line.spans
+        );
+    }
+}
+
+/// §美化：非 hover 卡片保持 panel 底（不高亮）。
+#[test]
+fn non_hovered_card_keeps_plain_panel() {
+    let mut view = ViewModel::default();
+    view.begin_tool("c1", "bash", Some("cmd".into()), None);
+    view.finish_tool(
+        ("c1", "bash"),
+        crate::tool::outcome::ToolStatus::Failed,
+        10,
+        Some(1),
+        "错误输出",
+        None,
+    );
+    // 无 hover 状态。
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    let theme = theme::Theme::omp();
+    let first_row = &plan.window[0];
+    assert!(
+        first_row
+            .spans
+            .iter()
+            .any(|s| s.style.bg == Some(theme.panel)),
+        "卡片默认 panel 底保留"
+    );
+    assert!(
+        first_row
+            .spans
+            .iter()
+            .all(|s| s.style.bg != Some(lighten(theme.panel))),
+        "未悬停不得提亮"
+    );
+}
+
+/// §美化：lighten 对 RGB 提亮、对非 RGB 原样返回。
+#[test]
+fn lighten_lifts_rgb_only() {
+    let theme = theme::Theme::omp();
+    let lifted = lighten(theme.panel);
+    let ratatui::style::Color::Rgb(r, g, b) = lifted else {
+        panic!("RGB 输入必须产出 RGB");
+    };
+    let ratatui::style::Color::Rgb(pr, pg, pb) = theme.panel else {
+        unreachable!();
+    };
+    assert!(r > pr && g > pg && b > pb, "三通道都提亮");
+    // 非 RGB（终端默认）原样。
+    assert_eq!(
+        lighten(ratatui::style::Color::Reset),
+        ratatui::style::Color::Reset
+    );
 }

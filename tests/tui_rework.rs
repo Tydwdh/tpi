@@ -206,6 +206,7 @@ fn detail_opens_overlay_not_inline_rewrite() {
     view.transcript.push(Entry::Tool {
         id: tpi::tui::scroll::EntryId(1),
         card,
+        search_cache: None,
     });
     view.open_tool_overlay("c");
     let overlay = view.overlay.as_ref().expect("overlay 打开");
@@ -287,13 +288,13 @@ fn scroll_lock_keeps_position_and_counts() {
         view.push_line(LineKind::Assistant, format!("line {i}"));
     }
     view.scroll_up(10);
-    let locked_scroll = view.transcript_scroll;
+    let locked_scroll = view.scroll_mode;
     // Agent 继续产生事件。
     view.push_line(LineKind::Assistant, "new-1");
     view.begin_tool("c", "bash", Some("cargo test".into()), None);
     view.finish_tool(("c", "bash"), ToolStatus::Succeeded, 100, Some(0), "", None);
     assert_eq!(
-        view.transcript_scroll, locked_scroll,
+        view.scroll_mode, locked_scroll,
         "scroll lock 期间位置不被拉回"
     );
     assert!(
@@ -302,7 +303,7 @@ fn scroll_lock_keeps_position_and_counts() {
         view.pending_below
     );
     view.follow_tail();
-    assert_eq!(view.transcript_scroll, 0);
+    assert_eq!(view.scroll_mode, tpi::tui::scroll::ScrollMode::Follow);
     assert_eq!(view.pending_below, 0);
 }
 
