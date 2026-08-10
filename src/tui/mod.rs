@@ -135,6 +135,11 @@ pub struct Renderer {
     committed_lines: usize,
     /// Markdown 渲染缓存：条目 version → 渲染结果（行 + 链接范围）。
     md_cache: HashMap<(u64, u16), RenderedMarkdown>,
+    /// wrap 结果缓存（§性能）：历史 entry (id, width) → 折行结果，跨帧复用；
+    /// transcript_revision 变化或 resize 时清空。
+    wrap_cache: HashMap<(EntryId, u16), Vec<WrappedRow>>,
+    /// 上次 draw 的 transcript 结构版本（wrap 缓存失效依据）。
+    last_transcript_revision: u64,
     /// 缓存有效时的终端宽度；宽度变化清空缓存并重置提交位置（§16.1）。
     cache_width: u16,
     /// 最近一帧的转录区矩形（鼠标 hit-test 用）。
@@ -166,6 +171,8 @@ impl Renderer {
             scrollback: mode == terminal::ViewMode::Inline,
             committed_lines: 0,
             md_cache: HashMap::new(),
+            wrap_cache: HashMap::new(),
+            last_transcript_revision: 0,
             cache_width: 0,
             last_transcript_rect: None,
             last_row_hits: Vec::new(),
@@ -266,12 +273,20 @@ impl Renderer {
         let theme = self.theme;
         let mode = self.driver.mode();
         let mut cache = std::mem::take(&mut self.md_cache);
+        let mut wrap_cache = std::mem::take(&mut self.wrap_cache);
         let mut cache_width = self.cache_width;
         let mut committed = self.committed_lines;
         let mut overflow: Vec<Line<'static>> = Vec::new();
         let mut new_committed = committed;
         let scrollback = self.scrollback;
         let mut plan_out: Option<FramePlan> = None;
+        // §性能：transcript 结构变化（新增/trim/折叠切换）→ 清空 wrap 缓存。
+        // 流式期间 revision 不变 → 历史行 wrap 结果跨帧复用。
+        let transcript_revision = view.transcript_revision;
+        if transcript_revision != self.last_transcript_revision {
+            wrap_cache.clear();
+            self.last_transcript_revision = transcript_revision;
+        }
         self.driver.draw(|frame| {
             let FramePlan {
                 window,
@@ -288,6 +303,7 @@ impl Renderer {
                 theme,
                 RenderContext {
                     markdown_cache: &mut cache,
+                    wrap_cache: &mut wrap_cache,
                     cache_width: &mut cache_width,
                     committed: &mut committed,
                     scrollback,
@@ -342,6 +358,7 @@ impl Renderer {
         }
         self.committed_lines = new_committed;
         self.md_cache = cache;
+        self.wrap_cache = wrap_cache;
         self.cache_width = cache_width;
         self.last_draw = Some(Instant::now());
         self.coalesced_events = 0;
@@ -375,6 +392,9 @@ impl Drop for Renderer {
 /// 自下而上：输入区（多行，≤4 行）→ footer（1 行）→ 计划条（0..4 行）→ 转录区。
 struct RenderContext<'a> {
     markdown_cache: &'a mut HashMap<(u64, u16), RenderedMarkdown>,
+    /// wrap 结果缓存（§性能：历史 entry 折叠/内容不变 → 跨帧复用，
+    /// 避免每帧对全量历史逐字符重建 span）。key = (entry_id, width)。
+    wrap_cache: &'a mut HashMap<(EntryId, u16), Vec<WrappedRow>>,
     cache_width: &'a mut u16,
     committed: &'a mut usize,
     scrollback: bool,
@@ -389,6 +409,7 @@ fn render_frame(
 ) -> FramePlan {
     let RenderContext {
         markdown_cache: cache,
+        wrap_cache,
         cache_width,
         committed,
         scrollback,
@@ -400,6 +421,8 @@ fn render_frame(
     let reset_committed = *cache_width != area.width;
     if reset_committed {
         cache.clear();
+        // §性能：wrap 结果按宽度缓存，resize 后一并失效（key 含 width）。
+        wrap_cache.clear();
         *cache_width = area.width;
     }
 
@@ -465,6 +488,7 @@ fn render_frame(
         *committed,
         reset_committed,
         cache,
+        wrap_cache,
     );
     *committed = plan.committed_after;
     let overflow = plan.overflow;
@@ -557,6 +581,7 @@ fn render_frame(
 ///   被 trim 时回退最早现存 entry（§68）；窗口越界时 clamp；
 /// - 布局后写回 layout_top / entry_heights / transcript_rows（renderer 写回，
 ///   滚动操作的基础，§4.3 resize 保持语义位置）。
+#[allow(clippy::too_many_arguments)] // §性能：布局输入 + 双缓存（md/wrap）。
 fn plan_window(
     view: &mut ViewModel,
     theme: theme::Theme,
@@ -565,14 +590,39 @@ fn plan_window(
     committed: usize,
     reset_committed: bool,
     cache: &mut HashMap<(u64, u16), RenderedMarkdown>,
+    wrap_cache: &mut HashMap<(EntryId, u16), Vec<WrappedRow>>,
 ) -> FramePlan {
     let width = width.max(1) as usize;
     // 按 entry 构建逻辑行（entry → wrapped 行 + hits + 语义文本）。
     // ids/heights 必须以 wrapped_by_entry 为准（含 live 哨兵 group，§7.2）。
     let per_entry = build_transcript_text(view, theme, cache, width);
     let mut wrapped_by_entry: Vec<(EntryId, Vec<WrappedRow>)> = Vec::with_capacity(per_entry.len());
+    // §性能：历史 transcript entry 的内容与折叠状态决定 wrap 结果。
+    // transcript_revision 变化时 wrap_cache 已被清空；命中则直接复用，
+    // 避免每帧对全量历史逐字符重建 span（上下文越多收益越大）。
+    // live 区（不在 transcript 中）内容每帧变化，不缓存。
+    let live_ids: std::collections::HashSet<EntryId> = view
+        .live
+        .tool_order
+        .iter()
+        .filter_map(|id| view.live.tools.get(id).map(|t| t.entry_id))
+        .chain(view.live.assistant.iter().map(|m| m.entry_id))
+        .chain(view.live.reasoning.iter().map(|m| m.entry_id))
+        .collect();
     for (id, logical, hits, semantic_lines) in per_entry {
-        let rows = wrap_with_semantic(logical, hits, &semantic_lines, width, id);
+        let cacheable = !live_ids.contains(&id);
+        let key = (id, width as u16);
+        let rows = if cacheable {
+            if let Some(hit) = wrap_cache.get(&key) {
+                hit.clone()
+            } else {
+                let rows = wrap_with_semantic(logical, hits, &semantic_lines, width, id);
+                wrap_cache.insert(key, rows.clone());
+                rows
+            }
+        } else {
+            wrap_with_semantic(logical, hits, &semantic_lines, width, id)
+        };
         wrapped_by_entry.push((id, rows));
     }
     let ids: Vec<EntryId> = wrapped_by_entry.iter().map(|(id, _)| *id).collect();
@@ -584,7 +634,6 @@ fn plan_window(
     for (id, height) in ids.iter().zip(heights.iter()) {
         view.entry_heights.insert(*id, *height);
     }
-
     let area_h = area_h.max(1) as usize;
     let mut window_start =
         crate::tui::scroll::window_start_row(&ids, &heights, &view.scroll_mode, area_h);
@@ -629,6 +678,52 @@ fn plan_window(
             window.push(row.line.clone());
             row_hits.push(row.hit.clone());
             semantic_rows.push(row.semantic.clone());
+        }
+    }
+    // §性能：search/active_hit 高亮在**窗口层**应用（wrap 缓存只缓存净内容，
+    // 这些装饰状态变化无需失效缓存；原 build 阶段的高亮移到这里，语义等价
+    // ——按行 entry_id / 行 hit 逐行判断）。补空格前应用，padding 一并高亮。
+    if let Some(search) = &view.search
+        && !search.hits.is_empty()
+    {
+        let hit_ids: std::collections::HashSet<EntryId> = search.hits.iter().copied().collect();
+        for (i, row) in semantic_rows.iter().enumerate() {
+            if let Some(row) = row
+                && hit_ids.contains(&row.entry_id)
+                && let Some(line) = window.get_mut(i)
+            {
+                *line = Line::from(
+                    line.spans
+                        .iter()
+                        .map(|s| {
+                            Span::styled(
+                                s.content.clone(),
+                                s.style.add_modifier(Modifier::UNDERLINED),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
+    if let Some(active) = &view.active_hit {
+        let active_bg = theme.surface;
+        for (i, hit) in row_hits.iter().enumerate() {
+            if hit.as_ref().map(|(t, _)| t) == Some(active)
+                && let Some(line) = window.get_mut(i)
+            {
+                *line = Line::from(
+                    line.spans
+                        .iter()
+                        .map(|s| {
+                            Span::styled(
+                                s.content.clone(),
+                                s.style.bg(active_bg).add_modifier(Modifier::BOLD),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
         }
     }
     // §用户诉求：卡片整行背景填满——有背景色（卡片/surface 或 diff 红绿）的
@@ -782,6 +877,30 @@ fn plan_window(
         overflow,
         committed_after,
     }
+}
+
+/// 测试便捷封装：plan_window 带独立临时 wrap 缓存（语义等同旧行为）。
+/// 生产路径在 Renderer 内复用缓存；单测逐次独立调用即可。
+#[cfg(test)]
+fn plan_window_simple(
+    view: &mut ViewModel,
+    theme: theme::Theme,
+    width: u16,
+    area_h: u16,
+    committed: usize,
+    reset_committed: bool,
+    cache: &mut HashMap<(u64, u16), RenderedMarkdown>,
+) -> FramePlan {
+    plan_window(
+        view,
+        theme,
+        width,
+        area_h,
+        committed,
+        reset_committed,
+        cache,
+        &mut HashMap::new(),
+    )
 }
 
 /// 每窗口行的语义信息（复制源；hit-test 与复制共用，§InteractionRefactor）。
@@ -1152,21 +1271,6 @@ struct GroupBuffers<'a> {
     groups: &'a mut Vec<EntryGroup>,
 }
 
-/// entry 是否命中当前 active_hit（§24 点击高亮）：hits 中任意一行与
-/// active_hit 相等即为命中（工具卡片所有行共享同一 hit）。
-fn entry_matches_active_hit(
-    _entry_id: &EntryId,
-    hits: &[Option<HitRange>],
-    active: &Option<HitTarget>,
-) -> bool {
-    match active {
-        Some(target) => hits
-            .iter()
-            .any(|h| h.as_ref().map(|(t, _)| t) == Some(target)),
-        None => false,
-    }
-}
-
 /// 构建一个"整行可点"的 hit（reasoning 折叠行）。
 fn full_line_hit(target: HitTarget, width: u16) -> Option<HitRange> {
     Some((target, width))
@@ -1219,12 +1323,6 @@ fn build_transcript_text(
             rail,
         });
     };
-    // 搜索命中集合（高亮用，§14）：只作用于 transcript，live 区不参与。
-    let hit_ids: std::collections::HashSet<EntryId> = view
-        .search
-        .as_ref()
-        .map(|s| s.hits.iter().copied().collect())
-        .unwrap_or_default();
     for entry in view.transcript.iter() {
         let entry_id = entry.id();
         out.clear();
@@ -1489,48 +1587,6 @@ fn build_transcript_text(
                     );
                 }
             }
-        }
-        // §14 高亮：命中条目整段加下划线（保留原有 fg 样式）。
-        if hit_ids.contains(&entry_id) {
-            let highlighted = std::mem::take(&mut out)
-                .into_iter()
-                .map(|line| {
-                    Line::from(
-                        line.spans
-                            .into_iter()
-                            .map(|span| {
-                                Span::styled(
-                                    span.content,
-                                    span.style.add_modifier(Modifier::UNDERLINED),
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect();
-            out = highlighted;
-        }
-        // §24：鼠标点击展开的工具卡片/reasoning 行高亮（Overlay 打开期间，
-        // 反馈"点到了哪一行"）。
-        if entry_matches_active_hit(&entry_id, &hits, &view.active_hit) {
-            let active_bg = theme.surface;
-            let highlighted = std::mem::take(&mut out)
-                .into_iter()
-                .map(|line| {
-                    Line::from(
-                        line.spans
-                            .into_iter()
-                            .map(|span| {
-                                Span::styled(
-                                    span.content,
-                                    span.style.bg(active_bg).add_modifier(Modifier::BOLD),
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect();
-            out = highlighted;
         }
         // §美化：块间间隔一行（opencode marginTop=1 留白即分隔）。
         // User/Assistant/Reasoning 消息 + 工具卡片都间隔；System 提示与
@@ -2448,6 +2504,7 @@ pub fn draw_to_test_backend_mode(
     };
     let theme = theme::Theme::omp();
     let mut cache: HashMap<(u64, u16), RenderedMarkdown> = HashMap::new();
+    let mut wrap_cache: HashMap<(EntryId, u16), Vec<WrappedRow>> = HashMap::new();
     let mut cache_width = 0u16;
     let mut committed = 0usize;
     let scrollback = mode == terminal::ViewMode::Inline;
@@ -2459,6 +2516,7 @@ pub fn draw_to_test_backend_mode(
                 theme,
                 RenderContext {
                     markdown_cache: &mut cache,
+                    wrap_cache: &mut wrap_cache,
                     cache_width: &mut cache_width,
                     committed: &mut committed,
                     scrollback,
@@ -2497,6 +2555,7 @@ pub fn draw_captured_bytes(view: &mut ViewModel) -> Vec<u8> {
         let mut cache: HashMap<(u64, u16), RenderedMarkdown> = HashMap::new();
         let mut cache_width = 0u16;
         let mut committed = 0usize;
+        let mut wrap_cache: HashMap<(EntryId, u16), Vec<WrappedRow>> = HashMap::new();
         let mut overflow: Vec<Line<'static>> = Vec::new();
         terminal
             .draw(|frame| {
@@ -2506,6 +2565,7 @@ pub fn draw_captured_bytes(view: &mut ViewModel) -> Vec<u8> {
                     theme,
                     RenderContext {
                         markdown_cache: &mut cache,
+                        wrap_cache: &mut wrap_cache,
                         cache_width: &mut cache_width,
                         committed: &mut committed,
                         scrollback: true,
@@ -2547,7 +2607,7 @@ mod tests {
             view.push_line(LineKind::Assistant, format!("line {i}"));
         }
         let mut cache = HashMap::new();
-        let plan = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         // §美化：每条 Assistant 消息后插 1 空行 → 10 条 = 20 行。
         // 跟随模式：窗口是最后 4 行，前 16 行提交到 scrollback。
         assert_eq!(plan.window.len(), 4);
@@ -2562,7 +2622,7 @@ mod tests {
         assert!(!window_text.contains("line 0"), "窗口不应包含已提交行");
 
         // 第二次调用：无新 overflow。
-        let plan2 = plan_window(
+        let plan2 = plan_window_simple(
             &mut view,
             theme::Theme::omp(),
             80,
@@ -2583,11 +2643,11 @@ mod tests {
         }
         let mut cache = HashMap::new();
         // 先布局一次（Follow 建立 layout_top = 视口顶部行）。
-        let _ = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let _ = plan_window_simple(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         // §美化：10 条消息 = 20 行；Follow 顶部行 = 16。
         // TUI v2：翻页 = 锚点（视口顶部）上移 2 行 → 窗口 [14, 18)。
         view.scroll_up(2);
-        let plan = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         // Locked：不提交到 scrollback。
         assert_eq!(plan.window.len(), 4);
         assert!(plan.overflow.is_empty());
@@ -2602,7 +2662,7 @@ mod tests {
         assert!(!window_text.contains("line 9"));
         // Locked 保持：新内容不移动视口（§58 场景 A）。
         view.push_line(LineKind::Assistant, "line 10 new".to_string());
-        let plan3 = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let plan3 = plan_window_simple(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         let window_text: String = plan3
             .window
             .iter()
@@ -2629,7 +2689,7 @@ mod tests {
             None,
         );
         let mut cache = HashMap::new();
-        let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+        let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
         // §美化：整卡可点击——主行与内容行都带 Tool hit（轻点任意行展开；
         // §美化：整卡可点击——主行与内容行都带 Tool hit；卡片后的留白
         // 空行（间隔）不可点。row_hits 与 window 等长。
@@ -2663,10 +2723,10 @@ mod tests {
         }
         let mut cache = HashMap::new();
         // §美化：10 条消息 = 20 行；先提交 16 行（含每条消息后的留白空行）。
-        let plan = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         assert_eq!(plan.committed_after, 16);
         // resize：不产生 overflow，提交位置重置为窗口起点。
-        let plan2 = plan_window(
+        let plan2 = plan_window_simple(
             &mut view,
             theme::Theme::omp(),
             40,
@@ -2690,7 +2750,7 @@ mod tests {
         }
         let mut cache = HashMap::new();
         // 布局：Follow，视口 4 行 → 顶部行 = 4（显示 line4-7）。
-        let plan = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         assert_eq!(plan.window.len(), 4);
         let window_text: String = plan
             .window
@@ -2709,7 +2769,8 @@ mod tests {
             matches!(view.scroll_mode, ScrollMode::Locked(_)),
             "PgUp 必须进入 Locked"
         );
-        let plan_top = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let plan_top =
+            plan_window_simple(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         let window_text: String = plan_top
             .window
             .iter()
@@ -2722,7 +2783,8 @@ mod tests {
 
         // 新内容到达（模拟 run 中）→ 仍 Locked（视口不动）。
         view.push_line(LineKind::Assistant, "line 8 new".to_string());
-        let plan_new = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let plan_new =
+            plan_window_simple(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         let window_text: String = plan_new
             .window
             .iter()
@@ -2737,7 +2799,8 @@ mod tests {
         for _ in 0..10 {
             view.scroll_down(8);
         }
-        let plan_bottom = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let plan_bottom =
+            plan_window_simple(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         let window_text: String = plan_bottom
             .window
             .iter()
@@ -2754,7 +2817,8 @@ mod tests {
             "滚到底后必须自动回到 Follow（新内容自动跟随，不再卡住）"
         );
         view.push_line(LineKind::Assistant, "line 9 newest".to_string());
-        let plan_newest = plan_window(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
+        let plan_newest =
+            plan_window_simple(&mut view, theme::Theme::omp(), 80, 4, 0, false, &mut cache);
         let window_text: String = plan_newest
             .window
             .iter()
@@ -3541,6 +3605,60 @@ fn cursor_hidden_during_run_when_input_empty() {
     );
 }
 
+/// §性能：wrap 缓存——历史 entry 跨帧复用；transcript 结构变化后
+/// （push_line 等 bump revision）缓存由 draw 层清空重建；active_hit/search
+/// 高亮在窗口层应用，不依赖缓存内容。
+#[test]
+fn wrap_cache_reuses_and_invalidates() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::Assistant, "第一行 hello");
+    let rev0 = view.transcript_revision;
+    let mut cache = HashMap::new();
+    let mut wrap_cache: HashMap<(EntryId, u16), Vec<WrappedRow>> = HashMap::new();
+    let plan1 = plan_window(
+        &mut view,
+        theme::Theme::omp(),
+        80,
+        10,
+        0,
+        false,
+        &mut cache,
+        &mut wrap_cache,
+    );
+    assert_eq!(wrap_cache.len(), 1, "历史 entry 必须写入缓存");
+    assert_eq!(plan1.window.len(), 2, "消息行 + 留白空行");
+    // 再次调用（revision 未变）→ 命中缓存，不新增条目。
+    let _plan2 = plan_window(
+        &mut view,
+        theme::Theme::omp(),
+        80,
+        10,
+        0,
+        false,
+        &mut cache,
+        &mut wrap_cache,
+    );
+    assert_eq!(wrap_cache.len(), 1, "未变化时命中缓存不增长");
+    // 新增 entry → revision bump；draw 层会清空缓存（此处模拟）。
+    view.push_line(LineKind::Assistant, "第二行 world");
+    assert_ne!(
+        view.transcript_revision, rev0,
+        "push_line 必须 bump revision"
+    );
+    wrap_cache.clear();
+    let _plan3 = plan_window(
+        &mut view,
+        theme::Theme::omp(),
+        80,
+        10,
+        0,
+        false,
+        &mut cache,
+        &mut wrap_cache,
+    );
+    assert_eq!(wrap_cache.len(), 2, "两个历史 entry 都缓存");
+}
+
 /// §14 高亮：搜索命中条目整段带下划线，未命中条目不带。
 #[test]
 fn search_highlight_underlines_matched_entries() {
@@ -3641,7 +3759,7 @@ fn selection_highlights_selected_window_rows() {
     view.selection_end();
     let mut cache = HashMap::new();
     // §美化：6 条消息 + 6 留白空行 = 12 行；视口 12 容纳全部。
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 12, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 12, 0, false, &mut cache);
     assert_eq!(
         plan.window.len(),
         12,
@@ -3677,7 +3795,7 @@ fn semantic_rows_align_with_window_and_map_text() {
     view.push_line(LineKind::Assistant, "hello world");
     view.push_line(LineKind::Assistant, "second line");
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
     // 语义行与窗口行等长（每 entry 至少 1 行）。
     assert_eq!(
         plan.semantic_rows.len(),
@@ -3832,7 +3950,7 @@ fn arbitrary_char_selection_is_char_precise() {
     let mut view = ViewModel::default();
     view.push_line(LineKind::Assistant, "hello world");
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
     let first = plan.semantic_rows[0]
         .as_ref()
         .expect("第一行必须有语义映射");
@@ -3865,7 +3983,7 @@ fn arbitrary_char_selection_is_char_precise() {
     //（不用固定 index——留白行 text 为空）。
     view.push_line(LineKind::Assistant, "你好世界");
     let mut cache2 = HashMap::new();
-    let plan2 = plan_window(
+    let plan2 = plan_window_simple(
         &mut view,
         theme::Theme::omp(),
         80,
@@ -3903,7 +4021,7 @@ fn user_message_gets_panel_background_assistant_stays_plain() {
     view.push_line(LineKind::User, "帮我修复");
     view.push_line(LineKind::Assistant, "好的");
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 12, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 12, 0, false, &mut cache);
     let theme = theme::Theme::omp();
     // 通过语义行定位正文行索引（wrap 后 span 逐字符拆分，不能直接按文本找）。
     let find_row = |target: &str| -> usize {
@@ -3939,7 +4057,7 @@ fn message_blocks_are_separated_by_gap_rows() {
     view.push_line(LineKind::Assistant, "line a");
     view.push_line(LineKind::Assistant, "line b");
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
     // 每条消息 1 正文 + 1 留白 = 4 行（无折行）。
     assert_eq!(plan.window.len(), 4);
     // 第 1、3 行是留白空行（语义为空，不可选）。
@@ -3956,7 +4074,7 @@ fn thinking_lines_carry_icon_prefix() {
     let mut view = ViewModel::default();
     view.push_line(LineKind::Reasoning, "先分析再动手");
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 12, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 12, 0, false, &mut cache);
     // 首行是 thinking（◆ 前缀 + 正文）；语义文本不含前缀。
     let first = &plan.window[0];
     let text: String = first.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -3998,7 +4116,7 @@ fn inline_code_bg_does_not_leak_into_trailing_padding() {
         r"请查看 `snake\src\main.rs` 是否已存在",
     );
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 60, 10, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 60, 10, 0, false, &mut cache);
     let theme = theme::Theme::omp();
     // 定位含 "main.rs" 的行。
     let row_idx = plan
@@ -4041,7 +4159,7 @@ fn diff_line_padding_keeps_panel_background() {
         Some("-    let x = 1;\n+    let x = 2;".into()),
     );
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 50, 20, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 50, 20, 0, false, &mut cache);
     let theme = theme::Theme::omp();
     // 定位删除行（含 "let x = 1"）。
     let row_idx = plan
@@ -4091,7 +4209,7 @@ fn tool_card_body_bg_matches_panel() {
         None,
     );
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
     let theme = theme::Theme::omp();
     // 主行 name span 带 panel（wrap 逐字符拆分，任一 "bash" 字符即可）。
     let header_row = &plan.window[0];
@@ -4135,7 +4253,7 @@ fn user_message_body_bg_matches_panel() {
     let mut view = ViewModel::default();
     view.push_line(LineKind::User, r"修复 `snake\src\main.rs`");
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 10, 0, false, &mut cache);
     let theme = theme::Theme::omp();
     let row = plan
         .window
@@ -4171,7 +4289,7 @@ fn thinking_renders_as_panel_card() {
     }
     view.push_line(LineKind::Reasoning, text);
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
     let theme = theme::Theme::omp();
     // 折叠态单行：panel 底 + 整行可点（Reasoning hit）。
     assert_eq!(plan.window.len(), 2, "折叠单行 + 留白空行");
@@ -4215,7 +4333,7 @@ fn thinking_expanded_rows_keep_panel_and_toggle_hint() {
     let entry_id = view.transcript[0].id();
     view.toggle_reasoning_expanded(entry_id);
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
     let theme = theme::Theme::omp();
     // 展开态：8 行正文 + 1 折叠提示 + 1 留白 = 10 行。
     assert_eq!(plan.window.len(), 10);
@@ -4265,7 +4383,7 @@ fn selecting_part_of_tool_card_highlights_only_that_row() {
         None,
     );
     let mut cache = HashMap::new();
-    let plan = plan_window(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
     // 定位内容行（含 "一" 的行）的语义 char_start。
     let body_row = plan
         .semantic_rows
@@ -4286,7 +4404,7 @@ fn selecting_part_of_tool_card_highlights_only_that_row() {
     });
     view.selection_end();
     let mut cache2 = HashMap::new();
-    let plan2 = plan_window(
+    let plan2 = plan_window_simple(
         &mut view,
         theme::Theme::omp(),
         80,

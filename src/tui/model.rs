@@ -496,6 +496,10 @@ pub struct ViewModel {
     pub search: Option<SearchState>,
     pub next_version: u64,
     pub next_entry_id: u64,
+    /// transcript 结构版本（§性能：任何会改变 wrap 输出的 transcript 修改
+    /// 都 bump——新增/trim/折叠切换。Renderer 据此失效 wrap 缓存；
+    /// 流式期间不变 → 历史行 wrap 结果可跨帧复用）。
+    pub transcript_revision: u64,
 }
 
 impl Default for ViewModel {
@@ -536,11 +540,17 @@ impl Default for ViewModel {
             search: None,
             next_version: 1,
             next_entry_id: 1,
+            transcript_revision: 0,
         }
     }
 }
 
 impl ViewModel {
+    /// 标记 transcript 结构变化（wrap 缓存失效依据；§性能）。
+    fn bump_transcript(&mut self) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+    }
+
     /// 输入行与光标位置（编辑器渲染用）。
     pub fn input_position(&self) -> (String, usize) {
         (self.input.clone(), self.input_cursor.min(self.input.len()))
@@ -585,6 +595,7 @@ impl ViewModel {
         self.search = None;
         self.active_hit = None;
         self.selection = None;
+        self.bump_transcript();
     }
 
     /// BUG-006：会话切换/恢复后把模型上下文（history）重建到屏幕，
@@ -626,6 +637,7 @@ impl ViewModel {
             search_cache: None,
             semantic_cache: None,
         });
+        self.bump_transcript();
         self.note_new_content();
         self.trim_transcript();
     }
@@ -730,6 +742,7 @@ impl ViewModel {
                     search_cache: None,
                     semantic_cache: None,
                 });
+                self.bump_transcript();
                 self.note_new_content();
             }
         }
@@ -757,6 +770,7 @@ impl ViewModel {
                     card,
                     search_cache: None,
                 });
+                self.bump_transcript();
                 self.note_new_content();
             }
         }
@@ -778,6 +792,7 @@ impl ViewModel {
                     card: tool.card,
                     search_cache: None,
                 });
+                self.bump_transcript();
                 self.note_new_content();
             }
         }
@@ -1066,6 +1081,7 @@ impl ViewModel {
                 && card.id == id
             {
                 card.expanded = !card.expanded;
+                self.bump_transcript();
                 return;
             }
         }
@@ -1076,6 +1092,7 @@ impl ViewModel {
         for entry in self.transcript.iter_mut().rev() {
             if let Entry::Tool { card, .. } = entry {
                 card.expanded = !card.expanded;
+                self.bump_transcript();
                 return;
             }
         }
@@ -1165,6 +1182,7 @@ impl ViewModel {
         } else {
             self.reasoning_expanded.insert(id);
         }
+        self.bump_transcript();
     }
 
     /// 该 entry 的 thinking 是否展开（按条目展开优先；否则跟随全局 Alt+T）。
@@ -1362,6 +1380,7 @@ impl ViewModel {
                 card: tool.card,
                 search_cache: None,
             });
+            self.bump_transcript();
             self.note_new_content();
             self.trim_transcript();
             return;
@@ -1389,6 +1408,7 @@ impl ViewModel {
                 }
                 // §成熟化：卡片字段变更 → 搜索缓存失效。
                 entry.invalidate_search_cache();
+                self.bump_transcript();
                 return;
             }
         }
@@ -1422,6 +1442,7 @@ impl ViewModel {
                 },
             },
         });
+        self.bump_transcript();
         self.note_new_content();
         self.trim_transcript();
     }
@@ -1449,6 +1470,7 @@ impl ViewModel {
                 })
                 .collect();
             self.transcript.drain(..keep);
+            self.bump_transcript();
             for id in &removed {
                 self.entry_heights.remove(id);
             }
