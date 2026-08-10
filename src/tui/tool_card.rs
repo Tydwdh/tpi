@@ -182,19 +182,24 @@ pub(super) fn tool_card_lines(
     for l in shown {
         // §美化：内容行「前缀带 panel 背景」→ plan_window 整行填满 panel，
         // 卡片主行+内容行同底成组（opencode 卡片"面"）。diff 行已自带
-        // 红绿背景（Line.style.bg 或 span bg），前缀保持无 bg（让红绿主导，
-        // 避免被 panel 覆盖）——按行检测而非按卡片，兼容「output 内含
-        // diff 段」的混合场景。
-        let is_diff_line = l.style.bg.is_some() || l.spans.iter().any(|s| s.style.bg.is_some());
-        let prefix_style = if is_diff_line {
-            Style::default().fg(theme.muted)
-        } else {
-            Style::default().fg(theme.muted).bg(theme.panel)
+        // 红绿背景——**必须落到每个 span**（wrap_with_semantic 逐字符重建
+        // Line 会丢 Line 级 style，红绿底将无法填充行尾 padding）。前缀
+        // 也带同 bg，让红绿主导整行；非 diff 行走 panel。
+        let line_bg = l.style.bg;
+        let prefix_style = match line_bg {
+            Some(bg) => Style::default().fg(theme.muted).bg(bg),
+            None => Style::default().fg(theme.muted).bg(theme.panel),
         };
         let mut spans = vec![Span::styled("│ ", prefix_style)];
-        spans.extend(l.spans.iter().cloned());
-        // 统一应用原行 style（diff 行 Line.style 含红绿底；非 diff 行只有
-        // fg，前缀 span 的 fg/bg 优先于 line 级，正文继承 line fg）。
+        for s in &l.spans {
+            let mut style = s.style;
+            if let Some(bg) = line_bg {
+                style = style.bg(bg);
+            }
+            spans.push(Span::styled(s.content.clone(), style));
+        }
+        // 非 diff 行保留 line fg（如失败 tail 的 error 色）；diff 行红绿已
+        // 落到 span，Line 级 style 仅供 render_diff_lines 单测断言使用。
         lines.push(Line::from(spans).style(l.style));
     }
     // 统一折叠提示（opencode 式：溢出才显示，点击展开/收缩）。

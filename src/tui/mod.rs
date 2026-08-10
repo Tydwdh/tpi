@@ -633,8 +633,16 @@ fn plan_window(
     }
     // §用户诉求：卡片整行背景填满——有背景色（卡片/surface 或 diff 红绿）的
     // 行补空格到满宽，避免「只有文字处有背景」的碎片感。
+    // BUG 修复：背景只取**行首 span**（rail/icon/prompt 前缀的 panel 底）或
+    // **Line 级样式**（diff 行的红绿底）。行内元素背景（inline code 的
+    // surface_subtle 等）绝不能被用来填 padding——否则 assistant 裸文本行
+    // 含行内 code 时，行尾空白会泄漏 code 的深色底一直铺到右缘。
     for line in window.iter_mut() {
-        let bg = line.spans.iter().find_map(|s| s.style.bg);
+        let bg = line
+            .spans
+            .first()
+            .and_then(|s| s.style.bg)
+            .or(line.style.bg);
         if let Some(color) = bg {
             let cur = unicode_width::UnicodeWidthStr::width(
                 line.spans
@@ -3982,5 +3990,81 @@ fn lighten_lifts_rgb_only() {
     assert_eq!(
         lighten(ratatui::style::Color::Reset),
         ratatui::style::Color::Reset
+    );
+}
+
+/// BUG 回归：assistant 裸文本行含行内 code 时，行尾 padding 不得继承
+/// code 的 surface_subtle 背景（此前 find_map 抓到行内第一个 bg span）。
+#[test]
+fn inline_code_bg_does_not_leak_into_trailing_padding() {
+    let mut view = ViewModel::default();
+    // assistant 消息行首 rail 无背景；行内含 inline code（surface_subtle 底）。
+    view.push_line(
+        LineKind::Assistant,
+        r"请查看 `snake\src\main.rs` 是否已存在",
+    );
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 60, 10, 0, false, &mut cache);
+    let theme = theme::Theme::omp();
+    // 定位含 "main.rs" 的行。
+    let row_idx = plan
+        .semantic_rows
+        .iter()
+        .position(|r| r.as_ref().is_some_and(|s| s.text.contains("main.rs")))
+        .expect("消息必须渲染");
+    let line = &plan.window[row_idx];
+    // inline code span 本身保留 surface_subtle 背景（wrap 逐字符拆分 span）。
+    let has_code_bg = line.spans.iter().any(|s| {
+        !s.content.is_empty()
+            && !s.content.chars().all(|c| c == ' ')
+            && s.style.bg == Some(theme.surface_subtle)
+    });
+    assert!(has_code_bg, "行内 code 背景必须保留: {:?}", line.spans);
+    // 行尾 padding（内容全空格的 span）不得带任何背景（不再泄漏）。
+    for span in &line.spans {
+        if span.content.chars().all(|c| c == ' ') && !span.content.is_empty() {
+            assert_eq!(
+                span.style.bg, None,
+                "行尾 padding 不得继承行内 code 背景: {:?}",
+                span
+            );
+        }
+    }
+}
+
+/// BUG 回归：diff 行 padding 仍用 Line 级红绿底填充（行首 `│ ` 无 bg，
+/// fallback 到 line.style.bg）。
+#[test]
+fn diff_line_padding_keeps_red_green_background() {
+    let mut view = ViewModel::default();
+    view.begin_tool("c1", "edit", Some("src/main.rs".into()), None);
+    view.finish_tool(
+        ("c1", "edit"),
+        crate::tool::outcome::ToolStatus::Succeeded,
+        10,
+        Some(0),
+        "",
+        Some("-    let x = 1;\n+    let x = 2;".into()),
+    );
+    let mut cache = HashMap::new();
+    let plan = plan_window(&mut view, theme::Theme::omp(), 50, 20, 0, false, &mut cache);
+    let theme = theme::Theme::omp();
+    // 定位删除行（含 "let x = 1"）。
+    let row_idx = plan
+        .semantic_rows
+        .iter()
+        .position(|r| r.as_ref().is_some_and(|s| s.text.contains("let x = 1")))
+        .expect("diff 删除行必须渲染");
+    let line = &plan.window[row_idx];
+    // 该行存在全空格 padding span，且背景 = error（红）——Line 级红绿 fallback。
+    let has_red_pad = line.spans.iter().any(|s| {
+        !s.content.is_empty()
+            && s.content.chars().all(|c| c == ' ')
+            && s.style.bg == Some(theme.error)
+    });
+    assert!(
+        has_red_pad,
+        "diff 删除行尾必须用红色填充到满宽: {:?}",
+        line.spans
     );
 }
