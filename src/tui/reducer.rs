@@ -16,7 +16,18 @@ use crate::tui::model::{LineKind, MenuKind, StatusLine};
 use crate::tui::state::UiState;
 
 /// 输入变化后重建菜单：`@` 文件菜单优先（维护中不触碰），否则斜杠命令菜单。
+///
+/// §用户诉求（/sessions 菜单）：Session 菜单是 Modal+Menu 组合、由 app 层
+/// 显式挂载，与输入无关——↑/↓/Tab 等导航会调用本函数，若走命令菜单刷新
+/// 会把菜单清成 None（refresh_command_menu 先 `self.menu = None`），导致
+/// “在会话列表上下移动后列表突然消失”。对 Session 菜单保持不动。
 fn refresh_menus(state: &mut UiState) {
+    if matches!(
+        state.view.menu.as_ref().map(|m| m.kind),
+        Some(MenuKind::Session)
+    ) {
+        return;
+    }
     if state.view.has_at_token() {
         state.view.refresh_at_menu();
     } else {

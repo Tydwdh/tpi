@@ -23,6 +23,7 @@ pub mod interaction;
 pub mod keymap;
 mod markdown;
 pub mod model;
+pub mod paste;
 pub mod reducer;
 pub mod scroll;
 pub mod state;
@@ -512,7 +513,12 @@ fn render_frame(
     // 命令补全菜单浮层（覆盖在转录区上方，§16.2 之外的小浮层）。
     if let Some(menu) = &view.menu {
         let h = (menu.items.len() as u16 + 1).min(9);
-        let w = area.width.min(48);
+        // §用户诉求（恢复会话可判断）：会话列表比命令/文件补全宽得多
+        // （名字 + 时间 + 事件数 + 短 id），48 列会截断会话名；其余菜单保持窄。
+        let w = match menu.kind {
+            model::MenuKind::Session => area.width.min(96),
+            _ => area.width.min(48),
+        };
         let y = trans_area.y + trans_area.height.saturating_sub(h);
         draw_menu(frame, Rect::new(area.x, y, w, h), view, theme);
     }
@@ -1893,10 +1899,40 @@ fn cached_markdown(
     (lines, links)
 }
 
+/// 计划条显示的行（§用户诉求：修复计划技能锁死）：活跃项（Pending/InProgress）
+/// 优先——整体替换后 Completed 历史排在 items 前，不能把进行中的计划挤出屏；
+/// 活跃不足 3 条时用 Completed 历史补齐（沉底）。
+fn plan_display_items(plan: &crate::tool::plan::Plan) -> Vec<&crate::tool::plan::PlanItem> {
+    use crate::tool::plan::PlanStatus;
+    let active: Vec<_> = plan
+        .items
+        .iter()
+        .filter(|i| i.status != PlanStatus::Completed)
+        .collect();
+    if active.is_empty() {
+        return plan
+            .items
+            .iter()
+            .filter(|i| i.status == PlanStatus::Completed)
+            .take(3)
+            .collect();
+    }
+    let mut out: Vec<_> = active.into_iter().take(3).collect();
+    if out.len() < 3 {
+        out.extend(
+            plan.items
+                .iter()
+                .filter(|i| i.status == PlanStatus::Completed)
+                .take(3 - out.len()),
+        );
+    }
+    out
+}
+
 /// 计划条（§16.2：编辑器上方独立紧凑区域，不出现在 transcript）。
 fn plan_area_rows(view: &ViewModel) -> u16 {
     match &view.plan {
-        Some(plan) if !plan.items.is_empty() => (1 + plan.items.len().min(3)) as u16,
+        Some(plan) if !plan.items.is_empty() => (1 + plan_display_items(plan).len()) as u16,
         _ => 0,
     }
 }
@@ -1920,7 +1956,7 @@ fn draw_plan(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: th
                 .add_modifier(Modifier::BOLD),
         ),
     ])];
-    for item in plan.items.iter().take(3) {
+    for item in plan_display_items(plan) {
         let (marker, style) = match item.status {
             crate::tool::plan::PlanStatus::Completed => (
                 "[x]",
@@ -2538,11 +2574,21 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
         };
         let label = match menu.kind {
             model::MenuKind::SlashCommand => format!("/{name}"),
-            model::MenuKind::File | model::MenuKind::Session => name.clone(),
+            model::MenuKind::File => name.clone(),
+            // §用户诉求（恢复会话可判断）：会话菜单主列显示名字（首条消息摘要
+            // + 时间 + 事件数），UUID 缩短为辅助列——不再让完整哈希抢视觉主体。
+            model::MenuKind::Session => desc.to_string(),
+        };
+        let sub = match menu.kind {
+            model::MenuKind::Session => {
+                let short: String = name.chars().take(13).collect();
+                format!("  (id {short}…)")
+            }
+            _ => format!("  {desc}"),
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{glyph} {label}"), style),
-            Span::styled(format!("  {desc}"), Style::default().fg(theme.muted)),
+            Span::styled(sub, Style::default().fg(theme.muted)),
         ]));
     }
     if bottom_ellipsis {
@@ -2805,6 +2851,79 @@ mod tests {
                 "整卡每行（第 {i} 行）都可点击展开: {hit:?}"
             );
         }
+    }
+
+    /// §用户诉求（修复计划技能锁死）：整体替换后 Completed 历史在 items 前，
+    /// 计划条必须优先显示活跃项，不能把进行中的计划挤出屏。
+    #[test]
+    fn plan_strip_prefers_active_items_over_history() {
+        use crate::tool::plan::{Plan, PlanItem, PlanStatus};
+        let plan = Plan {
+            explanation: None,
+            items: vec![
+                PlanItem {
+                    text: "old1".into(),
+                    status: PlanStatus::Completed,
+                },
+                PlanItem {
+                    text: "old2".into(),
+                    status: PlanStatus::Completed,
+                },
+                PlanItem {
+                    text: "new1".into(),
+                    status: PlanStatus::InProgress,
+                },
+                PlanItem {
+                    text: "new2".into(),
+                    status: PlanStatus::Pending,
+                },
+                PlanItem {
+                    text: "new3".into(),
+                    status: PlanStatus::Pending,
+                },
+            ],
+        };
+        let shown = plan_display_items(&plan);
+        let texts: Vec<&str> = shown.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, vec!["new1", "new2", "new3"], "活跃项优先于历史");
+        // 活跃不足 3 条时用 Completed 补齐（沉底）。
+        let plan2 = Plan {
+            explanation: None,
+            items: vec![
+                PlanItem {
+                    text: "old1".into(),
+                    status: PlanStatus::Completed,
+                },
+                PlanItem {
+                    text: "new1".into(),
+                    status: PlanStatus::InProgress,
+                },
+            ],
+        };
+        let texts2: Vec<&str> = plan_display_items(&plan2)
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect();
+        assert_eq!(texts2, vec!["new1", "old1"]);
+        // 全部完成：只显示最近的完成历史。
+        let plan3 = Plan {
+            explanation: None,
+            items: vec![
+                PlanItem {
+                    text: "a".into(),
+                    status: PlanStatus::Completed,
+                },
+                PlanItem {
+                    text: "b".into(),
+                    status: PlanStatus::Completed,
+                },
+                PlanItem {
+                    text: "c".into(),
+                    status: PlanStatus::Completed,
+                },
+            ],
+        };
+        assert_eq!(plan_display_items(&plan3).len(), 3);
     }
 
     #[test]

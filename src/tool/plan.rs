@@ -5,9 +5,12 @@
 //! transcript 渲染调用噪声（§16.4 由 UI 策略决定）。
 //!
 //! 不变量（§13）：
-//! - 最多 7 项，文本去空白后不可重复；
+//! - 活跃项（Pending/InProgress）最多 7 项，文本去空白后不可重复；
 //! - 存在未完成项时，必须且只能有一个 `InProgress`；
-//! - 每次更新替换完整计划，不使用逐条 CRUD。
+//! - 每次更新替换完整计划，不使用逐条 CRUD；
+//! - 完成的项作为完成历史保留（最近 [`MAX_PLAN_HISTORY`] 条），不占活跃项
+//!   名额——否则「整体替换满 7 项计划」和「长任务中途加新项」都会被
+//!   7 项上限顶爆（§用户诉求：修复计划技能锁死）。
 
 use serde::{Deserialize, Serialize};
 
@@ -51,8 +54,10 @@ pub struct Plan {
     pub items: Vec<PlanItem>,
 }
 
-/// 计划上限（§13：最多 7 项）。
+/// 计划上限（§13：活跃项最多 7 项）。
 pub const MAX_PLAN_ITEMS: usize = 7;
+/// 完成历史上限（Completed 项保留最近 N 条；超限丢弃最旧，防止长任务膨胀）。
+pub const MAX_PLAN_HISTORY: usize = 7;
 pub const MAX_PLAN_ITEM_BYTES: usize = 500;
 pub const MAX_PLAN_EXPLANATION_BYTES: usize = 2_000;
 
@@ -70,11 +75,23 @@ pub struct UpdatePlanArgs {
 /// 计划校验错误（§13 不变量）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
-    TooManyItems { count: usize },
-    DuplicateItems { text: String },
+    TooManyItems {
+        count: usize,
+    },
+    DuplicateItems {
+        text: String,
+    },
     EmptyItem,
-    ItemTooLong { bytes: usize },
-    ExplanationTooLong { bytes: usize },
+    ItemTooLong {
+        bytes: usize,
+    },
+    ExplanationTooLong {
+        bytes: usize,
+    },
+    /// Completed 完成历史超过 [`MAX_PLAN_HISTORY`]（build 时裁剪，仅防御性检查触发）。
+    CompletedHistoryOverflow {
+        count: usize,
+    },
 }
 
 impl std::fmt::Display for PlanError {
@@ -92,6 +109,10 @@ impl std::fmt::Display for PlanError {
             PlanError::ExplanationTooLong { bytes } => write!(
                 f,
                 "plan explanation 最多 {MAX_PLAN_EXPLANATION_BYTES} 字节（收到 {bytes} 字节）"
+            ),
+            PlanError::CompletedHistoryOverflow { count } => write!(
+                f,
+                "plan 完成历史最多保留 {MAX_PLAN_HISTORY} 条（收到 {count} 条）"
             ),
         }
     }
@@ -155,9 +176,11 @@ pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan
     let submitted: Vec<&str> = parsed.iter().map(|(t, _)| t.as_str()).collect();
 
     let mut items: Vec<PlanItem> = Vec::new();
-    // 1. 消失的旧项 → Completed（保持旧顺序排在前；已 Completed 的不重复追加）。
+    // 1. 消失的旧项 → Completed（保持旧顺序排在前）。已 Completed 的旧项也保留
+    //    为历史（不在本次提交中不丢弃——完成记录跨轮保留，由 MAX_PLAN_HISTORY
+    //    裁剪，防止长任务膨胀）；未完成旧项消失视为完成。
     for old in &previous_items {
-        if old.status != PlanStatus::Completed && !submitted.contains(&old.text.as_str()) {
+        if !submitted.contains(&old.text.as_str()) {
             items.push(PlanItem {
                 text: old.text.clone(),
                 status: PlanStatus::Completed,
@@ -201,9 +224,31 @@ pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan
             first.status = PlanStatus::InProgress;
         }
     }
-    // 4. 最终计划（含 Completed）也不得超过上限。
-    if items.len() > MAX_PLAN_ITEMS {
-        return Err(PlanError::TooManyItems { count: items.len() });
+    // 4. 上限（§用户诉求：修复计划技能锁死）——活跃项（Pending/InProgress）
+    //    受 MAX_PLAN_ITEMS 约束；Completed 作为完成历史保留但 ≤ MAX_PLAN_HISTORY，
+    //    超限丢弃最旧。这样「整体替换满 7 项计划」「长任务中途加新项」都
+    //    不会因消失旧项转 Completed 而顶爆 7 项上限。
+    let active = items
+        .iter()
+        .filter(|i| i.status != PlanStatus::Completed)
+        .count();
+    if active > MAX_PLAN_ITEMS {
+        return Err(PlanError::TooManyItems { count: active });
+    }
+    let mut completed = items
+        .iter()
+        .filter(|i| i.status == PlanStatus::Completed)
+        .count();
+    if completed > MAX_PLAN_HISTORY {
+        let mut kept: Vec<PlanItem> = Vec::with_capacity(items.len());
+        for item in items {
+            if item.status == PlanStatus::Completed && completed > MAX_PLAN_HISTORY {
+                completed -= 1;
+                continue; // 丢弃最旧的完成记录（Completed 排在前，先到的先丢）。
+            }
+            kept.push(item);
+        }
+        items = kept;
     }
 
     Ok(Plan { explanation, items })
@@ -211,11 +256,6 @@ pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan
 
 /// 计划完成状态（§13：存在未完成项时必须且只能有一个 InProgress）。
 pub fn validate_invariants(plan: &Plan) -> Result<(), PlanError> {
-    if plan.items.len() > MAX_PLAN_ITEMS {
-        return Err(PlanError::TooManyItems {
-            count: plan.items.len(),
-        });
-    }
     let mut seen = std::collections::HashSet::new();
     for item in &plan.items {
         let text = item.text.trim();
@@ -237,6 +277,20 @@ pub fn validate_invariants(plan: &Plan) -> Result<(), PlanError> {
         return Err(PlanError::ExplanationTooLong {
             bytes: explanation.len(),
         });
+    }
+    // §用户诉求：活跃项 ≤ MAX_PLAN_ITEMS；Completed 历史 ≤ MAX_PLAN_HISTORY
+    //（build_plan 已裁剪，这里做防御性不变量检查）。
+    let active = plan
+        .items
+        .iter()
+        .filter(|item| item.status != PlanStatus::Completed)
+        .count();
+    if active > MAX_PLAN_ITEMS {
+        return Err(PlanError::TooManyItems { count: active });
+    }
+    let completed = plan.items.len() - active;
+    if completed > MAX_PLAN_HISTORY {
+        return Err(PlanError::CompletedHistoryOverflow { count: completed });
     }
     let has_unfinished = plan
         .items
@@ -506,5 +560,99 @@ mod tests {
         assert_eq!(plan.items[0].status, PlanStatus::Completed);
         assert_eq!(plan.items[1].status, PlanStatus::InProgress);
         validate_invariants(&plan).unwrap();
+    }
+
+    /// §用户诉求（修复计划技能锁死）：整体替换满 7 项未完成计划不得被拒。
+    /// 消失的旧项转 Completed 作为历史保留，活跃项（新 7 项）≤ MAX_PLAN_ITEMS。
+    #[test]
+    fn replacing_full_plan_with_new_7_items_succeeds() {
+        let previous = build_plan(
+            &UpdatePlanArgs {
+                explanation: None,
+                items: (0..7)
+                    .map(|i| PlanItemArg::Text(format!("old{i}")))
+                    .collect(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(previous.items.len(), 7);
+        let next = build_plan(
+            &UpdatePlanArgs {
+                explanation: None,
+                items: (0..7)
+                    .map(|i| PlanItemArg::Text(format!("new{i}")))
+                    .collect(),
+            },
+            Some(&previous),
+        )
+        .unwrap();
+        // 7 条完成历史 + 7 条活跃，全部保留（历史 ≤ MAX_PLAN_HISTORY）。
+        assert_eq!(next.items.len(), 14);
+        let completed = next
+            .items
+            .iter()
+            .filter(|i| i.status == PlanStatus::Completed)
+            .count();
+        let active = next.items.len() - completed;
+        assert_eq!(completed, 7);
+        assert_eq!(active, 7);
+        validate_invariants(&next).unwrap();
+    }
+
+    /// §用户诉求（修复计划技能锁死）：长任务累积的完成历史超限时裁剪最旧，
+    /// 不锁死后续 update_plan。
+    #[test]
+    fn completed_history_is_pruned_to_cap() {
+        // 逐步完成：每轮把当前 InProgress 移除，累计 >MAX_PLAN_HISTORY 条历史。
+        let mut plan = build_plan(
+            &UpdatePlanArgs {
+                explanation: None,
+                items: vec![
+                    PlanItemArg::Text("s0".into()),
+                    PlanItemArg::Text("keep".into()),
+                ],
+            },
+            None,
+        )
+        .unwrap();
+        for i in 1..=MAX_PLAN_HISTORY + 2 {
+            plan = build_plan(
+                &UpdatePlanArgs {
+                    explanation: None,
+                    items: vec![
+                        PlanItemArg::Text("keep".into()),
+                        PlanItemArg::Text(format!("s{i}")),
+                    ],
+                },
+                Some(&plan),
+            )
+            .unwrap();
+            validate_invariants(&plan).unwrap();
+        }
+        let completed = plan
+            .items
+            .iter()
+            .filter(|i| i.status == PlanStatus::Completed)
+            .count();
+        assert_eq!(completed, MAX_PLAN_HISTORY, "完成历史必须裁剪到上限");
+        // 最旧的完成记录（s0）被丢弃，最新的（s9）保留。
+        assert!(!plan.items.iter().any(|i| i.text == "s0"));
+        assert!(plan.items.iter().any(|i| i.text == "keep"));
+    }
+
+    /// §用户诉求：活跃项仍严格 ≤ MAX_PLAN_ITEMS（Completed 历史不占名额，
+    /// 但新提交的 8 个活跃项依旧被拒）。
+    #[test]
+    fn active_items_still_capped_at_seven() {
+        let error = build_plan(
+            &UpdatePlanArgs {
+                explanation: None,
+                items: (0..8).map(|i| PlanItemArg::Text(format!("x{i}"))).collect(),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PlanError::TooManyItems { count: 8 }));
     }
 }

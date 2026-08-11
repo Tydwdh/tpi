@@ -988,6 +988,41 @@ fn esc_closes_sessions_browser_in_one_press() {
     );
 }
 
+/// §用户诉求（回归）：/sessions 菜单在 ↑/↓ 导航后必须保持——reducer 的
+/// MoveUp/MoveDown 会调用 refresh_menus，此前会把 Session 菜单清成 None，
+/// 导致“在会话列表上下移动后列表突然消失”。
+#[test]
+fn sessions_menu_survives_up_down_navigation() {
+    let mut s = state();
+    s.view.open_modal("/sessions", "会话列表");
+    s.view.menu = Some(tpi::tui::model::MenuView {
+        items: (0..5)
+            .map(|i| (format!("sess-{i}"), format!("会话 {i} · 时间 · 事件")))
+            .collect(),
+        selected: 0,
+        kind: tpi::tui::model::MenuKind::Session,
+    });
+    // ↓ 两次：选中 0 → 1 → 2；菜单必须始终存在，selected 跟随。
+    reducer::update(&mut s, key(KeyCode::Down));
+    assert_eq!(s.view.menu.as_ref().map(|m| m.selected), Some(1));
+    assert!(
+        s.view.menu.is_some(),
+        "↓ 后 Session 菜单不得被命令菜单刷新清掉"
+    );
+    reducer::update(&mut s, key(KeyCode::Down));
+    assert_eq!(s.view.menu.as_ref().map(|m| m.selected), Some(2));
+    assert!(s.view.menu.is_some());
+    // ↑ 回到 1，菜单仍在。
+    reducer::update(&mut s, key(KeyCode::Up));
+    assert_eq!(s.view.menu.as_ref().map(|m| m.selected), Some(1));
+    assert!(s.view.menu.is_some(), "↑ 后 Session 菜单仍须保持");
+    // 菜单种类仍是 Session（没有被替换成 SlashCommand）。
+    assert_eq!(
+        s.view.menu.as_ref().map(|m| m.kind),
+        Some(tpi::tui::model::MenuKind::Session)
+    );
+}
+
 /// §用户诉求：鼠标拖动选择后 Ctrl+C 触发 CopySelection effect（复制到剪贴板）。
 #[test]
 fn ctrl_c_with_selection_triggers_copy_effect() {

@@ -5,7 +5,8 @@
 //! tpi "修复这个测试"          # 进入交互并提交首条消息
 //! tpi -p "解释失败原因"       # 非交互，stdout 只输出最终答案
 //! tpi --continue              # 继续当前 workspace 最近 session
-//! tpi --resume <session-id>   # 恢复指定 session
+//! tpi sessions                # 列出可恢复会话（摘要 + 时间 + id）
+//! tpi --resume <session-id>   # 恢复指定 session（完整 id 或唯一前缀）
 //! tpi --model <name>
 //! tpi --no-session
 //! tpi auth set <provider>     # 把 token 写入 Windows Credential Manager
@@ -68,6 +69,8 @@ enum Command {
     Init,
     /// 环境检查（P2：config/模型/API key/Git Bash/目录）。
     Doctor,
+    /// 列出当前 workspace 的可恢复会话（摘要 + 时间 + 完整 id），供 --resume 选择。
+    Sessions,
     /// 清理过期 session/artifact（P2：`tpi prune --older-than <days>`）。
     Prune {
         /// 早于该天数（按 mtime）的文件被删除（默认 30）。
@@ -664,6 +667,39 @@ fn run(cli: Cli) -> Result<(), String> {
         return Ok(());
     }
 
+    // §用户诉求（恢复会话可判断）：`tpi sessions`——列出当前 workspace 的
+    // 可恢复会话（首条消息摘要 + 时间 + 完整 id），不再让用户面对文件系统里
+    // 的 UUID 哈希文件名。
+    if matches!(cli.command, Some(Command::Sessions)) {
+        let workspace_root = current_workspace_root(cli.cwd.as_deref())?;
+        let sessions_root = tpi::config::tpi_home().join("sessions");
+        let sessions = tpi::app::list_sessions(&sessions_root, &workspace_root)?;
+        if sessions.is_empty() {
+            println!("当前 workspace 没有历史会话（首次提交消息后创建）");
+            return Ok(());
+        }
+        println!(
+            "{} 个会话（按最近使用排序；--resume 可接完整 id 或唯一前缀）：",
+            sessions.len()
+        );
+        for (i, (id, modified, count, preview)) in sessions.iter().enumerate() {
+            let title = if preview.is_empty() {
+                "(无标题)".to_string()
+            } else {
+                preview.clone()
+            };
+            println!(
+                "{}  {}  {} 事件  {}\n      id: {}",
+                i + 1,
+                fmt_session_datetime(*modified),
+                count,
+                title,
+                id
+            );
+        }
+        return Ok(());
+    }
+
     // P2：`tpi prune`——清理过期 session/artifact（~/.tpi/sessions 与 artifacts）。
     if let Some(Command::Prune {
         older_than,
@@ -707,10 +743,14 @@ fn run(cli: Cli) -> Result<(), String> {
         return Err("--no-session 不能与 --continue/--resume 同时使用".into());
     }
 
+    // §用户诉求：--resume 支持完整 UUID 或唯一前缀（resolve_session_id_prefix
+    // 会补全），避免手抄/记忆 36 位哈希 id。
     let session_target = if cli.continue_session {
         SessionTarget::Continue
     } else if let Some(id) = cli.resume {
-        SessionTarget::Resume(id)
+        let resolved =
+            tpi::app::resolve_session_id_prefix(&id, &config.sessions_root, &workspace_root)?;
+        SessionTarget::Resume(resolved.to_string())
     } else {
         SessionTarget::New
     };
@@ -728,6 +768,22 @@ fn run(cli: Cli) -> Result<(), String> {
         cli.prompt_mode,
         cli.no_session,
     ))
+}
+
+/// `tpi sessions` 展示用的时间（YYYY-MM-DD HH:MM）。
+fn fmt_session_datetime(t: std::time::SystemTime) -> String {
+    // From<SystemTime> 对文件 mtime（远小于 64-bit 时间戳范围）是安全的。
+    let dt = time::OffsetDateTime::from(t);
+    let date = dt.date();
+    let tod = dt.time();
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day(),
+        tod.hour(),
+        tod.minute()
+    )
 }
 
 fn init_logging() -> Result<(), String> {
@@ -766,6 +822,23 @@ mod tests {
     fn continue_flag_matches_design_doc() {
         let cli = Cli::parse_from(["tpi", "--continue"]);
         assert!(cli.continue_session);
+    }
+
+    /// §用户诉求：`tpi sessions` 子命令可解析（列出可恢复会话）。
+    #[test]
+    fn sessions_subcommand_parses() {
+        let cli = Cli::parse_from(["tpi", "sessions"]);
+        assert!(matches!(cli.command, Some(Command::Sessions)));
+        // 顶层 --cwd 与 sessions 可组合（列出其他 workspace）。
+        let cli = Cli::parse_from(["tpi", "--cwd", ".", "sessions"]);
+        assert!(matches!(cli.command, Some(Command::Sessions)));
+    }
+
+    /// §用户诉求：--resume 接受任意字符串（前缀匹配在 run 时解析），CLI 不校验。
+    #[test]
+    fn resume_accepts_prefix_or_full_id() {
+        let cli = Cli::parse_from(["tpi", "--resume", "019feea2"]);
+        assert_eq!(cli.resume.as_deref(), Some("019feea2"));
     }
 
     /// 稳定 CLI：`tpi auth set <provider>` 子命令形态。

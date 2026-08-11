@@ -338,6 +338,43 @@ fn footer_shows_multi_line_input_hint() {
     assert!(!all2.contains("输入"), "单行输入不应显示行数: {all2:?}");
 }
 
+/// §用户诉求（恢复会话可判断）：/sessions 菜单名字（首条消息）置前为主列，
+/// UUID 缩短为辅助列——不再让完整哈希抢视觉主体。
+#[test]
+fn sessions_menu_shows_name_first_short_id_second() {
+    let mut view = ViewModel::default();
+    let id = "019feea2-e01d-7c00-be52-bf10a5f44d3c";
+    view.menu = Some(tpi::tui::model::MenuView {
+        items: vec![(
+            id.to_string(),
+            "修复测试 · 08-11 04:06 · 543 事件".to_string(),
+        )],
+        selected: 0,
+        kind: tpi::tui::model::MenuKind::Session,
+    });
+    // 宽屏：完整布局——名字主列 + 短 id 辅助列，完整 UUID 不再出现。
+    let buf = draw_to_test_backend_mode(&mut view, 160, 24, ViewMode::Fullscreen);
+    let all: String = row_texts(&buf).join("\n");
+    assert!(all.contains("修复测试"), "名字必须置前显示: {all:?}");
+    // 注意：row_texts 收集时跳过空格，故用无空格形式匹配渲染内容。
+    assert!(
+        all.contains("(id019feea2-e01d…)"),
+        "短 id 辅助显示: {all:?}"
+    );
+    assert!(
+        !all.contains("019feea2-e01d-7c00-be52-bf10a5f44d3c"),
+        "完整 UUID 不得再作为视觉主体: {all:?}"
+    );
+    // 窄屏（80 列）：辅助列被截断，但名字（主列）必须完整保留。
+    let buf_narrow = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
+    let narrow: String = row_texts(&buf_narrow).join("\n");
+    assert!(narrow.contains("修复测试"), "窄屏名字仍须保留: {narrow:?}");
+    assert!(
+        !narrow.contains("019feea2-e01d-7c00-be52-bf10a5f44d3c"),
+        "窄屏也不得显示完整 UUID: {narrow:?}"
+    );
+}
+
 /// 长菜单（/sessions 多会话）可视窗口跟随选中项：选中项始终可见，窗口外项隐藏。
 #[test]
 fn long_menu_window_follows_selection() {

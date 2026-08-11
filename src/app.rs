@@ -260,6 +260,13 @@ async fn interactive_loop<P: Provider>(
     if !conversation.history().is_empty() {
         ui_state.view.load_history(conversation.history());
     }
+    // §用户诉求：--continue/--resume 恢复后明确显示当前会话（首条消息预览 +
+    // 短 id），避免“恢复后不知道是哪一个会话”。
+    if conversation.log().is_some() {
+        ui_state
+            .view
+            .push_line(LineKind::System, session_resume_label(conversation.log()));
+    }
     // 排队语义（§12 稳定化任务书）：运行中输入先存 ui_state.pending_message，
     // 当前 run 完成后由主循环作为下一条消息提交——不是 run 内的
     // boundary steering。
@@ -291,11 +298,67 @@ async fn interactive_loop<P: Provider>(
 
     // 键盘线程：整个交互期间由独立线程读取 crossterm 事件（§16.1：模型生成中
     // 也响应输入/翻页/折叠；输入不因生成被阻塞）。
+    // §用户诉求（bracketed paste 降级）：不支持的终端把粘贴内容拆成连续按键
+    // 流（含 Enter），逐键路由会让换行命中 submit 直接发送。这里做时间窗合并
+    // ——相邻按键间隔 ≤ paste::GAP 且 ≥ paste::MIN_BURST 个可插入按键时，合并
+    // 为单个 Event::Paste（字面换行，不触发提交）；其余事件立即转发。
     let (key_tx, mut key_rx) = mpsc::channel::<Event>(128);
     std::thread::spawn(move || {
-        while let Ok(event) = event::read() {
-            if key_tx.blocking_send(event).is_err() {
-                break;
+        use crate::tui::paste;
+        // 阻塞等待首个事件（不增加输入延迟）；read 失败即退出线程。
+        while let Ok(first) = event::read() {
+            // 非按键事件（Paste/Mouse/Resize）：无需突发合并，立即转发。
+            let first_key = match first {
+                Event::Key(k) => k,
+                _ => {
+                    if key_tx.blocking_send(first).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            // GAP 内无后续事件 → 普通按键，立即转发。
+            if !event::poll(paste::GAP).unwrap_or(false) {
+                if key_tx.blocking_send(first).is_err() {
+                    break;
+                }
+                continue;
+            }
+            // 突发收集：已确认是突发后用放宽的 COLLECT_GAP 收进同一批（大文本
+            // 粘贴时终端按批次转发，批次间隔可能超过 30ms；若仍用探测窗会在
+            // 1~2 个键后断流 → merge 不足 MIN_BURST → 逐键转发 → 逐字符出现）。
+            // 期间到达的 Paste/Mouse/Resize 立即转发（不打断突发），
+            // Repeat/Release 也原样转发（下游本来就忽略，不属于粘贴内容）。
+            let mut burst: Vec<ratatui::crossterm::event::KeyEvent> = vec![first_key];
+            loop {
+                match event::read() {
+                    Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => burst.push(k),
+                    Ok(other) => {
+                        if key_tx.blocking_send(other).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => break,
+                }
+                if burst.len() >= paste::MAX_BURST
+                    || !event::poll(paste::COLLECT_GAP).unwrap_or(false)
+                {
+                    break;
+                }
+            }
+            match paste::merge(&burst) {
+                Some(text) => {
+                    if key_tx.blocking_send(Event::Paste(text)).is_err() {
+                        return;
+                    }
+                }
+                None => {
+                    for key in burst {
+                        if key_tx.blocking_send(Event::Key(key)).is_err() {
+                            return;
+                        }
+                    }
+                }
             }
         }
     });
@@ -385,10 +448,8 @@ async fn interactive_loop<P: Provider>(
                             *conversation = new_conversation;
                             // BUG-006：屏幕必须重建为新 session 的对话（不能残留旧屏幕）。
                             ui_state.view.load_history(conversation.history());
-                            ui_state.view.push_line(
-                                LineKind::System,
-                                format!("已恢复 session {id}（对话历史已加载）"),
-                            );
+                            let label = session_resume_label(conversation.log());
+                            ui_state.view.push_line(LineKind::System, label);
                         }
                         Err(error) => {
                             ui_state
@@ -625,8 +686,14 @@ workspace: {}
                                 } else {
                                     preview.clone()
                                 };
-                                let label =
-                                    format!("{} · {} · {} 事件", title, fmt_time(*modified), count);
+                                // §用户诉求：会话名（首条消息）置前；时间带日期
+                                // （MM-DD HH:MM），跨天会话不再难以分辨。
+                                let label = format!(
+                                    "{} · {} · {} 事件",
+                                    title,
+                                    fmt_time_short(*modified),
+                                    count
+                                );
                                 (id.to_string(), label)
                             })
                             .collect(),
@@ -1323,6 +1390,54 @@ pub fn parse_session_id(value: &str) -> Result<SessionId, String> {
     Ok(SessionId(uuid))
 }
 
+/// §用户诉求（恢复会话可判断）：`--resume` 支持 UUID 前缀匹配。
+///
+/// 完整 UUID 直接解析；否则在当前 workspace 的 session 目录里按前缀唯一匹配
+/// （不区分大小写）。无匹配/多匹配时给出可操作错误（提示 `tpi sessions` 列表），
+/// 不猜测、不歧义恢复。
+pub fn resolve_session_id_prefix(
+    value: &str,
+    sessions_root: &std::path::Path,
+    workspace_root: &Utf8PathBuf,
+) -> Result<SessionId, String> {
+    if let Ok(id) = parse_session_id(value) {
+        return Ok(id);
+    }
+    let prefix = value.trim().to_ascii_lowercase();
+    if prefix.is_empty() {
+        return Err("session id 为空；用 `tpi sessions` 列出可恢复会话".into());
+    }
+    let dir = sessions_root.join(session::workspace_id_for(workspace_root.as_std_path()));
+    let mut matches: Vec<String> = Vec::new();
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            let Ok(entry) = entry else { continue };
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".jsonl") else {
+                continue;
+            };
+            if stem.to_ascii_lowercase().starts_with(&prefix) && uuid::Uuid::parse_str(stem).is_ok()
+            {
+                matches.push(stem.to_string());
+            }
+        }
+    }
+    match matches.len() {
+        1 => parse_session_id(&matches[0]),
+        0 => Err(format!(
+            "没有找到以 `{prefix}` 开头的 session；用 `tpi sessions` 列出全部会话"
+        )),
+        _ => Err(format!(
+            "`{prefix}` 匹配 {} 个 session，请提供更长前缀：{}（`tpi sessions` 可查看完整 id）",
+            matches.len(),
+            matches.join(", ")
+        )),
+    }
+}
+
 /// 当前 workspace 最近的 session（§18.3 `--continue`）。
 fn latest_session_id(
     sessions_root: &std::path::Path,
@@ -1337,7 +1452,8 @@ fn latest_session_id(
 
 /// 列出当前 workspace 的全部 session（按修改时间倒序）：
 /// (id, 最后修改, 事件数, 首条用户消息预览)。
-fn list_sessions(
+/// `pub`：CLI `tpi sessions` 复用同一列表（§用户诉求：恢复前可浏览）。
+pub fn list_sessions(
     sessions_root: &std::path::Path,
     workspace_root: &Utf8PathBuf,
 ) -> Result<Vec<(SessionId, std::time::SystemTime, usize, String)>, String> {
@@ -1373,6 +1489,22 @@ fn list_sessions(
             (id, modified, count, preview)
         })
         .collect())
+}
+
+/// §用户诉求（恢复会话可判断）：恢复时显示人类可读标识——首条用户消息
+/// 预览 + 短 id，而不是让用户面对完整 UUID 哈希。
+fn session_resume_label(log: Option<&SessionLog>) -> String {
+    let Some(log) = log else {
+        return "已恢复会话".to_string();
+    };
+    let id = log.session_id().to_string();
+    let short: String = id.chars().take(13).collect(); // 019feea2-e01d
+    let preview = first_user_preview(log.path());
+    if preview.is_empty() {
+        format!("已恢复会话（{short}…）")
+    } else {
+        format!("已恢复会话「{preview}」（{short}…）")
+    }
 }
 
 /// P2：从 session 文件提取首条用户消息摘要（≤40 字符，单行）。
@@ -1461,21 +1593,17 @@ fn fmt_price(price: Option<f64>) -> String {
     }
 }
 
-/// 会话列表展示用的时间格式（HH:MM:SS 或 MM-DD HH:MM）。
-fn fmt_time(t: std::time::SystemTime) -> String {
-    let Ok(duration) = t.duration_since(std::time::UNIX_EPOCH) else {
-        return "-".into();
-    };
-    let secs = duration.as_secs();
-    let days = secs / 86400;
-    let hours = (secs % 86400) / 3600;
-    let minutes = (secs % 3600) / 60;
-    let seconds = secs % 60;
-    if days > 0 {
-        format!("{days}d {hours:02}:{minutes:02}")
-    } else {
-        format!("{hours:02}:{minutes:02}:{seconds:02}")
-    }
+/// 会话菜单展示用的时间（MM-DD HH:MM）：跨天会话带日期，一眼可分辨。
+/// 非 UTC 偏移 = 本机时间（mtime 已是本地语义）。
+fn fmt_time_short(t: std::time::SystemTime) -> String {
+    let dt = time::OffsetDateTime::from(t);
+    format!(
+        "{:02}-{:02} {:02}:{:02}",
+        u8::from(dt.month()),
+        dt.day(),
+        dt.hour(),
+        dt.minute()
+    )
 }
 
 #[cfg(test)]
@@ -1483,6 +1611,45 @@ mod tests {
     use super::*;
     use crate::tui::model::ViewModel;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// §用户诉求：--resume 前缀匹配——完整 UUID 直解、唯一前缀补全（大小写
+    /// 不敏感）、多匹配/无匹配给出可操作错误，不歧义恢复。
+    #[test]
+    fn resume_prefix_matches_uniquely() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_root = dir.path().join("sessions");
+        let workspace_root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let wid = session::workspace_id_for(workspace_root.as_std_path());
+        let sd = sessions_root.join(&wid);
+        std::fs::create_dir_all(&sd).unwrap();
+        let id1 = "019fda3c-c299-7890-b9ab-4cc7f311475a";
+        let id2 = "019fdabf-2250-7310-b988-673a49d1c675";
+        std::fs::write(sd.join(format!("{id1}.jsonl")), "").unwrap();
+        std::fs::write(sd.join(format!("{id2}.jsonl")), "").unwrap();
+        // 完整 UUID 直接解析。
+        assert_eq!(
+            resolve_session_id_prefix(id1, &sessions_root, &workspace_root)
+                .unwrap()
+                .to_string(),
+            id1
+        );
+        // 唯一前缀补全（大小写不敏感）。
+        assert_eq!(
+            resolve_session_id_prefix("019FDA3C", &sessions_root, &workspace_root)
+                .unwrap()
+                .to_string(),
+            id1
+        );
+        // 多匹配：报错列出候选，不猜测。
+        let err = resolve_session_id_prefix("019fd", &sessions_root, &workspace_root).unwrap_err();
+        assert!(err.contains("匹配 2 个"), "{err}");
+        // 无匹配：给出可操作提示。
+        let err = resolve_session_id_prefix("zzz", &sessions_root, &workspace_root).unwrap_err();
+        assert!(err.contains("没有找到"), "{err}");
+        // 空输入。
+        let err = resolve_session_id_prefix("", &sessions_root, &workspace_root).unwrap_err();
+        assert!(err.contains("为空"), "{err}");
+    }
 
     /// P1-13：事件数 = JSONL 行数（不 serde 解析全部事件）。
     #[test]

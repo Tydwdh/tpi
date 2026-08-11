@@ -285,7 +285,7 @@ current revision. Use `edit` instead for localized changes."
                 "Run a command through Git Bash with `set -o pipefail` enabled (pipeline failures are visible). This is the only execution tool: use it for programs, builds, tests, git, pipelines, redirection, globs and compound commands. Write Bash syntax; the host is Windows, never mix PowerShell syntax."
             }
             BuiltinTool::UpdatePlan => {
-                "Replace the whole short plan atomically (max 7 unique items). Items accept either plain text (status inferred by diff against the previous plan: removed items become completed) or an explicit object `{\"text\": \"...\", \"status\": \"completed|in_progress|pending\"}` so you can mark items done without removing them. Only for complex multi-step tasks; simple tasks do not need a plan. It is a progress state, not an extra workflow."
+                "Replace the whole short plan atomically (max 7 active items; completed items are kept as history, last 7). Items accept either plain text (status inferred by diff against the previous plan: removed items become completed) or an explicit object `{\"text\": \"...\", \"status\": \"completed|in_progress|pending\"}` so you can mark items done without removing them. Only for complex multi-step tasks; simple tasks do not need a plan. It is a progress state, not an extra workflow."
             }
             BuiltinTool::WebSearch => {
                 "Search the web (DuckDuckGo, free, no API key) to discover sources. Returns title, URL and snippet. Results are for discovery only; never opens a browser and never calls a summary model."
