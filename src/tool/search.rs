@@ -15,6 +15,34 @@ use serde::{Deserialize, Serialize};
 use crate::tool::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::tool::{ToolContext, path_rejected_outcome, resolve_tool_path};
 
+/// 路径不存在或非目录的统一诊断（§P0：区分「不存在」与「存在但非目录」，
+/// 避免对文件路径误报 not_found 误导调用方）。
+fn not_directory_outcome(tool: &'static str, root: &Utf8PathBuf) -> ToolOutcome {
+    let exists = root.exists();
+    let error = if exists {
+        "not_a_directory"
+    } else {
+        "not_found"
+    };
+    let hint = if exists {
+        "path 是文件而非目录（不是未找到）；该工具需要目录路径。"
+    } else {
+        "path 不存在。"
+    };
+    ToolOutcome::failed(
+        tool,
+        ModelPayload {
+            status: ToolStatus::Failed,
+            program: None,
+            exit_code: None,
+            duration_ms: 0,
+            output: format!("status: failed\ntool: {tool}\nerror: {error}\n\n{root}\n{hint}"),
+            effect: None,
+            artifact: None,
+        },
+    )
+}
+
 /// 单次默认计算预算（§8.4）。
 pub const MAX_SCAN_FILES: u64 = 20_000;
 pub const MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
@@ -48,6 +76,20 @@ fn default_depth() -> usize {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct GlobArgs {
+    /// 文件名 glob 模式（如 `**/*.rs`、`src/**/*.ts`、`Cargo.toml`）。
+    pub pattern: String,
+    #[serde(default = "default_path")]
+    pub path: String,
+    /// 上一页返回的 cursor（翻页不重新扫描）。
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// 目录深度（默认不限）。
+    #[serde(default)]
+    pub depth: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct SearchArgs {
     /// regex 模式（rust regex 语法）。
     pub pattern: String,
@@ -60,6 +102,20 @@ pub struct SearchArgs {
     /// 用于过滤 test/fixture/vendor 等噪音，src 等目标目录结果优先。
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// 结果条数上限（默认 100，最大 1000）。达到上限即停，可用 cursor 翻页继续。
+    #[serde(default = "default_max_results")]
+    pub max_results: usize,
+    /// 仅搜索匹配这些 glob 的文件（如 `**/*.rs`、`*.toml`）；空 = 不过滤。
+    /// 单文件 path 时忽略。
+    #[serde(default)]
+    pub include: Vec<String>,
+}
+
+/// search 结果条数上限硬顶（§P1：max_results 默认 100，最多 1000）。
+pub const MAX_SEARCH_RESULTS: usize = 1_000;
+
+fn default_max_results() -> usize {
+    100
 }
 
 /// 一次扫描的有界有序结果 snapshot（§8.4：cursor 指向 snapshot + offset）。
@@ -105,18 +161,7 @@ pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
         Err(error) => return path_rejected_outcome("list", error),
     };
     if !root.is_dir() {
-        return ToolOutcome::failed(
-            "list",
-            ModelPayload {
-                status: ToolStatus::Failed,
-                program: None,
-                exit_code: None,
-                duration_ms: 0,
-                output: format!("status: failed\ntool: list\nerror: not_found\n\n{}", root),
-                effect: None,
-                artifact: None,
-            },
-        );
+        return not_directory_outcome("list", &root);
     }
     let started = Instant::now();
     let mut items: Vec<String> = Vec::new();
@@ -178,6 +223,95 @@ pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
         started,
         stop_reason,
         "list",
+        true,
+    )
+}
+
+/// glob：按文件名模式查找文件（§P1；opencode 同款语义）。
+///
+/// - 遵循 `.gitignore`、不跟随 symlink；结果按修改时间降序（最近修改在前），
+///   同 mtime 按路径字典序；
+/// - 分页复用 ScanSnapshot（cursor 翻页不重新扫描）。
+pub fn glob(args: GlobArgs, ctx: &ToolContext) -> ToolOutcome {
+    if let Some(cursor) = &args.cursor {
+        return page(cursor, ctx);
+    }
+    let root = match resolve_tool_path(ctx, &args.path) {
+        Ok(path) => path,
+        Err(error) => return path_rejected_outcome("glob", error),
+    };
+    if !root.is_dir() {
+        return not_directory_outcome("glob", &root);
+    }
+    let matcher = match globset::Glob::new(&args.pattern).map(|g| g.compile_matcher()) {
+        Ok(matcher) => matcher,
+        Err(error) => {
+            return ToolOutcome::failed(
+                "glob",
+                ModelPayload {
+                    status: ToolStatus::Rejected,
+                    program: None,
+                    exit_code: None,
+                    duration_ms: 0,
+                    output: format!("status: rejected\ntool: glob\nerror: invalid_glob\n\n{error}"),
+                    effect: None,
+                    artifact: None,
+                },
+            );
+        }
+    };
+    let started = Instant::now();
+    let mut items: Vec<(String, std::time::SystemTime)> = Vec::new();
+    let mut scanned_files = 0u64;
+    let mut scanned_bytes = 0u64;
+    let mut stop_reason = StopReason::Complete;
+
+    'scan: for entry in WalkBuilder::new(&root, args.depth) {
+        if ctx.cancel.is_cancelled() {
+            stop_reason = StopReason::Cancelled;
+            break;
+        }
+        if started.elapsed() > SCAN_DEADLINE {
+            stop_reason = StopReason::Deadline;
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let rel = relative(&root, entry.path());
+        if !matcher.is_match(rel.as_str()) {
+            continue;
+        }
+        scanned_files = scanned_files.saturating_add(1);
+        scanned_bytes = scanned_bytes.saturating_add(meta.len());
+        if scanned_files >= MAX_SCAN_FILES || scanned_bytes >= MAX_SCAN_BYTES {
+            stop_reason = StopReason::ScanLimit;
+            break 'scan;
+        }
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        items.push((rel, mtime));
+        if items.len() >= MAX_RESULTS {
+            stop_reason = StopReason::ResultLimit;
+            break 'scan;
+        }
+    }
+    // §P1：按修改时间降序（最近修改在前；opencode glob 行为），同刻按路径序。
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let items: Vec<String> = items.into_iter().map(|(path, _)| path).collect();
+    finish_scan(
+        ctx,
+        items,
+        scanned_files,
+        scanned_bytes,
+        started,
+        stop_reason,
+        "glob",
+        false,
     )
 }
 
@@ -199,8 +333,8 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
             },
         );
     }
-    let pattern = match regex::Regex::new(&args.pattern) {
-        Ok(pattern) => pattern,
+    let matcher = match grep::regex::RegexMatcher::new(&args.pattern) {
+        Ok(matcher) => matcher,
         Err(error) => {
             return ToolOutcome::failed(
                 "search",
@@ -222,20 +356,34 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         Ok(path) => path,
         Err(error) => return path_rejected_outcome("search", error),
     };
-    if !root.is_dir() {
-        return ToolOutcome::failed(
-            "search",
-            ModelPayload {
-                status: ToolStatus::Failed,
-                program: None,
-                exit_code: None,
-                duration_ms: 0,
-                output: format!("status: failed\ntool: search\nerror: not_found\n\n{root}"),
-                effect: None,
-                artifact: None,
-            },
-        );
+    // §P1：search 支持单文件路径——文件路径直接搜该文件（ripgrep 语义），
+    // 不再误报 not_found。
+    if root.is_file() {
+        return search_single_file(&matcher, &root, &args, ctx);
     }
+    if !root.is_dir() {
+        return not_directory_outcome("search", &root);
+    }
+    // §P1：include glob 过滤（文件名模式；编译失败 → rejected）。
+    let include = match build_glob_set(&args.include) {
+        Ok(set) => set,
+        Err(error) => {
+            return ToolOutcome::failed(
+                "search",
+                ModelPayload {
+                    status: ToolStatus::Rejected,
+                    program: None,
+                    exit_code: None,
+                    duration_ms: 0,
+                    output: format!(
+                        "status: rejected\ntool: search\nerror: invalid_glob\n\n{error}"
+                    ),
+                    effect: None,
+                    artifact: None,
+                },
+            );
+        }
+    };
     let started = Instant::now();
     let mut items: Vec<String> = Vec::new();
     let mut scanned_files = 0u64;
@@ -249,12 +397,14 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         .map(|s| s.trim().to_ascii_lowercase())
         .collect();
 
-    // 匹配预算（§8.4：100 matches、单行 300 chars、最多 32 KiB）。
-    const MAX_MATCHES: usize = 100;
+    // 匹配预算（§8.4：max_results 条、单行 300 chars、最多 32 KiB）。
+    let max_results = args.max_results.clamp(1, MAX_SEARCH_RESULTS);
     const MAX_LINE_CHARS: usize = 300;
     const MAX_OUTPUT_BYTES: usize = 32 * 1024;
     let mut output_bytes = 0usize;
 
+    // ripgrep 内核：Searcher（memchr 加速逐行搜索 + 行号追踪）逐文件复用。
+    let mut searcher = grep::searcher::Searcher::new();
     'scan: for entry in WalkBuilder::new(&root, None) {
         if ctx.cancel.is_cancelled() {
             stop_reason = StopReason::Cancelled;
@@ -268,9 +418,9 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
             continue;
         }
+        let rel = relative(&root, entry.path());
         // §工具改进：exclude 匹配（路径任一组件命中即跳过，如 tests/fixtures）。
         if !exclude.is_empty() {
-            let rel = relative(&root, entry.path());
             let rel_lower = rel.as_str().to_ascii_lowercase();
             let excluded = exclude.iter().any(|pattern| {
                 rel_lower
@@ -280,6 +430,10 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
             if excluded {
                 continue;
             }
+        }
+        // §P1：include glob 过滤（如 `**/*.rs`）。
+        if !include.is_empty() && !include.is_match(rel.as_str()) {
+            continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
@@ -294,56 +448,24 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         if meta.len() > MAX_FILE_BYTES || meta.len() == 0 {
             continue;
         }
-        // binary 检测：只读头 8 KiB 查 NUL（P1-8：不整文件读入内存）。
-        let mut file = match std::fs::File::open(entry.path()) {
-            Ok(file) => file,
-            Err(_) => continue,
+        // ripgrep 内核逐文件搜索；binary 由 read_head 预检跳过，
+        // Searcher 设 quit(b'\0') 兜底。达上限 → 停止整个扫描。
+        let limits = SearchLimits {
+            max_results,
+            max_output_bytes: MAX_OUTPUT_BYTES,
+            max_line_chars: MAX_LINE_CHARS,
         };
-        {
-            use std::io::Read;
-            let mut head = [0u8; 8192];
-            let Ok(n) = file.read(&mut head) else {
-                continue;
-            };
-            if head[..n].contains(&0) {
-                continue;
-            }
-        }
-        // head 读取已消费文件内容（小文件可能已到 EOF）：回退到文件头再流式读。
-        {
-            use std::io::{Seek, SeekFrom};
-            if file.seek(SeekFrom::Start(0)).is_err() {
-                continue;
-            }
-        }
-        // 流式按行匹配（P1-8：大文件不整读，内存峰值恒定）。
-        let relative_path = truncate_line(&relative(&root, entry.path()), MAX_RESULT_PATH_CHARS);
-        use std::io::BufRead;
-        let reader = std::io::BufReader::new(file);
-        for (line_idx, line) in reader.lines().enumerate() {
-            if ctx.cancel.is_cancelled() {
-                stop_reason = StopReason::Cancelled;
-                break 'scan;
-            }
-            if started.elapsed() > SCAN_DEADLINE {
-                stop_reason = StopReason::Deadline;
-                break 'scan;
-            }
-            let Ok(line) = line else { break };
-            if pattern.is_match(&line) {
-                let line = truncate_line(&line, MAX_LINE_CHARS);
-                let item = format!("{}:{}: {}", relative_path, line_idx + 1, line);
-                if output_bytes.saturating_add(item.len()) > MAX_OUTPUT_BYTES {
-                    stop_reason = StopReason::ResultLimit;
-                    break 'scan;
-                }
-                output_bytes = output_bytes.saturating_add(item.len());
-                items.push(item);
-                if items.len() >= MAX_MATCHES || output_bytes >= MAX_OUTPUT_BYTES {
-                    stop_reason = StopReason::ResultLimit;
-                    break 'scan;
-                }
-            }
+        if search_file_into(
+            &mut searcher,
+            &matcher,
+            entry.path(),
+            &rel,
+            &limits,
+            &mut items,
+            &mut output_bytes,
+        ) {
+            stop_reason = StopReason::ResultLimit;
+            break 'scan;
         }
     }
 
@@ -355,9 +477,169 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         started,
         stop_reason,
         "search",
+        true,
     )
 }
 
+/// §P1：单文件搜索（search path 指向文件时；ripgrep 语义，不再误报 not_found）。
+fn search_single_file(
+    matcher: &grep::regex::RegexMatcher,
+    path: &Utf8PathBuf,
+    args: &SearchArgs,
+    ctx: &ToolContext,
+) -> ToolOutcome {
+    let started = Instant::now();
+    let mut items: Vec<String> = Vec::new();
+    let mut output_bytes = 0usize;
+    let mut stop_reason = StopReason::Complete;
+    let Ok(meta) = path.metadata() else {
+        return not_directory_outcome("search", path);
+    };
+    let scanned_files = 1u64;
+    let scanned_bytes = meta.len();
+    if meta.len() > 0 && meta.len() <= MAX_FILE_BYTES {
+        let rel = relative(&ctx.workspace_root, path.as_std_path());
+        let mut searcher = grep::searcher::Searcher::new();
+        let limits = SearchLimits {
+            max_results: args.max_results.clamp(1, MAX_SEARCH_RESULTS),
+            max_output_bytes: 32 * 1024,
+            max_line_chars: 300,
+        };
+        if search_file_into(
+            &mut searcher,
+            matcher,
+            path.as_std_path(),
+            &rel,
+            &limits,
+            &mut items,
+            &mut output_bytes,
+        ) {
+            stop_reason = StopReason::ResultLimit;
+        }
+    }
+    finish_scan(
+        ctx,
+        items,
+        scanned_files,
+        scanned_bytes,
+        started,
+        stop_reason,
+        "search",
+        true,
+    )
+}
+
+/// 搜索单文件时的预算（§P1：max_results 条、单行 300 chars、最多 32 KiB）。
+struct SearchLimits {
+    max_results: usize,
+    max_output_bytes: usize,
+    max_line_chars: usize,
+}
+
+/// 用 ripgrep 内核搜索单个文件，匹配累积进 `items`。返回 true = 达上限。
+/// binary 预检（头 8 KiB 查 NUL）后由 Searcher 流式按行搜（不整读文件）。
+fn search_file_into(
+    searcher: &mut grep::searcher::Searcher,
+    matcher: &grep::regex::RegexMatcher,
+    path: &std::path::Path,
+    rel: &str,
+    limits: &SearchLimits,
+    items: &mut Vec<String>,
+    output_bytes: &mut usize,
+) -> bool {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    {
+        use std::io::Read;
+        let mut head = [0u8; 8192];
+        let Ok(n) = file.read(&mut head) else {
+            return false;
+        };
+        if head[..n].contains(&0) {
+            return false; // binary：跳过（与目录模式一致）。
+        }
+    }
+    {
+        use std::io::{Seek, SeekFrom};
+        if file.seek(SeekFrom::Start(0)).is_err() {
+            return false;
+        }
+    }
+    let rel = truncate_line(rel, MAX_RESULT_PATH_CHARS);
+    let mut sink = SearchSink {
+        items,
+        output_bytes,
+        rel: rel.to_string(),
+        max_results: limits.max_results,
+        max_output_bytes: limits.max_output_bytes,
+        max_line_chars: limits.max_line_chars,
+        limit_hit: false,
+    };
+    // 兜底：binary 检测（遇 NUL 停止该文件搜索）；默认 \n 行分隔，
+    // CRLF 行的 \r 由 sink 剥离。
+    searcher.set_binary_detection(grep::searcher::BinaryDetection::quit(b'\0'));
+    let _ = searcher.search_reader(matcher, file, &mut sink);
+    sink.limit_hit
+}
+
+/// 搜索 sink：累积 `rel:line: content` 项，受条数/字节预算约束。
+/// 行号来自 ripgrep Searcher（1-based）。
+struct SearchSink<'a> {
+    items: &'a mut Vec<String>,
+    output_bytes: &'a mut usize,
+    rel: String,
+    max_results: usize,
+    max_output_bytes: usize,
+    max_line_chars: usize,
+    limit_hit: bool,
+}
+
+impl grep::searcher::Sink for SearchSink<'_> {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &grep::searcher::Searcher,
+        mat: &grep::searcher::SinkMatch,
+    ) -> Result<bool, Self::Error> {
+        let Some(line_number) = mat.line_number() else {
+            return Ok(true);
+        };
+        // 非 UTF-8 行：跳过（与 BufRead::lines 遇错中止文件语义近似）。
+        let Ok(line) = std::str::from_utf8(mat.bytes()) else {
+            return Ok(true);
+        };
+        // CRLF：Searcher 按 \n 切行，行尾 \r 属内容，剥离后再输出。
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line = truncate_line(line, self.max_line_chars);
+        let item = format!("{}:{line_number}: {line}", self.rel);
+        let item_len = item.len();
+        if self.output_bytes.saturating_add(item_len) > self.max_output_bytes {
+            self.limit_hit = true;
+            return Ok(false);
+        }
+        *self.output_bytes = self.output_bytes.saturating_add(item_len);
+        self.items.push(item);
+        if self.items.len() >= self.max_results {
+            self.limit_hit = true;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+/// 编译 include glob 模式集（§P1：`**/*.rs` 等；空列表返回空 set = 不过滤）。
+fn build_glob_set(patterns: &[String]) -> Result<globset::GlobSet, String> {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in patterns.iter().filter(|s| !s.trim().is_empty()) {
+        builder.add(globset::Glob::new(pattern).map_err(|e| e.to_string())?);
+    }
+    builder.build().map_err(|e| e.to_string())
+}
+
+#[allow(clippy::too_many_arguments)] // §P1：统计字段 + resort 开关，参数多但语义单一。
 fn finish_scan(
     ctx: &ToolContext,
     mut items: Vec<String>,
@@ -366,11 +648,14 @@ fn finish_scan(
     started: Instant,
     stop_reason: StopReason,
     tool: &'static str,
+    resort: bool,
 ) -> ToolOutcome {
     // §工具改进：噪音目录后置排序——src/根目录源码优先露出，tests/fixtures/
     // vendor 等噪音结果沉底（各自组内保持字典序），避免 100 条上限被
-    // 测试文件噪音淹没。
-    items.sort_unstable_by(|a, b| noise_rank(a).cmp(&noise_rank(b)).then_with(|| a.cmp(b)));
+    // 测试文件噪音淹没。glob 已按 mtime 降序排好，resort=false 保留其顺序。
+    if resort {
+        items.sort_unstable_by(|a, b| noise_rank(a).cmp(&noise_rank(b)).then_with(|| a.cmp(b)));
+    }
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let snapshot = ScanSnapshot {
         tool: tool.to_string(),
@@ -813,6 +1098,8 @@ mod tests {
                 path: ".".into(),
                 cursor: None,
                 exclude: Vec::new(),
+                max_results: 100,
+                include: Vec::new(),
             },
             &ctx,
         );
@@ -835,10 +1122,231 @@ mod tests {
                 path: ".".into(),
                 cursor: None,
                 exclude: Vec::new(),
+                max_results: 100,
+                include: Vec::new(),
             },
             &ctx,
         );
         assert_eq!(outcome.status, ToolStatus::Rejected);
         assert!(outcome.model_payload.output.contains("regex_too_large"));
+    }
+
+    /// §P0：区分「不存在」与「存在但非目录」——对文件路径不再误报 not_found。
+    #[test]
+    fn missing_and_non_directory_paths_are_distinguished() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::write(root.join("a.txt"), "needle\n").unwrap();
+        let ctx = test_ctx(&root);
+
+        // list 对文件路径：明确 not_a_directory，不是 not_found。
+        let listed = list(
+            ListArgs {
+                path: "a.txt".into(),
+                depth: 2,
+                cursor: None,
+            },
+            &ctx,
+        );
+        assert!(
+            listed.model_payload.output.contains("not_a_directory"),
+            "文件路径必须报 not_a_directory: {}",
+            listed.model_payload.output
+        );
+        assert!(!listed.model_payload.output.contains("not_found"));
+
+        // list 对不存在路径：not_found。
+        let missing = list(
+            ListArgs {
+                path: "nope".into(),
+                depth: 2,
+                cursor: None,
+            },
+            &ctx,
+        );
+        assert!(missing.model_payload.output.contains("not_found"));
+
+        // search 对不存在路径：not_found。
+        let searched = search(
+            SearchArgs {
+                pattern: "x".into(),
+                path: "nope".into(),
+                cursor: None,
+                exclude: Vec::new(),
+                max_results: 100,
+                include: Vec::new(),
+            },
+            &ctx,
+        );
+        assert!(searched.model_payload.output.contains("not_found"));
+    }
+
+    /// §P1：search 接受单文件路径（ripgrep 语义）——直接搜该文件，不再报错。
+    #[test]
+    fn search_accepts_single_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::write(root.join("a.txt"), "line one\nneedle here\n").unwrap();
+        let ctx = test_ctx(&root);
+        let outcome = search(
+            SearchArgs {
+                pattern: "needle".into(),
+                path: "a.txt".into(),
+                cursor: None,
+                exclude: Vec::new(),
+                max_results: 100,
+                include: Vec::new(),
+            },
+            &ctx,
+        );
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        let text = outcome.model_payload.output;
+        assert!(text.contains("a.txt:2: needle here"), "{text}");
+        assert!(!text.contains("line one"));
+    }
+
+    /// §P1：include glob 只搜匹配文件（`**/*.rs`）。
+    #[test]
+    fn search_include_glob_filters_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "needle\n").unwrap();
+        std::fs::write(root.join("src/a.txt"), "needle\n").unwrap();
+        let ctx = test_ctx(&root);
+        let outcome = search(
+            SearchArgs {
+                pattern: "needle".into(),
+                path: ".".into(),
+                cursor: None,
+                exclude: Vec::new(),
+                max_results: 100,
+                include: vec!["**/*.rs".into()],
+            },
+            &ctx,
+        );
+        let text = outcome.model_payload.output;
+        assert!(text.contains("src/a.rs:1: needle"), "{text}");
+        assert!(!text.contains("a.txt"), "include 过滤必须排除 .txt: {text}");
+    }
+
+    /// §P1：max_results 限制命中条数并报 result_limit。
+    #[test]
+    fn search_max_results_bounds_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        for i in 0..3 {
+            std::fs::write(root.join(format!("f{i}.txt")), "needle\n").unwrap();
+        }
+        let ctx = test_ctx(&root);
+        let outcome = search(
+            SearchArgs {
+                pattern: "needle".into(),
+                path: ".".into(),
+                cursor: None,
+                exclude: Vec::new(),
+                max_results: 2,
+                include: Vec::new(),
+            },
+            &ctx,
+        );
+        let text = outcome.model_payload.output;
+        assert!(text.contains("stop_reason: result_limit"), "{text}");
+        assert_eq!(
+            text.matches(":1: needle").count(),
+            2,
+            "max_results=2 只能有 2 条命中: {text}"
+        );
+    }
+
+    /// §P1：CRLF 文件匹配行剥离 \r（Windows 常见），输出干净。
+    #[test]
+    fn search_strips_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::write(root.join("win.txt"), b"needle\r\nsecond\r\n").unwrap();
+        let ctx = test_ctx(&root);
+        let outcome = search(
+            SearchArgs {
+                pattern: "needle".into(),
+                path: ".".into(),
+                cursor: None,
+                exclude: Vec::new(),
+                max_results: 100,
+                include: Vec::new(),
+            },
+            &ctx,
+        );
+        let text = outcome.model_payload.output;
+        assert!(
+            text.contains("win.txt:1: needle"),
+            "CRLF 必须剥离: {text:?}"
+        );
+        assert!(!text.contains("\\r"), "不得残留 \\r: {text:?}");
+    }
+
+    /// §P1：glob 按文件名模式匹配，结果按修改时间降序（最近修改在前）。
+    #[test]
+    fn glob_matches_pattern_and_sorts_by_mtime() {
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // 文件名顺序与 mtime 顺序相反：zzz 字典序最大但 mtime 最新。
+        // 只有 glob 按 mtime 降序（且 finish_scan 保留顺序）时 zzz 才排最前；
+        // 若被字典序覆盖，aaa 会排到 zzz 前——测试即失败。
+        std::fs::write(root.join("src/aaa.rs"), "x\n").unwrap();
+        std::fs::write(root.join("src/zzz.rs"), "y\n").unwrap();
+        std::fs::write(root.join("src/note.txt"), "z\n").unwrap();
+        // 显式设置 mtime：aaa 更早，zzz 更晚。
+        let now = SystemTime::now();
+        let set_mtime = |path: &str, age: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(root.join(path))
+                .unwrap()
+                .set_modified(now - Duration::from_secs(age))
+                .unwrap();
+        };
+        set_mtime("src/aaa.rs", 100);
+        set_mtime("src/zzz.rs", 10);
+        let ctx = test_ctx(&root);
+        let outcome = glob(
+            GlobArgs {
+                pattern: "**/*.rs".into(),
+                path: ".".into(),
+                cursor: None,
+                depth: None,
+            },
+            &ctx,
+        );
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        let text = outcome.model_payload.output;
+        let zzz_pos = text.find("src/zzz.rs").expect("含 zzz.rs: {text}");
+        let aaa_pos = text.find("src/aaa.rs").expect("含 aaa.rs: {text}");
+        assert!(
+            zzz_pos < aaa_pos,
+            "mtime 最新必须排最前（不被字典序覆盖）: {text}"
+        );
+        assert!(!text.contains("note.txt"), "非 .rs 不匹配: {text}");
+    }
+
+    /// §P1：glob 无效模式 → rejected。
+    #[test]
+    fn glob_invalid_pattern_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let ctx = test_ctx(&root);
+        let outcome = glob(
+            GlobArgs {
+                pattern: "[".into(),
+                path: ".".into(),
+                cursor: None,
+                depth: None,
+            },
+            &ctx,
+        );
+        assert_eq!(outcome.status, ToolStatus::Rejected);
+        assert!(outcome.model_payload.output.contains("invalid_glob"));
     }
 }

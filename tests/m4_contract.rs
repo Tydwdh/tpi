@@ -193,12 +193,16 @@ async fn watchdog_cancels_at_wall_deadline() {
 /// §13：update_plan 不变量（≤7 项、唯一 InProgress、完整替换、拒绝无效）。
 #[test]
 fn plan_invariants_enforced() {
-    use tpi::tool::plan::{UpdatePlanArgs, build_plan, validate_invariants};
+    use tpi::tool::plan::{PlanItemArg, UpdatePlanArgs, build_plan, validate_invariants};
     // 合法：3 项，唯一 InProgress。
     let plan = build_plan(
         &UpdatePlanArgs {
             explanation: Some("fix".into()),
-            items: vec!["a".into(), "b".into(), "c".into()],
+            items: vec![
+                PlanItemArg::Text("a".into()),
+                PlanItemArg::Text("b".into()),
+                PlanItemArg::Text("c".into()),
+            ],
         },
         None,
     )
@@ -215,7 +219,9 @@ fn plan_invariants_enforced() {
     let error = build_plan(
         &UpdatePlanArgs {
             explanation: None,
-            items: (0..8).map(|i| format!("item{i}")).collect(),
+            items: (0..8)
+                .map(|i| PlanItemArg::Text(format!("item{i}")))
+                .collect(),
         },
         None,
     )
@@ -226,7 +232,10 @@ fn plan_invariants_enforced() {
     let error = build_plan(
         &UpdatePlanArgs {
             explanation: None,
-            items: vec!["same".into(), "same".into()],
+            items: vec![
+                PlanItemArg::Text("same".into()),
+                PlanItemArg::Text("same".into()),
+            ],
         },
         None,
     )
@@ -237,7 +246,10 @@ fn plan_invariants_enforced() {
     let previous = build_plan(
         &UpdatePlanArgs {
             explanation: None,
-            items: vec!["old1".into(), "old2".into()],
+            items: vec![
+                PlanItemArg::Text("old1".into()),
+                PlanItemArg::Text("old2".into()),
+            ],
         },
         None,
     )
@@ -245,7 +257,7 @@ fn plan_invariants_enforced() {
     let next = build_plan(
         &UpdatePlanArgs {
             explanation: None,
-            items: vec!["new1".into()],
+            items: vec![PlanItemArg::Text("new1".into())],
         },
         Some(&previous),
     )
@@ -280,9 +292,23 @@ async fn update_plan_and_compaction_integration() {
     // 窗口 4000 会让第一轮就触发且 history 为空无法显著缩小（校验失败）；
     // 9000 保证首轮不触发、多轮 read 累积后触发且 history 足够大。
     let mut config = test_config(&workspace);
-    // 窗口 3600：系统基线 ~2857 首轮不触发；read 每次 +~280，
-    // 第 7 轮 >3500 触发 compaction；compaction 后回到基线+summary < 3500 能继续。
-    config.model.context_window = Some(3600);
+    // 动态基线：先用 agent 同款估算算「空会话请求」的系统开销（system prompt +
+    // 计划快照 + 工具 schema），窗口设在该基线之上，保证首轮不触发压缩、
+    // 多次 read 累积后触发。工具集/系统提示变化自动适应，无需手调 magic number。
+    // 当前基线实测 ~3393 tokens（含 glob/search 参数 schema）；窗口 = 基线 + 800，
+    // 8 轮 read 累积后触发 compaction，compaction 后回到基线+summary 仍能继续。
+    let baseline = tpi::context::estimate_request(
+        tpi::agent::DEFAULT_SYSTEM_PROMPT,
+        &[],
+        &tpi::tool::implemented_tools()
+            .iter()
+            .map(tpi::tool::BuiltinTool::schema)
+            .collect::<Vec<_>>(),
+    );
+    // 空会话 + 无计划时基线即系统开销；window = 基线 + 预留增长空间。
+    // 每轮 read 的结果会进入 messages（累计增长），window 只须容纳约 8 轮 +
+    // compaction 后的 summary 仍能继续。
+    config.model.context_window = Some(baseline + 800);
     config.safety_reserve_tokens = 100;
 
     // 单闭包状态机：工具请求按序推进（update_plan → read×N → 完成）；

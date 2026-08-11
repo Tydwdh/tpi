@@ -176,8 +176,9 @@ pub enum PointerGesture {
 }
 
 /// 拖动进入 selection 的最小位移（cells；Manhattan 距离）。
-/// §PointerHit：3（原 2）——减少工具卡片主行「点击误判为拖选」的误触。
-const DRAG_THRESHOLD: i32 = 3;
+/// §PointerHit：2（原 3）——用户反馈拖选不灵敏；「点击」是零位移，不触发
+/// 选择，误触仅限 3 cells 的拖动（那本就是拖动而非点击），可接受。
+const DRAG_THRESHOLD: i32 = 2;
 
 impl PointerGesture {
     /// 喂入一个指针事件，返回要发给 reducer 的语义事件。
@@ -201,7 +202,9 @@ impl PointerGesture {
                     origin_row: row,
                     origin_hit: hit,
                 };
-                Vec::new()
+                // §用户诉求：任何新按压先清除旧选区——点击其他地方即可取消选中
+                //（若随后拖选，SelectionStart 会建立新选区）。
+                vec![UiEvent::SelectionClear]
             }
             PointerInput::Drag { column, row, hit } => match self {
                 PointerGesture::Idle => Vec::new(),
@@ -427,7 +430,11 @@ mod tests {
         let mut g = PointerGesture::Idle;
         let action = PointerAction::Tool("c1".into());
         let hit = PointerHit::actionable(tp(1, 0), action);
-        assert!(g.feed(down(5, 5, hit.clone())).is_empty());
+        // Down：清除旧选区（§用户诉求），不产生 selection 本身。
+        assert_eq!(
+            g.feed(down(5, 5, hit.clone())),
+            vec![UiEvent::SelectionClear]
+        );
         assert!(
             g.feed(up(5, 5, hit))
                 .contains(&UiEvent::ClickTool("c1".into()))
@@ -593,7 +600,11 @@ mod tests {
         let mut g = PointerGesture::Idle;
         let action = PointerAction::Link("https://example.com".into());
         let hit = PointerHit::actionable(tp(1, 3), action);
-        assert!(g.feed(down(5, 5, hit.clone())).is_empty());
+        // Down：清除旧选区（§用户诉求）。
+        assert_eq!(
+            g.feed(down(5, 5, hit.clone())),
+            vec![UiEvent::SelectionClear]
+        );
         let events = g.feed(up(5, 5, hit));
         assert!(
             events.contains(&UiEvent::ClickLink("https://example.com".into())),
@@ -693,8 +704,11 @@ mod tests {
             entry_id: EntryId(1),
             offset: 14,
         };
-        // Down（记录 Pressed）。
-        assert!(g.feed(down(10, 5, PointerHit::text_at(p1))).is_empty());
+        // Down（记录 Pressed + 清除旧选区）。
+        assert_eq!(
+            g.feed(down(10, 5, PointerHit::text_at(p1))),
+            vec![UiEvent::SelectionClear]
+        );
         // Drag 超阈值 → begin_selecting 发出 SelectionStart + SelectionUpdate。
         let events = g.feed(drag(14, 5, PointerHit::text_at(p5)));
         assert!(
@@ -712,5 +726,24 @@ mod tests {
         let sel = state.view.selection.unwrap();
         assert_eq!(sel.anchor, p1);
         assert_eq!(sel.focus, p5);
+    }
+
+    /// §用户诉求：已有选区时再次按下（点击其他地方）→ 发 SelectionClear，
+    /// reducer 据此清除旧选区（点击别处取消选中）。
+    #[test]
+    fn new_press_clears_previous_selection() {
+        let mut g = PointerGesture::default();
+        // 第一次：按下 + 拖动超阈值 → 选中，抬起保留选区。
+        let _ = g.feed(down(5, 5, PointerHit::text_at(tp(1, 5))));
+        let _ = g.feed(drag(9, 5, PointerHit::text_at(tp(1, 9))));
+        let _ = g.feed(up(9, 5, PointerHit::text_at(tp(1, 9))));
+        assert!(matches!(g, PointerGesture::Idle));
+        // 第二次：点击别处 → Down 必须发 SelectionClear。
+        let events = g.feed(down(20, 10, PointerHit::text_at(tp(2, 0))));
+        assert!(
+            events.contains(&UiEvent::SelectionClear),
+            "新按压必须清除旧选区: {events:?}"
+        );
+        assert!(matches!(g, PointerGesture::Pressed { .. }));
     }
 }

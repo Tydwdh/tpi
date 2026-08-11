@@ -36,6 +36,10 @@ keyring = { version = "4.1", features = ["windows-native-keyring-store"] }
 camino = "1"
 ignore = "0.4"
 regex = "1"
+# search 内核（ripgrep 同源：grep-searcher 逐行搜索、自带 binary/行号处理）。
+grep = "0.4"
+# glob 工具与 search include 过滤（文件名模式匹配；ripgrep 生态）。
+globset = "0.4"
 similar = "3"
 # 代码块语法高亮（纯 Rust：regex-fancy，无 oniguruma C 依赖；default-fancy
 # 含默认语法集与主题集）。

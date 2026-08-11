@@ -50,6 +50,9 @@ fn tool_card(id: &str, status: ToolStatus, output: Option<&str>) -> ToolCard {
         diff: None,
         output_truncated: false,
         expanded: false,
+        line_number_start: None,
+        collapsed_lines: 10,
+        started_at_ms: None,
         tail: if status == ToolStatus::Succeeded {
             None
         } else {

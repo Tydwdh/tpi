@@ -190,7 +190,7 @@ fn fullscreen_shows_scrollbar_at_right_edge() {
         let sym = buf[((w - 1) as u16, y as u16)].symbol();
         if sym == "│" {
             found_track = true;
-        } else if sym == "▐" {
+        } else if sym == "█" {
             found_thumb = true;
         }
     }

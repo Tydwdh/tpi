@@ -242,6 +242,9 @@ async fn interactive_loop<P: Provider>(
         // add_usage 按 token 累计花费显示。
         price_input: config.model.price_input,
         price_output: config.model.price_output,
+        // §用户诉求：卡片折叠时显示的正文行数（[ui] collapsed_lines；
+        // 0 = 折叠态只显示主行摘要）。
+        collapsed_lines: config.ui_collapsed_lines,
         ..Default::default()
     };
     view.push_line(
@@ -615,16 +618,15 @@ workspace: {}
                         items: sessions
                             .iter()
                             .map(|(id, modified, count, preview)| {
-                                let label = if preview.is_empty() {
-                                    format!("{} · {} 事件", fmt_time(*modified), count)
+                                // §用户诉求：会话标题 = 首条用户消息（preview）置前；
+                                // 无预览时显示“无标题”兜底，不让用户面对哈希 id。
+                                let title = if preview.is_empty() {
+                                    "(无标题)".to_string()
                                 } else {
-                                    format!(
-                                        "{} · {} 事件 · {}",
-                                        fmt_time(*modified),
-                                        count,
-                                        preview
-                                    )
+                                    preview.clone()
                                 };
+                                let label =
+                                    format!("{} · {} · {} 事件", title, fmt_time(*modified), count);
                                 (id.to_string(), label)
                             })
                             .collect(),
@@ -1163,7 +1165,30 @@ async fn run_interactive<P: Provider>(
                 "run 达到 wall-time 预算被自动取消（非用户取消）；已保留已提交内容".to_string(),
             );
         }
-        _ => {}
+        // §用户诉求：所有结束原因显式提示——此前 Stop/MaxTurns/MaxToolCalls/
+        // Cancelled 走 `_ => {}` 完全静默，用户看到"bash 卡片后无下文"却不知为何结束。
+        crate::session::CompletionReason::Stop => {
+            ui_state
+                .view
+                .push_line(LineKind::System, "run 完成".to_string());
+        }
+        crate::session::CompletionReason::MaxTurns => {
+            ui_state.view.push_line(
+                LineKind::System,
+                "run 达到最大模型回合数（limits.max_model_turns）已停止".to_string(),
+            );
+        }
+        crate::session::CompletionReason::MaxToolCalls => {
+            ui_state.view.push_line(
+                LineKind::System,
+                "run 达到工具调用预算（limits.max_tool_calls）已停止".to_string(),
+            );
+        }
+        crate::session::CompletionReason::Cancelled => {
+            ui_state
+                .view
+                .push_line(LineKind::System, "run 已取消（Esc）".to_string());
+        }
     }
     ui_state.view.status = StatusLine::Idle;
     ui_state.view.turn = 0;

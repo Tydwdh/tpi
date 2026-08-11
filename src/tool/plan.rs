@@ -12,18 +12,36 @@
 use serde::{Deserialize, Serialize};
 
 /// 计划项状态（§13）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum PlanStatus {
     Pending,
     InProgress,
     Completed,
 }
 
-/// 计划项。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 计划项（§13）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PlanItem {
     pub text: String,
     pub status: PlanStatus,
+}
+
+/// 计划项参数：显式状态或纯文本（§用户诉求：修复隐式状态——
+/// 「全部完成」此前无法表达）。
+///
+/// - `"text"`（纯文本）：与旧计划 diff 推断状态（消失=Completed、
+///   保留=旧状态、新项=InProgress 候选）；
+/// - `{ "text": "...", "status": "completed" }`：显式指定状态
+///   （Completed 是终态；缺省 status 等同纯文本推断）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum PlanItemArg {
+    Text(String),
+    Full {
+        text: String,
+        #[serde(default)]
+        status: Option<PlanStatus>,
+    },
 }
 
 /// 原子短计划（§13）。
@@ -39,10 +57,14 @@ pub const MAX_PLAN_ITEM_BYTES: usize = 500;
 pub const MAX_PLAN_EXPLANATION_BYTES: usize = 2_000;
 
 /// update_plan 参数（§13：每次提交完整计划）。
+///
+/// `items` 支持显式状态（`{"text": "...", "status": "completed"}`）
+/// 或纯文本（`"text"`，按 diff 推断）——§用户诉求：完成项可显式标记，
+/// 全部完成不必清空计划。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 pub struct UpdatePlanArgs {
     pub explanation: Option<String>,
-    pub items: Vec<String>,
+    pub items: Vec<PlanItemArg>,
 }
 
 /// 计划校验错误（§13 不变量）。
@@ -75,11 +97,13 @@ impl std::fmt::Display for PlanError {
     }
 }
 
-/// 从模型参数构造新计划（§13：完整替换；状态由 runtime 推断）。
+/// 从模型参数构造新计划（§13：完整替换；状态由 runtime 推断或显式指定）。
 ///
-/// 状态推断：与旧计划 diff——新 items 中消失的旧项保留并标记 Completed；
-/// 重新提交的旧项保持旧状态；新项为 InProgress 候选；
-/// 唯一 InProgress 取第一个非 Completed 项；空 items 清空计划。
+/// 状态解析（§用户诉求：显式状态修复隐式缺陷）：
+/// - 纯文本项：与旧计划 diff——消失的旧项保留并标记 Completed；
+///   重新提交的旧项保持旧状态；新项为 InProgress 候选；
+/// - 显式 `{text, status}` 项：采用给定状态（Completed 是终态，不降级）；
+/// - 空 items 清空计划。
 pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan, PlanError> {
     let explanation = args
         .explanation
@@ -94,25 +118,32 @@ pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan
             bytes: explanation.len(),
         });
     }
-    let mut texts: Vec<String> = Vec::with_capacity(args.items.len());
-    for raw in &args.items {
-        let text = raw.trim().to_string();
+    // 解析为 (text, 显式状态) 列表：Text → None（推断）；Full → 显式。
+    let mut parsed: Vec<(String, Option<PlanStatus>)> = Vec::with_capacity(args.items.len());
+    for item in &args.items {
+        let (text, explicit) = match item {
+            PlanItemArg::Text(text) => (text.as_str(), None),
+            PlanItemArg::Full { text, status } => (text.as_str(), *status),
+        };
+        let text = text.trim().to_string();
         if text.is_empty() {
             return Err(PlanError::EmptyItem);
         }
         if text.len() > MAX_PLAN_ITEM_BYTES {
             return Err(PlanError::ItemTooLong { bytes: text.len() });
         }
-        if texts.contains(&text) {
+        if parsed.iter().any(|(t, _)| *t == text) {
             return Err(PlanError::DuplicateItems { text });
         }
-        texts.push(text);
+        parsed.push((text, explicit));
     }
-    if texts.len() > MAX_PLAN_ITEMS {
-        return Err(PlanError::TooManyItems { count: texts.len() });
+    if parsed.len() > MAX_PLAN_ITEMS {
+        return Err(PlanError::TooManyItems {
+            count: parsed.len(),
+        });
     }
     // 空提交：清空计划（Completed 也不保留）。
-    if texts.is_empty() {
+    if parsed.is_empty() {
         return Ok(Plan {
             explanation,
             items: Vec::new(),
@@ -120,43 +151,55 @@ pub fn build_plan(args: &UpdatePlanArgs, previous: Option<&Plan>) -> Result<Plan
     }
 
     let previous_items: Vec<PlanItem> = previous.map(|plan| plan.items.clone()).unwrap_or_default();
+    let previous_texts: Vec<&str> = previous_items.iter().map(|i| i.text.as_str()).collect();
+    let submitted: Vec<&str> = parsed.iter().map(|(t, _)| t.as_str()).collect();
 
     let mut items: Vec<PlanItem> = Vec::new();
     // 1. 消失的旧项 → Completed（保持旧顺序排在前；已 Completed 的不重复追加）。
     for old in &previous_items {
-        if old.status != PlanStatus::Completed && !texts.contains(&old.text) {
+        if old.status != PlanStatus::Completed && !submitted.contains(&old.text.as_str()) {
             items.push(PlanItem {
                 text: old.text.clone(),
                 status: PlanStatus::Completed,
             });
         }
     }
-    // 2. 提交项：重新提交的旧项保持旧状态（Completed 是终态）；新项 → InProgress 候选。
-    for text in texts {
-        let status = match previous_items.iter().find(|item| item.text == text) {
-            Some(old) => old.status,
-            None => PlanStatus::InProgress,
+    // 2. 提交项：显式状态优先；否则重新提交的旧项保持旧状态；新项 → InProgress 候选。
+    for (text, explicit) in parsed {
+        let status = match explicit {
+            Some(status) => status,
+            None => {
+                let old_idx = previous_texts.iter().position(|t| *t == text);
+                match old_idx {
+                    Some(i) => previous_items[i].status,
+                    None => PlanStatus::InProgress,
+                }
+            }
         };
         items.push(PlanItem { text, status });
     }
-    // 3. 唯一 InProgress：第一个 InProgress 之外的其余降级 Pending；
-    //    若没有 InProgress（全部 Completed 或重新激活场景），取第一个 Pending。
-    let mut assigned = false;
-    for item in &mut items {
-        if item.status == PlanStatus::InProgress {
-            if assigned {
-                item.status = PlanStatus::Pending;
-            } else {
-                assigned = true;
+    // 3. 唯一 InProgress：显式/推断后若有不完全项，必须且只能有一个 InProgress。
+    //    多个 InProgress → 第一个保留，其余降 Pending；无 InProgress → 第一个
+    //    Pending 升 InProgress（显式全部 Completed 时无未完成项，跳过）。
+    let has_unfinished = items.iter().any(|i| i.status != PlanStatus::Completed);
+    if has_unfinished {
+        let mut assigned = false;
+        for item in &mut items {
+            if item.status == PlanStatus::InProgress {
+                if assigned {
+                    item.status = PlanStatus::Pending;
+                } else {
+                    assigned = true;
+                }
             }
         }
-    }
-    if !assigned
-        && let Some(first) = items
-            .iter_mut()
-            .find(|item| item.status == PlanStatus::Pending)
-    {
-        first.status = PlanStatus::InProgress;
+        if !assigned
+            && let Some(first) = items
+                .iter_mut()
+                .find(|item| item.status == PlanStatus::Pending)
+        {
+            first.status = PlanStatus::InProgress;
+        }
     }
     // 4. 最终计划（含 Completed）也不得超过上限。
     if items.len() > MAX_PLAN_ITEMS {
@@ -303,7 +346,7 @@ mod tests {
         let previous = build_plan(
             &UpdatePlanArgs {
                 explanation: None,
-                items: vec!["a".into(), "b".into()],
+                items: vec![PlanItemArg::Text("a".into()), PlanItemArg::Text("b".into())],
             },
             None,
         )
@@ -316,7 +359,7 @@ mod tests {
         let next = build_plan(
             &UpdatePlanArgs {
                 explanation: None,
-                items: vec!["b".into()],
+                items: vec![PlanItemArg::Text("b".into())],
             },
             Some(&previous),
         )
@@ -337,7 +380,11 @@ mod tests {
         let plan = build_plan(
             &UpdatePlanArgs {
                 explanation: None,
-                items: vec!["a".into(), "b".into(), "c".into()],
+                items: vec![
+                    PlanItemArg::Text("a".into()),
+                    PlanItemArg::Text("b".into()),
+                    PlanItemArg::Text("c".into()),
+                ],
             },
             None,
         )
@@ -346,7 +393,7 @@ mod tests {
         let next = build_plan(
             &UpdatePlanArgs {
                 explanation: None,
-                items: vec!["b".into(), "c".into()],
+                items: vec![PlanItemArg::Text("b".into()), PlanItemArg::Text("c".into())],
             },
             Some(&plan),
         )
@@ -362,7 +409,7 @@ mod tests {
         let error = build_plan(
             &UpdatePlanArgs {
                 explanation: None,
-                items: vec!["x".repeat(MAX_PLAN_ITEM_BYTES + 1)],
+                items: vec![PlanItemArg::Text("x".repeat(MAX_PLAN_ITEM_BYTES + 1))],
             },
             None,
         )
@@ -372,11 +419,92 @@ mod tests {
         let error = build_plan(
             &UpdatePlanArgs {
                 explanation: Some("x".repeat(MAX_PLAN_EXPLANATION_BYTES + 1)),
-                items: vec!["step".into()],
+                items: vec![PlanItemArg::Text("step".into())],
             },
             None,
         )
         .unwrap_err();
         assert!(matches!(error, PlanError::ExplanationTooLong { .. }));
+    }
+
+    /// §用户诉求：显式 `{text, status}` 让「全部完成」可表达——此前隐式推断
+    /// 只有「清空计划」或「全部 InProgress」两个极端。
+    #[test]
+    fn explicit_completed_expresses_all_done() {
+        let plan = build_plan(
+            &UpdatePlanArgs {
+                explanation: None,
+                items: vec![
+                    PlanItemArg::Full {
+                        text: "a".into(),
+                        status: Some(PlanStatus::Completed),
+                    },
+                    PlanItemArg::Full {
+                        text: "b".into(),
+                        status: Some(PlanStatus::Completed),
+                    },
+                ],
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.items.len(), 2);
+        assert!(plan.items.iter().all(|i| i.status == PlanStatus::Completed));
+        // 全部完成 → 无不完全项 → validate_invariants 不再要求 InProgress。
+        validate_invariants(&plan).unwrap();
+    }
+
+    /// §用户诉求：显式 InProgress 与 Pending 混用，仍归一化为唯一 InProgress。
+    #[test]
+    fn explicit_statuses_keep_single_in_progress() {
+        let plan = build_plan(
+            &UpdatePlanArgs {
+                explanation: None,
+                items: vec![
+                    PlanItemArg::Full {
+                        text: "a".into(),
+                        status: Some(PlanStatus::InProgress),
+                    },
+                    PlanItemArg::Full {
+                        text: "b".into(),
+                        status: Some(PlanStatus::InProgress),
+                    },
+                ],
+            },
+            None,
+        )
+        .unwrap();
+        // 多个显式 InProgress → 第一个保留，其余降 Pending。
+        let in_progress = plan
+            .items
+            .iter()
+            .filter(|i| i.status == PlanStatus::InProgress)
+            .count();
+        assert_eq!(in_progress, 1, "必须归一化为唯一 InProgress");
+        assert_eq!(plan.items[0].status, PlanStatus::InProgress);
+        assert_eq!(plan.items[1].status, PlanStatus::Pending);
+        validate_invariants(&plan).unwrap();
+    }
+
+    /// §用户诉求：纯文本与显式混用——显式 Completed 保持，纯文本走推断。
+    #[test]
+    fn mixed_text_and_explicit_status() {
+        let plan = build_plan(
+            &UpdatePlanArgs {
+                explanation: None,
+                items: vec![
+                    PlanItemArg::Full {
+                        text: "done".into(),
+                        status: Some(PlanStatus::Completed),
+                    },
+                    PlanItemArg::Text("next".into()),
+                ],
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.items[0].status, PlanStatus::Completed);
+        assert_eq!(plan.items[1].status, PlanStatus::InProgress);
+        validate_invariants(&plan).unwrap();
     }
 }

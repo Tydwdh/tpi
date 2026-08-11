@@ -26,6 +26,9 @@ pub enum UiEvent {
     SelectionUpdate(TextPosition),
     /// 释放鼠标结束选择（选区保留）。
     SelectionEnd,
+    /// 清除当前选区（§用户诉求：新按压开始时清除旧选区——点击其他地方
+    /// 即可取消选中；由交互层在 Down 时发出）。
+    SelectionClear,
     /// 鼠标点击命中工具卡片（Renderer hit-test 后）。
     ClickTool(String),
     /// 鼠标点击命中折叠的 reasoning 行（Renderer hit-test 后；EntryId §4.1）。

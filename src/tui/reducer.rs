@@ -562,6 +562,11 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             state.view.selection_end();
             Vec::new()
         }
+        // §用户诉求：新按压清除旧选区（点击其他地方取消选中）。
+        UiEvent::SelectionClear => {
+            state.view.selection_clear();
+            Vec::new()
+        }
         UiEvent::ClickTool(id) => {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new(); // 弹层打开时鼠标点击不得打开后台 overlay

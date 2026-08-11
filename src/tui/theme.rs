@@ -57,7 +57,31 @@ impl Theme {
             "dark" => Self::dark(),
             "light" => Self::light(),
             "opencode" => Self::opencode(),
+            "onedarkpro" | "onedark" => Self::onedarkpro(),
             _ => Self::omp(),
+        }
+    }
+
+    /// OneDarkPro 配色（§用户诉求）：bg #282c34、fg #abb2bf、
+    /// red #e06c75、green #98c379、yellow #e5c07b、blue #61afef、
+    /// purple #c678dd、cyan #56b6c2、orange #d19a66。
+    /// 映射：primary=blue（强调/链接）、accent=purple（思考/竖线）、
+    /// info=cyan、success=green、warning=yellow、error=red、
+    /// panel=#2c313a（bg 提亮一档的面）、border=#3e4451（注释灰）。
+    pub fn onedarkpro() -> Self {
+        Self {
+            primary: Color::Rgb(0x61, 0xaf, 0xef), // blue
+            accent: Color::Rgb(0xc6, 0x78, 0xdd),  // purple
+            info: Color::Rgb(0x56, 0xb6, 0xc2),    // cyan
+            success: Color::Rgb(0x98, 0xc3, 0x79), // green
+            warning: Color::Rgb(0xe5, 0xc0, 0x7b), // yellow
+            error: Color::Rgb(0xe0, 0x6c, 0x75),   // red
+            text: Color::Rgb(0xab, 0xb2, 0xbf),    // fg
+            muted: Color::Rgb(0x7f, 0x84, 0x8e),   // 注释灰
+            panel: Color::Rgb(0x2c, 0x31, 0x3a),   // bg 提亮一档
+            border: Color::Rgb(0x3e, 0x44, 0x51),  // 边框灰
+            surface: Color::Rgb(0x21, 0x25, 0x2b), // 略暗于 bg
+            surface_subtle: Color::Rgb(0x31, 0x36, 0x3f),
         }
     }
 
@@ -143,6 +167,7 @@ mod tests {
             Theme::dark(),
             Theme::light(),
             Theme::opencode(),
+            Theme::onedarkpro(),
         ] {
             assert_ne!(
                 theme.panel, theme.border,
@@ -150,6 +175,19 @@ mod tests {
             );
             assert_ne!(theme.panel, theme.text, "panel 底不得与文字同色");
         }
+    }
+
+    /// §用户诉求：onedarkpro 按 OneDarkPro 配色解析；`onedark` 别名同样生效。
+    #[test]
+    fn onedarkpro_palette_and_alias() {
+        assert_eq!(Theme::named("onedarkpro"), Theme::onedarkpro());
+        assert_eq!(Theme::named("onedark"), Theme::onedarkpro());
+        let t = Theme::onedarkpro();
+        assert_eq!(t.primary, Color::Rgb(0x61, 0xaf, 0xef)); // blue
+        assert_eq!(t.success, Color::Rgb(0x98, 0xc3, 0x79)); // green
+        assert_eq!(t.error, Color::Rgb(0xe0, 0x6c, 0x75)); // red
+        assert_eq!(t.text, Color::Rgb(0xab, 0xb2, 0xbf));
+        assert_eq!(t.panel, Color::Rgb(0x2c, 0x31, 0x3a));
     }
 
     /// §16.3 调色板与设计文档逐项一致（主题是契约的一部分）。

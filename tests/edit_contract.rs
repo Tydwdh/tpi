@@ -95,3 +95,63 @@ fn write_new_file_cleans_up_temp() {
         "write 后目录残留临时文件: {leftovers:?}"
     );
 }
+
+/// §用户诉求：连续 edit 无需重新 read——第一次 edit 返回的 current_revision
+/// 可直接用于第二次 edit（apply_edit 从磁盘重读 digest 匹配）。
+#[test]
+fn consecutive_edits_use_current_revision_without_read() {
+    use tpi::tool::edit::{Replacement, apply_edit, commit_edit, prepare_commit};
+    let dir = tempfile::tempdir().unwrap();
+    let path = camino::Utf8PathBuf::from_path_buf(dir.path().join("c.rs")).unwrap();
+    std::fs::write(path.as_std_path(), "fn main() { let x = 1; }\n").unwrap();
+
+    // 第一次 edit：需要先读取得 revision（read 的 digest）。
+    let initial = std::fs::read_to_string(path.as_std_path()).unwrap();
+    let rev1 = revision_of(initial.as_bytes());
+    let r1 = apply_edit(
+        &path,
+        &rev1,
+        &[Replacement {
+            old_text: "let x = 1".into(),
+            new_text: "let x = 2".into(),
+        }],
+    )
+    .unwrap();
+    commit_edit(&r1, &path, &prepare_commit(&path)).unwrap();
+    // 第一次 edit 输出 current_revision = 提交后文件 digest。
+    let rev2 = r1.current_revision.clone();
+    assert_ne!(rev1, rev2, "edit 后 revision 必须变化");
+
+    // 第二次 edit：直接传第一次的 current_revision，不重新 read。
+    let r2 = apply_edit(
+        &path,
+        &rev2,
+        &[Replacement {
+            old_text: "let x = 2".into(),
+            new_text: "let x = 3".into(),
+        }],
+    )
+    .unwrap();
+    commit_edit(&r2, &path, &prepare_commit(&path)).unwrap();
+    assert_eq!(r2.applied, 1);
+    let final_text = std::fs::read_to_string(path.as_std_path()).unwrap();
+    assert!(
+        final_text.contains("let x = 3"),
+        "第二次 edit 生效: {final_text}"
+    );
+
+    // 旧 revision 会 stale（证明必须用最新 current_revision，而非磁盘快照外旧值）。
+    let stale = apply_edit(
+        &path,
+        &rev1,
+        &[Replacement {
+            old_text: "x = 3".into(),
+            new_text: "x = 4".into(),
+        }],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(stale, tpi::tool::edit::EditError::StaleRevision { .. }),
+        "旧 revision 必须 stale: {stale:?}"
+    );
+}

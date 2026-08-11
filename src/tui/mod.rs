@@ -1424,14 +1424,24 @@ fn build_transcript_text(
                     }
                 }
                 // §用户诉求：thinking 与工具统一折叠——未展开显示前 N 行 +
-                // "… 点击展开"，展开显示全文（点击行切换）。
-                // §美化：thinking 卡片化——与工具卡片统一视觉语言
-                // （panel 底 + 左竖线 + 整卡可点展开/折叠）。折叠态单行
-                // 摘要；展开态逐行显示；折叠提示行带 panel 底。
+                // "… 点击展开"，展开显示全文（点击行切换）。N = view.collapsed_lines
+                // （[ui] collapsed_lines；0 = 只显示主行摘要）。
+                // §用户诉求：thinking 用 markdown 渲染（代码块高亮，同 assistant）；
+                // §美化：thinking 卡片化——panel 底 + 左竖线 + 整卡可点展开/折叠。
                 LineKind::Reasoning => {
-                    const THINKING_COLLAPSED: usize = 6;
-                    let all_lines: Vec<&str> = line.text.split('\n').collect();
-                    let overflow = all_lines.len() > THINKING_COLLAPSED;
+                    let collapsed = view.collapsed_lines;
+                    // md 渲染预算：扣 rail（┃ 2 格）+ 首行前缀（◆ 思考 6 格）。
+                    let (rendered, _links) = cached_markdown(
+                        cache,
+                        line.version,
+                        &line.text,
+                        theme,
+                        width.saturating_sub(8).max(10),
+                    );
+                    let total_lines = rendered.len();
+                    // 折叠态 = 未展开 且 (正文超折叠线 或 折叠线为 0)。
+                    // 0 = 折叠态不显示任何正文行，只显示主行摘要。
+                    let overflow = collapsed == 0 || total_lines > collapsed;
                     let expanded = view.is_reasoning_expanded(entry_id);
                     // 竖线 + 面板背景（与工具卡片主行同款 rail_style 结构）。
                     let rail_style = Style::default()
@@ -1440,7 +1450,7 @@ fn build_transcript_text(
                         .add_modifier(Modifier::BOLD);
                     if overflow && !expanded {
                         // 折叠态：单行卡片「◆ 思考 · 共 N 行 · 点击展开」。
-                        let hint = format!("◆ 思考 · 共 {} 行 · 点击展开", all_lines.len());
+                        let hint = format!("◆ 思考 · 共 {total_lines} 行 · 点击展开");
                         push_hit(
                             &mut out,
                             &mut hits,
@@ -1461,10 +1471,32 @@ fn build_transcript_text(
                             Vec::new(),
                         );
                     } else {
-                        // 展开态 / 未溢出：逐行显示（首行带 ◆ 图标，续行对齐）。
+                        // 展开态 / 未溢出：md 渲染行逐行显示（首行带 ◆ 图标，续行对齐）。
                         let clickable = overflow; // 只有溢出才可点击折叠
-                        for (i, s) in all_lines.iter().enumerate() {
-                            let prefix = if i == 0 { "◆ 思考 " } else { "      " };
+                        for (i, rendered_line) in rendered.iter().enumerate() {
+                            // §用户诉求：续行 4 格对齐（原 6/8 格太宽）。
+                            let prefix = if i == 0 { "◆ 思考 " } else { "    " };
+                            let mut spans = vec![Span::styled("┃ ", rail_style)];
+                            spans.push(Span::styled(
+                                prefix,
+                                Style::default()
+                                    .fg(theme.muted)
+                                    .bg(theme.panel)
+                                    .add_modifier(Modifier::ITALIC),
+                            ));
+                            // md 行 span 烙 panel 底（与卡片面一致；保留 inline code 底色）。
+                            for s in &rendered_line.spans {
+                                let mut style = s.style;
+                                if style.bg.is_none() {
+                                    style = style.bg(theme.panel);
+                                }
+                                spans.push(Span::styled(s.content.clone(), style));
+                            }
+                            let semantic_text = rendered_line
+                                .spans
+                                .iter()
+                                .map(|s| s.content.as_ref())
+                                .collect::<String>();
                             let hit = if clickable {
                                 full_line_hit(HitTarget::Reasoning(entry_id), width as u16)
                             } else {
@@ -1474,18 +1506,9 @@ fn build_transcript_text(
                                 &mut out,
                                 &mut hits,
                                 &mut semantic,
-                                Line::from(vec![
-                                    Span::styled("┃ ", rail_style),
-                                    Span::styled(
-                                        format!("{prefix}{s}"),
-                                        Style::default()
-                                            .fg(theme.muted)
-                                            .bg(theme.panel)
-                                            .add_modifier(Modifier::ITALIC),
-                                    ),
-                                ]),
+                                Line::from(spans),
                                 hit,
-                                s.to_string(),
+                                semantic_text,
                                 Vec::new(),
                             );
                         }
@@ -1667,22 +1690,43 @@ fn build_live_group(
             .bg(theme.panel)
             .add_modifier(Modifier::BOLD);
         if view.reasoning_visible {
-            for s in msg.text.split('\n') {
-                let line = Line::from(vec![
-                    Span::styled("┃ ", rail_style),
-                    Span::styled(
-                        format!("◆ 思考 {s}"),
-                        Style::default()
-                            .fg(theme.muted)
-                            .bg(theme.panel)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                ]);
+            // §用户诉求：live thinking 也用 markdown 渲染（代码块高亮同 assistant）。
+            let (rendered, _links) = cached_markdown(
+                cache,
+                msg.version,
+                &msg.text,
+                theme,
+                width.saturating_sub(8).max(10),
+            );
+            for (i, rendered_line) in rendered.iter().enumerate() {
+                // §用户诉求：续行不再重复「◆ 思考」——首行带图标，续行 4 格对齐。
+                let prefix = if i == 0 { "◆ 思考 " } else { "    " };
+                let mut spans = vec![Span::styled("┃ ", rail_style)];
+                spans.push(Span::styled(
+                    prefix,
+                    Style::default()
+                        .fg(theme.muted)
+                        .bg(theme.panel)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+                for s in &rendered_line.spans {
+                    let mut style = s.style;
+                    if style.bg.is_none() {
+                        style = style.bg(theme.panel);
+                    }
+                    spans.push(Span::styled(s.content.clone(), style));
+                }
+                let semantic_text = rendered_line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>();
+                let line = Line::from(spans);
                 let rail = line.spans.first().cloned();
                 out.push(line);
                 hits.push(None);
                 semantic.push(SemanticLine {
-                    text: s.to_string(),
+                    text: semantic_text,
                     decor_cells: 10, // "┃ ◆ 思考 " 前缀
                     links: Vec::new(),
                     rail,
@@ -2083,6 +2127,8 @@ fn draw_scrollbar(
     total_rows: usize,
 ) {
     let area_h = rect.height.max(1) as usize;
+    // §用户诉求：滚动条加粗——thumb 用实心块（█ 比 ▐ 更粗更醒目），
+    // track 用细竖线。
     let mut glyphs: Vec<&'static str> = vec!["│"; area_h];
     if total_rows > area_h {
         let thumb_h =
@@ -2098,13 +2144,13 @@ fn draw_scrollbar(
             .take((top + thumb_h).min(area_h))
             .skip(top)
         {
-            *glyph = "▐";
+            *glyph = "█";
         }
     }
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(area_h);
     for g in glyphs {
-        let style = if g == "▐" {
-            Style::default().fg(theme.info)
+        let style = if g == "█" {
+            Style::default().fg(theme.info).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
         };
@@ -2117,43 +2163,54 @@ fn draw_scrollbar(
 /// 支持多行（Alt+Enter）；行数与光标位置按 display width 折行计算。
 /// §美化：输入区面板化——`❯ ` prompt 带 panel 背景 + 整行补空格，
 /// 输入区成为独立盒子（opencode Prompt 盒子；光标计算不受 bg 影响）。
+/// 输入区（§16.2：硬件 cursor 放在真实输入位置，优先保证中文 IME）。
+///
+/// 支持多行（Alt+Enter）；行数与光标位置按 display width 折行计算。
+/// §修复：折行必须「首行 width-prompt、续行 width」——此前 draw_input 按 width
+/// 折含 prompt 整行（首行截 2）、input_cursor_cell 按 width-2 折全部（续行多折 2），
+/// 视觉与光标各偏一档，多行后累积偏移（3 行偏 1、4 行偏 2）。两者共用 input_wrap。
 fn draw_input(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: theme::Theme) {
-    let line = Line::from(vec![
-        Span::styled(
-            "❯ ",
-            Style::default()
-                .fg(theme.accent)
-                .bg(theme.panel)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(view.input.clone(), Style::default().bg(theme.panel)),
-    ]);
-    let mut wrapped = wrap_lines(vec![line], area.width as usize);
-    // 整行补空格到满宽（面板底连续）。
-    for wrapped_line in wrapped.iter_mut() {
-        let cur = unicode_width::UnicodeWidthStr::width(
-            wrapped_line
-                .spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-                .as_str(),
-        );
-        let width = area.width as usize;
-        if cur < width {
-            let pad = width - cur;
-            wrapped_line.spans.push(Span::styled(
-                " ".repeat(pad),
+    const PROMPT_WIDTH: u16 = 2; // "❯ "
+    let wrapped = input_wrap(&view.input, area.width as usize, PROMPT_WIDTH as usize);
+    let prompt = Span::styled(
+        "❯ ",
+        Style::default()
+            .fg(theme.accent)
+            .bg(theme.panel)
+            .add_modifier(Modifier::BOLD),
+    );
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(wrapped.len());
+    for (i, text) in wrapped.iter().enumerate() {
+        let mut spans = if i == 0 {
+            vec![
+                prompt.clone(),
+                Span::styled(text.clone(), Style::default().bg(theme.panel)),
+            ]
+        } else {
+            vec![Span::styled(text.clone(), Style::default().bg(theme.panel))]
+        };
+        // 整行补空格到满宽（面板底连续）。
+        let cur: usize = spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+            .chars()
+            .map(crate::tui::text::char_cell_width)
+            .sum();
+        if cur < area.width as usize {
+            spans.push(Span::styled(
+                " ".repeat(area.width as usize - cur),
                 Style::default().bg(theme.panel),
             ));
         }
+        lines.push(Line::from(spans));
     }
-    let rows = wrapped.len().max(1) as u16;
+    let rows = lines.len().max(1) as u16;
     let (cursor_row, cursor_col) = input_cursor_cell(&view.input, view.input_cursor, area.width);
     // BUG-008：滚动基准必须是可见区域高度（area.height），而不是全部折行行数
     // （rows）——否则长输入（>8 行）时光标会被放到输入区之外、不可见。
     let scroll_rows = input_scroll_offset(cursor_row, rows, area.height);
-    frame.render_widget(Paragraph::new(wrapped).scroll((scroll_rows, 0)), area);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll_rows, 0)), area);
     let y = area.y + (cursor_row - scroll_rows);
     let x = area.x + cursor_col;
     // 光标可见性：ratatui 每帧 set_cursor_position 都会 show_cursor，导致模型输出期间光标一直闪烁。
@@ -2215,16 +2272,48 @@ fn input_cursor_cell(input: &str, cursor: usize, width: u16) -> (u16, u16) {
         // 空输入：光标必须停在 prompt 右侧（修复“首次打开光标在 ❯ 左边”）。
         return (0, PROMPT_WIDTH);
     }
-    let budget = width.saturating_sub(PROMPT_WIDTH).max(1) as usize;
-    // 光标前的文本按 `\n` + 宽度折行 → 折成逻辑行；定位光标所在逻辑行。
-    let before = &input[..cursor];
-    let wrapped_before = wrap_lines(vec![Line::from(Span::raw(before.to_string()))], budget);
-    // 光标后的内容决定光标所在行的列：该行已折行的最后一行宽度 = 光标列。
-    let row = wrapped_before.len().saturating_sub(1) as u16;
-    let col = wrapped_before.last().map(|l| l.width()).unwrap_or(0) as u16;
-    // 第 0 行含 prompt；续行从内容起点（无 prompt）。
-    let col = if row == 0 { PROMPT_WIDTH + col } else { col };
+    // 首行预算 width-prompt（含 ❯ ），续行预算 width（无 prompt）——
+    // 与 draw_input 同一折行（§修复：视觉与光标不再各自偏移）。
+    let rows = input_wrap(&input[..cursor], width as usize, PROMPT_WIDTH as usize);
+    let row = rows.len().saturating_sub(1) as u16;
+    let last_w = rows
+        .last()
+        .map(|s| s.chars().map(crate::tui::text::char_cell_width).sum())
+        .unwrap_or(0) as u16;
+    let col = if row == 0 {
+        PROMPT_WIDTH + last_w
+    } else {
+        last_w
+    };
     (row, col)
+}
+
+/// 输入文本按 display width 折行（§修复）：首行可用 `width - prompt_w`
+/// （prompt 占位），续行可用 `width`。返回每行纯文本（不含 prompt）。
+/// 显式 `\n` 也换行（多行输入/粘贴）。
+fn input_wrap(text: &str, width: usize, prompt_w: usize) -> Vec<String> {
+    let width = width.max(prompt_w + 1);
+    let budget = |row: usize| if row == 0 { width - prompt_w } else { width };
+    let mut rows: Vec<String> = vec![String::new()];
+    let mut row = 0usize;
+    let mut w = 0usize;
+    for ch in text.chars() {
+        if ch == '\n' {
+            rows.push(String::new());
+            row += 1;
+            w = 0;
+            continue;
+        }
+        let cw = crate::tui::text::char_cell_width(ch);
+        if w + cw > budget(row) && w > 0 {
+            rows.push(String::new());
+            row += 1;
+            w = 0;
+        }
+        rows[row].push(ch);
+        w += cw;
+    }
+    rows
 }
 
 /// 详情 Overlay（整改 B）：带边框对话框，展示 command/output/status；
@@ -2409,6 +2498,13 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
         return;
     };
     let total = menu.items.len();
+    // §防御：空菜单（会话被删光/过滤后）直接不画——selected 已 clamp，
+    // 避免窗口计算对 total=0 越界导致屏幕空白。
+    if total == 0 {
+        return;
+    }
+    // §防御：selected 可能因 items 刷新指向旧索引——clamp 到有效范围。
+    let selected = menu.selected.min(total - 1);
     let visible = (rect.height as usize).max(1);
     // 长菜单（如 /sessions 多会话）：可视窗口跟随选中项，上下用 … 表示有更多；
     // 否则选中项超出可视区时用户看不到当前选择。
@@ -2418,7 +2514,7 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
         .saturating_sub(usize::from(top_ellipsis) + usize::from(bottom_ellipsis))
         .max(1);
     let start = if total > window_rows {
-        (menu.selected.saturating_sub(window_rows / 2)).min(total - window_rows)
+        (selected.saturating_sub(window_rows / 2)).min(total - window_rows)
     } else {
         0
     };
@@ -2428,7 +2524,7 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
         lines.push(Line::styled("…", Style::default().fg(theme.muted)));
     }
     for (i, (name, desc)) in menu.items.iter().enumerate().skip(start).take(end - start) {
-        let selected = i == menu.selected;
+        let selected = i == selected;
         let (glyph, style) = if selected {
             (
                 "▸",
@@ -3027,35 +3123,63 @@ mod tests {
         );
     }
 
-    /// §用户诉求：unified diff 只改文字色（+ 绿字 / - 红字 / @@ 主色），
-    /// 不改背景——深色面板底上的红绿文字，避免整行红绿底刺眼。
+    /// §用户诉求：unified diff 渲染为用户友好形式——文件头隐藏、hunk 头变
+    /// 分隔行、内容行带真实行号；`+` 绿、`-` 红（只改前景色）。
     #[test]
     fn diff_lines_render_with_add_remove_colors() {
         let theme = theme::Theme::omp();
         let diff = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,4 @@\n fn main() {\n-    let x = 1;\n+    let x = 2;\n }";
         let lines = render_diff_lines(diff, theme);
-        // 行数 = diff 行数（7 行：--- +++ @@ 上下文 - + 上下文）。
-        assert_eq!(lines.len(), 7, "每行一个 Line: {lines:?}");
-        // - 行 → error 前景（红字），无背景。
+        // 文件头（---/+++）隐藏；hunk 头 → 1 行分隔；内容 4 行 → 共 5 行。
+        assert_eq!(lines.len(), 5, "文件头隐藏、@@ 变分隔行: {lines:?}");
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            !text.contains("--- a/") && !text.contains("+++ b/"),
+            "文件头必须隐藏: {text:?}"
+        );
+        assert!(text.contains("⋯"), "@@ 渲染为分隔行: {text:?}");
+        // - 行：行号 + 红字（span 级 error fg），无背景。
         let minus = lines
             .iter()
-            .find(|l| l.spans[0].content.starts_with("-    let x = 1;"))
+            .find(|l| l.spans.iter().any(|s| s.content.contains("let x = 1")))
             .expect("找到 - 行");
-        assert_eq!(minus.style.fg, Some(theme.error));
-        assert_eq!(minus.style.bg, None, "diff 行不带背景（只改前景色）");
-        // + 行 → success 前景（绿字），无背景。
+        assert!(
+            minus.spans.iter().any(|s| s.style.fg == Some(theme.error)),
+            "- 行红字: {minus:?}"
+        );
+        assert!(
+            minus.spans.iter().all(|s| s.style.bg.is_none()),
+            "diff 行不带背景（只改前景色）"
+        );
+        // + 行：行号 + 绿字（span 级 success fg），无背景。
         let plus = lines
             .iter()
-            .find(|l| l.spans[0].content.starts_with("+    let x = 2;"))
+            .find(|l| l.spans.iter().any(|s| s.content.contains("let x = 2")))
             .expect("找到 + 行");
-        assert_eq!(plus.style.fg, Some(theme.success));
-        assert_eq!(plus.style.bg, None, "diff 行不带背景（只改前景色）");
-        // @@ 行 → primary 色。
-        let hunk = lines
+        assert!(
+            plus.spans.iter().any(|s| s.style.fg == Some(theme.success)),
+            "+ 行绿字: {plus:?}"
+        );
+        assert!(
+            plus.spans.iter().all(|s| s.style.bg.is_none()),
+            "diff 行不带背景（只改前景色）"
+        );
+        // 行号：- 用旧行号 1，+ 用新行号 2。
+        let minus_no = minus
+            .spans
             .iter()
-            .find(|l| l.spans[0].content.starts_with("@@"))
-            .expect("找到 @@ 行");
-        assert_eq!(hunk.style.fg, Some(theme.primary));
+            .find(|s| s.content.trim().chars().all(|c| c.is_ascii_digit()))
+            .expect("- 行有行号 span");
+        assert_eq!(minus_no.content.trim(), "1", "- 行显示旧行号");
+        let plus_no = plus
+            .spans
+            .iter()
+            .find(|s| s.content.trim().chars().all(|c| c.is_ascii_digit()))
+            .expect("+ 行有行号 span");
+        assert_eq!(plus_no.content.trim(), "2", "+ 行显示新行号");
     }
 
     /// §用户诉求：edit/write 卡片**未展开**时 diff 也必须显示（默认可见）。
@@ -3074,10 +3198,13 @@ mod tests {
             },
             output: Some("status: succeeded\ntool: edit\npath: src/lib.rs\n".into()),
             diff: Some(
-                "--- a/src/lib.rs\n+++ b/src/lib.rs\n-    let x = 1;\n+    let x = 2;\n".into(),
+                "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-    let x = 1;\n+    let x = 2;\n".into(),
             ),
             output_truncated: false,
             expanded: false, // 未展开——diff 仍应显示
+            line_number_start: None,
+                    collapsed_lines: 10,
+                    started_at_ms: None,
             tail: None,
         };
         let lines = tool_card_lines(&card, 0, theme, 100);
@@ -3089,19 +3216,26 @@ mod tests {
             text.contains("let x = 1") && text.contains("let x = 2"),
             "未展开时 diff 必须显示: {text:?}"
         );
-        // diff 行只改前景色（红/绿字），面板底统一由卡片承担。
+        // diff 行只改前景色（红/绿字）；红绿背景不出现（面板底统一由卡片承担，
+        // Line 级 style 无 bg）。
         let minus = lines
             .iter()
             .find(|l| l.spans.iter().any(|s| s.content.contains("let x = 1")))
             .expect("找到 - 行");
-        assert_eq!(minus.style.fg, Some(theme.error), "删除行红字");
-        assert_eq!(minus.style.bg, None, "diff 行不带红底");
+        assert!(
+            minus.spans.iter().any(|s| s.style.fg == Some(theme.error)),
+            "删除行红字: {minus:?}"
+        );
+        assert_eq!(minus.style.bg, None, "diff 行不带红底（Line 级）");
         let plus = lines
             .iter()
             .find(|l| l.spans.iter().any(|s| s.content.contains("let x = 2")))
             .expect("找到 + 行");
-        assert_eq!(plus.style.fg, Some(theme.success), "新增行绿字");
-        assert_eq!(plus.style.bg, None, "diff 行不带绿底");
+        assert!(
+            plus.spans.iter().any(|s| s.style.fg == Some(theme.success)),
+            "新增行绿字: {plus:?}"
+        );
+        assert_eq!(plus.style.bg, None, "diff 行不带绿底（Line 级）");
     }
 
     /// §用户诉求：diff 自动展开但限长——未展开时只显示前 N 行 + 折叠提示，
@@ -3109,8 +3243,8 @@ mod tests {
     #[test]
     fn tool_card_diff_limits_length_when_collapsed() {
         let theme = theme::Theme::omp();
-        // 30 行 diff。
-        let mut diff = String::new();
+        // 30 行 diff（带 hunk 头，模拟 unified_diff 真实格式）。
+        let mut diff = "@@ -1,30 +1,30 @@\n".to_string();
         for i in 0..30 {
             diff.push_str(&format!("+line {i}\n"));
         }
@@ -3128,6 +3262,9 @@ mod tests {
             diff: Some(diff.clone()),
             output_truncated: false,
             expanded,
+            line_number_start: None,
+            collapsed_lines: 10,
+            started_at_ms: None,
             tail: None,
         };
         // 未展开：只显示 12 行 + 提示。
@@ -3145,6 +3282,25 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(text.contains("点击展开"), "折叠态显示展开提示: {text}");
+        // §修复：折叠提示行每个 span 烙 panel 底（wrap 只保留 span 级 bg，
+        // Line 级会丢——提示文字不得落到终端底色）。
+        let hint_line = collapsed
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("点击展开")))
+            .expect("找到提示行");
+        assert!(
+            hint_line
+                .spans
+                .iter()
+                .filter(|s| !s.content.is_empty())
+                .all(|s| s.style.bg == Some(theme.panel)),
+            "提示行每段都带 panel 底: {:?}",
+            hint_line
+                .spans
+                .iter()
+                .map(|s| (s.content.as_ref(), s.style.bg))
+                .collect::<Vec<_>>()
+        );
         // 展开：显示全部 30 行。
         let expanded = tool_card_lines(&mk(true), 0, theme, 100);
         let expanded_count = expanded
@@ -3167,6 +3323,9 @@ mod tests {
             diff: None,
             output_truncated: false,
             expanded: false,
+            line_number_start: None,
+            collapsed_lines: 10,
+            started_at_ms: None,
             tail: None,
         };
         let lines = tool_card_lines(&card, 0, theme, 100);
@@ -3197,6 +3356,9 @@ mod tests {
             diff: None,
             output_truncated: false,
             expanded: false,
+            line_number_start: None,
+            collapsed_lines: 10,
+            started_at_ms: None,
             tail: Some("exit_code: 1".into()),
         };
         let lines = tool_card_lines(&card, 0, theme, 100);
@@ -3294,6 +3456,9 @@ mod tests {
             diff: None,
             output_truncated: false,
             expanded: false,
+            line_number_start: None,
+            collapsed_lines: 10,
+            started_at_ms: None,
             tail: None,
         };
         let f0 = tool_card_lines(&card, 0, theme, 100).remove(0);
@@ -3320,6 +3485,9 @@ mod tests {
             diff: None,
             output_truncated: false,
             expanded: false,
+            line_number_start: None,
+                    collapsed_lines: 10,
+                    started_at_ms: None,
             tail: None,
         };
         let lines = tool_card_lines(&card, 0, theme, 100);
@@ -3353,6 +3521,9 @@ mod tests {
             diff: None,
             output_truncated: false,
             expanded: true,
+            line_number_start: None,
+            collapsed_lines: 10,
+            started_at_ms: None,
             tail: None,
         };
         let lines = tool_card_lines(&card, 0, theme, 100);
@@ -3365,6 +3536,44 @@ mod tests {
             "展开显示全部输出: {text}"
         );
         assert!(text.contains("✓"), "成功状态图标");
+    }
+
+    /// §用户诉求：read 卡片正文显示真实文件行号（从 line_number_start 递增）。
+    #[test]
+    fn read_card_shows_real_line_numbers() {
+        let theme = theme::Theme::omp();
+        let card = ToolCard {
+            id: "c".into(),
+            name: "read".into(),
+            target: Some("src/lib.rs".into()),
+            command: None,
+            state: ToolCardState::Done {
+                status: crate::tool::outcome::ToolStatus::Succeeded,
+                duration_ms: 5,
+                exit_code: Some(0),
+            },
+            output: Some("fn a() {}\nfn b() {}\n".into()),
+            diff: None,
+            output_truncated: false,
+            expanded: true,
+            line_number_start: Some(201),
+            collapsed_lines: 10,
+            started_at_ms: None,
+            tail: None,
+        };
+        let lines = tool_card_lines(&card, 0, theme, 100);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            text.contains("201 │") && text.contains("202 │"),
+            "必须显示递增的真实行号: {text:?}"
+        );
+        assert!(
+            text.contains("fn a() {}") && text.contains("fn b() {}"),
+            "正文保留: {text:?}"
+        );
     }
 }
 
@@ -4071,7 +4280,10 @@ fn message_blocks_are_separated_by_gap_rows() {
 /// §美化：thinking 加 ◆ 图标前缀（与正文/工具区分）。
 #[test]
 fn thinking_lines_carry_icon_prefix() {
-    let mut view = ViewModel::default();
+    let mut view = ViewModel {
+        collapsed_lines: 10, // 单行 thinking 不折叠（默认 0 会折叠）。
+        ..Default::default()
+    };
     view.push_line(LineKind::Reasoning, "先分析再动手");
     let mut cache = HashMap::new();
     let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 12, 0, false, &mut cache);
@@ -4148,7 +4360,10 @@ fn inline_code_bg_does_not_leak_into_trailing_padding() {
 /// 用 panel 填满，绝不出现红/绿背景（也不再需要 Line 级红绿 fallback）。
 #[test]
 fn diff_line_padding_keeps_panel_background() {
-    let mut view = ViewModel::default();
+    let mut view = ViewModel {
+        collapsed_lines: 10, // 展开 diff 正文（默认 0 折叠）。
+        ..Default::default()
+    };
     view.begin_tool("c1", "edit", Some("src/main.rs".into()), None);
     view.finish_tool(
         ("c1", "edit"),
@@ -4198,7 +4413,10 @@ fn diff_line_padding_keeps_panel_background() {
 /// 主行 name/内容行正文都烙 panel；inline code（surface_subtle）保留。
 #[test]
 fn tool_card_body_bg_matches_panel() {
-    let mut view = ViewModel::default();
+    let mut view = ViewModel {
+        collapsed_lines: 10, // 显示内容行正文（默认 0 折叠）。
+        ..Default::default()
+    };
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c1", "bash"),
@@ -4281,8 +4499,13 @@ fn user_message_body_bg_matches_panel() {
 /// §修复：thinking 卡片化——panel 底 + 左竖线 + 整卡可点展开。
 #[test]
 fn thinking_renders_as_panel_card() {
-    let mut view = ViewModel::default();
-    // 8 行 thinking → 折叠态（超过 6 行阈值）。
+    // 配置 collapsed_lines=6：8 行 thinking → 折叠态（8 > 6，且默认 0 只显示
+    // 主行；这里显式 6 复现“折叠线”场景）。
+    let mut view = ViewModel {
+        collapsed_lines: 6,
+        ..Default::default()
+    };
+    // 8 行 thinking → 折叠态。
     let mut text = String::new();
     for i in 0..8 {
         text.push_str(&format!("思考第{i}行\n"));
@@ -4322,7 +4545,10 @@ fn thinking_renders_as_panel_card() {
 /// §修复：展开态 thinking 逐行 panel 底；折叠提示行带 panel 底。
 #[test]
 fn thinking_expanded_rows_keep_panel_and_toggle_hint() {
-    let mut view = ViewModel::default();
+    let mut view = ViewModel {
+        collapsed_lines: 6, // 8 行 > 6 → 溢出（展开态有折叠提示行）。
+        ..Default::default()
+    };
     let mut text = String::new();
     // 8 行（末尾不换行——split('\n') 才恰好 8 段，避免空尾段）。
     for i in 0..7 {
@@ -4372,7 +4598,10 @@ fn thinking_expanded_rows_keep_panel_and_toggle_hint() {
 fn selecting_part_of_tool_card_highlights_only_that_row() {
     use crate::tui::interaction::TextPosition;
     use crate::tui::scroll::EntryId;
-    let mut view = ViewModel::default();
+    let mut view = ViewModel {
+        collapsed_lines: 10, // 显示内容行（默认 0 折叠）。
+        ..Default::default()
+    };
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c1", "bash"),
@@ -4433,4 +4662,77 @@ fn selecting_part_of_tool_card_highlights_only_that_row() {
     );
     // 复制内容 = "第一"（offset 对齐：渲染 char_start == selected_text 同 offset）。
     assert_eq!(view.selected_text(), "第一", "复制内容必须与高亮一致");
+}
+
+/// §用户诉求：默认 collapsed_lines=0 → 工具卡片折叠态只显示主行，不显示正文。
+#[test]
+fn tool_card_default_zero_collapses_to_main_row_only() {
+    let theme = theme::Theme::omp();
+    let card = ToolCard {
+        id: "c".into(),
+        name: "bash".into(),
+        target: None,
+        command: None,
+        state: ToolCardState::Done {
+            status: crate::tool::outcome::ToolStatus::Succeeded,
+            duration_ms: 10,
+            exit_code: Some(0),
+        },
+        output: Some("line1\nline2\nline3\n".into()),
+        diff: None,
+        output_truncated: false,
+        expanded: false,
+        line_number_start: None,
+        collapsed_lines: 0,
+        started_at_ms: None,
+        tail: None,
+    };
+    let lines = tool_card_lines(&card, 0, theme, 100);
+    let text: String = lines
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+        .collect();
+    assert!(
+        !text.contains("line1") && !text.contains("line2"),
+        "collapsed_lines=0 折叠态不显示正文: {text:?}"
+    );
+    assert!(text.contains("点击展开"), "折叠态显示展开提示: {text:?}");
+}
+
+/// §用户诉求：thinking 用 markdown 渲染——展开后代码块带语法高亮背景。
+#[test]
+fn thinking_expanded_renders_markdown_code_highlight() {
+    let mut view = ViewModel {
+        collapsed_lines: 10,
+        ..Default::default()
+    };
+    view.push_line(LineKind::Reasoning, "先想一下\n```rust\nlet x = 1;\n```");
+    let entry_id = view.transcript[0].id();
+    view.toggle_reasoning_expanded(entry_id);
+    let mut cache = HashMap::new();
+    let theme = theme::Theme::omp();
+    let plan = plan_window_simple(&mut view, theme, 80, 20, 0, false, &mut cache);
+    let text: String = plan
+        .window
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+        .collect();
+    assert!(
+        text.contains("先想一下") && text.contains("let x = 1"),
+        "thinking 展开显示 md 内容: {text:?}"
+    );
+    // 代码行有语法高亮背景（surface_subtle）。
+    assert!(
+        plan.window.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style.bg == Some(theme.surface_subtle))
+        }),
+        "代码块必须带高亮背景: {:?}",
+        plan.window
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter_map(|s| s.style.bg.map(|b| (s.content.as_ref(), b)))
+            .collect::<Vec<_>>()
+    );
 }

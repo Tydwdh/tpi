@@ -155,6 +155,7 @@ pub enum BuiltinTool {
     Read,
     List,
     Search,
+    Glob,
     Edit,
     Write,
     Bash,
@@ -210,6 +211,7 @@ impl BuiltinTool {
             BuiltinTool::Read => "read",
             BuiltinTool::List => "list",
             BuiltinTool::Search => "search",
+            BuiltinTool::Glob => "glob",
             BuiltinTool::Edit => "edit",
             BuiltinTool::Write => "write",
             BuiltinTool::Bash => "bash",
@@ -225,6 +227,7 @@ impl BuiltinTool {
             "read" => Some(Self::Read),
             "list" => Some(Self::List),
             "search" => Some(Self::Search),
+            "glob" => Some(Self::Glob),
             "edit" => Some(Self::Edit),
             "write" => Some(Self::Write),
             "bash" => Some(Self::Bash),
@@ -239,7 +242,7 @@ impl BuiltinTool {
     pub(crate) fn execution_class(self) -> ToolExecutionClass {
         match self {
             Self::Read => ToolExecutionClass::FileReadExact,
-            Self::List | Self::Search => ToolExecutionClass::FileReadRecursive,
+            Self::List | Self::Search | Self::Glob => ToolExecutionClass::FileReadRecursive,
             Self::Edit | Self::Write => ToolExecutionClass::FileWriteExact,
             Self::Bash => ToolExecutionClass::WorkspaceUnknown,
             Self::UpdatePlan | Self::WebSearch | Self::WebFetch => ToolExecutionClass::Pure,
@@ -263,7 +266,10 @@ impl BuiltinTool {
                 "List files and directories under a path with bounded output (200 items, depth 2). Follows .gitignore, skips symlinks, binaries and files over 2MiB. Use cursor for the next page; report includes scanned_files/scanned_bytes/elapsed_ms/stop_reason."
             }
             BuiltinTool::Search => {
-                "Search file contents with a regex (100 matches max, one line 300 chars). Follows .gitignore. Use cursor for the next page without rescanning."
+                "Search file contents with a regex (100 matches max, one line 300 chars). Follows .gitignore. Use cursor for the next page without rescanning. Path may be a directory (recursive) or a single file. Use max_results to bound hits, include to filter by glob (e.g. `**/*.rs`), exclude to skip path components."
+            }
+            BuiltinTool::Glob => {
+                "Find files by glob pattern (e.g. `**/*.rs`, `src/**/*.ts`). Follows .gitignore, skips symlinks. Results sorted by modification time (newest first). Use cursor for the next page without rescanning."
             }
             BuiltinTool::Edit => {
                 "Atomically edit one file using revision-bound exact text replacement. Only the explicit old_text is replaced; adjacent content is never implicitly deleted. All replacements are validated before the file is written; the whole batch applies or nothing does."
@@ -279,7 +285,7 @@ current revision. Use `edit` instead for localized changes."
                 "Run a command through Git Bash with `set -o pipefail` enabled (pipeline failures are visible). This is the only execution tool: use it for programs, builds, tests, git, pipelines, redirection, globs and compound commands. Write Bash syntax; the host is Windows, never mix PowerShell syntax."
             }
             BuiltinTool::UpdatePlan => {
-                "Replace the whole short plan atomically (max 7 unique items). Only for complex multi-step tasks; simple tasks do not need a plan. It is a progress state, not an extra workflow."
+                "Replace the whole short plan atomically (max 7 unique items). Items accept either plain text (status inferred by diff against the previous plan: removed items become completed) or an explicit object `{\"text\": \"...\", \"status\": \"completed|in_progress|pending\"}` so you can mark items done without removing them. Only for complex multi-step tasks; simple tasks do not need a plan. It is a progress state, not an extra workflow."
             }
             BuiltinTool::WebSearch => {
                 "Search the web (DuckDuckGo, free, no API key) to discover sources. Returns title, URL and snippet. Results are for discovery only; never opens a browser and never calls a summary model."
@@ -296,6 +302,7 @@ current revision. Use `edit` instead for localized changes."
             BuiltinTool::Read => schema_value::<files::ReadArgs>("read"),
             BuiltinTool::List => schema_value::<search::ListArgs>("list"),
             BuiltinTool::Search => schema_value::<search::SearchArgs>("search"),
+            BuiltinTool::Glob => schema_value::<search::GlobArgs>("glob"),
             BuiltinTool::Edit => schema_value::<edit::EditArgs>("edit"),
             BuiltinTool::Write => schema_value::<files::WriteArgs>("write"),
             BuiltinTool::Bash => schema_value::<command::BashArgs>("bash"),
@@ -316,6 +323,7 @@ current revision. Use `edit` instead for localized changes."
             BuiltinTool::Read => parse_args_typed("read", arguments, ValidatedArgs::Read),
             BuiltinTool::List => parse_args_typed("list", arguments, ValidatedArgs::List),
             BuiltinTool::Search => parse_args_typed("search", arguments, ValidatedArgs::Search),
+            BuiltinTool::Glob => parse_args_typed("glob", arguments, ValidatedArgs::Glob),
             BuiltinTool::Edit => parse_args_typed("edit", arguments, ValidatedArgs::Edit),
             BuiltinTool::Write => parse_args_typed("write", arguments, ValidatedArgs::Write),
             BuiltinTool::Bash => parse_args_typed("bash", arguments, ValidatedArgs::Bash),
@@ -338,6 +346,7 @@ pub enum ValidatedArgs {
     Read(files::ReadArgs),
     List(search::ListArgs),
     Search(search::SearchArgs),
+    Glob(search::GlobArgs),
     Edit(edit::EditArgs),
     Write(files::WriteArgs),
     Bash(command::BashArgs),
@@ -354,6 +363,7 @@ impl ValidatedArgs {
             Self::Read(_) => BuiltinTool::Read,
             Self::List(_) => BuiltinTool::List,
             Self::Search(_) => BuiltinTool::Search,
+            Self::Glob(_) => BuiltinTool::Glob,
             Self::Edit(_) => BuiltinTool::Edit,
             Self::Write(_) => BuiltinTool::Write,
             Self::Bash(_) => BuiltinTool::Bash,
@@ -370,6 +380,7 @@ impl ValidatedArgs {
             Self::Read(args) => Some(&args.path),
             Self::List(args) => Some(&args.path),
             Self::Search(args) => Some(&args.path),
+            Self::Glob(args) => Some(&args.path),
             Self::Edit(args) => Some(&args.path),
             Self::Write(args) => Some(&args.path),
             Self::Bash(_) | Self::UpdatePlan(_) | Self::WebSearch(_) | Self::WebFetch(_) => None,
@@ -643,6 +654,7 @@ pub async fn execute(
                 (BuiltinTool::Read, ValidatedArgs::Read(args)) => files::read(args, &ctx),
                 (BuiltinTool::List, ValidatedArgs::List(args)) => search::list(args, &ctx),
                 (BuiltinTool::Search, ValidatedArgs::Search(args)) => search::search(args, &ctx),
+                (BuiltinTool::Glob, ValidatedArgs::Glob(args)) => search::glob(args, &ctx),
                 (BuiltinTool::Edit, ValidatedArgs::Edit(args)) => files::edit(args, &ctx, plan.as_ref()),
                 (BuiltinTool::Write, ValidatedArgs::Write(args)) => files::write(args, &ctx, plan.as_ref()),
                 // §13：update_plan 是原生同步控制操作。
@@ -696,6 +708,7 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
         BuiltinTool::Read,
         BuiltinTool::List,
         BuiltinTool::Search,
+        BuiltinTool::Glob,
         BuiltinTool::Edit,
         BuiltinTool::Write,
         BuiltinTool::Bash,

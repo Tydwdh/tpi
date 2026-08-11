@@ -179,6 +179,8 @@ async fn list_and_search_respect_budget_and_cursor() {
             path: ".".into(),
             cursor: None,
             exclude: Vec::new(),
+            max_results: 100,
+            include: Vec::new(),
         },
         &ctx,
     );

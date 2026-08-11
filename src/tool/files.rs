@@ -489,7 +489,7 @@ fn failed_outcome(tool: &str, error: EditError) -> ToolOutcome {
     // P2：给模型明确的下一步动作，而不是只拒绝（“硬拒绝”→“可恢复引导”）。
     let hint = match &error {
         EditError::StaleRevision { current, .. } => format!(
-            "\nhint: 文件已变化（current_revision {current}）。请重新 read 该文件获取最新 revision，再基于它提交 edit。"
+            "\nhint: 文件已变化（current_revision {current}）。可直接用该 revision 重试 edit（无需重新 read）；需要确认内容时再 read。"
         ),
         EditError::NoMatch { .. } => {
             "\nhint: old_text 在文件中不存在；请先 read 确认实际内容，再调整 old_text。".into()

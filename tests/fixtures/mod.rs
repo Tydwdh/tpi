@@ -34,6 +34,7 @@ pub fn test_config(workspace_root: &Utf8PathBuf) -> Config {
         safety_reserve_tokens: 8192,
         ui_mode: Default::default(),
         ui_keymap: tpi::tui::keymap::Keymap::builtin(),
+        ui_collapsed_lines: 10,
         auto_open_browser: false,
         web_summary_model: "none".into(),
         system_prompt_extra: None,

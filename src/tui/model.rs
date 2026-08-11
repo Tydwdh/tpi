@@ -58,6 +58,13 @@ pub struct ToolCard {
     pub expanded: bool,
     /// 失败/超时等终态的关键 tail（有界，折叠态显示最多 4 行）。
     pub tail: Option<String>,
+    /// read 卡片的正文起始文件行号（§用户诉求：TUI 显示行号；模型数据
+    /// model_payload.output 不含行号——edit 的 old_text 匹配空间保持干净）。
+    pub line_number_start: Option<usize>,
+    /// §用户诉求 [ui] collapsed_lines：折叠时显示的正文行数；0 = 只显示主行。
+    pub collapsed_lines: usize,
+    /// 工具启动时间（epoch ms；Running 时显示已运行秒数，§用户诉求）。
+    pub started_at_ms: Option<u64>,
 }
 
 /// Stable identity carried by every tool lifecycle event.
@@ -110,6 +117,14 @@ pub fn fmt_duration(ms: u64) -> String {
     } else {
         format!("{}m{:02}s", ms / 60_000, (ms / 1_000) % 60)
     }
+}
+
+/// 当前 epoch 毫秒（工具启动时间；Running 卡片显示已运行秒数，§用户诉求）。
+pub(crate) fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCardState {
@@ -461,6 +476,9 @@ pub struct ViewModel {
     pub pending_queue_len: usize,
     /// 思考内容是否展开（Alt+T 全局切换；§用户诉求：点击单个 thinking 行按条目展开）。
     pub reasoning_visible: bool,
+    /// §用户诉求 [ui] collapsed_lines：卡片（thinking/工具）折叠时显示的正文行数；
+    /// 0（默认）= 折叠态只显示主行摘要，不显示正文。
+    pub collapsed_lines: usize,
     /// 按条目展开的 thinking（§用户诉求：像 diff 一样点击行展开/收缩）。
     /// 该 entry 的 thinking 折叠态显示一行，展开态显示全文。
     pub reasoning_expanded: std::collections::HashSet<EntryId>,
@@ -523,6 +541,7 @@ impl Default for ViewModel {
             pending_queue_len: 0,
             reasoning_visible: false,
             reasoning_expanded: std::collections::HashSet::new(),
+            collapsed_lines: 0,
             active_hit: None,
             selection: None,
             input_tokens: 0,
@@ -600,7 +619,9 @@ impl ViewModel {
 
     /// BUG-006：会话切换/恢复后把模型上下文（history）重建到屏幕，
     /// 避免“屏幕是 session A、模型在 session B”的状态不一致。
-    /// User/Assistant 按原文重建；工具结果以单行摘要呈现（不伪造卡片）。
+    /// User/Assistant 按原文重建；工具结果重建为净化后的卡片（§用户诉求：
+    /// 恢复会话后看到工具卡片细节，而不是 `bash: status: succeeded` 残留；
+    /// revision 等模型元数据由 user_visible_output 剥掉）。
     pub fn load_history(&mut self, history: &[crate::provider::ChatMessage]) {
         self.reset_for_new_session();
         for message in history {
@@ -614,14 +635,46 @@ impl ViewModel {
                     }
                 }
                 crate::provider::ChatMessage::Tool { name, content, .. } => {
-                    let first = content.lines().next().unwrap_or_default();
-                    self.push_line(LineKind::Tool, format!("{name}: {first}"));
+                    let visible = user_visible_output(name, content);
+                    let card = ToolCard {
+                        id: format!("hist-{name}-{}", self.transcript.len()),
+                        name: name.clone(),
+                        target: None,
+                        command: None,
+                        state: ToolCardState::Done {
+                            status: crate::tool::outcome::ToolStatus::Succeeded,
+                            duration_ms: 0,
+                            exit_code: None,
+                        },
+                        output: (!visible.0.is_empty()).then_some(bound_output(&visible.0)),
+                        diff: None,
+                        output_truncated: false,
+                        expanded: false,
+                        tail: None,
+                        line_number_start: visible.1,
+                        collapsed_lines: self.collapsed_lines,
+                        started_at_ms: None,
+                    };
+                    self.push_tool_card(card);
                 }
                 crate::provider::ChatMessage::System(text) => {
                     self.push_line(LineKind::System, text.clone());
                 }
             }
         }
+    }
+
+    /// 直接追加一张已完成工具卡片（恢复会话重建用；§用户诉求）。
+    fn push_tool_card(&mut self, card: ToolCard) {
+        let id = self.alloc_entry_id();
+        self.transcript.push(Entry::Tool {
+            id,
+            card,
+            search_cache: None,
+        });
+        self.bump_transcript();
+        self.note_new_content();
+        self.trim_transcript();
     }
     /// 追加转录行。
     pub fn push_line(&mut self, kind: LineKind, text: impl Into<String>) {
@@ -1033,6 +1086,9 @@ impl ViewModel {
                     output_truncated: false,
                     expanded: false,
                     tail: None,
+                    line_number_start: None,
+                    collapsed_lines: self.collapsed_lines,
+                    started_at_ms: Some(now_epoch_ms()),
                 },
             },
         );
@@ -1353,7 +1409,8 @@ impl ViewModel {
         // §用户诉求：TUI 卡片只显示用户可见内容——剥离面向模型的 envelope
         // 元数据头（status/revision/path/lines 等）。入库即净化：渲染与复制
         // 共用同一文本，语义 offset 不漂移；模型上下文仍读完整 model_payload。
-        let tail = user_visible_output(&name, &tail);
+        // 同时解析 read 正文起始文件行号（§用户诉求：TUI 显示行号）。
+        let (tail, line_start) = user_visible_output(&name, &tail);
         if let Some(mut tool) = self.live.tools.remove(&id) {
             tool.card.name = name;
             tool.card.state = ToolCardState::Done {
@@ -1363,6 +1420,7 @@ impl ViewModel {
             };
             // §用户诉求：edit/write 的 diff 独立保存（默认展开渲染）。
             tool.card.diff = diff.map(|value| bound_diff(&value));
+            tool.card.line_number_start = line_start;
             // 完整输出始终保留（成功也可见，Alt+E/鼠标展开）；失败时折叠态显示 tail。
             if !tail.is_empty() {
                 tool.card.output = Some(bound_output(&tail));
@@ -1435,6 +1493,9 @@ impl ViewModel {
                 diff: diff.map(|value| bound_diff(&value)),
                 output_truncated: tail.len() > MAX_CARD_OUTPUT,
                 expanded: false,
+                line_number_start: line_start,
+                collapsed_lines: self.collapsed_lines,
+                started_at_ms: None,
                 tail: if status == ToolStatus::Succeeded {
                     None
                 } else {
@@ -1707,9 +1768,12 @@ fn canonical_semantic_text(kind: LineKind, raw: &str) -> String {
 /// 路径已在卡片主行 target 展示，错误码在卡片 meta（`· exit N`）展示。
 ///
 /// 在 `finish_tool` 入库时调用一次——渲染与复制共用净化后文本，offset 不漂移。
-fn user_visible_output(name: &str, text: &str) -> String {
+///
+/// 返回 (用户可见正文, read 起始文件行号)。行号从 `lines: x-y of total` 头解析，
+/// 供 TUI 显示；模型数据 model_payload.output 仍无行号。非 read 或无头返回 None。
+fn user_visible_output(name: &str, text: &str) -> (String, Option<usize>) {
     if text.is_empty() {
-        return String::new();
+        return (String::new(), None);
     }
     let lines: Vec<&str> = text.lines().collect();
     // 面向模型的元数据行（按前缀识别，保留诊断行如 error:/exit_code:）。
@@ -1723,54 +1787,86 @@ fn user_visible_output(name: &str, text: &str) -> String {
             || l.starts_with("current_revision:")
             || l.starts_with("revision:")
             || l.starts_with("cursor:")
+            || l.starts_with("artifact: ")
     };
     match name {
         // bash/run：`…output: N bytes` 头之后才是实际输出（stdout/stderr 正文）。
+        // 尾部 `artifact: @artifact/...` 是给模型的 opaque 引用（§8.4 模型读完整
+        // 输出的入口），用户不该看到，剥离。
         "bash" | "run" => {
             if let Some(idx) = lines.iter().position(|l| l.starts_with("output: ")) {
-                let body = lines[idx + 1..]
-                    .iter()
-                    .skip_while(|l| l.is_empty())
-                    .copied()
-                    .collect::<Vec<_>>();
+                let mut body: Vec<&str> = Vec::new();
+                for l in lines[idx + 1..].iter() {
+                    if l.starts_with("artifact: ") || l.trim().is_empty() && !body.is_empty() {
+                        break; // 正文结束：artifact 引用/尾部空行不是内容。
+                    }
+                    if !l.is_empty() {
+                        body.push(l);
+                    }
+                }
                 if !body.is_empty() {
-                    return body.join("\n");
+                    return (body.join("\n"), None);
                 }
             }
             // 无标准头（rejected/cancelled/…）→ 剥元数据行，保留错误诊断。
-            lines
-                .iter()
-                .filter(|l| !is_ai_meta(l))
-                .copied()
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        // read：`[revision]/path/lines` 头之后是文件内容。
-        "read" => {
-            if let Some(idx) = lines.iter().position(|l| l.is_empty()) {
-                let body = lines[idx + 1..]
+            (
+                lines
                     .iter()
-                    .skip_while(|l| l.is_empty())
+                    .filter(|l| !is_ai_meta(l))
                     .copied()
-                    .collect::<Vec<_>>();
-                if !body.is_empty() {
-                    return body.join("\n");
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                None,
+            )
+        }
+        // read：`[revision]/path/lines` 头之后是文件内容；起始行号从 lines: 头取。
+        // 正文后的「续读: read …」/「内容超过 … 预算被截断」是给模型的截断续读
+        // 指引（§10.2），不是文件内容——用户不该看到，剥离。
+        "read" => {
+            let start = lines.iter().find_map(|l| {
+                let rest = l.strip_prefix("lines: ")?;
+                let start = rest.split('-').next()?;
+                start.parse::<usize>().ok()
+            });
+            let mut body: Vec<&str> = Vec::new();
+            let mut started = false;
+            for l in &lines {
+                if !started {
+                    if l.is_empty() {
+                        started = true; // 头（revision/path/lines）后的空行 = 正文开始。
+                    }
+                    continue;
                 }
+                if l.starts_with("续读: ") || l.starts_with("内容超过 ") || l.trim().is_empty()
+                {
+                    break; // 正文结束：续读指引/尾部空行不是内容。
+                }
+                body.push(l);
             }
-            lines
-                .iter()
-                .filter(|l| !is_ai_meta(l))
-                .copied()
-                .collect::<Vec<_>>()
-                .join("\n")
+            let body = body.join("\n");
+            if !body.is_empty() {
+                return (body, start);
+            }
+            (
+                lines
+                    .iter()
+                    .filter(|l| !is_ai_meta(l))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                None,
+            )
         }
         // 其余（edit/write/search/list/web_search/update_plan/…）：剥元数据行。
-        _ => lines
-            .iter()
-            .filter(|l| !is_ai_meta(l))
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n"),
+        _ => (
+            lines
+                .iter()
+                .filter(|l| !is_ai_meta(l))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None,
+        ),
     }
 }
 
@@ -1836,21 +1932,55 @@ mod tests {
     /// （status/revision/path/lines/cursor 等）剥掉；错误诊断保留。
     #[test]
     fn user_visible_output_strips_ai_metadata() {
-        // bash：`output:` 头之后是实际输出。
+        // bash：`output:` 头之后是实际输出；无行号。
         let bash = "status: succeeded\nprogram: bash\nexit_code: 0\nduration_ms: 42\noutput: 11 bytes\n\nhello world";
-        assert_eq!(user_visible_output("bash", bash), "hello world");
-        // read：`[revision]/path/lines` 头之后是文件内容。
+        assert_eq!(
+            user_visible_output("bash", bash),
+            ("hello world".into(), None)
+        );
+        // bash：尾部 `artifact: @artifact/...` 是给模型的 opaque 引用，必须剥离。
+        let bash_artifact = "status: succeeded\nprogram: bash\nexit_code: 0\nduration_ms: 9\noutput: 4 bytes\n\nhi\n\nartifact: @artifact/019fec4e-fdd0-7ab3-aa13-2aaf7233e02b/019fed0a-b3c8-7092-b470-50aba264f763";
+        assert_eq!(
+            user_visible_output("bash", bash_artifact),
+            ("hi".into(), None),
+            "artifact 引用不能进用户视野"
+        );
+        // read：`[revision]/path/lines` 头之后是文件内容；起始行号解析自 lines: 头。
         let read = "[revision=b3:abc]\npath: src/main.rs\nlines: 1-10 of 20\n\nfn main() {}";
-        assert_eq!(user_visible_output("read", read), "fn main() {}");
-        // edit：剥 revision 元数据，保留 applied 摘要（path 已在卡片 target）。
+        assert_eq!(
+            user_visible_output("read", read),
+            ("fn main() {}".into(), Some(1))
+        );
+        // read：非 1 起始行号（分段读取）也必须精确。
+        let read2 =
+            "[revision=b3:abc]\npath: src/main.rs\nlines: 201-240 of 400\n\nline 201\nline 202";
+        assert_eq!(
+            user_visible_output("read", read2),
+            ("line 201\nline 202".into(), Some(201))
+        );
+        // read：截断续读指引（§10.2 是给模型的，非文件内容）必须剥掉。
+        let read_truncated = "[revision=b3:abc]\npath: src/main.rs\nlines: 1-200 of 400\n\nline 1\nline 2\n\n续读: read src/main.rs start_line=201 line_count=200";
+        assert_eq!(
+            user_visible_output("read", read_truncated),
+            ("line 1\nline 2".into(), Some(1)),
+            "续读指引不能进用户视野"
+        );
+        // read：字节截断提示同样剥离。
+        let read_bytes = "[revision=b3:abc]\npath: src/main.rs\nlines: 1-2 of 400\n\nline 1\nline 2\n\n内容超过 32 KiB 预算被截断，请用 start_line/line_count 分段读取。";
+        assert_eq!(
+            user_visible_output("read", read_bytes),
+            ("line 1\nline 2".into(), Some(1)),
+            "字节截断提示不能进用户视野"
+        );
+        // edit：剥 revision 元数据，保留 applied 摘要（path 已在卡片 target）；无行号。
         let edit = "status: succeeded\ntool: edit\npath: src/a.rs\napplied: replaced 2 of 2\nprevious_revision: b3:aaa\ncurrent_revision: b3:bbb";
         assert_eq!(
             user_visible_output("edit", edit),
-            "applied: replaced 2 of 2"
+            ("applied: replaced 2 of 2".into(), None)
         );
         // search：剥 status，保留扫描统计与命中正文。
         let search = "status: succeeded\nscanned_files: 42\nscanned_bytes: 12345\nelapsed_ms: 3\nstop_reason: complete\nitems: 2 shown of 2\n\na.txt:1: hit";
-        let out = user_visible_output("search", search);
+        let (out, _) = user_visible_output("search", search);
         assert!(
             out.contains("scanned_files: 42") && out.contains("hit"),
             "扫描统计与命中保留: {out:?}"
@@ -1858,13 +1988,13 @@ mod tests {
         assert!(!out.contains("status:"), "status 头必须剥掉: {out:?}");
         // 失败诊断保留（error 行不剥）。
         let err = "status: failed\ntool: read\nerror: artifact_not_found";
-        let out = user_visible_output("read", err);
+        let (out, _) = user_visible_output("read", err);
         assert!(out.contains("error: artifact_not_found"), "{out:?}");
         assert!(!out.contains("status:"));
         // 无元数据的纯文本原样返回（只归一化末尾换行）。
         assert_eq!(
             user_visible_output("bash", "line-1\nline-2\n"),
-            "line-1\nline-2"
+            ("line-1\nline-2".into(), None)
         );
     }
 
@@ -2395,6 +2525,45 @@ mod p2_card_nav_tests {
             kinds,
             vec![LineKind::User, LineKind::Assistant, LineKind::Tool]
         );
+    }
+
+    /// §用户诉求：恢复会话后工具卡片净化——不再残留 `bash: status: succeeded`
+    /// 或 `[revision=...]`；read 正文保留并带起始行号。
+    #[test]
+    fn load_history_rebuilds_sanitized_tool_cards() {
+        let mut view = ViewModel::default();
+        let history = vec![
+            crate::provider::ChatMessage::Tool {
+                tool_call_id: "call-1".into(),
+                name: "read".into(),
+                content:
+                    "[revision=b3:abc]\npath: src/a.rs\nlines: 10-12 of 50\n\nline 10\nline 11"
+                        .into(),
+            },
+            crate::provider::ChatMessage::Tool {
+                tool_call_id: "call-2".into(),
+                name: "bash".into(),
+                content: "status: succeeded\noutput: 4 bytes\n\nhi".into(),
+            },
+        ];
+        view.load_history(&history);
+        assert_eq!(view.transcript.len(), 2, "两个工具卡片");
+        for entry in &view.transcript {
+            let Entry::Tool { card, .. } = entry else {
+                panic!("恢复后工具必须是卡片");
+            };
+            let body = card.output.as_deref().unwrap_or("");
+            assert!(
+                !body.contains("[revision=") && !body.contains("status: succeeded"),
+                "模型元数据必须剥掉: {body:?}"
+            );
+            if card.name == "read" {
+                assert_eq!(card.line_number_start, Some(10), "read 起始行号");
+                assert!(body.contains("line 10"), "read 正文保留: {body:?}");
+            } else {
+                assert_eq!(body, "hi", "bash 只显示输出: {body:?}");
+            }
+        }
     }
 
     /// §24：点击工具卡片设置 active_hit（高亮反馈），关闭 Overlay 清除。

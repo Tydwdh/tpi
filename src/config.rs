@@ -46,6 +46,9 @@ pub struct UiFile {
     /// 键位覆盖表：`{ action = "ctrl+enter" }` 或 `{ action = ["k", "ctrl+p"] }`。
     /// 未配置的动作保持内建默认；workspace 的 keymap 逐 key 覆盖 home。
     pub keymap: Option<toml::Table>,
+    /// 卡片折叠时显示的正文行数（§用户诉求：thinking/工具卡片统一）；
+    /// 默认 0 = 折叠态只显示主行摘要，不显示正文。配置如 `collapsed_lines = 10`。
+    pub collapsed_lines: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -138,6 +141,9 @@ pub struct Config {
     pub ui_mode: crate::tui::terminal::ViewMode,
     /// §成熟化 [ui] keymap：动作 → 按键覆盖（未配置动作保持内建默认）。
     pub ui_keymap: crate::tui::keymap::Keymap,
+    /// §用户诉求 [ui] collapsed_lines：卡片折叠时显示的正文行数（thinking/工具
+    /// 卡片统一）；默认 10；0 = 折叠态只显示主行摘要。
+    pub ui_collapsed_lines: usize,
     /// §9.1：文件工具（read/edit/write/list/search）是否允许访问 workspace 外路径。
     /// 默认 true（bash 本来就能自由访问，保持一致）；false 恢复严格沙箱。
     pub allow_outside_workspace: bool,
@@ -319,7 +325,12 @@ pub(crate) fn load_from_home(
         web_summary_model: "none".into(),
         system_prompt_extra,
         source,
-        ui_theme: merged.ui.theme.clone().unwrap_or_else(|| "omp".to_string()),
+        ui_theme: merged
+            .ui
+            .theme
+            .clone()
+            .unwrap_or_else(|| "onedarkpro".to_string()),
+        ui_collapsed_lines: merged.ui.collapsed_lines.unwrap_or(0),
         ui_mode: merged
             .ui
             .mode
@@ -366,6 +377,7 @@ fn merge(home: ConfigFile, workspace: ConfigFile) -> ConfigFile {
             theme: workspace.ui.theme.or(home.ui.theme),
             mode: workspace.ui.mode.or(home.ui.mode),
             keymap: merge_keymap(home.ui.keymap, workspace.ui.keymap),
+            collapsed_lines: workspace.ui.collapsed_lines.or(home.ui.collapsed_lines),
         },
     }
 }
