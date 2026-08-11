@@ -302,8 +302,14 @@ pub async fn run<P: Provider>(
                 config.safety_reserve_tokens,
             );
             let plan = tool_runtime.plan_snapshot();
-            let system_prompt = system_prompt_text(config, plan.as_ref(), None);
-            let projected = crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
+            let plan_text = crate::tool::plan::plan_snapshot(plan.as_ref());
+            let system_prompt = system_prompt_text(config, None);
+            let projected = crate::context::estimate_request(
+                &system_prompt,
+                &messages,
+                &tool_defs,
+                Some(&plan_text),
+            );
             if crate::context::should_compact(projected, usable) && !compaction_failed {
                 match compact_turn(
                     provider,
@@ -319,9 +325,14 @@ pub async fn run<P: Provider>(
                         // P1-4：compaction 成功后若仍无法容纳（窗口过小），
                         // 不再发起普通请求（必然 length error），明确结束并提示用户。
                         let plan = tool_runtime.plan_snapshot();
-                        let system_prompt = system_prompt_text(config, plan.as_ref(), None);
-                        let after =
-                            crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
+                        let plan_text = crate::tool::plan::plan_snapshot(plan.as_ref());
+                        let system_prompt = system_prompt_text(config, None);
+                        let after = crate::context::estimate_request(
+                            &system_prompt,
+                            &messages,
+                            &tool_defs,
+                            Some(&plan_text),
+                        );
                         if after > usable {
                             session
                                 .append_event(&SessionEvent::RunCompleted {
@@ -342,9 +353,14 @@ pub async fn run<P: Provider>(
                         messages = crate::context::prune_messages(messages);
                         // P1-4：prune 后仍超窗口（如 user 消息本身巨大）→ 明确结束。
                         let plan = tool_runtime.plan_snapshot();
-                        let system_prompt = system_prompt_text(config, plan.as_ref(), None);
-                        let after =
-                            crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
+                        let plan_text = crate::tool::plan::plan_snapshot(plan.as_ref());
+                        let system_prompt = system_prompt_text(config, None);
+                        let after = crate::context::estimate_request(
+                            &system_prompt,
+                            &messages,
+                            &tool_defs,
+                            Some(&plan_text),
+                        );
                         if after > usable {
                             session
                                 .append_event(&SessionEvent::RunCompleted {
@@ -402,10 +418,14 @@ pub async fn run<P: Provider>(
                     config.safety_reserve_tokens,
                 );
                 let plan = tool_runtime.plan_snapshot();
-                let system_prompt =
-                    system_prompt_text(config, plan.as_ref(), ephemeral_system.as_deref());
-                let projected =
-                    crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
+                let plan_text = crate::tool::plan::plan_snapshot(plan.as_ref());
+                let system_prompt = system_prompt_text(config, ephemeral_system.as_deref());
+                let projected = crate::context::estimate_request(
+                    &system_prompt,
+                    &messages,
+                    &tool_defs,
+                    Some(&plan_text),
+                );
                 let _ = ui
                     .send(RuntimeEvent::ContextUsage { projected, usable })
                     .await;
@@ -931,20 +951,11 @@ fn accumulate_usage(total: &mut Usage, additional: Usage) {
 ///
 /// `ephemeral_system` 是 harness control metadata（如续写 recovery instruction）：
 /// 只在本次 request 出现，不进 session、不进对话投影，也不伪装成 User 消息。
-fn system_prompt_text(
-    config: &Config,
-    plan: Option<&crate::tool::plan::Plan>,
-    ephemeral_system: Option<&str>,
-) -> String {
+fn system_prompt_text(config: &Config, ephemeral_system: Option<&str>) -> String {
     let mut system = DEFAULT_SYSTEM_PROMPT.to_string();
     if let Some(extra) = &config.system_prompt_extra {
         system.push_str("\n\n");
         system.push_str(extra);
-    }
-    let snapshot = crate::tool::plan::plan_snapshot(plan);
-    if !snapshot.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&snapshot);
     }
     if let Some(ephemeral) = ephemeral_system {
         system.push_str("\n\n");
@@ -956,7 +967,9 @@ fn system_prompt_text(
 /// 构造上下文 projection（§15.1 顺序：system → 用户目标 → 历史 turns → 当前输入在尾部）。
 ///
 /// §13：每次 model request 的 runtime snapshot 都包含规范化计划（compaction 或
-/// 长对话不会让模型只靠记忆遵循 Todo）。
+/// 长对话不会让模型只靠记忆遵循 Todo）。plan 快照不进 system prompt——
+/// 它随每次 update 变化，放 system 会破坏 system 前缀缓存（长上下文下
+/// 每次请求都要重算 system 部分）；改为以 user 消息追加轨迹尾部。
 ///
 /// `ephemeral_system`：本次 request 的 harness control metadata（§4.3 续写指令），
 /// 以 system 指令注入，不进入对话投影。
@@ -966,13 +979,18 @@ fn build_context(
     plan: Option<&crate::tool::plan::Plan>,
     ephemeral_system: Option<&str>,
 ) -> Vec<ChatMessage> {
-    let mut out = Vec::with_capacity(messages.len() + 2);
+    let mut out = Vec::with_capacity(messages.len() + 3);
     out.push(ChatMessage::System(system_prompt_text(
         config,
-        plan,
         ephemeral_system,
     )));
     out.extend_from_slice(messages);
+    if let Some(plan) = plan {
+        let snapshot = crate::tool::plan::plan_snapshot(Some(plan));
+        if !snapshot.is_empty() {
+            out.push(ChatMessage::User(snapshot));
+        }
+    }
     out
 }
 

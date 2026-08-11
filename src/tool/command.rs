@@ -26,9 +26,12 @@ pub const STDERR_MIN_BUDGET: usize = 4 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct BashArgs {
     /// Bash 命令（Bash 语法；wrapper 统一启用 `set -o pipefail`）。
+    /// 示例："cargo test"、"git status"、"python -c \"print(1)\""。
     pub command: String,
+    /// 工作目录（默认 workspace root；每次调用都是新 shell，cwd 不跨调用保留）。
     #[serde(default = "default_cwd")]
     pub cwd: String,
+    /// 超时毫秒（默认 120000，上限 24h）。长任务（构建/测试）显式调大。
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
 }

@@ -21,9 +21,12 @@ pub use crate::tool::outcome::Effect;
 /// edit 工具参数（§10.3）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 pub struct EditArgs {
+    /// 目标文件路径（workspace 内相对路径或绝对路径）。
     pub path: String,
-    /// `read` 输出的 `[revision=...]` 或裸 `b3:<64-hex>`。
+    /// `read` 输出的 `[revision=...]` 或裸 `b3:<64-hex>`——必须是文件当前 revision，
+    /// 否则 stale_revision 拒绝。
     pub revision: String,
+    /// 批量替换（§10.3：逐条校验；任一条不匹配则整体拒绝）。
     pub replacements: Vec<Replacement>,
 }
 

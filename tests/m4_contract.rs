@@ -304,6 +304,7 @@ async fn update_plan_and_compaction_integration() {
             .iter()
             .map(tpi::tool::BuiltinTool::schema)
             .collect::<Vec<_>>(),
+        None,
     );
     // 空会话 + 无计划时基线即系统开销；window = 基线 + 预留增长空间。
     // 每轮 read 的结果会进入 messages（累计增长），window 只须容纳约 8 轮 +
@@ -321,19 +322,13 @@ async fn update_plan_and_compaction_integration() {
             );
         }
         let current = step.get();
-        // §13：计划建立后（step > 0）的每次请求必须注入计划 snapshot。
+        // §13：计划建立后（step > 0）plan snapshot 以 user 消息追加轨迹尾部，
+        // 不进 system prompt（避免每次 update 破坏 system 前缀缓存）。
         if current > 0 {
-            let system = request
-                .messages
-                .iter()
-                .find_map(|m| match m {
-                    tpi::provider::ChatMessage::System(text) => Some(text.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let last = request.messages.last().unwrap();
             assert!(
-                system.contains("当前计划"),
-                "每次 model request 的 runtime snapshot 必须包含计划（§13）: {system}"
+                matches!(last, tpi::provider::ChatMessage::User(text) if text.contains("当前计划")),
+                "每次 model request 的 runtime snapshot 必须包含计划（§13，尾部 user 消息）: {last:?}"
             );
         }
         if current == 0 {

@@ -52,6 +52,7 @@ const YAHOO_ENDPOINT: &str = "https://search.yahoo.com/search";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct WebSearchArgs {
+    /// 搜索查询（支持自然语言；可组合 site: 域过滤）。示例："rust tokio select"。
     pub query: String,
     /// 结果数（默认 5，上限 20）。
     #[serde(default = "default_count")]
@@ -59,7 +60,7 @@ pub struct WebSearchArgs {
     /// freshness（"pd_1d"/"pd_1w"/"pd_1m"/"pd_1y";透传给 DDG 的 df 参数）。
     #[serde(default)]
     pub freshness: Option<String>,
-    /// 限制搜索域（拼接为 site: 过滤）。
+    /// 限制搜索域（拼接为 site: 过滤）。示例：["rust-lang.org"]。
     #[serde(default)]
     pub domains: Option<Vec<String>>,
 }
@@ -70,6 +71,8 @@ fn default_count() -> u32 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct WebFetchArgs {
+    /// 目标 URL（仅 http/https；拒绝 loopback/私网/链路本地，禁止内嵌凭据）。
+    /// 示例："https://docs.rs/tokio"。
     pub url: String,
 }
 
@@ -462,7 +465,7 @@ fn search_succeeded(args: &WebSearchArgs, hits: Vec<DdgHit>, count: u32) -> Tool
         .collect();
     let mut output = String::from("status: succeeded\ntool: web_search\n");
     output.push_str(&format!(
-        "query: {}\nresults: {}\n\n",
+        "query: {}\nresults: {}\n\n<external_content source=\"web_search\">\n",
         args.query,
         hits.len()
     ));
@@ -480,6 +483,7 @@ fn search_succeeded(args: &WebSearchArgs, hits: Vec<DdgHit>, count: u32) -> Tool
         }
         output.push_str(&item);
     }
+    output.push_str("</external_content>\n");
     ToolOutcome::succeeded("web_search", output).with_metadata(ToolMetadata {
         tool: "web_search".into(),
         target: Some(args.query.clone()),
@@ -1146,7 +1150,7 @@ async fn web_fetch_with_policy(
         "error: http_status\n".to_string()
     };
     let output = format!(
-        "status: {outcome_status}\ntool: web_fetch\n{http_error}url: {final_url}\nhttp: {status}\ncontent_type: {}\ntitle: {}{}\n\n{}",
+        "status: {outcome_status}\ntool: web_fetch\n{http_error}url: {final_url}\nhttp: {status}\ncontent_type: {}\ntitle: {}{}\n\n<external_content source=\"{final_url}\">\n{}\n</external_content>\n",
         content_type,
         extract_title(&body),
         if truncated {

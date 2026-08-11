@@ -37,13 +37,24 @@ pub fn estimate_messages(messages: &[ChatMessage]) -> u64 {
 /// 请求级 token 估算（P0-9：compaction 判断与用量条必须包含 system prompt、
 /// 计划快照和工具 schema，不能只算 messages——否则实际请求超窗口而估算
 /// 不触发，provider 直接报 length error）。
+///
+/// `plan_tail`：plan 快照不再注入 system prompt（§13：避免每次 update 破坏
+/// system 前缀缓存），而是作为 user 消息追加轨迹尾部；估算必须把它计入。
 pub fn estimate_request(
     system_prompt: &str,
     messages: &[ChatMessage],
     tools: &[crate::provider::ToolDef],
+    plan_tail: Option<&str>,
 ) -> u64 {
     let mut total = estimate_tokens(system_prompt);
     total = total.saturating_add(estimate_messages(messages));
+    if let Some(plan) = plan_tail
+        && !plan.is_empty()
+    {
+        // plan 作为 user 消息追加轨迹尾部：内容 + envelope 开销（§15.4 保守系数）。
+        total = total.saturating_add(estimate_tokens(plan));
+        total = total.saturating_add(8);
+    }
     for tool in tools {
         total = total.saturating_add(estimate_tokens(&tool.name));
         total = total.saturating_add(estimate_tokens(&tool.description));
@@ -331,7 +342,7 @@ mod tests {
                 "properties": {"cmd": {"type": "string"}}
             }),
         };
-        let estimate = estimate_request(&system, &messages, std::slice::from_ref(&tool));
+        let estimate = estimate_request(&system, &messages, std::slice::from_ref(&tool), None);
         // system prompt（3000 ASCII 字符 ≈ 1000 token，§PointerHit 6 启发式）必须计入。
         assert!(
             estimate > estimate_messages(&messages),
@@ -340,10 +351,29 @@ mod tests {
         assert!(estimate >= 1000, "system prompt 估算过低: {estimate}");
         // 工具 schema 数量影响估算。
         let many_tools = vec![tool; 20];
-        let with_many = estimate_request(&system, &messages, &many_tools);
+        let with_many = estimate_request(&system, &messages, &many_tools, None);
         assert!(
             with_many > estimate,
             "tool schema 必须计入: {with_many} vs {estimate}"
+        );
+    }
+
+    /// §13：plan 快照作为尾部 user 消息计入估算（空/无 plan 不计）。
+    #[test]
+    fn estimate_request_counts_plan_tail() {
+        let system = "s".repeat(3000);
+        let messages = vec![ChatMessage::User("hello".into())];
+        let tools: Vec<ToolDef> = Vec::new();
+        let without = estimate_request(&system, &messages, &tools, None);
+        let with_plan = estimate_request(&system, &messages, &tools, Some("当前计划：\n[>] fix\n"));
+        assert!(
+            with_plan > without,
+            "plan tail 必须计入估算: {with_plan} vs {without}"
+        );
+        assert_eq!(
+            estimate_request(&system, &messages, &tools, Some("")),
+            without,
+            "空 plan tail 不计入"
         );
     }
 

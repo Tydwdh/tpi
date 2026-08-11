@@ -91,7 +91,7 @@ pub struct GlobArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct SearchArgs {
-    /// regex 模式（rust regex 语法）。
+    /// regex 模式（rust regex 语法）。示例："fn estimate_request"、"TODO\\(.*\\)"。
     pub pattern: String,
     #[serde(default = "default_path")]
     pub path: String,

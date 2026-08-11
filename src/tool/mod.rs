@@ -260,38 +260,89 @@ impl BuiltinTool {
     pub fn description(&self) -> &'static str {
         match self {
             BuiltinTool::Read => {
-                "Read the contents of a file (or an @artifact/... reference). Text output begins with [revision=HASH], which can be passed to edit as revision. Text is truncated to 200 lines or 32KiB (whichever is hit first). Use start_line/line_count for large files."
+                "Read the contents of a file (or an @artifact/... reference) as text. \
+Output: `[revision=HASH]` header (pass to edit as revision) + `lines: X-Y of N` range + \
+numbered lines `N: text` (precise single-line references). Truncated at 200 lines or 32KiB; \
+use start_line/line_count to page, and follow the returned 续读 hint. \
+Use to inspect files before editing; no cost beyond local I/O. \
+Example: read src/main.rs"
             }
             BuiltinTool::List => {
-                "List files and directories under a path with bounded output (200 items, depth 2). Follows .gitignore, skips symlinks, binaries and files over 2MiB. Use cursor for the next page; report includes scanned_files/scanned_bytes/elapsed_ms/stop_reason."
+                "List files and directories under a path (bounded: 200 items, depth 2). \
+Follows .gitignore, skips symlinks, binaries and files over 2MiB. \
+Output: items with relative paths + report (scanned_files/scanned_bytes/elapsed_ms/stop_reason); \
+use returned cursor for the next page without rescanning. \
+Use for a directory overview before searching/editing. \
+Example: list path=src depth=2"
             }
             BuiltinTool::Search => {
-                "Search file contents with a regex (100 matches max, one line 300 chars). Follows .gitignore. Use cursor for the next page without rescanning. Path may be a directory (recursive) or a single file. Use max_results to bound hits, include to filter by glob (e.g. `**/*.rs`), exclude to skip path components."
+                "Search file contents with a rust regex (ripgrep kernel; 100 matches max, \
+one line 300 chars). Follows .gitignore. \
+Output: matched lines with file paths; cursor pages without rescanning. \
+Path may be a directory (recursive) or a single file. \
+Use max_results to bound hits, include to filter by glob (e.g. `**/*.rs`), \
+exclude to skip path components (e.g. \"tests\", \"vendor\"). \
+Use when you know the text pattern but not which file. \
+Example: search pattern=\"fn estimate_request\" include=[\"**/*.rs\"]"
             }
             BuiltinTool::Glob => {
-                "Find files by glob pattern (e.g. `**/*.rs`, `src/**/*.ts`). Follows .gitignore, skips symlinks. Results sorted by modification time (newest first). Use cursor for the next page without rescanning."
+                "Find files by filename glob pattern (e.g. `**/*.rs`, `src/**/*.ts`, `Cargo.toml`). \
+Follows .gitignore, skips symlinks; results sorted by modification time (newest first). \
+Use when you know the filename/path shape but not the location; prefer over search \
+when the match is on file names, not contents. \
+Example: glob pattern=\"**/*test*.rs\""
             }
             BuiltinTool::Edit => {
-                "Atomically edit one file using revision-bound exact text replacement. Only the explicit old_text is replaced; adjacent content is never implicitly deleted. All replacements are validated before the file is written; the whole batch applies or nothing does."
+                "Atomically edit one file using revision-bound exact text replacement. \
+Only the explicit old_text is replaced; adjacent content is never implicitly deleted; \
+the whole batch applies or nothing does. \
+You must pass the file's current revision (from read output) — stale revisions are rejected. \
+Output: unified diff + applied count + previous/current revision. \
+Prefer edit over write for localized changes (smaller, safer diffs). \
+Example: edit path=src/main.rs revision=b3:<hex> replacements=[{old_text, new_text}]"
             }
             BuiltinTool::Write => {
-                "Write an entire file.
-
-If the file does not exist, creates it.
-If the file already exists, `revision` is required and must match the
-current revision. Use `edit` instead for localized changes."
+                "Write an entire file (creates if missing; if it exists, `revision` must match \
+the current one — use edit for localized changes). \
+Output: unified diff + applied count. \
+Use for new files or full rewrites. \
+Example: write path=README.md content=... revision=..."
             }
             BuiltinTool::Bash => {
-                "Run a command through Git Bash with `set -o pipefail` enabled (pipeline failures are visible). This is the only execution tool: use it for programs, builds, tests, git, pipelines, redirection, globs and compound commands. Write Bash syntax; the host is Windows, never mix PowerShell syntax."
+                "Run a command through Git Bash (`set -o pipefail` enabled; stderr is not \
+failure — check status/exit_code). This is the only execution tool: use it for programs, \
+builds, tests, git, pipelines, redirection and compound commands. \
+Output: status/program/exit_code + bounded stdout/stderr tail; the full output is saved as \
+an @artifact/... reference (read it for the complete result). \
+Each invocation is a fresh shell — no persistent cwd/env across calls; set cwd explicitly. \
+Cost: real execution time, capped by timeout_ms (default 120s, max 24h). \
+Example: bash command=\"cargo test\" timeout_ms=180000"
             }
             BuiltinTool::UpdatePlan => {
-                "Replace the whole short plan atomically (max 7 active items; completed items are kept as history, last 7). Items accept either plain text (status inferred by diff against the previous plan: removed items become completed) or an explicit object `{\"text\": \"...\", \"status\": \"completed|in_progress|pending\"}` so you can mark items done without removing them. Only for complex multi-step tasks; simple tasks do not need a plan. It is a progress state, not an extra workflow."
+                "Replace the whole short plan atomically (max 7 active items; completed items are \
+kept as history, last 7). Items accept either plain text (status inferred by diff) or an \
+explicit object {\"text\": ..., \"status\": \"completed|in_progress|pending\"}. \
+Only for complex multi-step tasks; simple tasks do not need a plan. It is a progress \
+state, not an extra workflow. \
+Example: update_plan items=[{\"text\": \"fix build\", \"status\": \"in_progress\"}, \"run tests\"]"
             }
             BuiltinTool::WebSearch => {
-                "Search the web (DuckDuckGo, free, no API key) to discover sources. Returns title, URL and snippet. Results are for discovery only; never opens a browser and never calls a summary model."
+                "Search the web (DuckDuckGo HTML endpoint, free, no API key) to discover sources. \
+Output: <external_content source=\"web_search\"> wrapping numbered hits (title, url, snippet). \
+Results are for discovery only — never opens a browser, never calls a summary model; \
+verify claims by fetching the source. \
+Use to find sources; don't cite snippets as final evidence. \
+Cost: network request, ~1-5s. \
+Example: web_search query=\"rust tokio select\" count=5"
             }
             BuiltinTool::WebFetch => {
-                "Fetch a URL and convert HTML to plain text (bounded body). Returns final URL, status, content type, title and body; full body is stored as artifact."
+                "Fetch a URL and convert HTML to plain text (bounded to 48KiB body). \
+Output: <external_content source=\"URL\"> wrapping final url/status/content_type/title + \
+body; the full body is saved as an @artifact/... reference. \
+Rejects loopback/private/link-local targets (SSRF guard). \
+Use to read the actual source found by web_search. \
+Cost: network round-trip, ~1-15s depending on site. \
+Example: web_fetch url=\"https://docs.rs/tokio\""
             }
         }
     }
@@ -751,6 +802,64 @@ mod tests {
             );
             assert_eq!(tool.recovery_policy(), class.recovery_policy());
         }
+    }
+
+    /// §4 ACI：工具 description 必须含典型调用示例（书中：示例提升工具准确率 72%→90%），
+    /// 高频工具（bash/search/web_fetch/edit）必须含执行代价或边界说明。
+    #[test]
+    fn tool_descriptions_carry_examples_and_cost() {
+        for tool in implemented_tools() {
+            let desc = tool.description();
+            assert!(
+                desc.contains("Example:"),
+                "{} description 必须含典型示例: {desc}",
+                tool.name()
+            );
+        }
+        // 高频工具必须有执行代价或边界（bash 代价 / web_fetch 代价+SSRF / search 何时用）。
+        for (name, marker) in [
+            ("bash", "timeout_ms"),
+            ("web_fetch", "SSRF"),
+            ("web_search", "discovery only"),
+            ("search", "Use when"),
+            ("edit", "stale revisions are rejected"),
+        ] {
+            let tool = BuiltinTool::from_name(name).unwrap();
+            assert!(
+                tool.description().contains(marker),
+                "{} description 应含 {marker}",
+                name
+            );
+        }
+    }
+
+    /// §4 ACI：参数 doc 注释必须注入 schema description（schemars 默认行为）——
+    /// 否则模型看不到参数示例/语义。
+    #[test]
+    fn parameter_docs_reach_schema_descriptions() {
+        let schema = BuiltinTool::Bash.schema();
+        let params = schema.parameters.to_string();
+        assert!(
+            params.contains("cargo test"),
+            "bash.command 示例必须进 schema: {params}"
+        );
+        assert!(
+            params.contains("120000"),
+            "bash.timeout_ms 默认值必须进 schema: {params}"
+        );
+        let search_schema = BuiltinTool::Search.schema();
+        assert!(
+            search_schema
+                .parameters
+                .to_string()
+                .contains("fn estimate_request"),
+            "search.pattern 示例必须进 schema"
+        );
+        let fetch_schema = BuiltinTool::WebFetch.schema();
+        assert!(
+            fetch_schema.parameters.to_string().contains("loopback"),
+            "web_fetch.url 边界必须进 schema"
+        );
     }
 
     /// BUG-009：同步工具（read）经 spawn_blocking 执行后仍返回正确结果。

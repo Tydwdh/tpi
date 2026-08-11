@@ -1,7 +1,8 @@
 //! 文件读取、写入和目录访问工具。
 //!
 //! `read` 结果必须分别给出 path、revision、returned_lines、total_lines、truncated
-//! 和正文（§10.2）。正文统一 LF，因此模型复制出的 `old_text` 与匹配空间一致。
+//! 和正文（§10.2）。正文统一 LF，因此模型复制出的 `old_text` 与匹配空间一致；
+//! 每行带 `{n}: ` 行号前缀（§read 精度：模型可精确引用单行）。
 
 use crate::tool::edit::{self, EditError};
 use crate::tool::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
@@ -37,6 +38,19 @@ fn default_start_line() -> usize {
 
 fn default_line_count() -> usize {
     DEFAULT_READ_LINES
+}
+
+/// read 正文的行号前缀：`{n}: {line}`（§read 精度）。
+/// 空窗口（0 行）返回空串，不产生 `0: ` 这类无效行号。
+fn number_lines(text: &str, start_line: usize) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut numbered = String::with_capacity(text.len() + text.lines().count().saturating_mul(6));
+    for (index, line) in text.split('\n').enumerate() {
+        numbered.push_str(&format!("{}: {line}\n", start_line + index));
+    }
+    numbered
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -128,12 +142,13 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
                     window.start_line + window.returned_lines - 1
                 )
             };
+            let numbered = number_lines(&text, window.start_line);
             let mut output = format!(
                 "{revision_header}\npath: {}\nlines: {line_range} of {}{}\n\n{}",
                 display_path(&ctx.workspace_root, &path),
                 window.total_lines,
                 if truncated { " (truncated)" } else { "" },
-                text,
+                numbered,
             );
             // §工具改进：截断续读指引——不再让模型/用户反复猜。
             // 行数截断（窗口超界）：提示用 start_line 续读下一段。
@@ -224,11 +239,12 @@ fn read_artifact(
     } else {
         shown_start.saturating_add(window.returned_lines - 1)
     };
+    let numbered = number_lines(&text, shown_start);
     let output = format!(
         "path: @artifact/{session_id}/{id}\nbytes: {}\nlines: {shown_start}-{shown_end}{}\n\n{}",
         record.byte_length,
         if window.truncated { " (truncated)" } else { "" },
-        text,
+        numbered,
     );
     ToolOutcome::succeeded("read", output).with_metadata(ToolMetadata {
         tool: "read".into(),
@@ -587,12 +603,18 @@ mod tests {
             !output.contains('\u{FFFD}'),
             "截断不得产生 replacement char"
         );
-        // 正文（去掉头部信息后）不得超过 32 KiB 预算。
+        // 正文（去掉头部信息后）不得超过 32 KiB 预算。行号前缀是展示开销
+        // （§read 精度），预算按去掉 `{n}: ` 前缀后的纯文本计。
         let body = output.split("\n\n").last().unwrap_or("");
+        let unnumbered: String = body
+            .lines()
+            .map(|line| line.split_once(": ").map(|(_, rest)| rest).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            body.len() <= 32 * 1024,
+            unnumbered.len() <= 32 * 1024,
             "正文超出预算: {} bytes",
-            body.len()
+            unnumbered.len()
         );
     }
 
