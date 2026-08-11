@@ -299,64 +299,238 @@ async fn interactive_loop<P: Provider>(
     // 键盘线程：整个交互期间由独立线程读取 crossterm 事件（§16.1：模型生成中
     // 也响应输入/翻页/折叠；输入不因生成被阻塞）。
     // §用户诉求（bracketed paste 降级）：不支持的终端把粘贴内容拆成连续按键
-    // 流（含 Enter），逐键路由会让换行命中 submit 直接发送。这里做时间窗合并
-    // ——相邻按键间隔 ≤ paste::GAP 且 ≥ paste::MIN_BURST 个可插入按键时，合并
-    // 为单个 Event::Paste（字面换行，不触发提交）；其余事件立即转发。
+    // 流（含 Enter），逐键路由会让换行命中 submit 直接发送。
+    // 间隔感知（§用户诉求：打字 0 延迟）：粘贴检测的代价只发生在「连续两键
+    // 间隔 < paste::DENSE_GAP（16ms）」之后——该间隔人类打字不可能达到，只
+    // 有终端批量转发可达。普通按键（间隔 ≥16ms）**立即转发、0 等待**，打字
+    // 路径不承担任何探测/收集开销；确认是洪流后用 FLUSH_GAP 分块流式 flush
+    // 为 Event::Paste（字面换行，不触发提交），字符连续流入无顿感。
     let (key_tx, mut key_rx) = mpsc::channel::<Event>(128);
     std::thread::spawn(move || {
         use crate::tui::paste;
-        // 阻塞等待首个事件（不增加输入延迟）；read 失败即退出线程。
-        while let Ok(first) = event::read() {
-            // 非按键事件（Paste/Mouse/Resize）：无需突发合并，立即转发。
-            let first_key = match first {
-                Event::Key(k) => k,
-                _ => {
-                    if key_tx.blocking_send(first).is_err() {
-                        break;
+        // 待处理事件队列：Enter 探测 read 出的后续事件放回这里再处理，
+        // 保证探测过程中读出的任何事件都不丢失。
+        let mut backlog: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
+        // 最近一次按键（Press）到达时刻：洪流判定只依据相邻按键间隔，
+        // 不依赖任何时间窗等待。None = 尚无按键或刚被非按键事件打断。
+        let mut last_press: Option<std::time::Instant> = None;
+        // 取下一个事件：backlog 优先，否则阻塞 read（不增加输入延迟）。
+        macro_rules! next_event {
+            () => {
+                if let Some(e) = backlog.pop_front() {
+                    e
+                } else {
+                    match event::read() {
+                        Ok(e) => e,
+                        Err(_) => break,
                     }
-                    continue;
                 }
             };
-            // GAP 内无后续事件 → 普通按键，立即转发。
-            if !event::poll(paste::GAP).unwrap_or(false) {
-                if key_tx.blocking_send(first).is_err() {
+        }
+        loop {
+            let event = next_event!();
+            let now = std::time::Instant::now();
+            let (is_key, is_press) = match &event {
+                Event::Key(k) => (true, k.kind == KeyEventKind::Press),
+                _ => (false, false),
+            };
+            if !is_key {
+                // Paste/Mouse/Resize：无需洪流合并，立即转发；并重置间隔基线
+                //（新输入上下文，后续按键不与旧按键比间隔）。
+                if key_tx.blocking_send(event).is_err() {
                     break;
+                }
+                last_press = None;
+                continue;
+            }
+            // §优化（粘贴瞬间出现）：Ctrl+V / Shift+Insert 直读系统剪贴板，
+            // 整段一次 Event::Paste（一次 draw 完成），任何终端都生效。
+            if is_press && is_paste_shortcut(&event) {
+                if let Some(text) = crate::clipboard::read_text().ok().flatten()
+                    && !text.is_empty()
+                    && key_tx.blocking_send(Event::Paste(text)).is_err()
+                {
+                    return;
+                }
+                last_press = None;
+                continue;
+            }
+            // §bug 修复（先输入再粘贴会误发送）：降级路径下粘贴按键流中的
+            // Enter——若位于粘贴开头/批次边界，与上一键间隔 ≥DENSE_GAP 会被
+            // 当普通按键逐键转发 → 命中 submit，把输入框已有文本发送出去。
+            // 无修饰 Enter（提交键）不在洪流中时：探测短窗（FLUSH_GAP），
+            // 后续 40ms 内若紧跟 Press 按键（粘贴流特征）→ 判定为粘贴流中的
+            // Enter，转 \n 进收集；否则是用户提交，立即转发（Enter 后无事件
+            // 时 0 额外延迟；Enter 是低频提交动作，40ms 探测无感）。
+            if is_press
+                && paste::is_plain_enter(match &event {
+                    Event::Key(k) => k,
+                    _ => unreachable!(),
+                })
+                && !paste::is_dense(last_press, now)
+            {
+                if event::poll(paste::FLUSH_GAP).unwrap_or(false)
+                    && let Ok(next) = event::read()
+                {
+                    let dense_next =
+                        matches!(&next, Event::Key(k) if k.kind == KeyEventKind::Press);
+                    backlog.push_front(next);
+                    if dense_next {
+                        // 粘贴流中的 Enter：转 \n，与后续键一起进入洪流收集。
+                        let mut buf = String::from("\n");
+                        loop {
+                            if buf.len() >= paste::MAX_BUF
+                                && key_tx
+                                    .blocking_send(Event::Paste(std::mem::take(&mut buf)))
+                                    .is_err()
+                            {
+                                return;
+                            }
+                            match next_event!() {
+                                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                                    last_press = Some(std::time::Instant::now());
+                                    match paste::paste_char(&k) {
+                                        Some(c) => buf.push(c),
+                                        None => {
+                                            if !buf.is_empty()
+                                                && key_tx
+                                                    .blocking_send(Event::Paste(std::mem::take(
+                                                        &mut buf,
+                                                    )))
+                                                    .is_err()
+                                            {
+                                                return;
+                                            }
+                                            if key_tx.blocking_send(Event::Key(k)).is_err() {
+                                                return;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    if !event::poll(paste::FLUSH_GAP).unwrap_or(false) {
+                                        if !buf.is_empty()
+                                            && key_tx
+                                                .blocking_send(Event::Paste(std::mem::take(
+                                                    &mut buf,
+                                                )))
+                                                .is_err()
+                                        {
+                                            return;
+                                        }
+                                        break;
+                                    }
+                                }
+                                other => {
+                                    if !buf.is_empty()
+                                        && key_tx
+                                            .blocking_send(Event::Paste(std::mem::take(&mut buf)))
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                    if key_tx.blocking_send(other).is_err() {
+                                        return;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+                // 无后续密集键：用户正常提交，立即转发 Enter。
+                if key_tx.blocking_send(event).is_err() {
+                    return;
+                }
+                last_press = Some(now);
+                continue;
+            }
+            // 普通按键（含非 Press 的 Repeat/Release）：立即转发，0 延迟。
+            if !is_press || !paste::is_dense(last_press, now) {
+                if key_tx.blocking_send(event).is_err() {
+                    break;
+                }
+                if is_press {
+                    last_press = Some(now);
                 }
                 continue;
             }
-            // 突发收集：已确认是突发后用放宽的 COLLECT_GAP 收进同一批（大文本
-            // 粘贴时终端按批次转发，批次间隔可能超过 30ms；若仍用探测窗会在
-            // 1~2 个键后断流 → merge 不足 MIN_BURST → 逐键转发 → 逐字符出现）。
-            // 期间到达的 Paste/Mouse/Resize 立即转发（不打断突发），
-            // Repeat/Release 也原样转发（下游本来就忽略，不属于粘贴内容）。
-            let mut burst: Vec<ratatui::crossterm::event::KeyEvent> = vec![first_key];
+            // 与上一键间隔 < DENSE_GAP：粘贴洪流信号（人类打字不可能）。
+            // 分块流式 flush：把后续可插入按键收进缓冲区，相邻批次间隔 >
+            // FLUSH_GAP 即 flush 为一次 Event::Paste 上屏——字符连续流入，
+            // 无「整批等超时后一起出现」的顿感；洪流中的 Enter 经 paste_char
+            // 转字面换行（不触发提交）。期间到达的 Paste/Mouse/Resize 立即
+            // 转发（先 flush 已收内容），特殊键/Repeat 终止收集并原样转发。
+            let mut buf: String = String::new();
+            match paste::paste_char(&match event {
+                Event::Key(k) => k,
+                _ => unreachable!(),
+            }) {
+                Some(c) => buf.push(c),
+                None => {
+                    // 触发洪流的键本身不可插入（理论边角）：原样转发，不收集。
+                    if key_tx.blocking_send(event).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+            }
             loop {
-                match event::read() {
-                    Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => burst.push(k),
-                    Ok(other) => {
+                // 单块上限：防异常长流无限累积（超限先 flush 再继续，语义不变）。
+                if buf.len() >= paste::MAX_BUF
+                    && key_tx
+                        .blocking_send(Event::Paste(std::mem::take(&mut buf)))
+                        .is_err()
+                {
+                    return;
+                }
+                match next_event!() {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => {
+                        last_press = Some(std::time::Instant::now());
+                        match paste::paste_char(&k) {
+                            Some(c) => buf.push(c),
+                            None => {
+                                // 特殊键/修饰组合：flush 已收内容，再原样转发该键。
+                                if !buf.is_empty()
+                                    && key_tx
+                                        .blocking_send(Event::Paste(std::mem::take(&mut buf)))
+                                        .is_err()
+                                {
+                                    return;
+                                }
+                                if key_tx.blocking_send(Event::Key(k)).is_err() {
+                                    return;
+                                }
+                                break;
+                            }
+                        }
+                        // 相邻批次间隔 > FLUSH_GAP：本批结束，flush 上屏。
+                        // （批次内间隔 <16ms，poll 立即返回继续收；节流批次
+                        // 间隔 30~50ms 收进同一块，感知连续无停顿。）
+                        if !event::poll(paste::FLUSH_GAP).unwrap_or(false) {
+                            if !buf.is_empty()
+                                && key_tx
+                                    .blocking_send(Event::Paste(std::mem::take(&mut buf)))
+                                    .is_err()
+                            {
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                    other => {
+                        // 非按键事件：先 flush 已收内容，再立即转发。
+                        if !buf.is_empty()
+                            && key_tx
+                                .blocking_send(Event::Paste(std::mem::take(&mut buf)))
+                                .is_err()
+                        {
+                            return;
+                        }
                         if key_tx.blocking_send(other).is_err() {
                             return;
                         }
-                    }
-                    Err(_) => break,
-                }
-                if burst.len() >= paste::MAX_BURST
-                    || !event::poll(paste::COLLECT_GAP).unwrap_or(false)
-                {
-                    break;
-                }
-            }
-            match paste::merge(&burst) {
-                Some(text) => {
-                    if key_tx.blocking_send(Event::Paste(text)).is_err() {
-                        return;
-                    }
-                }
-                None => {
-                    for key in burst {
-                        if key_tx.blocking_send(Event::Key(key)).is_err() {
-                            return;
-                        }
+                        break;
                     }
                 }
             }
@@ -1314,6 +1488,34 @@ fn last_edit_diff(log: &SessionLog) -> String {
         out.push_str(diff);
     }
     out
+}
+
+/// 粘贴快捷键判定（§优化：应用直读剪贴板，不依赖终端 bracketed paste）。
+///
+/// - Ctrl+V：Windows 标准粘贴；
+/// - Shift+Insert：旧式粘贴（部分终端仍以此映射）。
+///
+/// 支持 bracketed paste 的终端会把这两个键转为 `Event::Paste` 直接送达
+/// （键盘线程第一分支转发），不会到这里；这里只处理终端把按键原样转发
+/// 的情况（mintty/旧 conhost/SSH 嵌入终端等）。两条路径互斥，不重复粘贴。
+fn is_paste_shortcut(event: &Event) -> bool {
+    let ratatui::crossterm::event::Event::Key(k) = event else {
+        return false;
+    };
+    let mods = k.modifiers;
+    match k.code {
+        ratatui::crossterm::event::KeyCode::Char('v')
+            if mods.contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            true
+        }
+        ratatui::crossterm::event::KeyCode::Insert
+            if mods.contains(ratatui::crossterm::event::KeyModifiers::SHIFT) =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 fn spawn_ctrl_c_handler(current_cancel: Arc<Mutex<Option<CancellationToken>>>) {

@@ -1620,13 +1620,19 @@ fn build_transcript_text(
         // §美化：块间间隔一行（opencode marginTop=1 留白即分隔）。
         // User/Assistant/Reasoning 消息 + 工具卡片都间隔；System 提示与
         // 旧 Tool 文本行保持紧凑。
+        // §用户诉求（紧凑）：collapsed_lines==0 且未展开的工具卡片只显示
+        // 主行（无正文/提示），卡片间取消间隔；展开态（多行块）保留间隔
+        // 以分隔。消息块间隔不变。
         let message_kind = match entry {
             Entry::Message { line, .. } => Some(line.kind),
             Entry::Tool { .. } => None,
         };
         let needs_gap = match message_kind {
             Some(LineKind::User | LineKind::Assistant | LineKind::Reasoning) => true,
-            None => true, // 工具卡片（Entry::Tool）
+            None => !matches!(entry, Entry::Tool { card, .. }
+                if card.collapsed_lines == 0
+                    && !card.expanded
+                    && (card.diff.is_some() || card.output.is_some() || card.tail.is_some())),
             Some(_) => false,
         };
         if needs_gap {
@@ -1730,7 +1736,10 @@ fn build_live_group(
                 let line = Line::from(spans);
                 let rail = line.spans.first().cloned();
                 out.push(line);
-                hits.push(None);
+                // §修复：展开态每行都可点击（点正文任意处收起）——与历史
+                // reasoning 展开态一致；否则 live 展开后无任何 Reasoning hit，
+                // 点击无法触发收起（“打开后关不上”）。
+                hits.push(Some((HitTarget::Reasoning(msg.entry_id), width as u16)));
                 semantic.push(SemanticLine {
                     text: semantic_text,
                     decor_cells: 10, // "┃ ◆ 思考 " 前缀
@@ -1738,6 +1747,24 @@ fn build_live_group(
                     rail,
                 });
             }
+            // 与历史 reasoning 展开态一致：末尾折叠提示行（可点击收起）。
+            out.push(Line::from(vec![
+                Span::styled("┃ ", rail_style),
+                Span::styled(
+                    "思考 · 点击折叠",
+                    Style::default()
+                        .fg(theme.muted)
+                        .bg(theme.panel)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+            hits.push(Some((HitTarget::Reasoning(msg.entry_id), width as u16)));
+            semantic.push(SemanticLine {
+                text: String::new(),
+                decor_cells: 0,
+                links: Vec::new(),
+                rail: None,
+            });
         } else {
             out.push(Line::from(vec![
                 Span::styled("┃ ", rail_style),
@@ -4711,6 +4738,48 @@ fn thinking_expanded_rows_keep_panel_and_toggle_hint() {
     );
 }
 
+/// §修复：live reasoning 展开态每行都可点击（点正文任意处收起）——
+/// 否则展开后无任何 Reasoning hit，点击无法触发收起（“打开后关不上”）。
+#[test]
+fn live_reasoning_expanded_rows_are_clickable_to_collapse() {
+    let mut view = ViewModel::default();
+    // 流式 reasoning（live 区，非 transcript）。
+    let text = "第一行思考\n第二行思考\n第三行思考";
+    view.push_stream_delta(LineKind::Reasoning, text);
+    view.reasoning_visible = true; // 全局展开
+    let mut cache = HashMap::new();
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    let live_entry = view
+        .live
+        .reasoning
+        .as_ref()
+        .expect("live reasoning")
+        .entry_id;
+    let mut content_hits = 0usize;
+    for (line, hit) in plan.window.iter().zip(plan.row_hits.iter()) {
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        if rendered.contains("行思考") {
+            assert!(
+                matches!(hit, Some((HitTarget::Reasoning(id), end)) if *id == live_entry && *end > 0),
+                "live 展开正文行必须可点（id={live_entry:?}）: {rendered:?} hit={hit:?}"
+            );
+            content_hits += 1;
+        }
+    }
+    assert_eq!(content_hits, 3, "3 行思考正文都应是 Reasoning hit");
+    // 折叠提示行也可点（与历史展开态一致）。
+    assert!(
+        plan.window
+            .iter()
+            .zip(plan.row_hits.iter())
+            .any(|(line, hit)| {
+                let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                rendered.contains("点击折叠") && hit.is_some()
+            }),
+        "展开态必须有可点击的折叠提示行"
+    );
+}
+
 /// §修复：卡片内选中一小段 → 只高亮该行（不得整卡全选），
 /// 且复制内容与高亮一致（offset 对齐）。
 #[test]
@@ -4783,7 +4852,8 @@ fn selecting_part_of_tool_card_highlights_only_that_row() {
     assert_eq!(view.selected_text(), "第一", "复制内容必须与高亮一致");
 }
 
-/// §用户诉求：默认 collapsed_lines=0 → 工具卡片折叠态只显示主行，不显示正文。
+/// §用户诉求：默认 collapsed_lines=0 → 工具卡片折叠态只显示主行，
+/// 不显示正文，也不显示「点击展开」提示（干净的主行摘要）。
 #[test]
 fn tool_card_default_zero_collapses_to_main_row_only() {
     let theme = theme::Theme::omp();
@@ -4815,7 +4885,81 @@ fn tool_card_default_zero_collapses_to_main_row_only() {
         !text.contains("line1") && !text.contains("line2"),
         "collapsed_lines=0 折叠态不显示正文: {text:?}"
     );
-    assert!(text.contains("点击展开"), "折叠态显示展开提示: {text:?}");
+    assert!(
+        !text.contains("点击展开") && !text.contains("点击折叠"),
+        "collapsed_lines=0 折叠态只显示主行（无提示）: {text:?}"
+    );
+}
+
+/// §用户诉求（紧凑）：collapsed_lines==0 且未展开的工具卡片之间取消间隔
+/// （只显示主行）；展开态卡片保留间隔（多行块需要分隔）。
+#[test]
+fn zero_collapsed_tool_cards_have_no_gap_between() {
+    let mut view = ViewModel::default();
+    view.begin_tool("c1", "bash", Some("cmd1".into()), None);
+    view.finish_tool(
+        ("c1", "bash"),
+        crate::tool::outcome::ToolStatus::Succeeded,
+        10,
+        Some(0),
+        "out1",
+        None,
+    );
+    view.begin_tool("c2", "read", Some("file.rs".into()), None);
+    view.finish_tool(
+        ("c2", "read"),
+        crate::tool::outcome::ToolStatus::Succeeded,
+        5,
+        Some(0),
+        "out2",
+        None,
+    );
+    let mut cache = HashMap::new();
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    assert!(
+        plan.window.iter().all(|l| !l.spans.is_empty()),
+        "两张 0 折叠未展开卡之间无空行（紧凑）: {:?}",
+        plan.window
+            .iter()
+            .map(|l| l
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        plan.window.len(),
+        2,
+        "只主行、无留白空行: {:?}",
+        plan.window
+    );
+
+    // 展开第一张 → 多行块，其后保留间隔（空行）以分隔。
+    view.toggle_expand("c1");
+    let mut cache2 = HashMap::new();
+    let plan2 = plan_window_simple(
+        &mut view,
+        theme::Theme::omp(),
+        80,
+        20,
+        0,
+        false,
+        &mut cache2,
+    );
+    assert!(
+        plan2.window.iter().any(|l| l.spans.is_empty()),
+        "展开卡后保留间隔空行: {:?}",
+        plan2
+            .window
+            .iter()
+            .map(|l| l
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>())
+            .collect::<Vec<_>>()
+    );
 }
 
 /// §用户诉求：thinking 用 markdown 渲染——展开后代码块带语法高亮背景。

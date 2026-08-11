@@ -10,6 +10,47 @@ use std::ptr;
 /// CF_UNICODETEXT（windows-sys 放在 Win32::System::Ole；值为 13）。
 const CF_UNICODETEXT: u32 = 13;
 
+/// 读取系统剪贴板文本（CF_UNICODETEXT）。
+///
+/// - `Ok(Some(text))`：剪贴板有 Unicode 文本；
+/// - `Ok(None)`：无文本 / 剪贴板被占用 / 打开失败（粘贴尽力而为，不打断）；
+/// - `Err`：读取过程出现硬错误（当前实现不会触发，保留语义完整性）。
+///
+/// §优化：粘贴快捷键直读剪贴板——不依赖终端 bracketed paste 支持，
+/// 任何终端下 Ctrl+V 都能整段一次上屏。
+pub fn read_text() -> std::io::Result<Option<String>> {
+    if !open_clipboard() {
+        return Ok(None);
+    }
+    let result = (|| {
+        let h = get_clipboard_data(CF_UNICODETEXT);
+        if h.is_null() {
+            return Ok(None);
+        }
+        let lock = global_lock(h);
+        if lock.is_null() {
+            return Ok(None);
+        }
+        let mut len = 0usize;
+        let ptr = lock.cast::<u16>();
+        // SAFETY: GetClipboardData(CF_UNICODETEXT) 返回系统所有权的
+        // NUL 结尾 UTF-16 内存；GlobalLock 保证持有锁期间该内存有效。
+        // 扫描在字符串边界内停止，不会越界读取。
+        unsafe {
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+        }
+        // SAFETY: 上述循环确认 ptr[0..len] 是已初始化的 UTF-16 单元。
+        let wide = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let text = String::from_utf16_lossy(wide);
+        global_unlock(h);
+        Ok(Some(text))
+    })();
+    close_clipboard();
+    result
+}
+
 /// 把 UTF-8 文本写入系统剪贴板（CF_UNICODETEXT）。
 ///
 /// 失败（剪贴板被占用/打开失败）时静默返回 false——复制是尽力而为，
@@ -118,6 +159,14 @@ fn set_clipboard_data(h: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
     unsafe { SetClipboardData(CF_UNICODETEXT, h as _) }
 }
 
+#[cfg(windows)]
+fn get_clipboard_data(format: u32) -> *mut std::ffi::c_void {
+    use windows_sys::Win32::System::DataExchange::GetClipboardData;
+    // SAFETY: clipboard is open; GetClipboardData returns a system-owned
+    // handle for the requested format (NULL when the format is absent).
+    unsafe { GetClipboardData(format) }
+}
+
 // 非 Windows 平台（编译兜底；TPI 面向 Windows，此处仅保证可编译）。
 #[cfg(not(windows))]
 fn open_clipboard() -> bool {
@@ -145,5 +194,9 @@ fn global_unlock(_h: *mut std::ffi::c_void) {}
 fn global_free(_h: *mut std::ffi::c_void) {}
 #[cfg(not(windows))]
 fn set_clipboard_data(_h: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+    ptr::null_mut()
+}
+#[cfg(not(windows))]
+fn get_clipboard_data(_format: u32) -> *mut std::ffi::c_void {
     ptr::null_mut()
 }

@@ -399,9 +399,8 @@ pub fn write(
                 revision,
             );
             let mut outcome = ToolOutcome::succeeded("write", output);
-            if let Ok(snapshot) =
-                crate::tool::edit::build_snapshot(path.clone(), args.content.into_bytes())
-            {
+            let new_raw = args.content.into_bytes();
+            if let Ok(snapshot) = crate::tool::edit::build_snapshot(path.clone(), new_raw.clone()) {
                 crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
             }
             outcome
@@ -410,9 +409,20 @@ pub fn write(
                     path: display_path(&ctx.workspace_root, &path),
                     revision: revision.clone(),
                 });
+            // §用户诉求（修复）：新建文件同样生成 unified diff（空 → 新内容，
+            // 全 `+` 行），与 edit / 重写路径一致——否则 TUI 卡片既无 diff 也
+            // 无正文（total==0），点击展开无任何内容变化（"write 无法展开"）。
+            let diff = crate::tool::edit::unified_diff(&crate::tool::edit::EditResult {
+                previous_revision: crate::tool::edit::revision_of(&[]),
+                current_revision: revision.clone(),
+                applied: 1,
+                previous_raw: Vec::new(),
+                new_raw: new_raw.clone(),
+            });
             outcome.session_metadata = ToolMetadata {
                 tool: "write".into(),
                 target: Some(display_path(&ctx.workspace_root, &path)),
+                diff: if diff.is_empty() { None } else { Some(diff) },
                 ..Default::default()
             };
             outcome
@@ -632,6 +642,57 @@ mod tests {
         assert_eq!(
             std::fs::read(path.as_std_path()).unwrap(),
             b"external change"
+        );
+    }
+
+    /// §用户诉求（修复）：write 新建文件也必须带 unified diff（空 → 新内容），
+    /// 与 edit / 重写路径一致——否则 TUI 卡片无可展开内容。
+    #[test]
+    fn write_new_file_carries_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("new.txt")).unwrap();
+        let ctx = ToolContext {
+            workspace_root: workspace,
+            cancel: CancellationToken::new(),
+            artifacts_root: dir.path().join("artifacts"),
+            session_id: "test-session".into(),
+            call_id: crate::ids::ToolCallId::new_v7(),
+            output_tx: None,
+            scan_snapshots: Default::default(),
+            shell_path: None,
+            snapshot_store: Default::default(),
+            current_plan: Default::default(),
+            interactive: false,
+            allow_outside_workspace: true,
+        };
+        let plan = crate::tool::edit::prepare_commit(&path);
+        let outcome = write(
+            WriteArgs {
+                path: path.to_string(),
+                content: "line1\nline2\n".into(),
+                revision: None,
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        let diff = outcome
+            .session_metadata
+            .diff
+            .as_deref()
+            .expect("新建文件 write 必须携带 diff");
+        assert!(
+            diff.contains("+line1") && diff.contains("+line2"),
+            "diff 必须包含新增内容行: {diff}"
+        );
+        assert!(
+            !outcome.model_payload.output.contains("\ndiff:\n"),
+            "完整 diff 只能进入 TUI 字段，不能重复占用模型上下文"
+        );
+        assert_eq!(
+            std::fs::read(path.as_std_path()).unwrap(),
+            b"line1\nline2\n"
         );
     }
 }

@@ -585,14 +585,49 @@ fn retryable_status_error(status: reqwest::StatusCode, attempt: u32) -> Provider
 fn sse_transport_error_retryable(received_any: bool) -> bool {
     !received_any
 }
+
+/// reqwest 传输错误的类别摘要（诊断用：区分 body 解码失败 / 超时 / 连接重置等）。
+fn reqwest_error_kind(error: &reqwest::Error) -> String {
+    let mut parts = Vec::new();
+    if error.is_timeout() {
+        parts.push("timeout");
+    }
+    if error.is_connect() {
+        parts.push("connect");
+    }
+    if error.is_body() {
+        parts.push("body");
+    }
+    if error.is_decode() {
+        parts.push("decode");
+    }
+    if error.is_redirect() {
+        parts.push("redirect");
+    }
+    if error.is_request() {
+        parts.push("request");
+    }
+    if parts.is_empty() {
+        parts.push("unknown");
+    }
+    parts.join("|")
+}
 async fn consume_stream(
     response: reqwest::Response,
     events: tokio::sync::mpsc::Sender<ProviderEvent>,
     cancel: CancellationToken,
 ) -> ConsumeResult {
     let mut frame_guard = SseFrameGuard::default();
+    // §诊断：累计已读字节，transport 错误时附上（定位“解码失败是发生在流开头
+    // 还是输出中途”，以及是解码/超时/连接重置哪一类）。
+    let streamed_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let streamed_bytes_for_stream = streamed_bytes.clone();
     let guarded_stream = response.bytes_stream().map(move |result| match result {
-        Ok(chunk) => frame_guard.inspect(&chunk).map(|()| chunk),
+        Ok(chunk) => {
+            let counter = &streamed_bytes_for_stream;
+            counter.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
+            frame_guard.inspect(&chunk).map(|()| chunk)
+        }
         Err(error) => Err(BoundedSseStreamError::Transport(error)),
     });
     let mut stream = guarded_stream.eventsource();
@@ -621,8 +656,30 @@ async fn consume_stream(
         let event = match event {
             Ok(event) => event,
             Err(e) => {
+                // §诊断：消息带错误类别 + 已读字节 + 是否已收到语义事件，
+                // 便于区分“流开头就解码失败”（服务端/代理问题）与
+                // “输出中途被截断”（网关超时/连接重置）。
+                let (kind, detail) = match &e {
+                    eventsource_stream::EventStreamError::Transport(inner) => match inner {
+                        BoundedSseStreamError::FrameTooLarge => {
+                            ("frame_too_large".to_string(), String::new())
+                        }
+                        BoundedSseStreamError::Transport(err) => {
+                            (reqwest_error_kind(err), err.to_string())
+                        }
+                    },
+                    eventsource_stream::EventStreamError::Parser(err) => {
+                        ("parse".to_string(), err.to_string())
+                    }
+                    eventsource_stream::EventStreamError::Utf8(err) => {
+                        ("utf8".to_string(), err.to_string())
+                    }
+                };
                 return ConsumeResult::Failed {
-                    error: ProviderError::Connection(e.to_string()),
+                    error: ProviderError::Connection(format!(
+                        "stream transport ({kind}): {detail}; events_received={received_any}; bytes_read={}",
+                        streamed_bytes.load(std::sync::atomic::Ordering::Relaxed)
+                    )),
                     // §7.3/§15：只有未收到任何事件时才能重试——否则重发请求会重复
                     // 已到达的文本/工具调用（此前恒为 true，SSE 中途断开会重复内容）。
                     retryable: sse_transport_error_retryable(received_any),

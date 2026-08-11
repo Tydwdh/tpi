@@ -245,20 +245,27 @@ pub(super) fn tool_card_lines(
     // 提示行会成噪音；整卡仍可点击展开。
     // §修复：提示行每个 span 烙 panel 底——wrap 逐字符重建 span 只保留
     // span 级 style，Line 级 bg 会丢失，导致提示文字落在终端底色上。
+    // §用户诉求：collapsed_lines==0 折叠态只显示主行，不显示「点击展开」
+    // 提示（干净的主行摘要）；提示只在展开态（「点击折叠」）或
+    // collapsed_lines>0 折叠（显示前 N 行）时给出。
     if overflow && !is_failed && !is_running {
         let hint = if card.expanded {
-            "点击折叠".to_string()
+            Some("点击折叠".to_string())
+        } else if collapsed_lines > 0 {
+            Some(format!("… 点击展开（共 {} 行）", total))
         } else {
-            format!("… 点击展开（共 {} 行）", total)
+            None
         };
-        let hint_style = Style::default()
-            .fg(theme.info)
-            .bg(theme.panel)
-            .add_modifier(Modifier::ITALIC);
-        lines.push(Line::from(vec![
-            Span::styled("│ ", Style::default().fg(theme.muted).bg(theme.panel)),
-            Span::styled(hint, hint_style),
-        ]));
+        if let Some(hint) = hint {
+            let hint_style = Style::default()
+                .fg(theme.info)
+                .bg(theme.panel)
+                .add_modifier(Modifier::ITALIC);
+            lines.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(theme.muted).bg(theme.panel)),
+                Span::styled(hint, hint_style),
+            ]));
+        }
     }
     lines
 }
