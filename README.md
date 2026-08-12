@@ -64,7 +64,8 @@ renderer 可以写终端；生产 `web_fetch` 始终拒绝 loopback、私网和�
   裸文本 rail —— 用户有底、助手无底的层级对比。消息块间留白、工具卡片/plan/输入区
   面板化（panel 背景）、footer 独立分隔线、thinking 带 `◆` 图标。
   主题 `[ui] theme` 支持 `omp`（默认）/`dark`/`light`/**`opencode`**（近黑底 +
-  灰阶层 + 暖橙强调，opencode 原版观感）。
+  灰阶层 + 暖橙强调，opencode 原版观感）/**`onedarkpro`**（One Dark Pro v3 官方色板：蓝紫语法 +
+   橙常量 + widget 深底，代码高亮随之生效）。
 - **性能**：搜索命中与选区语义文本按条目惰性缓存（长转录下复制与搜索不重复渲染）。
 
 ## 开发与验证

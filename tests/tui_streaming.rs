@@ -279,10 +279,18 @@ fn reasoning_can_be_folded() {
     );
     assert!(!rendered.contains("推理第9行"), "超 6 行的内容折叠不可见");
 
-    // Alt+T 全局展开后显示原文。
-    view.reasoning_visible = true;
+    // Alt+T（全量切换）展开后显示原文。
+    view.toggle_all_reasoning();
     let buffer = draw_to_test_backend(&mut view, 80, 12);
     assert!(buffer_text(&buffer).contains("推理第9行"), "展开后全文可见");
+
+    // 再按 Alt+T 全部收起（可反复切换）。
+    view.toggle_all_reasoning();
+    let buffer = draw_to_test_backend(&mut view, 80, 12);
+    assert!(
+        !buffer_text(&buffer).contains("推理第9行"),
+        "再次 Alt+T 后恢复折叠"
+    );
 }
 
 /// Markdown 渲染：assistant 消息中加粗/行内代码进入 buffer 且带样式。

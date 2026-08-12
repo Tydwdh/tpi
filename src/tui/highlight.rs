@@ -53,8 +53,10 @@ fn scope_style(scope: &Scope, theme: Theme) -> Style {
         theme.primary
     } else if name.contains("string") || name.contains("character") {
         theme.success
-    } else if name.contains("constant.numeric") {
-        theme.warning
+    } else if name.contains("constant.numeric") || name.contains("constant") {
+        // §用户诉求：常量/数字用主题橙色（One Dark Pro #d19a66；
+        // 其他主题 orange 与 warning 同值，观感不变）。
+        theme.orange
     } else if name.contains("entity.name.function") || name.contains("support.function") {
         theme.accent
     } else if name.contains("entity.name.type")
@@ -62,7 +64,7 @@ fn scope_style(scope: &Scope, theme: Theme) -> Style {
         || name.contains("support.type")
     {
         theme.info
-    } else if name.contains("constant") || name.contains("variable.parameter") {
+    } else if name.contains("variable.parameter") {
         theme.warning
     } else {
         return style;

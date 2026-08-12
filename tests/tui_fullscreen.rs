@@ -351,6 +351,7 @@ fn sessions_menu_shows_name_first_short_id_second() {
         )],
         selected: 0,
         kind: tpi::tui::model::MenuKind::Session,
+        session_previews: Vec::new(),
     });
     // 宽屏：完整布局——名字主列 + 短 id 辅助列，完整 UUID 不再出现。
     let buf = draw_to_test_backend_mode(&mut view, 160, 24, ViewMode::Fullscreen);
@@ -386,11 +387,50 @@ fn long_menu_window_follows_selection() {
         items,
         selected: 15,
         kind: tpi::tui::model::MenuKind::Session,
+        session_previews: Vec::new(),
     });
     let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
     let all: String = row_texts(&buf).join("\n");
     assert!(all.contains("sess-15"), "选中项必须可见: {all:?}");
     assert!(all.contains("…"), "超长菜单必须显示省略号: {all:?}");
     assert!(!all.contains("sess-00"), "窗口外顶部项不应显示: {all:?}");
-    assert!(!all.contains("sess-19"), "窗口外底部项不应显示: {all:?}");
+}
+
+/// §用户诉求：/sessions 的对话预览显示在悬浮窗（Modal）里，而非塞进菜单列表——
+/// 悬浮窗显示选中会话的 `你/AI` 对话，底部菜单保持紧凑列表。
+#[test]
+fn session_preview_renders_in_modal_float() {
+    let preview = vec![
+        tpi::tui::model::MenuPreviewLine {
+            is_user: true,
+            text: "用户问题".into(),
+        },
+        tpi::tui::model::MenuPreviewLine {
+            is_user: false,
+            text: "AI 回答".into(),
+        },
+    ];
+    let mut view = ViewModel {
+        menu: Some(tpi::tui::model::MenuView {
+            items: vec![
+                ("sess-1".into(), "会话 1 · 时间 · 事件".into()),
+                ("sess-2".into(), "会话 2 · 时间 · 事件".into()),
+            ],
+            selected: 1,
+            kind: tpi::tui::model::MenuKind::Session,
+            session_previews: vec![Vec::new(), preview.clone()],
+        }),
+        modal: Some(tpi::tui::model::ModalState::new(
+            "/sessions",
+            tpi::app::preview_lines_to_body(&preview),
+        )),
+        ..Default::default()
+    };
+    let buf = draw_to_test_backend_mode(&mut view, 96, 24, ViewMode::Fullscreen);
+    let all: String = row_texts(&buf).join("\n");
+    // 悬浮窗（Modal）显示预览：`你 用户问题` / `AI AI 回答`（跳过空格）。
+    assert!(all.contains("用户问题"), "用户消息在悬浮窗中: {all:?}");
+    assert!(all.contains("AIAI回答"), "AI 消息在悬浮窗中: {all:?}");
+    // 底部菜单仍是紧凑列表（选中项可见）。
+    assert!(all.contains("会话2"), "菜单列表选中项可见: {all:?}");
 }

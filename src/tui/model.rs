@@ -386,6 +386,14 @@ pub enum StatusLine {
     Compacting,
 }
 
+/// 会话对话预览的一行：角色 + 文本（§用户诉求：/sessions 菜单内预览
+/// User 与 AI 的对话，帮助分辨会话，不含工具输出）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuPreviewLine {
+    pub is_user: bool,
+    pub text: String,
+}
+
 /// 斜杠命令补全菜单（输入以 `/` 开头时弹出，§16.2 信息层级之外的小浮层）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuView {
@@ -393,6 +401,9 @@ pub struct MenuView {
     pub items: Vec<(String, String)>,
     pub selected: usize,
     pub kind: MenuKind,
+    /// Session 菜单：每项对应的对话预览（与 items 等长；其他菜单为空）。
+    /// 渲染时跟随选中项显示，帮助用户分辨会话内容。
+    pub session_previews: Vec<Vec<MenuPreviewLine>>,
 }
 
 /// 菜单种类（决定 Enter/Tab 的插入行为）。
@@ -474,12 +485,12 @@ pub struct ViewModel {
     pub transcript_rows: u16,
     /// 排队中的待提交消息数（footer 提示；由 UiState 同步）。
     pub pending_queue_len: usize,
-    /// 思考内容是否展开（Alt+T 全局切换；§用户诉求：点击单个 thinking 行按条目展开）。
-    pub reasoning_visible: bool,
     /// §用户诉求 [ui] collapsed_lines：卡片（thinking/工具）折叠时显示的正文行数；
     /// 0（默认）= 折叠态只显示主行摘要，不显示正文。
     pub collapsed_lines: usize,
-    /// 按条目展开的 thinking（§用户诉求：像 diff 一样点击行展开/收缩）。
+    /// 按条目展开的 thinking（§用户诉求：像 diff 一样点击行展开/收缩；
+    /// Alt+T 全量切换同样写这里——与工具卡 `expanded` 同构：单套状态、
+    /// 无全局 fallback，点击即切换，最终化后状态延续）。
     /// 该 entry 的 thinking 折叠态显示一行，展开态显示全文。
     pub reasoning_expanded: std::collections::HashSet<EntryId>,
     /// 鼠标点击命中的目标（工具卡片/reasoning 行；§24 高亮反馈）。
@@ -539,7 +550,6 @@ impl Default for ViewModel {
             entry_heights: HashMap::new(),
             transcript_rows: 0,
             pending_queue_len: 0,
-            reasoning_visible: false,
             reasoning_expanded: std::collections::HashSet::new(),
             collapsed_lines: 0,
             active_hit: None,
@@ -1232,6 +1242,9 @@ impl ViewModel {
     }
 
     /// §用户诉求：thinking 按条目展开/收缩（点击该行，像 diff 一样）。
+    /// 与工具卡 `toggle_expand` 同构：直接翻转该 entry 的展开位，
+    /// 不依赖任何全局状态——最终化（live → transcript）后 id 沿用，
+    /// 点击始终能再次收起（修复“展开后关不上”）。
     pub fn toggle_reasoning_expanded(&mut self, id: EntryId) {
         if self.reasoning_expanded.contains(&id) {
             self.reasoning_expanded.remove(&id);
@@ -1241,12 +1254,38 @@ impl ViewModel {
         self.bump_transcript();
     }
 
-    /// 该 entry 的 thinking 是否展开（按条目展开优先；否则跟随全局 Alt+T）。
+    /// 该 entry 的 thinking 是否展开（单套按条目状态，无全局 fallback）。
     pub fn is_reasoning_expanded(&self, id: EntryId) -> bool {
-        if self.reasoning_expanded.contains(&id) {
-            return true;
+        self.reasoning_expanded.contains(&id)
+    }
+
+    /// Alt+T：全量切换所有 thinking 卡（历史 + live 同一套状态）——
+    /// 全部已展开则全部收起，否则全部展开。与工具卡“每卡独立展开位”
+    /// 同构，只是批量操作。
+    pub fn toggle_all_reasoning(&mut self) {
+        let mut ids: Vec<EntryId> = self
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Message { id, line, .. } if line.kind == LineKind::Reasoning => Some(*id),
+                _ => None,
+            })
+            .collect();
+        if let Some(msg) = &self.live.reasoning {
+            ids.push(msg.entry_id);
         }
-        self.reasoning_visible
+        let all_expanded =
+            !ids.is_empty() && ids.iter().all(|id| self.reasoning_expanded.contains(id));
+        if all_expanded {
+            for id in ids {
+                self.reasoning_expanded.remove(&id);
+            }
+        } else {
+            for id in ids {
+                self.reasoning_expanded.insert(id);
+            }
+        }
+        self.bump_transcript();
     }
 
     /// 打开 reasoning 原文 Overlay（点击折叠的 reasoning 行）。
@@ -1613,6 +1652,7 @@ impl ViewModel {
             selected: selected.min(items.len() - 1),
             items,
             kind: MenuKind::SlashCommand,
+            session_previews: Vec::new(),
         });
     }
 
@@ -1646,6 +1686,7 @@ impl ViewModel {
             selected: selected.min(items.len() - 1),
             items,
             kind: MenuKind::File,
+            session_previews: Vec::new(),
         });
     }
 
@@ -1828,7 +1869,7 @@ fn user_visible_output(name: &str, text: &str) -> (String, Option<usize>) {
                 let start = rest.split('-').next()?;
                 start.parse::<usize>().ok()
             });
-            let mut body: Vec<&str> = Vec::new();
+            let mut body: Vec<String> = Vec::new();
             let mut started = false;
             for l in &lines {
                 if !started {
@@ -1841,7 +1882,16 @@ fn user_visible_output(name: &str, text: &str) -> (String, Option<usize>) {
                 {
                     break; // 正文结束：续读指引/尾部空行不是内容。
                 }
-                body.push(l);
+                // §修复：read 工具输出正文每行带 `{n}: ` 行号前缀（files.rs
+                // number_lines，给模型精确定位单行用）；TUI 自己在卡片上渲染
+                // 行号（line_number_start 递增），这里剥掉，避免「双行号」。
+                // body 无空行（空行已 break），len() 即该行的相对偏移。
+                if let Some(start) = start {
+                    let prefix = format!("{}: ", start + body.len());
+                    body.push(l.strip_prefix(&prefix).unwrap_or(l).to_string());
+                } else {
+                    body.push(l.to_string());
+                }
             }
             let body = body.join("\n");
             if !body.is_empty() {

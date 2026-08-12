@@ -424,7 +424,7 @@ fn parse_diff(diff_text: &str) -> Vec<DiffRow> {
 
 /// 渲染 unified diff 为用户友好形式（§用户诉求）：
 /// - `---`/`+++` 文件头：隐藏（卡片主行 target 已显示路径）；
-/// - `@@` hunk 头：渲染为区块分隔行 `⋯ ···`；
+/// - `@@` hunk 头：渲染为区块分隔行 `…`（与全项目省略号统一）；
 /// - 内容行：带真实文件行号（`-` 旧行号、`+` 新行号、上下文新行号），
 ///   行号 muted 右对齐；`-` 红、`+` 绿，只改前景色（背景由卡片面板承担）。
 pub(super) fn render_diff_lines(diff_text: &str, theme: theme::Theme) -> Vec<Line<'static>> {
@@ -439,8 +439,10 @@ pub(super) fn render_diff_lines(diff_text: &str, theme: theme::Theme) -> Vec<Lin
     for row in rows {
         let line = match row.kind {
             // 区块分隔：行号在此跳变（多 hunk diff 的分割点）。
+            // §用户诉求：统一用 `…`（U+2026）——此前 `⋯ ···` 混用居中省略号
+            // 与 3 个 ASCII 点（视觉 6 点），与其它省略样式不一致。
             DiffKind::Hunk => Line::styled(
-                "⋯ ···",
+                "…",
                 Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
             ),
             DiffKind::Minus => Line::from(vec![

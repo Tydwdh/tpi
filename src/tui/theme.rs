@@ -20,6 +20,8 @@ pub struct Theme {
     pub info: Color,
     pub success: Color,
     pub warning: Color,
+    /// 常量/数字/属性色（One Dark Pro 的橙色 #d19a66；语法高亮 numeric 用）。
+    pub orange: Color,
     pub error: Color,
     pub text: Color,
     pub muted: Color,
@@ -40,6 +42,7 @@ impl Theme {
             info: Color::Rgb(0x89, 0xdc, 0xeb),
             success: Color::Rgb(0xa6, 0xe3, 0xa1),
             warning: Color::Rgb(0xf9, 0xe2, 0xaf),
+            orange: Color::Rgb(0xf9, 0xe2, 0xaf),
             error: Color::Rgb(0xf3, 0x8b, 0xa8),
             text: Color::Rgb(0xcd, 0xd6, 0xf4),
             muted: Color::Rgb(0x7f, 0x84, 0x9c),
@@ -62,26 +65,28 @@ impl Theme {
         }
     }
 
-    /// OneDarkPro 配色（§用户诉求）：bg #282c34、fg #abb2bf、
-    /// red #e06c75、green #98c379、yellow #e5c07b、blue #61afef、
-    /// purple #c678dd、cyan #56b6c2、orange #d19a66。
-    /// 映射：primary=blue（强调/链接）、accent=purple（思考/竖线）、
-    /// info=cyan、success=green、warning=yellow、error=red、
-    /// panel=#2c313a（bg 提亮一档的面）、border=#3e4451（注释灰）。
+    /// OneDarkPro 配色（§用户诉求，对齐 onedarkpro v3 官方色板）：
+    /// bg #282c34、fg #abb2bf、comment #7f848e、red #e06c75、green #98c379、
+    /// yellow #e5c07b、blue #61afef、purple #c678dd、cyan #56b6c2、orange #d19a66。
+    /// 映射：primary=blue（强调/链接/AI rail）、accent=purple（思考/竖线）、
+    /// info=cyan、success=green、warning=yellow、orange=#d19a66（常量/数字）、
+    /// error=red、panel=#2c313a（currentLine 提亮面）、border=#3e4451（selection）、
+    /// surface=#21252b（widget/sidebar）、surface_subtle=#1e2227（input 深底）。
     pub fn onedarkpro() -> Self {
         Self {
-            primary: Color::Rgb(0x61, 0xaf, 0xef), // blue
-            accent: Color::Rgb(0xc6, 0x78, 0xdd),  // purple
-            info: Color::Rgb(0x56, 0xb6, 0xc2),    // cyan
-            success: Color::Rgb(0x98, 0xc3, 0x79), // green
-            warning: Color::Rgb(0xe5, 0xc0, 0x7b), // yellow
-            error: Color::Rgb(0xe0, 0x6c, 0x75),   // red
-            text: Color::Rgb(0xab, 0xb2, 0xbf),    // fg
-            muted: Color::Rgb(0x7f, 0x84, 0x8e),   // 注释灰
-            panel: Color::Rgb(0x2c, 0x31, 0x3a),   // bg 提亮一档
-            border: Color::Rgb(0x3e, 0x44, 0x51),  // 边框灰
-            surface: Color::Rgb(0x21, 0x25, 0x2b), // 略暗于 bg
-            surface_subtle: Color::Rgb(0x31, 0x36, 0x3f),
+            primary: Color::Rgb(0x61, 0xaf, 0xef),        // blue
+            accent: Color::Rgb(0xc6, 0x78, 0xdd),         // purple
+            info: Color::Rgb(0x56, 0xb6, 0xc2),           // cyan
+            success: Color::Rgb(0x98, 0xc3, 0x79),        // green
+            warning: Color::Rgb(0xe5, 0xc0, 0x7b),        // yellow
+            orange: Color::Rgb(0xd1, 0x9a, 0x66),         // orange（常量/数字）
+            error: Color::Rgb(0xe0, 0x6c, 0x75),          // red
+            text: Color::Rgb(0xab, 0xb2, 0xbf),           // fg
+            muted: Color::Rgb(0x7f, 0x84, 0x8e),          // comment
+            panel: Color::Rgb(0x2c, 0x31, 0x3a),          // currentLine 提亮面
+            border: Color::Rgb(0x3e, 0x44, 0x51),         // selection 边框灰
+            surface: Color::Rgb(0x21, 0x25, 0x2b),        // widget/sidebar
+            surface_subtle: Color::Rgb(0x1e, 0x22, 0x27), // input 深底（代码块）
         }
     }
 
@@ -93,6 +98,7 @@ impl Theme {
             info: Color::Rgb(0x79, 0xc0, 0xff),
             success: Color::Rgb(0x57, 0xab, 0x5a),
             warning: Color::Rgb(0xd2, 0x99, 0x22),
+            orange: Color::Rgb(0xd2, 0x99, 0x22),
             error: Color::Rgb(0xff, 0x6b, 0x6b),
             text: Color::Rgb(0xd8, 0xde, 0xe9),
             muted: Color::Rgb(0x7f, 0x8c, 0x9d),
@@ -111,6 +117,7 @@ impl Theme {
             info: Color::Rgb(0x0b, 0x7c, 0xc4),
             success: Color::Rgb(0x2e, 0x7d, 0x32),
             warning: Color::Rgb(0xb0, 0x6a, 0x00),
+            orange: Color::Rgb(0xb0, 0x6a, 0x00),
             error: Color::Rgb(0xc6, 0x28, 0x28),
             text: Color::Rgb(0x24, 0x29, 0x2e),
             muted: Color::Rgb(0x61, 0x6e, 0x7c),
@@ -130,6 +137,7 @@ impl Theme {
             info: Color::Rgb(0x56, 0xb6, 0xc2),
             success: Color::Rgb(0x7f, 0xd8, 0x8f),
             warning: Color::Rgb(0xf5, 0xa7, 0x42),
+            orange: Color::Rgb(0xf5, 0xa7, 0x42),
             error: Color::Rgb(0xe0, 0x6c, 0x75),
             text: Color::Rgb(0xee, 0xee, 0xee),
             muted: Color::Rgb(0x80, 0x80, 0x80),
@@ -178,6 +186,8 @@ mod tests {
     }
 
     /// §用户诉求：onedarkpro 按 OneDarkPro 配色解析；`onedark` 别名同样生效。
+    /// 对齐 onedarkpro v3 官方色板：comment #7f848e、orange #d19a66、
+    /// widget #21252b、input 深底 #1e2227。
     #[test]
     fn onedarkpro_palette_and_alias() {
         assert_eq!(Theme::named("onedarkpro"), Theme::onedarkpro());
@@ -188,6 +198,11 @@ mod tests {
         assert_eq!(t.error, Color::Rgb(0xe0, 0x6c, 0x75)); // red
         assert_eq!(t.text, Color::Rgb(0xab, 0xb2, 0xbf));
         assert_eq!(t.panel, Color::Rgb(0x2c, 0x31, 0x3a));
+        assert_eq!(t.muted, Color::Rgb(0x7f, 0x84, 0x8e)); // comment
+        assert_eq!(t.orange, Color::Rgb(0xd1, 0x9a, 0x66)); // orange
+        assert_eq!(t.surface, Color::Rgb(0x21, 0x25, 0x2b)); // widget/sidebar
+        assert_eq!(t.surface_subtle, Color::Rgb(0x1e, 0x22, 0x27)); // input 深底
+        assert_eq!(t.border, Color::Rgb(0x3e, 0x44, 0x51)); // selection 边框
     }
 
     /// §16.3 调色板与设计文档逐项一致（主题是契约的一部分）。
@@ -199,6 +214,7 @@ mod tests {
         assert_eq!(t.info, Color::Rgb(0x89, 0xdc, 0xeb));
         assert_eq!(t.success, Color::Rgb(0xa6, 0xe3, 0xa1));
         assert_eq!(t.warning, Color::Rgb(0xf9, 0xe2, 0xaf));
+        assert_eq!(t.orange, Color::Rgb(0xf9, 0xe2, 0xaf)); // 与 warning 同值
         assert_eq!(t.error, Color::Rgb(0xf3, 0x8b, 0xa8));
         assert_eq!(t.text, Color::Rgb(0xcd, 0xd6, 0xf4));
         assert_eq!(t.muted, Color::Rgb(0x7f, 0x84, 0x9c));

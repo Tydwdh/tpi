@@ -506,6 +506,30 @@ fn render_frame(
         None
     };
 
+    // 操作型 Modal（§42：/help /settings /doctor 等；覆盖显示，Esc 关闭）。
+    // §用户诉求：/sessions 悬浮窗（Modal）显示选中会话的对话预览——靠上小窗
+    // （标题 + ≤6 行预览），与底部菜单列表错开；其余 Modal 保持居中大框。
+    // 先画 Modal 再画菜单：菜单浮在最上，列表永不被悬浮窗盖住。
+    let is_session_menu = matches!(
+        view.menu.as_ref().map(|m| m.kind),
+        Some(model::MenuKind::Session)
+    );
+    if view.modal.is_some() {
+        let w = modal_width(area.width);
+        let h = if is_session_menu {
+            (10u16).min(trans_area.height.saturating_sub(2).max(1))
+        } else {
+            modal_height(trans_area.height)
+        };
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = if is_session_menu {
+            trans_area.y + 1
+        } else {
+            trans_area.y + trans_area.height.saturating_sub(h) / 2
+        };
+        draw_modal(frame, Rect::new(x, y, w, h), view, theme);
+    }
+
     // 命令补全菜单浮层（覆盖在转录区上方，§16.2 之外的小浮层）。
     if let Some(menu) = &view.menu {
         let h = (menu.items.len() as u16 + 1).min(9);
@@ -517,15 +541,6 @@ fn render_frame(
         };
         let y = trans_area.y + trans_area.height.saturating_sub(h);
         draw_menu(frame, Rect::new(area.x, y, w, h), view, theme);
-    }
-
-    // 操作型 Modal（§42：/help /settings /doctor 等；覆盖显示，Esc 关闭）。
-    if view.modal.is_some() {
-        let w = modal_width(area.width);
-        let h = modal_height(trans_area.height);
-        let x = area.x + (area.width.saturating_sub(w)) / 2;
-        let y = trans_area.y + trans_area.height.saturating_sub(h) / 2;
-        draw_modal(frame, Rect::new(x, y, w, h), view, theme);
     }
 
     // 搜索框（§14：Ctrl+F；悬浮在转录区顶部）。
@@ -1278,6 +1293,42 @@ fn full_line_hit(target: HitTarget, width: u16) -> Option<HitRange> {
     Some((target, width))
 }
 
+/// 工具卡片是否"紧凑"：collapsed_lines==0 且未展开且带内容——只显示主行，
+/// 卡片之间取消间隔（§用户诉求：紧凑）。
+fn tool_card_compact(card: &ToolCard) -> bool {
+    card.collapsed_lines == 0
+        && !card.expanded
+        && (card.diff.is_some() || card.output.is_some() || card.tail.is_some())
+}
+
+/// live 区首个组是否为 thinking/assistant 卡（历史末尾与 live 衔接时判定
+/// 是否需要补间隔；§用户诉求：思考 / AI 输出卡与其他卡片保持一格间隔）。
+fn live_starts_with_gap_card(view: &ViewModel) -> bool {
+    view.live
+        .reasoning
+        .as_ref()
+        .is_some_and(|m| !m.text.is_empty())
+        || view
+            .live
+            .assistant
+            .as_ref()
+            .is_some_and(|m| !m.text.is_empty())
+}
+
+/// 历史末尾 entry 是否要求与 live 首组补间隔：compact 工具卡或 System/Tool
+/// 文本行（这类 entry 的 gap 完全依赖下一组的类型；User/Assistant/Reasoning
+/// 与展开态工具卡在历史循环里已无条件补间隔）。
+fn history_tail_requires_gap(view: &ViewModel) -> bool {
+    matches!(
+        view.transcript.last(),
+        Some(Entry::Tool { card, .. }) if tool_card_compact(card)
+    ) || matches!(
+        view.transcript.last(),
+        Some(Entry::Message { line, .. })
+            if matches!(line.kind, LineKind::System | LineKind::Tool)
+    )
+}
+
 /// 把转录条目渲染为逻辑行（Message 按类型着色/加 rail；Tool 渲染为卡片）。
 ///
 /// 返回按 entry 分组的结果（含 live 哨兵组，§7.2）。
@@ -1325,7 +1376,7 @@ fn build_transcript_text(
             rail,
         });
     };
-    for entry in view.transcript.iter() {
+    for (i, entry) in view.transcript.iter().enumerate() {
         let entry_id = entry.id();
         out.clear();
         hits.clear();
@@ -1619,17 +1670,28 @@ fn build_transcript_text(
         // §用户诉求（紧凑）：collapsed_lines==0 且未展开的工具卡片只显示
         // 主行（无正文/提示），卡片间取消间隔；展开态（多行块）保留间隔
         // 以分隔。消息块间隔不变。
+        // §用户诉求：思考卡片 / AI 输出卡片始终与其他卡片保持一格间隔——
+        // 紧凑工具卡（或 System 行）后若紧接 thinking/assistant 卡，强制补间隔。
+        // §修复：历史末尾与 live 首组（thinking/assistant）的间隔不在这里补，
+        // 改由 build_live_group 在 live 首组前补——live 组每帧重建不缓存，历史
+        // wrap 结果不再依赖 live 状态；否则 thinking 流式开始后 wrap_cache 命中
+        // 无 gap 旧行，思考卡顶部缺空行（transcript_revision 流式期间不变）。
         let message_kind = match entry {
             Entry::Message { line, .. } => Some(line.kind),
             Entry::Tool { .. } => None,
         };
+        let next_is_gap_card = matches!(
+            view.transcript.get(i + 1),
+            Some(Entry::Message { line, .. })
+                if matches!(line.kind, LineKind::Reasoning | LineKind::Assistant)
+        );
         let needs_gap = match message_kind {
             Some(LineKind::User | LineKind::Assistant | LineKind::Reasoning) => true,
-            None => !matches!(entry, Entry::Tool { card, .. }
-                if card.collapsed_lines == 0
-                    && !card.expanded
-                    && (card.diff.is_some() || card.output.is_some() || card.tail.is_some())),
-            Some(_) => false,
+            None => {
+                let compact = matches!(entry, Entry::Tool { card, .. } if tool_card_compact(card));
+                !compact || next_is_gap_card
+            }
+            Some(_) => next_is_gap_card,
         };
         if needs_gap {
             out.push(Line::default());
@@ -1665,6 +1727,22 @@ fn build_transcript_text(
     groups
 }
 
+/// 追加一行间隔（块间留白；text 空、不可选，与历史区 needs_gap 同构）。
+fn push_gap_row(
+    out: &mut Vec<Line<'static>>,
+    hits: &mut Vec<Option<HitRange>>,
+    semantic: &mut Vec<SemanticLine>,
+) {
+    out.push(Line::default());
+    hits.push(None);
+    semantic.push(SemanticLine {
+        text: String::new(),
+        decor_cells: 0,
+        links: Vec::new(),
+        rail: None,
+    });
+}
+
 /// 渲染 live 区（§7.2）：reasoning（折叠策略同历史）→ assistant（Markdown）
 /// → 运行中工具卡片（按启动顺序）。
 fn build_live_group(
@@ -1687,6 +1765,17 @@ fn build_live_group(
     out.clear();
     hits.clear();
     semantic.clear();
+    // §修复：历史末尾 compact 工具卡 / System 行与 live 首组（thinking/
+    // assistant）之间的间隔在 live 首组前补——live 组每帧重建不缓存，历史
+    // wrap 结果不依赖 live 状态（否则 thinking 流式开始后 wrap_cache 命中
+    // 无 gap 旧行，思考卡顶部缺空行；finalize 后 revision 变化才恢复）。
+    if history_tail_requires_gap(view) && live_starts_with_gap_card(view) {
+        push_gap_row(out, hits, semantic);
+    }
+    // §用户诉求：live 区组间与历史区同规则——思考卡片 / AI 输出卡片与
+    // 相邻组保持一格间隔；紧凑工具卡之间取消间隔。prev_requires_gap = 上一组
+    // 是否要求与后续间隔。
+    let mut prev_requires_gap = false;
     // 流式 reasoning（折叠策略与历史一致：Alt+T 展开 / 点击查看）。
     // §PointerHit ⑤：reasoning 是独立 group（自己的稳定 EntryId）。
     // §美化：与历史 thinking 卡片同构——panel 底 + 左竖线。
@@ -1697,7 +1786,9 @@ fn build_live_group(
             .fg(theme.accent)
             .bg(theme.panel)
             .add_modifier(Modifier::BOLD);
-        if view.reasoning_visible {
+        // §修复：live thinking 与历史同用按条目状态（entry_id finalize 后沿用，
+        // 点击收起稳定生效）——不再依赖全局 reasoning_visible。
+        if view.is_reasoning_expanded(msg.entry_id) {
             // §用户诉求：live thinking 也用 markdown 渲染（代码块高亮同 assistant）。
             let (rendered, _links) = cached_markdown(
                 cache,
@@ -1731,14 +1822,26 @@ fn build_live_group(
                     .collect::<String>();
                 let line = Line::from(spans);
                 let rail = line.spans.first().cloned();
-                out.push(line);
                 // §修复：展开态每行都可点击（点正文任意处收起）——与历史
                 // reasoning 展开态一致；否则 live 展开后无任何 Reasoning hit，
                 // 点击无法触发收起（“打开后关不上”）。
                 hits.push(Some((HitTarget::Reasoning(msg.entry_id), width as u16)));
+                // §修复：decor 按实际宽度动态计算（与 push_hit 一致）——此前
+                // 硬编码 10，但 "┃ ◆ 思考 " 实际只有 9 cell（┃/◆ 各宽 1），
+                // 内容首字会被误判为装饰，语义文本错位丢字。
+                let line_width = unicode_width::UnicodeWidthStr::width(
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                        .as_str(),
+                );
+                let text_width = unicode_width::UnicodeWidthStr::width(semantic_text.as_str());
+                let decor_cells = line_width.saturating_sub(text_width);
+                out.push(line);
                 semantic.push(SemanticLine {
                     text: semantic_text,
-                    decor_cells: 10, // "┃ ◆ 思考 " 前缀
+                    decor_cells,
                     links: Vec::new(),
                     rail,
                 });
@@ -1791,12 +1894,18 @@ fn build_live_group(
         out.clear();
         hits.clear();
         semantic.clear();
+        // §用户诉求：思考卡与后续组保持一格间隔。
+        prev_requires_gap = true;
     }
     // 流式 assistant（Markdown，按 version 缓存）。带左 rail + AI 标签，
     // 与历史 assistant 消息一致（§16.2 层次感）。独立 group（稳定 id）。
     if let Some(msg) = &live.assistant
         && !msg.text.is_empty()
     {
+        // §用户诉求：AI 输出卡与前面的思考/工具卡保持一格间隔。
+        if prev_requires_gap {
+            push_gap_row(out, hits, semantic);
+        }
         let (rendered, line_links) = cached_markdown(cache, msg.version, &msg.text, theme, width);
         for (i, rendered_line) in rendered.iter().enumerate() {
             let mut spans = vec![Span::styled(
@@ -1849,11 +1958,18 @@ fn build_live_group(
         out.clear();
         hits.clear();
         semantic.clear();
+        // §用户诉求：AI 输出卡与后续工具卡保持一格间隔。
+        prev_requires_gap = true;
     }
     // 运行中工具卡片（按启动顺序）。§PointerHit ⑤：每张卡片独立 group/稳定 id。
     for call_id in &live.tool_order {
         if let Some(tool) = live.tools.get(call_id) {
             let card = &tool.card;
+            // §用户诉求：前面是思考/AI 输出卡（或展开态工具卡）时补间隔；
+            // 紧凑工具卡之间保持紧凑（与历史区规则一致）。
+            if prev_requires_gap {
+                push_gap_row(out, hits, semantic);
+            }
             let card_id = card.id.clone();
             let card_lines = tool_card_lines(card, view.anim_tick, theme, width);
             for (i, line) in card_lines.into_iter().enumerate() {
@@ -1891,6 +2007,8 @@ fn build_live_group(
             out.clear();
             hits.clear();
             semantic.clear();
+            // 紧凑工具卡后不强制间隔；展开态（多行块）保留间隔。
+            prev_requires_gap = !tool_card_compact(&tool.card);
         }
     }
 }
@@ -2407,25 +2525,30 @@ fn draw_modal(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: t
     content.push(Line::default());
     // §16.2 增强：/diff Modal 的 diff 行红绿着色；其他 Modal 保持纯文本
     // （避免 settings/help 里以 +/- 开头的行被误着色）。
+    // §用户诉求：/sessions 悬浮窗预览行着色——`你 ` accent、`AI ` 正文色。
     let diff_colored = modal.title == "/diff";
+    let session_preview = modal.title == "/sessions";
     for line in modal.body.lines() {
-        let styled: Line<'static> =
-            if diff_colored && line.starts_with('+') && !line.starts_with("+++") {
-                Line::styled(line.to_string(), Style::default().fg(theme.success))
-            } else if diff_colored && line.starts_with('-') && !line.starts_with("---") {
-                Line::styled(line.to_string(), Style::default().fg(theme.error))
-            } else if diff_colored && line.starts_with("@@") {
-                Line::styled(line.to_string(), Style::default().fg(theme.primary))
-            } else if diff_colored && (line.starts_with("+++") || line.starts_with("---")) {
-                Line::styled(
-                    line.to_string(),
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Line::styled(line.to_string(), Style::default().fg(theme.text))
-            };
+        let styled: Line<'static> = if session_preview && line.starts_with("你 ") {
+            Line::styled(line.to_string(), Style::default().fg(theme.accent))
+        } else if session_preview && line.starts_with("AI ") {
+            Line::styled(line.to_string(), Style::default().fg(theme.text))
+        } else if diff_colored && line.starts_with('+') && !line.starts_with("+++") {
+            Line::styled(line.to_string(), Style::default().fg(theme.success))
+        } else if diff_colored && line.starts_with('-') && !line.starts_with("---") {
+            Line::styled(line.to_string(), Style::default().fg(theme.error))
+        } else if diff_colored && line.starts_with("@@") {
+            Line::styled(line.to_string(), Style::default().fg(theme.primary))
+        } else if diff_colored && (line.starts_with("+++") || line.starts_with("---")) {
+            Line::styled(
+                line.to_string(),
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Line::styled(line.to_string(), Style::default().fg(theme.text))
+        };
         content.push(styled);
     }
     let wrapped = wrap_lines(content, inner_w);

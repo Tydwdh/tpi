@@ -21,6 +21,25 @@ use crate::tui::state::UiState;
 /// 显式挂载，与输入无关——↑/↓/Tab 等导航会调用本函数，若走命令菜单刷新
 /// 会把菜单清成 None（refresh_command_menu 先 `self.menu = None`），导致
 /// “在会话列表上下移动后列表突然消失”。对 Session 菜单保持不动。
+/// §用户诉求：/sessions 悬浮窗（Modal）随选中项更新对话预览——
+/// ↑/↓ 移动 Session 菜单后同步 modal.body。非 Session 菜单无操作。
+fn sync_session_preview(state: &mut UiState) {
+    let Some(menu) = state.view.menu.as_ref() else {
+        return;
+    };
+    if menu.kind != MenuKind::Session {
+        return;
+    }
+    let Some(preview) = menu.session_previews.get(menu.selected) else {
+        return;
+    };
+    let body = crate::app::preview_lines_to_body(preview);
+    if let Some(modal) = &mut state.view.modal {
+        modal.body = body;
+        modal.scroll = 0;
+    }
+}
+
 fn refresh_menus(state: &mut UiState) {
     if matches!(
         state.view.menu.as_ref().map(|m| m.kind),
@@ -210,6 +229,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.editor.set_text(state.view.input.clone());
                 state.sync_input();
             }
+            sync_session_preview(state);
         }
         KeyAction::Escape => {
             // §49：Esc 优先级 = overlay > modal > menu > run 取消。
@@ -297,6 +317,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 {
                     menu.selected = (menu.selected + menu.items.len() - 1) % menu.items.len();
                 }
+                sync_session_preview(state);
             } else if let Some(modal) = &mut state.view.modal {
                 // BUG-013：Modal 提示 ↑/↓ 滚动——让提示与实际行为一致。
                 modal.scroll = modal.scroll.saturating_sub(1);
@@ -317,6 +338,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 {
                     menu.selected = (menu.selected + 1) % menu.items.len();
                 }
+                sync_session_preview(state);
             } else if let Some(modal) = &mut state.view.modal {
                 // BUG-013：Modal ↑/↓ 滚动。
                 modal.scroll = modal.scroll.saturating_add(1);
@@ -379,7 +401,8 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             state.view.open_search();
         }
         KeyAction::ToggleReasoning => {
-            state.view.reasoning_visible = !state.view.reasoning_visible;
+            // Alt+T：全量切换所有 thinking 卡（历史 + live 同一套按条目状态）。
+            state.view.toggle_all_reasoning();
         }
         KeyAction::OpenLastTool => {
             // 打开最近一张工具卡片的详情 Overlay（鼠标点击的键盘等价）。
@@ -589,14 +612,11 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new();
             }
-            // §PointerHit：live reasoning 折叠行点击 → 切换全局展开；
-            // 历史 reasoning → 按条目展开（与 diff 一致）。
-            let in_transcript = state.view.transcript.iter().any(|entry| entry.id() == id);
-            if in_transcript {
-                state.view.toggle_reasoning_expanded(id);
-            } else {
-                state.view.reasoning_visible = !state.view.reasoning_visible;
-            }
+            // §修复：历史与 live reasoning 统一按条目切换（与工具卡 toggle_expand
+            // 同构）。live 的 entry_id 在 finalize 后沿用，点击始终能再次收起——
+            // 此前 live 点击切全局 reasoning_visible、历史点击切按条目，混合后
+            // 一旦 reasoning_visible=true 所有历史卡都“展开后关不上”。
+            state.view.toggle_reasoning_expanded(id);
             Vec::new()
         }
         UiEvent::ClickLink(url) => {

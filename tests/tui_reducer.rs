@@ -962,6 +962,7 @@ fn sessions_menu_enter_still_works_with_modal_open() {
         items: vec![("sess-1".into(), "label".into())],
         selected: 0,
         kind: tpi::tui::model::MenuKind::Session,
+        session_previews: Vec::new(),
     });
     reducer::update(&mut s, key(KeyCode::Enter));
     assert_eq!(s.pending_session.as_deref(), Some("sess-1"));
@@ -980,6 +981,7 @@ fn esc_closes_sessions_browser_in_one_press() {
         items: vec![("sess-1".into(), "label".into())],
         selected: 0,
         kind: tpi::tui::model::MenuKind::Session,
+        session_previews: Vec::new(),
     });
     reducer::update(&mut s, key(KeyCode::Esc));
     assert!(
@@ -1001,6 +1003,14 @@ fn sessions_menu_survives_up_down_navigation() {
             .collect(),
         selected: 0,
         kind: tpi::tui::model::MenuKind::Session,
+        session_previews: (0..5)
+            .map(|i| {
+                vec![tpi::tui::model::MenuPreviewLine {
+                    is_user: i % 2 == 0,
+                    text: format!("预览 {i}"),
+                }]
+            })
+            .collect(),
     });
     // ↓ 两次：选中 0 → 1 → 2；菜单必须始终存在，selected 跟随。
     reducer::update(&mut s, key(KeyCode::Down));
@@ -1009,9 +1019,20 @@ fn sessions_menu_survives_up_down_navigation() {
         s.view.menu.is_some(),
         "↓ 后 Session 菜单不得被命令菜单刷新清掉"
     );
+    // §用户诉求：↓ 后悬浮窗（Modal）预览同步为选中会话（选中 1 → `预览 1`）。
+    assert_eq!(
+        s.view.modal.as_ref().map(|m| m.body.as_str()),
+        Some("AI 预览 1"),
+        "↓ 后悬浮窗必须显示选中会话的预览"
+    );
     reducer::update(&mut s, key(KeyCode::Down));
     assert_eq!(s.view.menu.as_ref().map(|m| m.selected), Some(2));
     assert!(s.view.menu.is_some());
+    assert_eq!(
+        s.view.modal.as_ref().map(|m| m.body.as_str()),
+        Some("你 预览 2"),
+        "再 ↓ 后悬浮窗预览跟随"
+    );
     // ↑ 回到 1，菜单仍在。
     reducer::update(&mut s, key(KeyCode::Up));
     assert_eq!(s.view.menu.as_ref().map(|m| m.selected), Some(1));
