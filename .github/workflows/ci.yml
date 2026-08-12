@@ -19,27 +19,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.97
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
       - name: Check formatting
-        shell: pwsh
-        run: |
-          $output = cargo fmt --all -- --check 2>&1
-          $exitCode = $LASTEXITCODE
-          $output | Write-Output
-          if ($exitCode -ne 0) {
-            cargo fmt --all
-            $changed = @(git diff --name-only -- '*.rs')
-            if ($changed.Count -gt 0) {
-              $details = "rustfmt would change: $($changed -join ', ')"
-            } else {
-              $details = "rustfmt failed without a diff: $($output -join ' | ')"
-            }
-            $details = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
-            Write-Output "::error title=rustfmt check failed::$details"
-            exit $exitCode
-          }
+        run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
       - run: cargo test --all-targets --all-features
 
@@ -48,7 +32,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.97
+      - uses: dtolnay/rust-toolchain@1.97.1
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
       - run: cargo audit
