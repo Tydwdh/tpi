@@ -48,6 +48,16 @@ pub enum SessionTarget {
     Resume(String),
 }
 
+/// slash 命令分派结果：`interactive_loop` 据其短路 run 路径。
+enum SlashAction {
+    /// 退出交互循环（/quit、/exit）。
+    Quit,
+    /// 已作为命令消费，跳过 run（continue）。
+    Consumed,
+    /// 不是 slash 命令，按普通消息处理。
+    NotCommand,
+}
+
 /// 应用入口。
 pub async fn run(
     config: Config,
@@ -218,7 +228,6 @@ async fn interactive_loop<P: Provider>(
     initial_prompt: &str,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 ) -> Result<(), String> {
-    use crate::tui::SLASH_COMMANDS;
     use crate::tui::event::UiEvent;
     use crate::tui::model::LineKind;
     use crate::tui::state::UiState;
@@ -686,308 +695,18 @@ async fn interactive_loop<P: Provider>(
 
         // 有提交的消息：运行。
         if let Some(message) = ui_state.pop_pending() {
-            match message.as_str() {
-                "/quit" | "/exit" => break,
-                "/settings" => {
-                    let shell = config
-                        .shell_path
-                        .as_ref()
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| "未配置（自动查找 Git Bash）".to_string());
-                    // §成熟化：展示 [ui.keymap] 生效绑定（默认 + 自定义合并后）。
-                    let mut keymap_text = String::new();
-                    for (action, keys) in config.ui_keymap.display_bindings() {
-                        keymap_text.push_str(&format!("  {action}: {keys}\n"));
-                    }
-                    ui_state.view.open_modal(
-                        "/settings",
-                        format!(
-                            "配置来源: {}
-workspace: {}
-sessions: {}
-artifacts: {}
-shell: {shell}
-主题: {}（omp / dark / light / opencode）
-web_search: DuckDuckGo（免费，无需 API key）
-自动打开浏览器: {}
-保留 token: {}
-允许访问 workspace 外路径: {}
-模型单价: {}/百万输入 · {}/百万输出（未配置则不在 footer 显示花费）
-
-键位（[ui.keymap]，{}）:
-{keymap_text}",
-                            config.source,
-                            config.workspace_root,
-                            config.sessions_root.display(),
-                            config.artifacts_root.display(),
-                            config.ui_theme,
-                            if config.auto_open_browser {
-                                "是"
-                            } else {
-                                "否"
-                            },
-                            config.safety_reserve_tokens,
-                            if config.allow_outside_workspace {
-                                "是（AI 自由模式）"
-                            } else {
-                                "否（严格沙箱）"
-                            },
-                            fmt_price(config.model.price_input),
-                            fmt_price(config.model.price_output),
-                            "未配置时为内建默认",
-                        ),
-                    );
-                    renderer
-                        .draw(&mut ui_state.view)
-                        .map_err(|e| e.to_string())?;
-                    continue;
-                }
-                "/model" => {
-                    ui_state.view.open_modal(
-                        "/model",
-                        format!(
-                            "primary:
-  名称: {}
-  provider: {}
-  base_url: {}
-  reasoning: {}
-  max_output_tokens: {}
-  context_window: {}
-  api_key_env: {}",
-                            config.model.name,
-                            config.model.provider,
-                            config.model.base_url,
-                            config
-                                .model
-                                .reasoning
-                                .clone()
-                                .unwrap_or_else(|| "默认".to_string()),
-                            config
-                                .model
-                                .max_output_tokens
-                                .map(|v| v.to_string())
-                                .unwrap_or_else(|| "默认".to_string()),
-                            config
-                                .model
-                                .context_window
-                                .map(|v| v.to_string())
-                                .unwrap_or_else(|| "未配置".to_string()),
-                            config.model.api_key_env,
-                        ),
-                    );
-                    renderer
-                        .draw(&mut ui_state.view)
-                        .map_err(|e| e.to_string())?;
-                    continue;
-                }
-                "/help" => {
-                    let mut text = String::from(
-                        "命令：
-",
-                    );
-                    for (name, desc) in SLASH_COMMANDS {
-                        text.push_str(&format!(
-                            "/{name} —— {desc}
-"
-                        ));
-                    }
-                    text.push_str(
-                        "快捷键：Shift+Enter 换行 · ↑/↓ 多行/历史 · Tab 命令补全 ·
-                        @文件 引用补全 · Alt+T 思考折叠 · Alt+E/Alt+O 工具详情 ·
-                        Alt+[/] 切换工具 · Ctrl+F 搜索 · Ctrl+U 清空 ·
-                        Ctrl+Z 撤销 · Ctrl+Y 重做 ·
-                        Ctrl+A/E 行首/行尾 · PgUp/PgDn 翻页 · 滚轮/滚动条滚动 ·
-                        Ctrl+Home 顶部 · Ctrl+End 最新 · Modal ↑/↓ 滚动 ·
-                        点击工具卡片（任意行）展开 · 悬停卡片微高亮 ·
-                        点击链接打开 · 拖选自动滚动 ·
-                        Esc 取消 run
-                        键位可在配置 [ui.keymap] 中自定义（/settings 查看当前绑定）",
-                    );
-                    ui_state.view.open_modal("/help", text);
-                    renderer
-                        .draw(&mut ui_state.view)
-                        .map_err(|e| e.to_string())?;
-                    continue;
-                }
-                "/session" => {
-                    let info = match conversation.log() {
-                        Some(log) => format!(
-                            "session: {}
-workspace: {}
-事件数: {}",
-                            log.session_id(),
-                            log.workspace_id(),
-                            log.seq()
-                        ),
-                        None => "尚无 session（第一条消息后创建）".to_string(),
-                    };
-                    ui_state.view.open_modal("/session", info);
-                    renderer
-                        .draw(&mut ui_state.view)
-                        .map_err(|e| e.to_string())?;
-                    continue;
-                }
-                "/sessions" => {
-                    // 会话浏览器：列出当前 workspace 的 session，Enter 恢复。
-                    let sessions =
-                        match list_sessions(&config.sessions_root, &config.workspace_root) {
-                            Ok(sessions) => sessions,
-                            Err(error) => {
-                                push_system_line(
-                                    &mut ui_state.view,
-                                    &mut renderer,
-                                    format!("无法列出 session: {error}"),
-                                )?;
-                                continue;
-                            }
-                        };
-                    if sessions.is_empty() {
-                        push_system_line(
-                            &mut ui_state.view,
-                            &mut renderer,
-                            "当前 workspace 没有历史 session".to_string(),
-                        )?;
-                        continue;
-                    }
-                    ui_state.view.menu = Some(crate::tui::model::MenuView {
-                        items: sessions
-                            .iter()
-                            .map(|(id, modified, count, preview)| {
-                                // §用户诉求：会话标题 = 首条用户消息（preview）置前；
-                                // 无预览时显示“无标题”兜底，不让用户面对哈希 id。
-                                let title = if preview.is_empty() {
-                                    "(无标题)".to_string()
-                                } else {
-                                    preview.clone()
-                                };
-                                // §用户诉求：会话名（首条消息）置前；时间带日期
-                                // （MM-DD HH:MM），跨天会话不再难以分辨。
-                                let label = format!(
-                                    "{} · {} · {} 事件",
-                                    title,
-                                    fmt_time_short(*modified),
-                                    count
-                                );
-                                (id.to_string(), label)
-                            })
-                            .collect(),
-                        selected: 0,
-                        kind: crate::tui::model::MenuKind::Session,
-                    });
-                    ui_state
-                        .view
-                        .open_modal("/sessions", "会话列表：↑/↓ 选择，Enter 恢复（Esc 关闭）");
-                    renderer
-                        .draw(&mut ui_state.view)
-                        .map_err(|e| e.to_string())?;
-                    continue;
-                }
-                "/new" => {
-                    conversation.reset();
-                    // BUG-006：屏幕投影必须与已清空的上下文同步（否则显示旧 session）。
-                    ui_state.view.reset_for_new_session();
-                    push_system_line(
-                        &mut ui_state.view,
-                        &mut renderer,
-                        "已开始新会话".to_string(),
-                    )?;
-                    continue;
-                }
-                "/cancel" => {
-                    if let Some(cancel) =
-                        crate::util::lock_mutex(&current_cancel, "current_cancel").clone()
-                    {
-                        cancel.cancel();
-                        push_system_line(
-                            &mut ui_state.view,
-                            &mut renderer,
-                            "已发送取消（§11.5：保留 session）".to_string(),
-                        )?;
-                    } else {
-                        push_system_line(
-                            &mut ui_state.view,
-                            &mut renderer,
-                            "当前没有正在运行的 run".to_string(),
-                        )?;
-                    }
-                    continue;
-                }
-                "/thinking" => {
-                    let value = config
-                        .model
-                        .reasoning
-                        .clone()
-                        .unwrap_or_else(|| "未配置（默认）".to_string());
-                    ui_state.view.open_modal(
-                        "/thinking",
-                        format!(
-                            "reasoning: {value}
-说明: 透传给 provider 的推理设置（§18.1 [model.primary] reasoning）；
-未配置时使用 provider 默认。",
-                        ),
-                    );
-                    renderer
-                        .draw(&mut ui_state.view)
-                        .map_err(|e| e.to_string())?;
-                    continue;
-                }
-                "/diff" => {
-                    // §19：diff 是查看型内容，走 Modal 不污染 transcript。
-                    let diff = match conversation.log() {
-                        Some(log) => last_edit_diff(log),
-                        None => "尚无 session".to_string(),
-                    };
-                    ui_state.view.open_modal("/diff", diff);
-                    renderer
-                        .draw(&mut ui_state.view)
-                        .map_err(|e| e.to_string())?;
-                    continue;
-                }
-                "/doctor" => {
-                    // §19：环境检查报告走 Modal（此前 push 进 transcript 污染聊天历史）。
-                    ui_state.view.open_modal(
-                        "/doctor",
-                        crate::doctor::render_report(&config.workspace_root),
-                    );
-                    renderer
-                        .draw(&mut ui_state.view)
-                        .map_err(|e| e.to_string())?;
-                    continue;
-                }
-                "/compact" => {
-                    // P1-10：手动压缩——在下一次 run 开始时的完整边界执行。
-                    ui_state.force_compaction = true;
-                    push_system_line(
-                        &mut ui_state.view,
-                        &mut renderer,
-                        "将在下一次 run 开始时执行手动压缩（压缩旧历史为摘要）".to_string(),
-                    )?;
-                    continue;
-                }
-                "/retry" => {
-                    // §4.3：重试上一次失败/中断的 ModelTurn——不是重发 User 消息。
-                    // 目标消息入 pending_retry，主循环以空 user_message 发起 run，
-                    // 不重复记录 UserSubmitted，也不追加 User 消息（不污染对话）。
-                    match last_failed_message.clone() {
-                        Some(target) => {
-                            ui_state.push_retry(target.clone());
-                            push_system_line(
-                                &mut ui_state.view,
-                                &mut renderer,
-                                format!("⟳ 重试上一次 turn（{target}）"),
-                            )?;
-                        }
-                        None => {
-                            push_system_line(
-                                &mut ui_state.view,
-                                &mut renderer,
-                                "没有可重试的 turn（上一次 run 成功或尚无 run）".to_string(),
-                            )?;
-                        }
-                    }
-                    continue;
-                }
-                _ => {}
+            match handle_slash_command(
+                &message,
+                &mut ui_state,
+                &mut renderer,
+                config,
+                conversation,
+                &current_cancel,
+                &last_failed_message,
+            )? {
+                SlashAction::Quit => break,
+                SlashAction::Consumed => continue,
+                SlashAction::NotCommand => {}
             }
             ui_state.view.push_line(LineKind::User, message.clone());
             renderer
@@ -1056,6 +775,330 @@ workspace: {}
 }
 
 /// §PointerHit ⑥：统一 idle/run 的鼠标 dispatch——同一实现，杜绝两处 drift。
+/// 分派 slash 命令（从 `interactive_loop` 内联块提取）：命令在循环内短路
+/// run 路径。返回 [`SlashAction`] 由主循环解释；错误（draw/IO）向上传播，
+/// 与原内联 `?` 语义一致。
+fn handle_slash_command(
+    message: &str,
+    ui_state: &mut UiState,
+    renderer: &mut Renderer,
+    config: &Config,
+    conversation: &mut Conversation,
+    current_cancel: &Arc<Mutex<Option<CancellationToken>>>,
+    last_failed_message: &Option<String>,
+) -> Result<SlashAction, String> {
+    use crate::tui::SLASH_COMMANDS;
+    match message {
+        "/quit" | "/exit" => Ok(SlashAction::Quit),
+        "/settings" => {
+            let shell = config
+                .shell_path
+                .as_ref()
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "未配置（自动查找 Git Bash）".to_string());
+            // §成熟化：展示 [ui.keymap] 生效绑定（默认 + 自定义合并后）。
+            let mut keymap_text = String::new();
+            for (action, keys) in config.ui_keymap.display_bindings() {
+                keymap_text.push_str(&format!("  {action}: {keys}\n"));
+            }
+            ui_state.view.open_modal(
+                "/settings",
+                format!(
+                    "配置来源: {}
+workspace: {}
+sessions: {}
+artifacts: {}
+shell: {shell}
+主题: {}（omp / dark / light / opencode）
+web_search: DuckDuckGo（免费，无需 API key）
+自动打开浏览器: {}
+保留 token: {}
+允许访问 workspace 外路径: {}
+模型单价: {}/百万输入 · {}/百万输出（未配置则不在 footer 显示花费）
+
+键位（[ui.keymap]，{}）:
+{keymap_text}",
+                    config.source,
+                    config.workspace_root,
+                    config.sessions_root.display(),
+                    config.artifacts_root.display(),
+                    config.ui_theme,
+                    if config.auto_open_browser {
+                        "是"
+                    } else {
+                        "否"
+                    },
+                    config.safety_reserve_tokens,
+                    if config.allow_outside_workspace {
+                        "是（AI 自由模式）"
+                    } else {
+                        "否（严格沙箱）"
+                    },
+                    fmt_price(config.model.price_input),
+                    fmt_price(config.model.price_output),
+                    "未配置时为内建默认",
+                ),
+            );
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+            Ok(SlashAction::Consumed)
+        }
+        "/model" => {
+            ui_state.view.open_modal(
+                "/model",
+                format!(
+                    "primary:
+  名称: {}
+  provider: {}
+  base_url: {}
+  reasoning: {}
+  max_output_tokens: {}
+  context_window: {}
+  api_key_env: {}",
+                    config.model.name,
+                    config.model.provider,
+                    config.model.base_url,
+                    config
+                        .model
+                        .reasoning
+                        .clone()
+                        .unwrap_or_else(|| "默认".to_string()),
+                    config
+                        .model
+                        .max_output_tokens
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "默认".to_string()),
+                    config
+                        .model
+                        .context_window
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "未配置".to_string()),
+                    config.model.api_key_env,
+                ),
+            );
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+            Ok(SlashAction::Consumed)
+        }
+        "/help" => {
+            let mut text = String::from(
+                "命令：
+",
+            );
+            for (name, desc) in SLASH_COMMANDS {
+                text.push_str(&format!(
+                    "/{name} —— {desc}
+"
+                ));
+            }
+            text.push_str(
+                "快捷键：Shift+Enter 换行 · ↑/↓ 多行/历史 · Tab 命令补全 ·
+                        @文件 引用补全 · Alt+T 思考折叠 · Alt+E/Alt+O 工具详情 ·
+                        Alt+[/] 切换工具 · Ctrl+F 搜索 · Ctrl+U 清空 ·
+                        Ctrl+Z 撤销 · Ctrl+Y 重做 ·
+                        Ctrl+A/E 行首/行尾 · PgUp/PgDn 翻页 · 滚轮/滚动条滚动 ·
+                        Ctrl+Home 顶部 · Ctrl+End 最新 · Modal ↑/↓ 滚动 ·
+                        点击工具卡片（任意行）展开 · 悬停卡片微高亮 ·
+                        点击链接打开 · 拖选自动滚动 ·
+                        Esc 取消 run
+                        键位可在配置 [ui.keymap] 中自定义（/settings 查看当前绑定）",
+            );
+            ui_state.view.open_modal("/help", text);
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+            Ok(SlashAction::Consumed)
+        }
+        "/session" => {
+            let info = match conversation.log() {
+                Some(log) => format!(
+                    "session: {}
+workspace: {}
+事件数: {}",
+                    log.session_id(),
+                    log.workspace_id(),
+                    log.seq()
+                ),
+                None => "尚无 session（第一条消息后创建）".to_string(),
+            };
+            ui_state.view.open_modal("/session", info);
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+            Ok(SlashAction::Consumed)
+        }
+        "/sessions" => {
+            // 会话浏览器：列出当前 workspace 的 session，Enter 恢复。
+            let sessions = match list_sessions(&config.sessions_root, &config.workspace_root) {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    push_system_line(
+                        &mut ui_state.view,
+                        renderer,
+                        format!("无法列出 session: {error}"),
+                    )?;
+                    return Ok(SlashAction::Consumed);
+                }
+            };
+            if sessions.is_empty() {
+                push_system_line(
+                    &mut ui_state.view,
+                    renderer,
+                    "当前 workspace 没有历史 session".to_string(),
+                )?;
+                return Ok(SlashAction::Consumed);
+            }
+            let wid = session::workspace_id_for(config.workspace_root.as_std_path());
+            let sessions_dir = config.sessions_root.join(&wid);
+            let menu_items: Vec<(String, String)> = sessions
+                .iter()
+                .map(|(id, modified, count, preview)| {
+                    // §用户诉求：会话标题 = 首条用户消息（preview）置前；
+                    // 无预览时显示“无标题”兜底，不让用户面对哈希 id。
+                    let title = if preview.is_empty() {
+                        "(无标题)".to_string()
+                    } else {
+                        preview.clone()
+                    };
+                    // §用户诉求：会话名（首条消息）置前；时间带日期
+                    // （MM-DD HH:MM），跨天会话不再难以分辨。
+                    let label =
+                        format!("{} · {} · {} 事件", title, fmt_time_short(*modified), count);
+                    (id.to_string(), label)
+                })
+                .collect();
+            // §用户诉求：/sessions 菜单内预览选中会话的对话（只取 User 与
+            // AI 消息，不含工具输出），帮助分辨会话内容。
+            let session_previews: Vec<Vec<crate::tui::model::MenuPreviewLine>> = sessions
+                .iter()
+                .map(|(id, ..)| session_dialogue_preview(&sessions_dir.join(format!("{id}.jsonl"))))
+                .collect();
+            // §用户诉求：/sessions 悬浮窗（Modal）显示选中会话的对话预览——
+            // 初始为第一个会话；↑/↓ 移动时 reducer 同步更新。
+            let preview_body = preview_lines_to_body(
+                session_previews
+                    .first()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            );
+            ui_state.view.menu = Some(crate::tui::model::MenuView {
+                items: menu_items,
+                selected: 0,
+                kind: crate::tui::model::MenuKind::Session,
+                session_previews,
+            });
+            ui_state.view.open_modal("/sessions", preview_body);
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+            Ok(SlashAction::Consumed)
+        }
+        "/new" => {
+            conversation.reset();
+            // BUG-006：屏幕投影必须与已清空的上下文同步（否则显示旧 session）。
+            ui_state.view.reset_for_new_session();
+            push_system_line(&mut ui_state.view, renderer, "已开始新会话".to_string())?;
+            Ok(SlashAction::Consumed)
+        }
+        "/cancel" => {
+            if let Some(cancel) = crate::util::lock_mutex(current_cancel, "current_cancel").clone()
+            {
+                cancel.cancel();
+                push_system_line(
+                    &mut ui_state.view,
+                    renderer,
+                    "已发送取消（§11.5：保留 session）".to_string(),
+                )?;
+            } else {
+                push_system_line(
+                    &mut ui_state.view,
+                    renderer,
+                    "当前没有正在运行的 run".to_string(),
+                )?;
+            }
+            Ok(SlashAction::Consumed)
+        }
+        "/thinking" => {
+            let value = config
+                .model
+                .reasoning
+                .clone()
+                .unwrap_or_else(|| "未配置（默认）".to_string());
+            ui_state.view.open_modal(
+                "/thinking",
+                format!(
+                    "reasoning: {value}
+说明: 透传给 provider 的推理设置（§18.1 [model.primary] reasoning）；
+未配置时使用 provider 默认。",
+                ),
+            );
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+            Ok(SlashAction::Consumed)
+        }
+        "/diff" => {
+            // §19：diff 是查看型内容，走 Modal 不污染 transcript。
+            let diff = match conversation.log() {
+                Some(log) => last_edit_diff(log),
+                None => "尚无 session".to_string(),
+            };
+            ui_state.view.open_modal("/diff", diff);
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+            Ok(SlashAction::Consumed)
+        }
+        "/doctor" => {
+            // §19：环境检查报告走 Modal（此前 push 进 transcript 污染聊天历史）。
+            ui_state.view.open_modal(
+                "/doctor",
+                crate::doctor::render_report(&config.workspace_root),
+            );
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+            Ok(SlashAction::Consumed)
+        }
+        "/compact" => {
+            // P1-10：手动压缩——在下一次 run 开始时的完整边界执行。
+            ui_state.force_compaction = true;
+            push_system_line(
+                &mut ui_state.view,
+                renderer,
+                "将在下一次 run 开始时执行手动压缩（压缩旧历史为摘要）".to_string(),
+            )?;
+            Ok(SlashAction::Consumed)
+        }
+        "/retry" => {
+            // §4.3：重试上一次失败/中断的 ModelTurn——不是重发 User 消息。
+            // 目标消息入 pending_retry，主循环以空 user_message 发起 run，
+            // 不重复记录 UserSubmitted，也不追加 User 消息（不污染对话）。
+            match last_failed_message.clone() {
+                Some(target) => {
+                    ui_state.push_retry(target.clone());
+                    push_system_line(
+                        &mut ui_state.view,
+                        renderer,
+                        format!("⟳ 重试上一次 turn（{target}）"),
+                    )?;
+                }
+                None => {
+                    push_system_line(
+                        &mut ui_state.view,
+                        renderer,
+                        "没有可重试的 turn（上一次 run 成功或尚无 run）".to_string(),
+                    )?;
+                }
+            }
+            Ok(SlashAction::Consumed)
+        }
+        _ => Ok(SlashAction::NotCommand),
+    }
+}
+
 /// 输入 crossterm MouseEvent + renderer + 状态机，输出语义化 UiEvent。
 /// `overlay_open`：弹层打开时点击不动作。
 fn handle_mouse(
@@ -1755,6 +1798,85 @@ fn first_user_preview(path: &std::path::Path) -> String {
     }
     String::new()
 }
+/// 会话对话预览（§用户诉求：/sessions 菜单内预览选中会话）：流式读文件头部，
+/// 只收集 UserSubmitted 与 AssistantMessageCommitted 消息（不含工具/系统事件），
+/// 每条取首行前 [`PREVIEW_LINE_CHARS`] 字符；最多 [`PREVIEW_MAX_LINES`] 条。
+/// 与 [`first_user_preview`] 同一有界读策略（≤500 行 / 1 MiB 预算）。
+fn session_dialogue_preview(path: &std::path::Path) -> Vec<crate::tui::model::MenuPreviewLine> {
+    const MAX_LINES: usize = 500;
+    const MAX_PREVIEW_EVENT_BYTES: usize = 1024 * 1024;
+    const PREVIEW_MAX_LINES: usize = 6;
+    const PREVIEW_LINE_CHARS: usize = 60;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut out: Vec<crate::tui::model::MenuPreviewLine> = Vec::new();
+    let mut lines_read = 0usize;
+    loop {
+        let line = match crate::util::read_line_bounded(&mut reader, MAX_PREVIEW_EVENT_BYTES) {
+            Ok(crate::util::BoundedLineRead::Eof) | Err(_) => break,
+            Ok(crate::util::BoundedLineRead::TooLong) => {
+                lines_read = lines_read.saturating_add(1);
+                if lines_read >= MAX_LINES {
+                    break;
+                }
+                continue;
+            }
+            Ok(crate::util::BoundedLineRead::Line(line)) => line.bytes,
+        };
+        lines_read = lines_read.saturating_add(1);
+        if lines_read > MAX_LINES || out.len() >= PREVIEW_MAX_LINES {
+            break;
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Ok(envelope) = serde_json::from_slice::<crate::session::Envelope>(&line) else {
+            continue;
+        };
+        let content = match envelope.body {
+            crate::session::EventBody::UserSubmitted { payload } => Some((true, payload.content)),
+            crate::session::EventBody::AssistantMessageCommitted { payload } => {
+                Some((false, payload.message.content))
+            }
+            _ => None,
+        };
+        let Some((is_user, content)) = content else {
+            continue;
+        };
+        let first_line = content.lines().next().unwrap_or_default().trim();
+        if first_line.is_empty() {
+            continue;
+        }
+        let chars: String = first_line.chars().take(PREVIEW_LINE_CHARS).collect();
+        let text = if first_line.chars().count() > PREVIEW_LINE_CHARS {
+            format!("{chars}…")
+        } else {
+            chars
+        };
+        out.push(crate::tui::model::MenuPreviewLine { is_user, text });
+    }
+    out
+}
+
+/// 把对话预览行格式化为 Modal 正文（§用户诉求：/sessions 悬浮窗显示预览）。
+/// 每行 `你 {text}` / `AI {text}`，draw_modal 按前缀着色；空预览给占位提示。
+pub fn preview_lines_to_body(lines: &[crate::tui::model::MenuPreviewLine]) -> String {
+    if lines.is_empty() {
+        return "（无对话记录）".to_string();
+    }
+    let mut out = String::new();
+    for line in lines {
+        let prefix = if line.is_user { "你 " } else { "AI " };
+        out.push_str(prefix);
+        out.push_str(&line.text);
+        out.push('\n');
+    }
+    out.pop(); // 去掉末尾换行
+    out
+}
+
 /// P1-13：事件数 = JSONL 行数（每行一个事件，§14.2）；只数行不 serde 解析，
 /// session 增多时 `/sessions` 列表仍保持轻量（此前对每个文件解析全部事件）。
 fn count_jsonl_lines(path: &std::path::Path) -> usize {
@@ -2058,4 +2180,114 @@ fn first_user_preview_skips_a_whole_oversized_line_without_losing_alignment() {
     drop(file);
 
     assert_eq!(first_user_preview(&path), "仍可读取");
+}
+
+/// §用户诉求：/sessions 菜单对话预览——只取 User 与 AI 消息（工具/系统事件
+/// 跳过），角色标记正确，多行消息取首行并截断，超过 6 条封顶。
+#[test]
+fn session_dialogue_preview_collects_user_and_ai_only() {
+    use crate::tui::model::MenuPreviewLine;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dialogue.jsonl");
+    let mut content = String::new();
+    let env = |seq: u64, ty: &str, payload: serde_json::Value| {
+        serde_json::to_string(&serde_json::json!({
+            "schema": 1,
+            "seq": seq,
+            "event_id": format!("00000000-0000-7000-8000-{:012}", seq),
+            "timestamp": "2026-01-01T00:00:00Z",
+            "session_id": "00000000-0000-7000-8000-000000000000",
+            "run_id": "00000000-0000-7000-8000-000000000001",
+            "type": ty,
+            "payload": payload
+        }))
+        .unwrap()
+    };
+    // 1 user、1 assistant（多行）、1 工具事件（应跳过）、1 assistant、超长 user。
+    content.push_str(&env(
+        1,
+        "user_submitted",
+        serde_json::json!(
+            {"content": "帮我看看这个仓库"}
+        ),
+    ));
+    content.push('\n');
+    content.push_str(&env(
+        2,
+        "assistant_message_committed",
+        serde_json::json!(
+            {"message": {"content": "好的，我先看下结构\n第二行", "tool_calls": []}}
+        ),
+    ));
+    content.push('\n');
+    content.push_str(&env(3, "tool_completed", serde_json::json!(
+        {"call_id": "c1", "outcome": {"status": "succeeded", "program": "bash", "exit_code": 0, "duration_ms": 1, "output": "xxx", "effect": null, "artifact": null}}
+    )));
+    content.push('\n');
+    content.push_str(&env(
+        4,
+        "assistant_message_committed",
+        serde_json::json!(
+            {"message": {"content": "结论：这是一个 Rust 项目", "tool_calls": []}}
+        ),
+    ));
+    content.push('\n');
+    let long_user = "x".repeat(200);
+    content.push_str(&env(
+        5,
+        "user_submitted",
+        serde_json::json!(
+            {"content": long_user}
+        ),
+    ));
+    content.push('\n');
+    std::fs::write(&path, content).unwrap();
+
+    let preview = session_dialogue_preview(&path);
+    let texts: Vec<(bool, &str)> = preview
+        .iter()
+        .map(|MenuPreviewLine { is_user, text }| (*is_user, text.as_str()))
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            (true, "帮我看看这个仓库"),
+            (false, "好的，我先看下结构"),
+            (false, "结论：这是一个 Rust 项目"),
+            (true, &format!("{}…", "x".repeat(60))),
+        ],
+        "只取 User/AI 首行、工具跳过、多行取首行、超长截断: {texts:?}"
+    );
+    assert!(
+        preview.iter().all(|l| !l.text.is_empty()),
+        "空内容消息不进入预览"
+    );
+}
+
+/// §用户诉求：对话预览有界——收集满 6 条即停（长会话不解析整个文件）。
+#[test]
+fn session_dialogue_preview_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("many.jsonl");
+    let mut content = String::new();
+    for i in 0..20 {
+        let envelope = serde_json::json!({
+            "schema": 1,
+            "seq": i + 1,
+            "event_id": format!("00000000-0000-7000-8000-{:012}", i + 1),
+            "timestamp": "2026-01-01T00:00:00Z",
+            "session_id": "00000000-0000-7000-8000-000000000000",
+            "run_id": "00000000-0000-7000-8000-000000000001",
+            "type": "user_submitted",
+            "payload": {"content": format!("消息 {i}")}
+        });
+        content.push_str(&serde_json::to_string(&envelope).unwrap());
+        content.push('\n');
+    }
+    std::fs::write(&path, content).unwrap();
+    assert_eq!(
+        session_dialogue_preview(&path).len(),
+        6,
+        "预览最多 6 条（长会话不解析整个文件）"
+    );
 }
