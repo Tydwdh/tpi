@@ -69,8 +69,11 @@ enum Command {
     Init,
     /// 环境检查（P2：config/模型/API key/Git Bash/目录）。
     Doctor,
-    /// 列出当前 workspace 的可恢复会话（摘要 + 时间 + 完整 id），供 --resume 选择。
-    Sessions,
+    /// 列出/修复当前 workspace 的可恢复会话（摘要 + 时间 + 完整 id），供 --resume 选择。
+    Sessions {
+        #[command(subcommand)]
+        command: Option<SessionsCommand>,
+    },
     /// 清理过期 session/artifact（P2：`tpi prune --older-than <days>`）。
     Prune {
         /// 早于该天数（按 mtime）的文件被删除（默认 30）。
@@ -102,6 +105,19 @@ enum Command {
         /// evals 根目录（默认 <workspace>/evals）。
         #[arg(long)]
         evals: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionsCommand {
+    /// 列出当前 workspace 的可恢复会话（摘要 + 时间 + 完整 id），供 --resume 选择。
+    List,
+    /// 诊断并修复损坏的 session（中间坏行导致无法恢复，P0-2）。
+    /// 修复前自动备份，坏行隔离到 `<session>.quarantine`。
+    Repair {
+        /// 只诊断（显示坏行位置），不修改文件。
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -371,6 +387,64 @@ fn prune_old_data(older_than_days: u64, dry_run: bool) -> Result<(), String> {
         println!("将删除 {removed} 个文件（早于 {older_than_days} 天）");
     } else {
         println!("已删除 {removed} 个过期文件（早于 {older_than_days} 天）");
+    }
+    Ok(())
+}
+
+/// `tpi sessions repair`：诊断并修复当前 workspace 的损坏 session（P0-2）。
+/// 中间坏行会导致 session 无法恢复；repair 备份 → 隔离坏行 → 重写 → 重建。
+/// `--dry-run` 只诊断显示坏行位置，不修改文件。
+fn repair_sessions(
+    sessions_root: &std::path::Path,
+    workspace_root: &Utf8PathBuf,
+    dry_run: bool,
+) -> Result<(), String> {
+    let workspace_id = tpi::session::workspace_id_for(workspace_root.as_std_path());
+    let dir = sessions_root.join(&workspace_id);
+    let mut any_issue = false;
+    if !dir.exists() {
+        println!("当前 workspace 没有历史会话（首次提交消息后创建）");
+        return Ok(());
+    }
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("读取会话目录失败: {e}"))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().map(|e| e == "jsonl").unwrap_or(false))
+        .collect();
+    files.sort();
+    for path in files {
+        // 跳过修复/备份的附属文件（如 .bak-* / .quarantine 也是 .jsonl 结尾，
+        // 但它们的 stem 不是 UUID，diagnose 会因 session_id 不匹配而误报）。
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if uuid::Uuid::parse_str(stem).is_err() {
+            continue;
+        }
+        let bad = tpi::session::repair::diagnose(&path)
+            .map_err(|e| format!("诊断 {} 失败: {e}", path.display()))?;
+        if bad.is_empty() {
+            continue;
+        }
+        any_issue = true;
+        println!("会话 {} 损坏（{} 行）:", stem, bad.len());
+        for line in &bad {
+            println!("  L{}: {}", line.line, line.reason);
+        }
+        if dry_run {
+            println!("  [dry-run] 未修改（`tpi sessions repair` 修复）\n");
+            continue;
+        }
+        let report = tpi::session::repair::repair(&path)
+            .map_err(|e| format!("修复 {} 失败: {e}", path.display()))?;
+        println!(
+            "  已修复：隔离 {} 行，重建 seq={}，合成 Interrupted={}\n",
+            report.removed.len(),
+            report.max_seq,
+            report.synthesized_interrupted
+        );
+    }
+    if !any_issue {
+        println!("当前 workspace 的 session 全部健康");
     }
     Ok(())
 }
@@ -670,34 +744,41 @@ fn run(cli: Cli) -> Result<(), String> {
     // §用户诉求（恢复会话可判断）：`tpi sessions`——列出当前 workspace 的
     // 可恢复会话（首条消息摘要 + 时间 + 完整 id），不再让用户面对文件系统里
     // 的 UUID 哈希文件名。
-    if matches!(cli.command, Some(Command::Sessions)) {
+    if let Some(Command::Sessions { command }) = &cli.command {
         let workspace_root = current_workspace_root(cli.cwd.as_deref())?;
         let sessions_root = tpi::config::tpi_home().join("sessions");
-        let sessions = tpi::app::list_sessions(&sessions_root, &workspace_root)?;
-        if sessions.is_empty() {
-            println!("当前 workspace 没有历史会话（首次提交消息后创建）");
-            return Ok(());
+        match command {
+            None | Some(SessionsCommand::List) => {
+                let sessions = tpi::app::list_sessions(&sessions_root, &workspace_root)?;
+                if sessions.is_empty() {
+                    println!("当前 workspace 没有历史会话（首次提交消息后创建）");
+                    return Ok(());
+                }
+                println!(
+                    "{} 个会话（按最近使用排序；--resume 可接完整 id 或唯一前缀）：",
+                    sessions.len()
+                );
+                for (i, (id, modified, count, preview)) in sessions.iter().enumerate() {
+                    let title = if preview.is_empty() {
+                        "(无标题)".to_string()
+                    } else {
+                        preview.clone()
+                    };
+                    println!(
+                        "{}  {}  {} 事件  {}\n      id: {}",
+                        i + 1,
+                        fmt_session_datetime(*modified),
+                        count,
+                        title,
+                        id
+                    );
+                }
+                return Ok(());
+            }
+            Some(SessionsCommand::Repair { dry_run }) => {
+                return repair_sessions(&sessions_root, &workspace_root, *dry_run);
+            }
         }
-        println!(
-            "{} 个会话（按最近使用排序；--resume 可接完整 id 或唯一前缀）：",
-            sessions.len()
-        );
-        for (i, (id, modified, count, preview)) in sessions.iter().enumerate() {
-            let title = if preview.is_empty() {
-                "(无标题)".to_string()
-            } else {
-                preview.clone()
-            };
-            println!(
-                "{}  {}  {} 事件  {}\n      id: {}",
-                i + 1,
-                fmt_session_datetime(*modified),
-                count,
-                title,
-                id
-            );
-        }
-        return Ok(());
     }
 
     // P2：`tpi prune`——清理过期 session/artifact（~/.tpi/sessions 与 artifacts）。
@@ -828,10 +909,38 @@ mod tests {
     #[test]
     fn sessions_subcommand_parses() {
         let cli = Cli::parse_from(["tpi", "sessions"]);
-        assert!(matches!(cli.command, Some(Command::Sessions)));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sessions { command: None })
+        ));
+        let cli = Cli::parse_from(["tpi", "sessions", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sessions {
+                command: Some(SessionsCommand::List)
+            })
+        ));
         // 顶层 --cwd 与 sessions 可组合（列出其他 workspace）。
         let cli = Cli::parse_from(["tpi", "--cwd", ".", "sessions"]);
-        assert!(matches!(cli.command, Some(Command::Sessions)));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sessions { command: None })
+        ));
+        // P0-2：`tpi sessions repair`（P0-2 修复损坏 session）。
+        let cli = Cli::parse_from(["tpi", "sessions", "repair"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sessions {
+                command: Some(SessionsCommand::Repair { dry_run: false })
+            })
+        ));
+        let cli = Cli::parse_from(["tpi", "sessions", "repair", "--dry-run"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sessions {
+                command: Some(SessionsCommand::Repair { dry_run: true })
+            })
+        ));
     }
 
     /// §用户诉求：--resume 接受任意字符串（前缀匹配在 run 时解析），CLI 不校验。

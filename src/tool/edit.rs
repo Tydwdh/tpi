@@ -3,7 +3,11 @@
 //! - revision 对原始字节计算 BLAKE3，协议传完整 256 bit digest：`b3:<64-hex>`（§10.1）。
 //! - 内部使用 `logical_lf_text`（去 BOM、CRLF→LF）作为匹配空间，
 //!   但写回时只替换命中的原始 byte ranges，未触及字节原样保留（§10.5）。
-//! - 第一版严格拒绝 stale revision，不自动 fuzzy rebase（§10.3 第 12 条）。
+//! - stale revision 处理（§修复）：先对**当前文件**做唯一匹配预检——若所有
+//!   非 no-op replacement 仍唯一匹配（fmt 等外部空白改动后常见），允许宽松应用
+//!   （免重新 read）；否则仍 `stale_revision` 拒绝，并回填当前文件相关区域
+//!   内容（[`locate_similar`]），模型免 read 即可纠正。
+//! - no-op（old_text == new_text）项跳过不整批拒绝（§修复）；全部 no-op 才报错。
 //! - `write` 是 revision-bound 整文件写入：新建或提供匹配 revision 的整体重写（§10.6）。
 //! - M3：Windows 提交使用 `ReplaceFileW` + 同卷唯一 backup（§10.7）；
 //!   成功校验 backup digest，失败/校验不符进入可诊断恢复。
@@ -27,6 +31,8 @@ pub struct EditArgs {
     /// 否则 stale_revision 拒绝。
     pub revision: String,
     /// 批量替换（§10.3：逐条校验；任一条不匹配则整体拒绝）。
+    /// §修复：no-op（old_text == new_text）项自动跳过；stale 时若所有非 no-op
+    /// 项在当前文件仍唯一匹配，允许宽松应用（见 [`apply_edit`]）。
     pub replacements: Vec<Replacement>,
 }
 
@@ -238,6 +244,9 @@ pub enum EditError {
         path: Utf8PathBuf,
         current: String,
         expected: String,
+        /// stale 且 replacement 不再唯一匹配时，当前文件相关区域上下文
+        /// （模型免 read 自纠；§修复）。
+        context: Option<String>,
     },
     #[error("invalid revision: {value}")]
     InvalidRevision { value: String },
@@ -246,7 +255,12 @@ pub enum EditError {
     #[error("too many replacements in {path}: {count} (max {MAX_REPLACEMENTS})")]
     TooManyReplacements { path: Utf8PathBuf, count: usize },
     #[error("no match for replacements[{index}] in {path}")]
-    NoMatch { path: Utf8PathBuf, index: usize },
+    NoMatch {
+        path: Utf8PathBuf,
+        index: usize,
+        /// 当前文件相关区域上下文（模型免 read 自纠；§修复）。
+        context: Option<String>,
+    },
     #[error("multiple matches for replacements[{index}] in {path} (must be unique)")]
     MultipleMatches { path: Utf8PathBuf, index: usize },
     #[error("replacements[{a}] and replacements[{b}] overlap in {path}")]
@@ -257,6 +271,8 @@ pub enum EditError {
     },
     #[error("replacement {index} is a no-op (old_text == new_text) in {path}")]
     NoOp { path: Utf8PathBuf, index: usize },
+    #[error("all replacements are no-ops (old_text == new_text) in {path}")]
+    AllNoOps { path: Utf8PathBuf },
     #[error("non-canonical line endings in replacements[{index}] of {path} (\\r not allowed)")]
     NonCanonicalLineEndings { path: Utf8PathBuf, index: usize },
     #[error("target already exists: {path}")]
@@ -285,7 +301,7 @@ impl EditError {
             EditError::NoMatch { .. } => "no_match",
             EditError::MultipleMatches { .. } => "multiple_matches",
             EditError::Overlap { .. } => "overlap",
-            EditError::NoOp { .. } => "no_op",
+            EditError::NoOp { .. } | EditError::AllNoOps { .. } => "no_op",
             EditError::NonCanonicalLineEndings { .. } => "non_canonical_line_endings",
             EditError::AlreadyExists { .. } => "already_exists",
             EditError::CommitFailed { .. } => "commit_failed",
@@ -317,7 +333,10 @@ struct PreparedReplacement {
 pub struct EditResult {
     pub previous_revision: String,
     pub current_revision: String,
+    /// 实际应用的 replacement 数（不含跳过的 no-op）。
     pub applied: usize,
+    /// 因 old_text == new_text 而跳过的 no-op 条目数（§修复）。
+    pub skipped_noops: usize,
     /// 编辑前原始字节（unified diff 与诊断用）。
     pub previous_raw: Vec<u8>,
     pub new_raw: Vec<u8>,
@@ -414,16 +433,13 @@ fn apply_edit_to_snapshot(
             count: replacements.len(),
         });
     }
-    if snapshot.revision != expected_revision {
-        return Err(EditError::StaleRevision {
-            path: snapshot.path.clone(),
-            current: snapshot.revision,
-            expected: expected_revision.to_string(),
-        });
-    }
 
-    // 预检（§10.3 第 1-5 条）：全部通过才应用。
+    // 预检（§10.3 第 1-5 条）：基于当前文件内容，不依赖 revision。
+    // §修复 #4：no-op（old_text == new_text）项跳过不整批拒绝；其余逐条校验，
+    // 记录第一个失败的定位诊断（原子性：任一条失败即整体拒绝）。
     let mut prepared: Vec<PreparedReplacement> = Vec::with_capacity(replacements.len());
+    let mut skipped_noops = 0usize;
+    let mut precheck_error: Option<EditError> = None;
     for (index, replacement) in replacements.iter().enumerate() {
         if replacement.old_text.is_empty() {
             return Err(EditError::EmptyOldText {
@@ -436,24 +452,27 @@ fn apply_edit_to_snapshot(
                 index,
             });
         }
+        // §修复 #4：no-op 跳过（不整批拒绝）。
         if replacement.old_text == replacement.new_text {
-            return Err(EditError::NoOp {
-                path: snapshot.path.clone(),
-                index,
-            });
+            skipped_noops += 1;
+            continue;
         }
         let occurrences = count_occurrences(&snapshot.logical_lf_text, &replacement.old_text);
         if occurrences == 0 {
-            return Err(EditError::NoMatch {
+            precheck_error = Some(EditError::NoMatch {
                 path: snapshot.path.clone(),
                 index,
+                // §修复 #3：定位失败处当前文件内容，模型免 read 自纠。
+                context: locate_context(&snapshot.logical_lf_text, &replacement.old_text),
             });
+            break;
         }
         if occurrences > 1 {
-            return Err(EditError::MultipleMatches {
+            precheck_error = Some(EditError::MultipleMatches {
                 path: snapshot.path.clone(),
                 index,
             });
+            break;
         }
         // occurrences == 1 已保证唯一；find 失败意味着计数与查找不一致
         // （内部不变量被破坏）——按 NoMatch 处理并记录日志，不 panic。
@@ -465,10 +484,12 @@ fn apply_edit_to_snapshot(
                     index,
                     "edit: count_occurrences 与 find 不一致（内部不变量破坏）",
                 );
-                return Err(EditError::NoMatch {
+                precheck_error = Some(EditError::NoMatch {
                     path: snapshot.path.clone(),
                     index,
+                    context: None,
                 });
+                break;
             }
         };
         prepared.push(PreparedReplacement {
@@ -476,6 +497,39 @@ fn apply_edit_to_snapshot(
             logical_start,
             logical_end: logical_start + replacement.old_text.len(),
             new_logical: replacement.new_text.clone(),
+        });
+    }
+
+    // revision 判定：
+    // - 预检失败（NoMatch/MultipleMatches）优先报告；stale 时归并为
+    //   StaleRevision（§修复 #2：回填当前区域上下文），非 stale 报原错误。
+    // - stale 且所有非 no-op 项仍唯一匹配（§修复 #1：fmt 等外部空白改动后
+    //   常见）→ 宽松应用（基于当前内容，免重新 read）。
+    if let Some(error) = precheck_error {
+        if snapshot.revision != expected_revision {
+            let context = match &error {
+                EditError::NoMatch { context, .. } => context.clone(),
+                _ => None,
+            };
+            return Err(EditError::StaleRevision {
+                path: snapshot.path.clone(),
+                current: snapshot.revision,
+                expected: expected_revision.to_string(),
+                context,
+            });
+        }
+        return Err(error);
+    }
+    if snapshot.revision != expected_revision {
+        tracing::info!(
+            path = %snapshot.path,
+            "edit: revision stale but all replacements match current content; applying (lenient unique match)",
+        );
+    }
+    // §修复 #4：无预检错误但没有任何可应用项（全部是 no-op）→ 明确拒绝。
+    if prepared.is_empty() {
+        return Err(EditError::AllNoOps {
+            path: snapshot.path.clone(),
         });
     }
 
@@ -538,9 +592,64 @@ fn apply_edit_to_snapshot(
         previous_revision,
         current_revision,
         applied: prepared.len(),
+        skipped_noops,
         previous_raw: snapshot.raw.to_vec(),
         new_raw,
     })
+}
+
+/// 在文本中定位 `old_text` 最接近出现处的上下文（§修复 #2/#3：失败时回填
+/// 当前文件相关区域，模型免 read 即可自纠）。
+///
+/// 策略：精确匹配优先；否则按行找与 old_text 首行最相似的行，取该行前后
+/// 各 2 行、带行号、有界（≤400 字符）；找不到则返回文件头几行。
+fn locate_context(text: &str, old_text: &str) -> Option<String> {
+    const RADIUS_LINES: usize = 2;
+    const MAX_CTX_CHARS: usize = 400;
+
+    let first_line = old_text.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    // 精确匹配 old_text 的起始行号。
+    let exact_line = text.lines().position(|line| line.contains(old_text));
+    // 找不到精确匹配时，用首行做行内子串定位（容缩进/上下文差异）。
+    let target_line =
+        exact_line.or_else(|| text.lines().position(|line| line.contains(first_line)));
+    let line_no = match target_line {
+        Some(i) => i + 1,
+        None => 1,
+    };
+    // 0-based 起始行（覆盖前 RADIUS 行；saturating 防 line_no=1 时下溢）。
+    let start_line_0 = line_no.saturating_sub(RADIUS_LINES + 1);
+    let mut snippet = String::new();
+    for (offset, line) in text
+        .lines()
+        .skip(start_line_0)
+        .take(RADIUS_LINES * 2 + 1)
+        .enumerate()
+    {
+        let no = start_line_0 + offset + 1;
+        if no == line_no {
+            snippet.push_str(&format!(">> {no}: {line}\n"));
+        } else {
+            snippet.push_str(&format!("   {no}: {line}\n"));
+        }
+        if snippet.len() > MAX_CTX_CHARS {
+            snippet.push_str("...[truncated]\n");
+            break;
+        }
+    }
+    // 找不到任何定位（空文件/全空行）：回退文件头几行。
+    if snippet.is_empty() {
+        for (offset, line) in text.lines().take(RADIUS_LINES * 2 + 1).enumerate() {
+            snippet.push_str(&format!("   {}: {line}\n", offset + 1));
+            if snippet.len() > MAX_CTX_CHARS {
+                break;
+            }
+        }
+    }
+    Some(snippet)
 }
 
 /// 把 replacement 的 LF 编码为目标行尾（§10.5：anchor 附近行尾，M1 用文件多数行尾）。
@@ -751,6 +860,8 @@ pub fn commit_edit(
             path: path.clone(),
             current,
             expected: result.previous_revision.clone(),
+            // commit 阶段的竞态校验：无 replacement 可定位，回填 None。
+            context: None,
         });
     }
 
@@ -1228,20 +1339,137 @@ mod tests {
     }
 
     #[test]
-    fn edit_rejects_stale_revision() {
+    fn edit_rejects_stale_revision_when_old_text_no_longer_matches() {
+        // §修复 #1：stale 但 old_text 在当前文件不存在/不再唯一 → 仍拒绝。
         let dir = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
         std::fs::write(path.as_std_path(), "let x = 1;\n").unwrap();
+        // 外部把文件改成不包含 old_text 的内容（等价 fmt/编辑后 old_text 失效）。
+        std::fs::write(path.as_std_path(), "let y = 9;\n").unwrap();
         let error = apply_edit(
             &path,
             "b3:0000000000000000000000000000000000000000000000000000000000000000",
             &[Replacement {
-                old_text: "1".into(),
-                new_text: "2".into(),
+                old_text: "x = 1".into(),
+                new_text: "x = 2".into(),
             }],
         )
         .unwrap_err();
         assert_eq!(error.code(), "stale_revision");
+        assert!(
+            matches!(
+                error,
+                EditError::StaleRevision {
+                    context: Some(_),
+                    ..
+                }
+            ),
+            "stale 拒绝必须回填当前区域上下文: {error:?}"
+        );
+    }
+
+    #[test]
+    fn edit_applies_when_stale_but_old_text_still_unique() {
+        // §修复 #1：revision 过期（如 fmt 改动其他区域）但 old_text 在当前文件
+        // 仍唯一匹配 → 宽松应用，免重新 read。
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "let x = 1;\n").unwrap();
+        let old_revision = revision_of(b"let x = 1;\n");
+        // 外部 fmt 只改动其他区域（缩进/换行），目标 old_text 仍唯一存在。
+        std::fs::write(path.as_std_path(), "let x = 1;\n\nfn main() {}\n").unwrap();
+        let result = apply_edit(
+            &path,
+            &old_revision,
+            &[Replacement {
+                old_text: "let x = 1".into(),
+                new_text: "let x = 2".into(),
+            }],
+        )
+        .expect("stale 但唯一匹配应宽松应用");
+        assert_eq!(result.applied, 1);
+        let text = String::from_utf8(result.new_raw).unwrap();
+        assert!(text.contains("let x = 2"), "宽松应用必须生效: {text}");
+    }
+
+    #[test]
+    fn edit_skips_noop_replacements_in_batch() {
+        // §修复 #4：no-op（old == new）项跳过，其余正常应用；结果带 skipped_noops。
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
+        let original = "let a = 1;\nlet b = 2;\n";
+        std::fs::write(path.as_std_path(), original).unwrap();
+        let revision = revision_of(original.as_bytes());
+        let result = apply_edit(
+            &path,
+            &revision,
+            &[
+                Replacement {
+                    old_text: "a = 1".into(),
+                    new_text: "a = 10".into(),
+                },
+                // no-op：跳过，不整批拒绝。
+                Replacement {
+                    old_text: "b = 2".into(),
+                    new_text: "b = 2".into(),
+                },
+            ],
+        )
+        .expect("含 no-op 的批量应跳过 no-op 并应用其余");
+        assert_eq!(result.applied, 1);
+        assert_eq!(result.skipped_noops, 1);
+        let text = String::from_utf8(result.new_raw).unwrap();
+        assert!(text.contains("a = 10") && text.contains("b = 2"), "{text}");
+    }
+
+    #[test]
+    fn edit_all_noops_is_rejected() {
+        // §修复 #4：全部都是 no-op → 明确拒绝（机器码 no_op），不静默。
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "let a = 1;\n").unwrap();
+        let revision = revision_of(b"let a = 1;\n");
+        let error = apply_edit(
+            &path,
+            &revision,
+            &[Replacement {
+                old_text: "a = 1".into(),
+                new_text: "a = 1".into(),
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "no_op");
+        assert!(matches!(error, EditError::AllNoOps { .. }));
+    }
+
+    #[test]
+    fn no_match_error_carries_current_context() {
+        // §修复 #3：no_match 附当前文件相关区域（定位失败处，模型免 read 自纠）。
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
+        let original = "fn main() {\n    work();\n}\n";
+        std::fs::write(path.as_std_path(), original).unwrap();
+        let revision = revision_of(original.as_bytes());
+        let error = apply_edit(
+            &path,
+            &revision,
+            &[Replacement {
+                old_text: "helper()".into(),
+                new_text: "helper2()".into(),
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "no_match");
+        match error {
+            EditError::NoMatch { context, .. } => {
+                let ctx = context.unwrap_or_default();
+                assert!(
+                    ctx.contains("work()") || ctx.contains("fn main"),
+                    "context 必须包含当前文件内容: {ctx}"
+                );
+            }
+            other => panic!("期望 NoMatch: {other:?}"),
+        }
     }
 
     #[test]
@@ -1487,6 +1715,7 @@ mod tests {
             previous_revision: revision_of(&previous_raw),
             current_revision: revision_of(&new_raw),
             applied: 1,
+            skipped_noops: 0,
             previous_raw,
             new_raw,
         };

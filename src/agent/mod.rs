@@ -59,6 +59,16 @@ Partial assistant output already shown to the user:
 Continue the same response from where it was interrupted.
 Do not repeat the already emitted text.";
 
+/// 用户对一个已经提交了 partial assistant 的 Error/Length turn 执行 `/retry`
+/// 时，不能用空输入让模型猜语义；明确要求续写且不复述。该控制指令只用于
+/// retry 的首个 model request，不写入 durable conversation。
+const MANUAL_CONTINUE_INSTRUCTION: &str = "\
+The previous assistant response did not complete successfully.
+Continue it from the exact point where it stopped.
+Do not restart, summarize, or repeat text already present in the conversation.";
+
+const MIN_RECOVERY_OVERLAP_BYTES: usize = 8;
+
 /// 单轮 run 的结果。
 pub struct AgentOutcome {
     pub reason: CompletionReason,
@@ -236,6 +246,11 @@ pub async fn run<P: Provider>(
 
     let mut usage_total = Usage::default();
     let mut messages: Vec<ChatMessage> = history.to_vec();
+    let manual_retry_continuation = user_message.is_empty()
+        && matches!(
+            history.last(),
+            Some(ChatMessage::Assistant { content, .. }) if !content.trim().is_empty()
+        );
     if !user_message.is_empty() {
         messages.push(ChatMessage::User(user_message.clone()));
     }
@@ -258,11 +273,14 @@ pub async fn run<P: Provider>(
         }
     }
     // 工具共享状态与 ToolContext 构造由 run-scoped runtime 统一管理。
+    let initial_plan = crate::session::latest_plan(session.path())
+        .map_err(|e| RunFailure::Session(format!("restore plan: {e}")))?;
     let tool_runtime = ToolRuntime::new(
         config,
         session.session_id().to_string(),
         cancel.clone(),
         interactive,
+        initial_plan,
     );
 
     let mut turn = 0u32;
@@ -304,9 +322,10 @@ pub async fn run<P: Provider>(
             let plan = tool_runtime.plan_snapshot();
             let plan_text = crate::tool::plan::plan_snapshot(plan.as_ref());
             let system_prompt = system_prompt_text(config, None);
+            let request_history = model_context_messages(&messages);
             let projected = crate::context::estimate_request(
                 &system_prompt,
-                &messages,
+                &request_history,
                 &tool_defs,
                 Some(&plan_text),
             );
@@ -327,9 +346,10 @@ pub async fn run<P: Provider>(
                         let plan = tool_runtime.plan_snapshot();
                         let plan_text = crate::tool::plan::plan_snapshot(plan.as_ref());
                         let system_prompt = system_prompt_text(config, None);
+                        let request_history = model_context_messages(&messages);
                         let after = crate::context::estimate_request(
                             &system_prompt,
-                            &messages,
+                            &request_history,
                             &tool_defs,
                             Some(&plan_text),
                         );
@@ -355,9 +375,10 @@ pub async fn run<P: Provider>(
                         let plan = tool_runtime.plan_snapshot();
                         let plan_text = crate::tool::plan::plan_snapshot(plan.as_ref());
                         let system_prompt = system_prompt_text(config, None);
+                        let request_history = model_context_messages(&messages);
                         let after = crate::context::estimate_request(
                             &system_prompt,
-                            &messages,
+                            &request_history,
                             &tool_defs,
                             Some(&plan_text),
                         );
@@ -391,11 +412,17 @@ pub async fn run<P: Provider>(
             // 续写 attempt 的 recovery instruction 是 harness control metadata：
             // 作为 ephemeral system instruction 注入 build_context（不进 session、
             // 不进对话投影），而不是伪装成 User 消息。
-            let ephemeral_system = if stream_recoveries == 0 {
-                None
-            } else {
+            let ephemeral_system = if stream_recoveries > 0 {
                 Some(STREAM_RECOVERY_INSTRUCTION.replace("{partial}", &content))
+            } else if manual_retry_continuation && turn == 1 {
+                Some(MANUAL_CONTINUE_INSTRUCTION.to_string())
+            } else {
+                None
             };
+            // 自动续写的文本先在 attempt 缓冲区聚合。provider 常会从上一段或
+            // 整个回答开头重放；若边收边直接 push 到 TUI，去重时已经太晚。
+            let recovering_text = stream_recoveries > 0;
+            let mut recovery_content = String::new();
             let plan = tool_runtime.plan_snapshot();
             let request = ModelRequest {
                 model: config.model.name.clone(),
@@ -420,9 +447,10 @@ pub async fn run<P: Provider>(
                 let plan = tool_runtime.plan_snapshot();
                 let plan_text = crate::tool::plan::plan_snapshot(plan.as_ref());
                 let system_prompt = system_prompt_text(config, ephemeral_system.as_deref());
+                let request_history = model_context_messages(&messages);
                 let projected = crate::context::estimate_request(
                     &system_prompt,
-                    &messages,
+                    &request_history,
                     &tool_defs,
                     Some(&plan_text),
                 );
@@ -441,10 +469,12 @@ pub async fn run<P: Provider>(
             loop {
                 tokio::select! {
                     Some(event) = event_rx.recv() => {
-                        consume_stream_event(
+                        consume_attempt_stream_event(
                             event,
                             request_id,
                             &mut content,
+                            &mut recovery_content,
+                            recovering_text,
                             &mut saw_any_semantic,
                             &mut saw_tool_calls,
                             &ui,
@@ -458,16 +488,26 @@ pub async fn run<P: Provider>(
                                 // 先收完 provider 返回前已入队的残余 delta（与 Ok 分支一致），
                                 // 否则取消时已到达的文本可能丢失（P1-1 测试场景）。
                                 while let Ok(event) = event_rx.try_recv() {
-                                    consume_stream_event(
+                                    consume_attempt_stream_event(
                                         event,
                                         request_id,
                                         &mut content,
+                                        &mut recovery_content,
+                                        recovering_text,
                                         &mut saw_any_semantic,
                                         &mut saw_tool_calls,
                                         &ui,
                                     )
                                     .await;
                                 }
+                                flush_recovery_text(
+                                    recovering_text,
+                                    request_id,
+                                    &mut content,
+                                    &mut recovery_content,
+                                    &ui,
+                                )
+                                .await;
                                 // §6.2/§11.5：取消（Esc/Ctrl-C）是正常结束——提交已到达的内容，
                                 // 记录 Cancelled 原因并保留 session，而不是让 run 以错误退出。
                                 if !content.is_empty() {
@@ -506,16 +546,26 @@ pub async fn run<P: Provider>(
                                 tracing::error!(%request_id, error = %e, "provider request failed");
                                 // 先收完已入队的残余 delta（与 Cancelled 分支一致）。
                                 while let Ok(event) = event_rx.try_recv() {
-                                    consume_stream_event(
+                                    consume_attempt_stream_event(
                                         event,
                                         request_id,
                                         &mut content,
+                                        &mut recovery_content,
+                                        recovering_text,
                                         &mut saw_any_semantic,
                                         &mut saw_tool_calls,
                                         &ui,
                                     )
                                     .await;
                                 }
+                                flush_recovery_text(
+                                    recovering_text,
+                                    request_id,
+                                    &mut content,
+                                    &mut recovery_content,
+                                    &ui,
+                                )
+                                .await;
                             // §4.3 第二阶段：text-only attempt 断联 → 自动续写一次。
                             // 条件：已产生文本（非连接不可用）、未出现 tool delta（partial
                             // JSON 恢复风险大）、还有续写额度。
@@ -613,16 +663,26 @@ pub async fn run<P: Provider>(
                         // provider 返回后仍可能有已经入队的末尾 delta；这些发送都已完成，
                         // 因而非阻塞 drain 即可，也不会依赖 future 内部 Sender 的析构时机。
                         while let Ok(event) = event_rx.try_recv() {
-                            consume_stream_event(
+                            consume_attempt_stream_event(
                                 event,
                                 request_id,
                                 &mut content,
+                                &mut recovery_content,
+                                recovering_text,
                                 &mut saw_any_semantic,
                                 &mut saw_tool_calls,
                                 &ui,
                             )
                             .await;
                         }
+                        flush_recovery_text(
+                            recovering_text,
+                            request_id,
+                            &mut content,
+                            &mut recovery_content,
+                            &ui,
+                        )
+                        .await;
                         break 'attempt response;
                     }
                 }
@@ -739,6 +799,7 @@ async fn consume_stream_event(
     saw_any_semantic: &mut bool,
     saw_tool_calls: &mut bool,
     ui: &mpsc::Sender<RuntimeEvent>,
+    emit_text: bool,
 ) {
     match &event {
         ProviderEvent::TextDelta(_) => *saw_any_semantic = true,
@@ -748,7 +809,115 @@ async fn consume_stream_event(
         }
         ProviderEvent::ReasoningDelta(_) | ProviderEvent::Usage(_) => {}
     }
-    forward_provider_event(event, request_id, content, ui).await;
+    forward_provider_event(event, request_id, content, ui, emit_text).await;
+}
+
+/// 自动续写 attempt 的文本不立即投影到 UI，而是先聚合、去掉 provider 重放的
+/// 前缀，再作为一个 delta 追加。非文本事件仍实时转发。
+#[allow(clippy::too_many_arguments)]
+async fn consume_attempt_stream_event(
+    event: ProviderEvent,
+    request_id: RequestId,
+    content: &mut String,
+    recovery_content: &mut String,
+    recovering_text: bool,
+    saw_any_semantic: &mut bool,
+    saw_tool_calls: &mut bool,
+    ui: &mpsc::Sender<RuntimeEvent>,
+) {
+    let target = if recovering_text {
+        recovery_content
+    } else {
+        content
+    };
+    consume_stream_event(
+        event,
+        request_id,
+        target,
+        saw_any_semantic,
+        saw_tool_calls,
+        ui,
+        !recovering_text,
+    )
+    .await;
+}
+
+async fn flush_recovery_text(
+    recovering_text: bool,
+    request_id: RequestId,
+    content: &mut String,
+    recovery_content: &mut String,
+    ui: &mpsc::Sender<RuntimeEvent>,
+) {
+    if !recovering_text || recovery_content.is_empty() {
+        return;
+    }
+    let overlap = recovery_overlap_bytes(content, recovery_content);
+    let append = recovery_content[overlap..].to_string();
+    content.push_str(&append);
+    recovery_content.clear();
+    if !append.is_empty() {
+        let _ = ui
+            .send(RuntimeEvent::AssistantDelta {
+                request_id,
+                kind: DeltaKind::Text,
+                text: append,
+            })
+            .await;
+    }
+}
+
+/// 求 `existing` 后缀与 `replayed` 前缀的最长精确重叠。
+/// provider 从整段开头重放是常见情况，单独用 `starts_with(existing)` 快速处理；
+/// 其余用 KMP 在线扫描，保持线性复杂度并在 UTF-8 字符边界回退。
+fn recovery_overlap_bytes(existing: &str, replayed: &str) -> usize {
+    if existing.is_empty() || replayed.is_empty() {
+        return 0;
+    }
+    if replayed.starts_with(existing) {
+        return existing.len();
+    }
+    if existing.starts_with(replayed) {
+        return replayed.len();
+    }
+
+    let pattern = replayed.as_bytes();
+    let mut prefix = vec![0usize; pattern.len()];
+    for i in 1..pattern.len() {
+        let mut matched = prefix[i - 1];
+        while matched > 0 && pattern[i] != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if pattern[i] == pattern[matched] {
+            matched += 1;
+        }
+        prefix[i] = matched;
+    }
+
+    let bytes = existing.as_bytes();
+    let mut matched = 0usize;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        while matched > 0 && byte != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if byte == pattern[matched] {
+            matched += 1;
+        }
+        if matched == pattern.len() && index + 1 < bytes.len() {
+            matched = prefix[matched - 1];
+        }
+    }
+    while matched > 0
+        && (!replayed.is_char_boundary(matched)
+            || !existing.is_char_boundary(existing.len().saturating_sub(matched)))
+    {
+        matched = prefix[matched - 1];
+    }
+    if matched >= MIN_RECOVERY_OVERLAP_BYTES {
+        matched
+    } else {
+        0
+    }
 }
 
 /// 把 provider 的单个增量同时投影到 session 待提交内容和 TUI。
@@ -757,17 +926,20 @@ async fn forward_provider_event(
     request_id: RequestId,
     content: &mut String,
     ui: &mpsc::Sender<RuntimeEvent>,
+    emit_text: bool,
 ) {
     match event {
         ProviderEvent::TextDelta(text) => {
             content.push_str(&text);
-            let _ = ui
-                .send(RuntimeEvent::AssistantDelta {
-                    request_id,
-                    kind: DeltaKind::Text,
-                    text,
-                })
-                .await;
+            if emit_text {
+                let _ = ui
+                    .send(RuntimeEvent::AssistantDelta {
+                        request_id,
+                        kind: DeltaKind::Text,
+                        text,
+                    })
+                    .await;
+            }
         }
         ProviderEvent::ReasoningDelta(text) => {
             // §15.5：reasoning 只在 UI 展示，不进入 durable facts。
@@ -984,7 +1156,7 @@ fn build_context(
         config,
         ephemeral_system,
     )));
-    out.extend_from_slice(messages);
+    out.extend(model_context_messages(messages));
     if let Some(plan) = plan {
         let snapshot = crate::tool::plan::plan_snapshot(Some(plan));
         if !snapshot.is_empty() {
@@ -992,6 +1164,60 @@ fn build_context(
         }
     }
     out
+}
+
+/// 从 provider 请求投影里删除“纯 update_plan 控制轮”。
+///
+/// 完整 Assistant/Tool 事实仍保留在 session，保证审计与协议恢复；当前计划另以
+/// 一个紧凑尾部快照注入。若还把每次 update_plan 的参数和结果永久重放给模型，
+/// 高频更新会同时膨胀历史并降低缓存利用率。混合工具轮或带正文的 assistant 轮
+/// 不删除，避免丢失真实工作上下文。
+fn model_context_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut projected = Vec::with_capacity(messages.len());
+    let mut index = 0usize;
+    while index < messages.len() {
+        let ChatMessage::Assistant {
+            content,
+            tool_calls,
+        } = &messages[index]
+        else {
+            projected.push(messages[index].clone());
+            index += 1;
+            continue;
+        };
+        if !content.trim().is_empty()
+            || tool_calls.is_empty()
+            || tool_calls.iter().any(|call| call.name != "update_plan")
+        {
+            projected.push(messages[index].clone());
+            index += 1;
+            continue;
+        }
+
+        let expected: std::collections::HashSet<&str> = tool_calls
+            .iter()
+            .map(|call| call.provider_id.as_str())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut end = index + 1;
+        while let Some(ChatMessage::Tool {
+            tool_call_id, name, ..
+        }) = messages.get(end)
+        {
+            if name != "update_plan" || !expected.contains(tool_call_id.as_str()) {
+                break;
+            }
+            seen.insert(tool_call_id.as_str());
+            end += 1;
+        }
+        if seen.len() == expected.len() {
+            index = end;
+        } else {
+            projected.push(messages[index].clone());
+            index += 1;
+        }
+    }
+    projected
 }
 
 /// 恢复一个中断 session 后继续：把 Interrupted outcome 注入历史（§4.3）。
@@ -1021,7 +1247,9 @@ pub fn session_path(
 
 #[cfg(test)]
 mod tests {
-    use super::AbortTaskOnDrop;
+    use super::{AbortTaskOnDrop, model_context_messages, recovery_overlap_bytes};
+    use crate::ids::ToolCallId;
+    use crate::provider::{ChatMessage, ToolCall};
 
     struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
@@ -1054,5 +1282,82 @@ mod tests {
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "guard drop 必须 abort 并销毁后台 task"
         );
+    }
+
+    fn plan_call(provider_id: &str) -> ToolCall {
+        ToolCall {
+            call_id: ToolCallId::new_v7(),
+            provider_id: provider_id.into(),
+            name: "update_plan".into(),
+            arguments: r#"{"items":["one"]}"#.into(),
+        }
+    }
+
+    #[test]
+    fn pure_plan_control_turns_do_not_pollute_model_history() {
+        let messages = vec![
+            ChatMessage::User("修复项目".into()),
+            ChatMessage::Assistant {
+                content: String::new(),
+                tool_calls: vec![plan_call("plan-1")],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "plan-1".into(),
+                name: "update_plan".into(),
+                content: "status: succeeded".into(),
+            },
+            ChatMessage::Assistant {
+                content: "开始处理".into(),
+                tool_calls: Vec::new(),
+            },
+        ];
+
+        let projected = model_context_messages(&messages);
+
+        assert_eq!(projected.len(), 2);
+        assert!(matches!(&projected[0], ChatMessage::User(text) if text == "修复项目"));
+        assert!(
+            matches!(&projected[1], ChatMessage::Assistant { content, .. } if content == "开始处理")
+        );
+    }
+
+    #[test]
+    fn mixed_or_incomplete_control_turns_are_preserved() {
+        let mixed = vec![ChatMessage::Assistant {
+            content: String::new(),
+            tool_calls: vec![
+                plan_call("plan-1"),
+                ToolCall {
+                    call_id: ToolCallId::new_v7(),
+                    provider_id: "read-1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                },
+            ],
+        }];
+        assert_eq!(model_context_messages(&mixed), mixed);
+
+        let incomplete = vec![ChatMessage::Assistant {
+            content: String::new(),
+            tool_calls: vec![plan_call("plan-2")],
+        }];
+        assert_eq!(model_context_messages(&incomplete), incomplete);
+    }
+
+    #[test]
+    fn recovery_overlap_handles_full_replay_suffix_and_utf8() {
+        let existing = "第一段\n第二段已经输出";
+        let full_replay = "第一段\n第二段已经输出，继续内容";
+        assert_eq!(
+            recovery_overlap_bytes(existing, full_replay),
+            existing.len()
+        );
+
+        let suffix_replay = "第二段已经输出，继续内容";
+        assert_eq!(
+            recovery_overlap_bytes(existing, suffix_replay),
+            "第二段已经输出".len()
+        );
+        assert_eq!(recovery_overlap_bytes(existing, "完全不同的新内容"), 0);
     }
 }

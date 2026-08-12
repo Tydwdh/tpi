@@ -1,6 +1,6 @@
 // TPI 交互验收驱动（§40）：通过 node-pty（Windows ConPTY）在真实终端语义下
 // 驱动 tpi.exe，验证：真实 provider 流式运行、工具调用（read/bash/cargo test）、
-// 运行中 Ctrl-C 取消、空闲 Ctrl-C 退出、运行中排队下一条消息自动执行、
+// 运行中 Ctrl-C 取消、空闲双击 Ctrl-C 退出、运行中排队下一条消息自动执行、
 // PgUp/PgDn/Ctrl+End、鼠标滚轮后输入存活、运行中 resize、/new 会话切换、/quit 干净退出。
 //
 // 用法（仓库外临时目录，避免污染工作区依赖）：
@@ -77,14 +77,16 @@ async function quitAndCheck(s) {
     await quitAndCheck(s);
   }));
 
-  // 3. 空闲 Ctrl-C → 直接退出（Quit effect）
-  results.push(await scenario('ctrl-c-idle-quits', async () => {
+  // 3. 空闲 Ctrl-C → 首次仅提示，2 秒内第二次退出（Quit effect）
+  results.push(await scenario('ctrl-c-idle-double-press-quits', async () => {
     const s = spawnTpi();
     await waitFor(s.clean, (o) => o.includes('TPI：'), 20000, 'welcome');
     await new Promise((r) => setTimeout(r, 500));
     s.proc.write('\x03');
+    await waitFor(s.clean, (o) => o.includes('再按一次 Ctrl+C'), 5000, 'first-press-hint');
+    s.proc.write('\x03');
     const code = await Promise.race([s.exited, new Promise((r) => setTimeout(() => r('TIMEOUT'), 15000))]);
-    if (code === 'TIMEOUT') throw new Error('did not exit on idle Ctrl-C');
+    if (code === 'TIMEOUT') throw new Error('did not exit on second idle Ctrl-C');
   }));
 
   // 4. 滚动键（PgUp/PgDn/Ctrl+End）后正常退出

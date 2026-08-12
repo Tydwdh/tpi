@@ -88,7 +88,8 @@ pub fn recover(path: &Path) -> std::io::Result<RecoveryOutcome> {
 /// - 其他 → unknown。
 ///
 /// 纯读工具无副作用，记为 not_applied。
-fn classify_effect(tool_name: &str, recovery: Option<&RecoveryMetadata>) -> Effect {
+/// `pub(crate)`：session repair 在重建 interrupted tool outcome 时复用。
+pub(crate) fn classify_effect(tool_name: &str, recovery: Option<&RecoveryMetadata>) -> Effect {
     let policy = BuiltinTool::from_name(tool_name).map(BuiltinTool::recovery_policy);
     match policy {
         Some(ToolRecoveryPolicy::NoEffect) => Effect::NotApplied,

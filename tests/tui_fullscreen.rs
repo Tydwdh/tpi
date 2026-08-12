@@ -14,6 +14,9 @@ fn busy_view(rows: usize) -> ViewModel {
         workspace: "tpi".into(),
         ..Default::default()
     };
+    // §用户诉求：侧边栏默认打开，但这些测试测主区/scrollbar/footer 布局，
+    // 需在 sidebar 关闭下运行（主区占满全宽）。
+    view.sidebar.open = false;
     for i in 0..rows {
         view.push_line(LineKind::Assistant, format!("第 {i} 行内容 中文混排"));
     }
@@ -260,6 +263,7 @@ fn system_separator_fills_width_without_wrap() {
 #[test]
 fn tool_card_stays_single_line_on_narrow_terminal() {
     let mut view = ViewModel::default();
+    view.sidebar.open = false; // 测主区卡片布局，sidebar 关闭。
     let long = format!("cargo test -- --nocapture {}", "x".repeat(200));
     view.begin_tool("c", "bash", Some(long.clone()), Some(long));
     view.finish_tool(

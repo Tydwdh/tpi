@@ -292,13 +292,17 @@ pub fn edit(
         Ok(result) => {
             // §10.3 第 10 条：返回 unified diff 与修改统计。
             let diff = crate::tool::edit::unified_diff(&result);
-            let output = format!(
+            let mut output = format!(
                 "status: succeeded\ntool: edit\npath: {}\napplied: {}\nprevious_revision: {}\ncurrent_revision: {}",
                 display_path(&ctx.workspace_root, &path),
                 result.applied,
                 result.previous_revision,
                 result.current_revision,
             );
+            // §修复 #4：跳过的 no-op 条目数对模型可见（不静默）。
+            if result.skipped_noops > 0 {
+                output.push_str(&format!("\nskipped_noops: {}", result.skipped_noops));
+            }
             let mut outcome = ToolOutcome::succeeded("edit", output);
             outcome
                 .observed_resources
@@ -394,6 +398,8 @@ pub fn write(
                     path: path.clone(),
                     current,
                     expected: expected.clone(),
+                    // 整文件重写：无 replacement 可定位，回填 None。
+                    context: None,
                 },
             );
         }
@@ -432,6 +438,7 @@ pub fn write(
                 previous_revision: crate::tool::edit::revision_of(&[]),
                 current_revision: revision.clone(),
                 applied: 1,
+                skipped_noops: 0,
                 previous_raw: Vec::new(),
                 new_raw: new_raw.clone(),
             });
@@ -469,6 +476,8 @@ fn rewrite_with_revision(
                 path: path.clone(),
                 current: observed_revision,
                 expected: expected_revision.to_string(),
+                // 整文件重写：无 replacement 可定位，回填 None。
+                context: None,
             },
         );
     }
@@ -476,6 +485,7 @@ fn rewrite_with_revision(
         previous_revision: observed_revision,
         current_revision: crate::tool::edit::revision_of(content),
         applied: 1,
+        skipped_noops: 0,
         previous_raw,
         new_raw: content.to_vec(),
     };
@@ -524,8 +534,26 @@ fn failed_outcome(tool: &str, error: EditError) -> ToolOutcome {
             "\nhint: old_text 出现多次；请包含更多上下文使匹配唯一。".into()
         }
         EditError::Overlap { .. } => "\nhint: 多个 replacement 重叠；请拆分为独立批次。".into(),
+        EditError::AllNoOps { .. } => {
+            "\nhint: 所有 replacement 都是 no-op（old_text == new_text），未做任何修改；请确认意图。"
+                .into()
+        }
         _ => String::new(),
     };
+    // §修复 #2/#3：stale/no_match 时回填当前文件相关区域内容，模型免 read 自纠。
+    let context_note = match &error {
+        EditError::StaleRevision { context, .. } | EditError::NoMatch { context, .. } => context
+            .as_deref()
+            .map(|ctx| format!("\n当前文件相关区域:\n{ctx}")),
+        _ => None,
+    };
+    let mut output = format!(
+        "status: failed\ntool: {tool}\nerror: {}\n\n{error}{hint}",
+        error.code()
+    );
+    if let Some(note) = context_note {
+        output.push_str(&note);
+    }
     ToolOutcome::failed(
         tool,
         ModelPayload {
@@ -533,10 +561,7 @@ fn failed_outcome(tool: &str, error: EditError) -> ToolOutcome {
             program: None,
             exit_code: None,
             duration_ms: 0,
-            output: format!(
-                "status: failed\ntool: {tool}\nerror: {}\n\n{error}{hint}",
-                error.code()
-            ),
+            output,
             effect: None,
             artifact: None,
         },

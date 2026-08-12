@@ -37,6 +37,14 @@ pub enum UiEvent {
     ClickLink(String),
     /// 点击/拖拽垂直 scrollbar（§24）：参数是点击行在转录区内的偏移（0-based）。
     ScrollbarClick(u16),
+    /// 侧边栏大纲点击：跳转到对应用户消息（锁定 transcript 到该 entry）。
+    SidebarJump(crate::tui::scroll::EntryId),
+    /// 侧边栏内部滚动（大纲/todo 过长时；§用户诉求：限定区域 + 滚动条）。
+    SidebarScroll(/* up */ bool),
+    /// 侧边栏滚动条点击/拖拽：按比例跳转（参数 = 点击行在侧边栏内偏移）。
+    SidebarScrollbarClick(u16),
+    /// 切换侧边栏开关（§用户诉求；默认 Ctrl+B）。
+    ToggleSidebar,
     /// bracketed paste 文本。
     Paste(String),
     /// Agent 运行时事件（模型增量/工具生命周期/上下文用量）。

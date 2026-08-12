@@ -19,6 +19,185 @@ pub(super) fn tool_name_style(name: &str, theme: theme::Theme) -> Style {
     Style::default().fg(color)
 }
 
+/// 卡片内容行（正文区）：渲染行与 canonical 语义行**成对**产出（P0-1）。
+///
+/// 折叠窗口（collapsed/expanded/failed tail/running tail）由 [`visible_window`]
+/// 统一决定，渲染与复制在同一个窗口上取行——`RowSemantic.char_start` 与
+/// `card_canonical_text` 的 offset 不可能错位。
+///
+/// `semantic` 是该内容行的**可复制原文**（diff 无行号标记、read 无行号前缀、
+/// 无 rail/icon）——`selected_text` 按它拼接，`char_start` 只对它累计。
+struct CardContentRow {
+    line: Line<'static>,
+    semantic: String,
+}
+
+/// 构建卡片内容行（正文区，不含主行）。
+///
+/// 选择顺序（与历史一致）：diff 优先 → 失败 tail（红色诊断）→ output
+/// （含 `diff:` 段拆分）→ 无 output 时的 tail。`semantic` 与渲染行一一对应。
+fn card_content_rows(card: &ToolCard, theme: theme::Theme) -> Vec<CardContentRow> {
+    let is_failed = matches!(
+        &card.state,
+        ToolCardState::Done { status, .. } if *status != crate::tool::outcome::ToolStatus::Succeeded
+    );
+    let error_style = Style::default().fg(theme.error).add_modifier(Modifier::DIM);
+    let text_style = Style::default().fg(theme.text);
+    let mut rows: Vec<CardContentRow> = Vec::new();
+    // 追加一条普通文本内容行（trim 掉行尾空白；语义与渲染同文本）。
+    let push_text = |rows: &mut Vec<CardContentRow>, text: &str, style: Style| {
+        let text = text.trim_end().to_string();
+        rows.push(CardContentRow {
+            line: Line::styled(text.clone(), style),
+            semantic: text,
+        });
+    };
+    if let Some(diff_text) = &card.diff {
+        let rendered = render_diff_lines(diff_text, theme);
+        let canonical = canonical_diff_rows(diff_text);
+        for (line, semantic) in rendered.into_iter().zip(canonical) {
+            rows.push(CardContentRow { line, semantic });
+        }
+        return rows;
+    }
+    if let Some(tail) = card.tail.as_deref() {
+        if is_failed {
+            // 失败：红色关键 tail（错误诊断优先）。
+            for s in tail.lines() {
+                push_text(&mut rows, s, error_style);
+            }
+            return rows;
+        } else if let Some(body) = card.output.as_deref() {
+            for s in body.lines() {
+                push_text(&mut rows, s, text_style);
+            }
+            return rows;
+        } else {
+            for s in tail.lines() {
+                push_text(&mut rows, s, error_style);
+            }
+            return rows;
+        }
+    }
+    if let Some(body) = card.output.as_deref() {
+        if let Some(idx) = find_diff_start(body) {
+            // 输出里含 `diff:` 段 → diff 部分与正文同源拆分。
+            for s in body[..idx].lines() {
+                push_text(&mut rows, s, text_style);
+            }
+            let rendered = render_diff_lines(&body[idx..], theme);
+            let canonical = canonical_diff_rows(&body[idx..]);
+            for (line, semantic) in rendered.into_iter().zip(canonical) {
+                rows.push(CardContentRow { line, semantic });
+            }
+            return rows;
+        }
+        // §用户诉求：read 卡片正文显示真实文件行号（纯视觉装饰，语义文本
+        // 仍是行原文——复制/选中不携带行号；decor 由 push_hit 按视觉宽-语义宽
+        // 自动计算）。
+        let numbered = card.line_number_start.map(|start| {
+            let total = body.lines().count();
+            let last = start + total.saturating_sub(1);
+            (start, last.to_string().len())
+        });
+        for (i, s) in body.lines().enumerate() {
+            let text = s.trim_end().to_string();
+            let line = if let Some((start, width)) = numbered {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:>width$} │ ", start + i),
+                        Style::default().fg(theme.muted),
+                    ),
+                    Span::styled(text.clone(), text_style),
+                ])
+            } else {
+                Line::styled(text.clone(), text_style)
+            };
+            rows.push(CardContentRow {
+                line,
+                semantic: text,
+            });
+        }
+        return rows;
+    }
+    if let Some(tail) = card.tail.as_deref() {
+        // 无完整 output（失败摘要）→ 显示 tail（错误诊断）。
+        for s in tail.lines() {
+            push_text(&mut rows, s, error_style);
+        }
+    }
+    rows
+}
+
+/// diff 的 canonical 语义行（与 `render_diff_lines` 同源；P0-1）。
+///
+/// 每行 = `{marker}{content}`（Minus→`-`、Plus→`+`、Context→原文；Hunk→空）。
+/// 渲染的行号 span 不在语义中——复制/选中不携带行号（与 read 行号同策略）。
+fn canonical_diff_rows(diff_text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for row in parse_diff(diff_text) {
+        let text = match row.kind {
+            DiffKind::Hunk => String::new(),
+            DiffKind::Minus => format!("-{}", row.content.trim_end()),
+            DiffKind::Plus => format!("+{}", row.content.trim_end()),
+            DiffKind::Context => row.content.trim_end().to_string(),
+        };
+        out.push(text);
+    }
+    out
+}
+
+/// 折叠窗口（§PointerHit）：返回 (可见内容行区间 [start, end), 折叠提示行文本)。
+///
+/// 渲染（[`tool_card_lines`]）与语义（[`card_semantic_rows`] / [`card_canonical_text`]）
+/// 共用同一窗口——collapsed/expanded/failed tail/running tail 只改变**可见行**，
+/// 不改变每行内容本身（P0-1：canonical 文本与可见行 offset 恒对齐）。
+fn visible_window(card: &ToolCard, total: usize) -> (usize, usize, Option<String>) {
+    let collapsed = card.collapsed_lines;
+    // §PointerHit：失败/运行中折叠态用更小的尾部窗口——注释契约
+    // （"失败 tail ≤4 行、运行中实时输出 ≤3 行"），避免错误诊断被 10 行窗口
+    // 推到主行之后滚出视口。
+    const FAILED_LINES: usize = 4;
+    const RUNNING_LINES: usize = 3;
+    let is_failed = matches!(
+        &card.state,
+        ToolCardState::Done { status, .. } if *status != crate::tool::outcome::ToolStatus::Succeeded
+    );
+    let is_running = matches!(&card.state, ToolCardState::Running);
+    // 折叠态：collapsed_lines==0 → 只显示主行，不显示任何正文（overflow=true）；
+    // 否则正文超折叠线才折叠。空正文（total==0）不折叠、不显示提示行。
+    let overflow = total > 0 && (collapsed == 0 || total > collapsed);
+    let (start, end) = if card.expanded || !overflow {
+        (0, total)
+    } else if is_running {
+        // §PointerHit：运行中显示实时尾部（最新进度）。
+        (total.saturating_sub(RUNNING_LINES), total)
+    } else if is_failed {
+        // §PointerHit：失败显示错误尾部（tail 末尾，诊断优先）。
+        (total.saturating_sub(FAILED_LINES), total)
+    } else {
+        (0, collapsed.min(total))
+    };
+    // 统一折叠提示（opencode 式：溢出才显示，点击展开/收缩）。
+    // 失败/运行中卡不显示提示——tail 本就是诊断摘要（tail 优先），
+    // 提示行会成噪音；整卡仍可点击展开。
+    // §用户诉求：collapsed_lines==0 折叠态只显示主行，不显示「点击展开」
+    // 提示（干净的主行摘要）；提示只在展开态（「点击折叠」）或
+    // collapsed_lines>0 折叠（显示前 N 行）时给出。
+    let hint = if overflow && !is_failed && !is_running {
+        if card.expanded {
+            Some("点击折叠".to_string())
+        } else if collapsed > 0 {
+            Some(format!("… 点击展开（共 {total} 行）"))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    (start, end, hint)
+}
+
 /// 工具卡片主行（整改 A2/A3）：`icon name target…  metadata` 恒为单个 visual line。
 ///
 /// - icon/status 语义色；name 正常亮度 BOLD；target muted（display-width ellipsis）；
@@ -102,115 +281,13 @@ pub(super) fn tool_card_lines(
     // - 无 diff（bash 等）：渲染输出文本，同样前 N 行 + "… 点击展开"；
     // - 已展开：显示全部内容。
     // N = collapsed_lines（[ui] collapsed_lines；0 = 折叠态只显示主行摘要）。
-    let collapsed_lines = card.collapsed_lines;
-    // §PointerHit：失败/运行中折叠态用更小的尾部窗口——注释契约
-    // （"失败 tail ≤4 行、运行中实时输出 ≤3 行"），避免错误诊断被 10 行窗口
-    // 推到主行之后滚出视口。
-    const FAILED_LINES: usize = 4;
-    const RUNNING_LINES: usize = 3;
-
-    // §PointerHit：失败卡片折叠态显示错误 tail（不是 output 开头）；
-    // 运行中卡片折叠态显示实时尾部（最新进度）。
-    let is_failed = matches!(
-        &card.state,
-        ToolCardState::Done { status, .. } if *status != crate::tool::outcome::ToolStatus::Succeeded
-    );
-    let is_running = matches!(&card.state, ToolCardState::Running);
-
-    // 确定「内容行」：diff 优先；失败无 diff 用 tail；否则 output。
-    let content_lines: Vec<Line<'static>> = if let Some(diff_text) = &card.diff {
-        render_diff_lines(diff_text, theme)
-    } else if let Some(tail) = card.tail.as_deref() {
-        if is_failed {
-            // 失败：红色关键 tail（错误诊断优先）。
-            tail.lines()
-                .map(|s| {
-                    Line::styled(
-                        s.to_string(),
-                        Style::default().fg(theme.error).add_modifier(Modifier::DIM),
-                    )
-                })
-                .collect()
-        } else if let Some(body) = card.output.as_deref() {
-            body.lines()
-                .map(|s| Line::styled(s.to_string(), Style::default().fg(theme.text)))
-                .collect()
-        } else {
-            tail.lines()
-                .map(|s| {
-                    Line::styled(
-                        s.to_string(),
-                        Style::default().fg(theme.error).add_modifier(Modifier::DIM),
-                    )
-                })
-                .collect()
-        }
-    } else if let Some(body) = card.output.as_deref() {
-        let diff_idx = find_diff_start(body);
-        // 输出里含 `diff:` 段 → diff 部分着色，其余普通。
-        if let Some(idx) = diff_idx {
-            let mut out = Vec::new();
-            for s in body[..idx].lines() {
-                out.push(Line::styled(s.to_string(), Style::default().fg(theme.text)));
-            }
-            out.extend(render_diff_lines(&body[idx..], theme));
-            out
-        } else {
-            // §用户诉求：read 卡片正文显示真实文件行号（纯视觉装饰，语义文本
-            // 仍来自 card.output 原文——复制/选中不携带行号；decor 由 push_hit
-            // 按视觉宽-语义宽自动计算，hit 映射精确）。
-            let numbered = card.line_number_start.map(|start| {
-                let total = body.lines().count();
-                let last = start + total.saturating_sub(1);
-                (start, last.to_string().len())
-            });
-            body.lines()
-                .enumerate()
-                .map(|(i, s)| {
-                    if let Some((start, width)) = numbered {
-                        Line::from(vec![
-                            Span::styled(
-                                format!("{:>width$} │ ", start + i),
-                                Style::default().fg(theme.muted),
-                            ),
-                            Span::styled(s.to_string(), Style::default().fg(theme.text)),
-                        ])
-                    } else {
-                        Line::styled(s.to_string(), Style::default().fg(theme.text))
-                    }
-                })
-                .collect()
-        }
-    } else if let Some(tail) = card.tail.as_deref() {
-        // 无完整 output（失败摘要）→ 显示 tail（错误诊断）。
-        tail.lines()
-            .map(|s| {
-                Line::styled(
-                    s.to_string(),
-                    Style::default().fg(theme.error).add_modifier(Modifier::DIM),
-                )
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let total = content_lines.len();
-    // 折叠态：collapsed_lines==0 → 只显示主行，不显示任何正文（overflow=true）；
-    // 否则正文超折叠线才折叠。空正文（total==0）不折叠、不显示提示行。
-    let overflow = total > 0 && (collapsed_lines == 0 || total > collapsed_lines);
-    let shown = if card.expanded || !overflow {
-        content_lines.as_slice()
-    } else if is_running {
-        // §PointerHit：运行中显示实时尾部（最新进度）。
-        &content_lines[content_lines.len().saturating_sub(RUNNING_LINES)..]
-    } else if is_failed {
-        // §PointerHit：失败显示错误尾部（tail 末尾，诊断优先）。
-        &content_lines[content_lines.len().saturating_sub(FAILED_LINES)..]
-    } else {
-        &content_lines[..collapsed_lines.min(total)]
-    };
-    for l in shown {
+    // P0-1：内容行与折叠窗口统一来自 card_content_rows + visible_window（与
+    // card_semantic_rows / card_canonical_text 同源）——渲染与复制永不错位。
+    let rows = card_content_rows(card, theme);
+    let total = rows.len();
+    let (start, end, hint) = visible_window(card, total);
+    for row in &rows[start..end] {
+        let l = &row.line;
         // §美化：内容行「前缀带 panel 背景」→ plan_window 整行填满 panel，
         // 卡片主行+内容行同底成组（opencode 卡片"面"）。diff 行只带
         // 前景色（§用户诉求：红绿文字、不改背景）——下方烙 span 时统一
@@ -245,27 +322,15 @@ pub(super) fn tool_card_lines(
     // 提示行会成噪音；整卡仍可点击展开。
     // §修复：提示行每个 span 烙 panel 底——wrap 逐字符重建 span 只保留
     // span 级 style，Line 级 bg 会丢失，导致提示文字落在终端底色上。
-    // §用户诉求：collapsed_lines==0 折叠态只显示主行，不显示「点击展开」
-    // 提示（干净的主行摘要）；提示只在展开态（「点击折叠」）或
-    // collapsed_lines>0 折叠（显示前 N 行）时给出。
-    if overflow && !is_failed && !is_running {
-        let hint = if card.expanded {
-            Some("点击折叠".to_string())
-        } else if collapsed_lines > 0 {
-            Some(format!("… 点击展开（共 {} 行）", total))
-        } else {
-            None
-        };
-        if let Some(hint) = hint {
-            let hint_style = Style::default()
-                .fg(theme.info)
-                .bg(theme.panel)
-                .add_modifier(Modifier::ITALIC);
-            lines.push(Line::from(vec![
-                Span::styled("│ ", Style::default().fg(theme.muted).bg(theme.panel)),
-                Span::styled(hint, hint_style),
-            ]));
-        }
+    if let Some(hint) = hint {
+        let hint_style = Style::default()
+            .fg(theme.info)
+            .bg(theme.panel)
+            .add_modifier(Modifier::ITALIC);
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(theme.muted).bg(theme.panel)),
+            Span::styled(hint, hint_style),
+        ]));
     }
     lines
 }
@@ -319,41 +384,26 @@ fn tool_card_meta(card: &ToolCard) -> String {
     meta
 }
 
-/// 工具卡片内容行的语义文本（复制源）：diff 优先，否则 output/tail 对应行。
+/// 工具卡片**可见行**的语义文本（复制源；P0-1）。
 ///
-/// diff 卡片：渲染是解析式（文件头隐藏、@@ 变分隔行），语义行必须与渲染
-/// 行一一对应（`parse_diff` 同源），否则复制/选中会错位。
-pub(super) fn card_semantic_content(card: &ToolCard, index: usize, raw: &str) -> String {
-    // 内容区从第 1 行开始（第 0 行是主行）；折叠提示行（最后一行，含 "…"/"点击"）
-    // 不是内容，返回空。
-    let content_index = index.saturating_sub(1);
-    if raw.contains("点击") || raw.contains("…") {
-        return String::new(); // 折叠提示行不是可复制内容。
+/// 与 [`tool_card_lines`] 的渲染行一一对应：第 0 行 = 主行语义
+/// （[`card_semantic_header`]）；其后为折叠窗口内内容行的 canonical 文本
+/// （diff 无行号、read 无行号前缀）；折叠提示行为空串（不可复制）。
+///
+/// §PointerHit：渲染与复制必须基于同一份文本——否则 collapsed/expanded/failed
+/// tail/running tail 状态下 `RowSemantic.char_start` 与 `selected_text` offset
+/// 错位。这里与渲染共用 [`card_content_rows`] + [`visible_window`]，从源头杜绝。
+pub(super) fn card_semantic_rows(card: &ToolCard) -> Vec<String> {
+    let rows = card_content_rows(card, theme::Theme::omp());
+    let total = rows.len();
+    let (start, end, hint) = visible_window(card, total);
+    let mut out = Vec::with_capacity(end - start + 1 + usize::from(hint.is_some()));
+    out.push(card_semantic_header(card));
+    out.extend(rows[start..end].iter().map(|row| row.semantic.clone()));
+    if hint.is_some() {
+        out.push(String::new()); // 折叠提示行不是可复制内容。
     }
-    if let Some(diff) = &card.diff {
-        return match parse_diff(diff).get(content_index) {
-            Some(row) if !matches!(row.kind, DiffKind::Hunk) => {
-                let marker = match row.kind {
-                    DiffKind::Minus => "-",
-                    DiffKind::Plus => "+",
-                    _ => "",
-                };
-                format!("{marker}{}", row.content.trim_end())
-            }
-            // 分隔行（⋯ ···）/越界：无可复制内容。
-            _ => String::new(),
-        };
-    }
-    let source = card
-        .output
-        .as_deref()
-        .or(card.tail.as_deref())
-        .unwrap_or_default();
-    let line_of_source = source.split('\n').nth(content_index);
-    match line_of_source {
-        Some(text) => text.trim_end().to_string(),
-        None => raw.to_string(),
-    }
+    out
 }
 
 /// unified diff 解析行：kind（Hunk=区块分隔 / Minus / Plus / Context）+ 真实行号。

@@ -58,6 +58,12 @@ enum SlashAction {
     NotCommand,
 }
 
+#[derive(Debug, Clone)]
+struct RetryTarget {
+    message: String,
+    reason: crate::session::CompletionReason,
+}
+
 /// 应用入口。
 pub async fn run(
     config: Config,
@@ -142,7 +148,10 @@ pub async fn run(
             )
             .await?
         };
-        conversation.accept_context(outcome.messages.clone());
+        // P0-3：Cancel/ProviderInterrupted 后 runtime history 必须与 session
+        // 事实源一致——统一从 durable log 重建（outcome.messages 在部分提交
+        // 路径可能与 log 投影分叉）。
+        conversation.refresh_from_log()?;
         // §16：wall-time 自动取消不是用户取消，-p 也要明确提示（stderr）。
         if outcome.reason == crate::session::CompletionReason::WallTimeExceeded {
             eprintln!("警告：run 达到 wall-time 预算被自动取消（非用户取消）");
@@ -258,17 +267,20 @@ async fn interactive_loop<P: Provider>(
     };
     view.push_line(
         LineKind::System,
-        "TPI：/help 查看命令与快捷键 · Esc 取消当前 run",
+        "TPI：/help 查看命令与快捷键 · Esc 取消当前 run · 空闲 Ctrl+C 连按两次退出",
     );
     // §26-27：UiState 是 UI 单一事实源；交互循环只做
     // event → reducer → effects → draw（T3）。
     // §成熟化：注入 `[ui.keymap]` 生效键位（未配置动作保持内建默认）。
     let mut ui_state = UiState::with_keymap(view, config.ui_keymap.clone());
+    // §用户诉求：右侧边栏默认打开（todo + 用户消息大纲；Ctrl+B 切换）。
+    ui_state.view.sidebar.open = true;
     // BUG-006：--continue/--resume 启动时把已加载的 history 重建到屏幕，
     // 避免“模型有历史、屏幕空白/显示旧内容”的不一致。
     if !conversation.history().is_empty() {
         ui_state.view.load_history(conversation.history());
     }
+    ui_state.view.plan = conversation.plan().cloned();
     // §用户诉求：--continue/--resume 恢复后明确显示当前会话（首条消息预览 +
     // 短 id），避免“恢复后不知道是哪一个会话”。
     if conversation.log().is_some() {
@@ -307,9 +319,15 @@ async fn interactive_loop<P: Provider>(
 
     // 键盘线程：整个交互期间由独立线程读取 crossterm 事件（§16.1：模型生成中
     // 也响应输入/翻页/折叠；输入不因生成被阻塞）。
-    // §用户诉求（bracketed paste 降级）：不支持的终端把粘贴内容拆成连续按键
-    // 流（含 Enter），逐键路由会让换行命中 submit 直接发送。
-    // 间隔感知（§用户诉求：打字 0 延迟）：粘贴检测的代价只发生在「连续两键
+    // §用户诉求（粘贴整段上屏）：支持 bracketed paste 的终端（WT/conhost 新
+    // 版）把 Ctrl+V 注入为 `\x1b[200~ … \x1b[201~` 按键流；crossterm Windows
+    // 后端不解析该序列。键盘线程按 Esc+`[` 检测粘贴开始、消费前缀 `[200~`、
+    // 缓冲内容按键直到 `[201~`，整段作为一次 Event::Paste 上屏——不依赖
+    // 间隔猜测、不读剪贴板，行尾 Enter 转 \n 不触发 submit，也不出现 `[200~`
+    // 垃圾前缀。
+    // §降级路径（不支持 bracketed paste 的旧 conhost/mintty/SSH）：粘贴内容
+    // 拆成连续按键流（含 Enter），逐键路由会让换行命中 submit 直接发送。
+    // 间隔感知（§用户诉求：打字 0 延迟）：降级检测的代价只发生在「连续两键
     // 间隔 < paste::DENSE_GAP（16ms）」之后——该间隔人类打字不可能达到，只
     // 有终端批量转发可达。普通按键（间隔 ≥16ms）**立即转发、0 等待**，打字
     // 路径不承担任何探测/收集开销；确认是洪流后用 FLUSH_GAP 分块流式 flush
@@ -317,6 +335,7 @@ async fn interactive_loop<P: Provider>(
     let (key_tx, mut key_rx) = mpsc::channel::<Event>(128);
     std::thread::spawn(move || {
         use crate::tui::paste;
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         // 待处理事件队列：Enter 探测 read 出的后续事件放回这里再处理，
         // 保证探测过程中读出的任何事件都不丢失。
         let mut backlog: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
@@ -362,6 +381,165 @@ async fn interactive_loop<P: Provider>(
                     return;
                 }
                 last_press = None;
+                continue;
+            }
+            // §bracketed paste 序列解析（WT/conhost 等支持 bracketed paste 的
+            // 终端）：Ctrl+V 粘贴被注入为 `\x1b[200~ … \x1b[201~` 按键流——
+            // crossterm Windows 后端不解析该序列（逐键产生 KeyEvent），逐键转发
+            // 会把 `[200~` 垃圾送进输入框，行尾 Enter 在批次边界还可能被下方
+            // Enter 探测窗误判为提交。检测无修饰 Esc 后紧跟 `[` 键 → 判定粘贴
+            // 开始：消费前缀 `[200~`，内容按键全部缓冲，直到 `[201~`（Esc 后
+            // 紧接 `2,0,1,~`）结束，整段作为一次 Event::Paste 上屏。不依赖间隔
+            // 猜测、不读剪贴板；行尾 Enter 经 paste_char 转 \n，不会误提交。
+            // 空闲超时兜底：异常/误判时 PASTE_IDLE_TIMEOUT 无新键即 flush 退出。
+            if is_press
+                && paste::is_plain_escape(match &event {
+                    Event::Key(k) => k,
+                    _ => unreachable!(),
+                })
+            {
+                if event::poll(paste::BRACKETED_PROBE_GAP).unwrap_or(false)
+                    && let Ok(next) = event::read()
+                {
+                    // 只匹配字符码：终端注入 `[` 时可能带 SHIFT 修饰（美式键盘
+                    // `[` 是 Shift+[），不检查修饰，避免探测失败。Esc+Char('[')
+                    // 组合正常输入只可能来自 bracketed paste 前缀。
+                    let is_bracket = matches!(
+                        &next,
+                        Event::Key(k)
+                            if k.kind == KeyEventKind::Press && k.code == KeyCode::Char('[')
+                    );
+                    backlog.push_front(next);
+                    if is_bracket {
+                        // 消费前缀 `[200~`：backlog 里是 '['，随后是 '2','0','0','~'。
+                        let mut buf = String::new();
+                        let mut prefix_ok = true;
+                        for _ in 0..5 {
+                            let e = next_event!();
+                            match &e {
+                                Event::Key(k) if k.kind == KeyEventKind::Press => {}
+                                _ => {
+                                    // 前缀中断（终端异常）：转发当前事件，退出收集。
+                                    if key_tx.blocking_send(e).is_err() {
+                                        return;
+                                    }
+                                    prefix_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !prefix_ok {
+                            last_press = None;
+                            continue;
+                        }
+                        // 内容收集：直到 `[201~` 或空闲超时。内容完整缓冲，
+                        // 一次 Event::Paste 上屏（大粘贴由 reducer 占位符路径处理）。
+                        loop {
+                            if !event::poll(paste::PASTE_IDLE_TIMEOUT).unwrap_or(false) {
+                                // 空闲超时：粘贴流结束但未收到 201~（异常/误判）。
+                                if !buf.is_empty()
+                                    && key_tx
+                                        .blocking_send(Event::Paste(std::mem::take(&mut buf)))
+                                        .is_err()
+                                {
+                                    return;
+                                }
+                                break;
+                            }
+                            let e = next_event!();
+                            match &e {
+                                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                                    if k.code == KeyCode::Esc && k.modifiers == KeyModifiers::NONE {
+                                        // 可能是 `[201~` 结束序列：Esc 后紧接
+                                        // '2','0','1','~'（同批注入，间隔 <1ms）。
+                                        let mut is_end = true;
+                                        for expected in ['2', '0', '1', '~'] {
+                                            if event::poll(paste::BRACKETED_PROBE_GAP)
+                                                .unwrap_or(false)
+                                                && let Ok(nxt) = event::read()
+                                            {
+                                                // 同样不检查修饰：注入的 `2`/`~` 可能带
+                                                // SHIFT（Shift+2、Shift+`）。
+                                                let ok = matches!(
+                                                    &nxt,
+                                                    Event::Key(k2)
+                                                        if k2.kind == KeyEventKind::Press
+                                                            && k2.code
+                                                                == KeyCode::Char(expected)
+                                                );
+                                                backlog.push_front(nxt);
+                                                if !ok {
+                                                    is_end = false;
+                                                    break;
+                                                }
+                                            } else {
+                                                is_end = false;
+                                                break;
+                                            }
+                                        }
+                                        if is_end {
+                                            // `[201~`：粘贴结束，整段一次上屏。
+                                            if !buf.is_empty()
+                                                && key_tx
+                                                    .blocking_send(Event::Paste(std::mem::take(
+                                                        &mut buf,
+                                                    )))
+                                                    .is_err()
+                                            {
+                                                return;
+                                            }
+                                            break;
+                                        }
+                                        // 不是结束序列：Esc 是粘贴内容（极罕见），保留。
+                                        buf.push('\u{1b}');
+                                        continue;
+                                    }
+                                    match paste::paste_char(k) {
+                                        Some(c) => buf.push(c),
+                                        None => {
+                                            // 异常键（修饰组合/特殊键）：flush 已收，
+                                            // 原样转发该键，退出收集。
+                                            if !buf.is_empty()
+                                                && key_tx
+                                                    .blocking_send(Event::Paste(std::mem::take(
+                                                        &mut buf,
+                                                    )))
+                                                    .is_err()
+                                            {
+                                                return;
+                                            }
+                                            if key_tx.blocking_send(Event::Key(*k)).is_err() {
+                                                return;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                                other => {
+                                    // 非按键事件：flush 已收，转发，退出收集。
+                                    if !buf.is_empty()
+                                        && key_tx
+                                            .blocking_send(Event::Paste(std::mem::take(&mut buf)))
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                    if key_tx.blocking_send(other.clone()).is_err() {
+                                        return;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        last_press = None;
+                        continue;
+                    }
+                }
+                // 无后续 `[`：普通 Esc，立即转发。
+                if key_tx.blocking_send(event).is_err() {
+                    return;
+                }
+                last_press = Some(now);
                 continue;
             }
             // §bug 修复（先输入再粘贴会误发送）：降级路径下粘贴按键流中的
@@ -546,9 +724,9 @@ async fn interactive_loop<P: Provider>(
         }
     });
 
-    // `/retry` 目标：上一次因 provider 失败而中断的 turn 的用户消息。
-    // 成功完成后清空；失败/中断后保留，供用户一键重试（§4.3）。
-    let mut last_failed_message: Option<String> = None;
+    // `/retry` 目标：上一次因 provider 失败而中断的 turn。
+    // reason 决定是否先移除 TUI 中未提交的 partial；成功后必须清空。
+    let mut last_failed: Option<RetryTarget> = None;
     // §InteractionRefactor：统一指针状态机（idle 与 run 共用），
     // 取代旧的 mouse_down/drag_selecting 两套路径。
     let mut pointer_gesture = crate::tui::interaction::PointerGesture::default();
@@ -631,6 +809,8 @@ async fn interactive_loop<P: Provider>(
                             *conversation = new_conversation;
                             // BUG-006：屏幕必须重建为新 session 的对话（不能残留旧屏幕）。
                             ui_state.view.load_history(conversation.history());
+                            ui_state.view.plan = conversation.plan().cloned();
+                            last_failed = None;
                             let label = session_resume_label(conversation.log());
                             ui_state.view.push_line(LineKind::System, label);
                         }
@@ -651,7 +831,12 @@ async fn interactive_loop<P: Provider>(
 
         // `/retry`：重试上一次失败 turn（空 user_message → agent 不重复 UserSubmitted）。
         if let Some(retry_target) = ui_state.take_pending_retry() {
-            let _ = retry_target; // 仅展示用；run 以空 user_message 发起
+            if matches!(
+                last_failed.as_ref().map(|target| target.reason),
+                Some(crate::session::CompletionReason::ProviderInterrupted)
+            ) {
+                ui_state.view.discard_last_interrupted_attempt();
+            }
             conversation.ensure_started(&config.sessions_root, &config.workspace_root)?;
             // retry：user_message 传空（§4.3：不重复记录 UserSubmitted，复用 history）。
             let run_result = {
@@ -684,11 +869,25 @@ async fn interactive_loop<P: Provider>(
                     renderer
                         .draw(&mut ui_state.view)
                         .map_err(|e| e.to_string())?;
+                    last_failed = Some(RetryTarget {
+                        message: retry_target,
+                        reason: crate::session::CompletionReason::Error,
+                    });
                     continue;
                 }
             };
             ui_state.view.add_usage(&outcome.usage);
-            conversation.accept_context(outcome.messages.clone());
+            // P0-3：统一从 durable log 重建 history（与 -p 路径一致）。
+            conversation.refresh_from_log()?;
+            last_failed = match outcome.reason {
+                crate::session::CompletionReason::ProviderInterrupted
+                | crate::session::CompletionReason::ProviderUnavailable
+                | crate::session::CompletionReason::Error => Some(RetryTarget {
+                    message: retry_target,
+                    reason: outcome.reason,
+                }),
+                _ => None,
+            };
             ui_state.view.push_line(LineKind::System, "─".repeat(40));
             continue;
         }
@@ -702,7 +901,7 @@ async fn interactive_loop<P: Provider>(
                 config,
                 conversation,
                 &current_cancel,
-                &last_failed_message,
+                &mut last_failed,
             )? {
                 SlashAction::Quit => break,
                 SlashAction::Consumed => continue,
@@ -749,22 +948,29 @@ async fn interactive_loop<P: Provider>(
                         .draw(&mut ui_state.view)
                         .map_err(|e| e.to_string())?;
                     // 记录失败 turn 供 /retry（§4.3）。
-                    last_failed_message = Some(message.clone());
+                    last_failed = Some(RetryTarget {
+                        message: message.clone(),
+                        reason: crate::session::CompletionReason::Error,
+                    });
                     continue;
                 }
             };
             ui_state.view.add_usage(&outcome.usage);
-            // P0-1：outcome.messages 是完整 context（含旧历史），必须 replace。
-            conversation.accept_context(outcome.messages.clone());
+            // P0-3：统一从 durable log 重建 history——Cancel/ProviderInterrupted/
+            // 正常完成都由 session 事实源投影，杜绝 runtime 与 log 分叉。
+            conversation.refresh_from_log()?;
             // 成功（或正常中断）后清空 retry 目标；ProviderInterrupted 是失败类，
             // 保留以便用户 /retry。
             match outcome.reason {
                 crate::session::CompletionReason::ProviderInterrupted
                 | crate::session::CompletionReason::ProviderUnavailable
                 | crate::session::CompletionReason::Error => {
-                    last_failed_message = Some(message.clone());
+                    last_failed = Some(RetryTarget {
+                        message: message.clone(),
+                        reason: outcome.reason,
+                    });
                 }
-                _ => last_failed_message = None,
+                _ => last_failed = None,
             }
             ui_state.view.push_line(LineKind::System, "─".repeat(40));
         }
@@ -785,7 +991,7 @@ fn handle_slash_command(
     config: &Config,
     conversation: &mut Conversation,
     current_cancel: &Arc<Mutex<Option<CancellationToken>>>,
-    last_failed_message: &Option<String>,
+    last_failed: &mut Option<RetryTarget>,
 ) -> Result<SlashAction, String> {
     use crate::tui::SLASH_COMMANDS;
     match message {
@@ -902,7 +1108,7 @@ web_search: DuckDuckGo（免费，无需 API key）
                         Ctrl+Home 顶部 · Ctrl+End 最新 · Modal ↑/↓ 滚动 ·
                         点击工具卡片（任意行）展开 · 悬停卡片微高亮 ·
                         点击链接打开 · 拖选自动滚动 ·
-                        Esc 取消 run
+                        Esc 取消 run · Ctrl+C 有选区复制/运行中取消/空闲连按两次退出
                         键位可在配置 [ui.keymap] 中自定义（/settings 查看当前绑定）",
             );
             ui_state.view.open_modal("/help", text);
@@ -997,6 +1203,7 @@ workspace: {}
         }
         "/new" => {
             conversation.reset();
+            *last_failed = None;
             // BUG-006：屏幕投影必须与已清空的上下文同步（否则显示旧 session）。
             ui_state.view.reset_for_new_session();
             push_system_line(&mut ui_state.view, renderer, "已开始新会话".to_string())?;
@@ -1076,13 +1283,13 @@ workspace: {}
             // §4.3：重试上一次失败/中断的 ModelTurn——不是重发 User 消息。
             // 目标消息入 pending_retry，主循环以空 user_message 发起 run，
             // 不重复记录 UserSubmitted，也不追加 User 消息（不污染对话）。
-            match last_failed_message.clone() {
+            match last_failed.clone() {
                 Some(target) => {
-                    ui_state.push_retry(target.clone());
+                    ui_state.push_retry(target.message.clone());
                     push_system_line(
                         &mut ui_state.view,
                         renderer,
-                        format!("⟳ 重试上一次 turn（{target}）"),
+                        format!("⟳ 重试上一次 turn（{}）", target.message),
                     )?;
                 }
                 None => {
@@ -1110,6 +1317,34 @@ fn handle_mouse(
     use crate::tui::interaction::PointerInput;
     use ratatui::crossterm::event::MouseButton;
     use ratatui::crossterm::event::MouseEventKind;
+    // §用户诉求：侧边栏区域的滚轮/滚动条点击在进入 pointer 状态机前拦截——
+    // 滚轮滚动侧边栏（而非转录区）；最右滚动条列点击/拖拽按比例跳转。
+    if !overlay_open
+        && let Some(rect) = renderer.sidebar_rect()
+        && mouse.column >= rect.x
+        && mouse.column < rect.x + rect.width
+        && mouse.row >= rect.y
+        && mouse.row < rect.y + rect.height
+    {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                return vec![crate::tui::event::UiEvent::SidebarScroll(true)];
+            }
+            MouseEventKind::ScrollDown => {
+                return vec![crate::tui::event::UiEvent::SidebarScroll(false)];
+            }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+                if mouse.column == rect.x + rect.width - 1 =>
+            {
+                // 侧边栏滚动条列：按比例跳转（不走 pointer 状态机，避免误入
+                // transcript 的 DraggingScrollbar）。
+                return vec![crate::tui::event::UiEvent::SidebarScrollbarClick(
+                    mouse.row.saturating_sub(rect.y),
+                )];
+            }
+            _ => {}
+        }
+    }
     let hit = if overlay_open {
         crate::tui::interaction::PointerHit::none()
     } else {
@@ -1153,6 +1388,20 @@ fn pointer_target(
     row: u16,
 ) -> crate::tui::interaction::PointerHit {
     use crate::tui::interaction::{PointerAction, PointerHit, PointerRegion};
+    // 右侧边栏命中优先（§用户诉求：大纲行点击跳转；非转录文本，不可选择）。
+    if let Some(rect) = renderer.sidebar_rect()
+        && column >= rect.x
+        && column < rect.x + rect.width
+        && row >= rect.y
+        && row < rect.y + rect.height
+    {
+        // 边栏最右列是滚动条：handle_mouse 已拦截（SidebarScrollbarClick），
+        // 这里只对内容列返回大纲跳转/空白（避免滚动条列误入 transcript 状态机）。
+        return match renderer.sidebar_hit(column, row) {
+            Some(entry) => PointerHit::sidebar_jump(entry),
+            None => PointerHit::sidebar_blank(),
+        };
+    }
     // scrollbar 优先（1 列窄条，避免误判为文本）。
     if let Some(rect) = renderer.scrollbar_rect()
         && column >= rect.x
@@ -1563,6 +1812,10 @@ fn is_paste_shortcut(event: &Event) -> bool {
 
 fn spawn_ctrl_c_handler(current_cancel: Arc<Mutex<Option<CancellationToken>>>) {
     tokio::spawn(async move {
+        // P0-4：空闲 Ctrl+C 连按两次退出（2 秒窗口）——与 reducer 的 TUI 双击
+        // 语义一致；只覆盖非 raw mode 路径（-p 模式等 Ctrl+C 走 SIGINT 的场景）。
+        let exit_armed: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
         loop {
             if tokio::signal::ctrl_c().await.is_err() {
                 break;
@@ -1575,10 +1828,18 @@ fn spawn_ctrl_c_handler(current_cancel: Arc<Mutex<Option<CancellationToken>>>) {
                     cancel.cancel();
                 }
             } else {
-                // 空闲时 Ctrl-C：退出（§11.5 第二次快速 Ctrl-C 的简化）。
-                // process::exit 不执行析构，必须显式恢复终端，否则残留 raw mode（无回显）。
-                restore_terminal_on_exit();
-                std::process::exit(130);
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let first = exit_armed.swap(now_ms, std::sync::atomic::Ordering::SeqCst);
+                if first != 0 && now_ms.saturating_sub(first) < 2000 {
+                    // 2 秒内第二次：退出。process::exit 不执行析构，必须显式
+                    // 恢复终端，否则残留 raw mode（无回显）。
+                    restore_terminal_on_exit();
+                    std::process::exit(130);
+                }
+                // 第一次：仅记录，不退出（避免一次误触直接终止）。
             }
         }
     });

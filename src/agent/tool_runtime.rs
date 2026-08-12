@@ -46,6 +46,7 @@ impl ToolRuntime {
         session_id: String,
         cancel: CancellationToken,
         interactive: bool,
+        initial_plan: Option<Plan>,
     ) -> Self {
         Self {
             config: RuntimeConfig {
@@ -59,7 +60,7 @@ impl ToolRuntime {
             interactive,
             scan_snapshots: Default::default(),
             snapshot_store: Default::default(),
-            current_plan: Default::default(),
+            current_plan: Arc::new(Mutex::new(initial_plan)),
         }
     }
 

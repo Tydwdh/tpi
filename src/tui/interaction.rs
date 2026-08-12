@@ -53,6 +53,8 @@ pub enum PointerAction {
     Reasoning(EntryId),
     /// 链接文本（点击打开 Link Overlay；§成熟化）。
     Link(String),
+    /// 侧边栏用户消息大纲行（点击跳转到该 User 消息）。
+    SidebarJump(EntryId),
 }
 
 /// 命中区域类别（决定手势路由：scrollbar 拖拽 vs 文本选择 vs 无动作）。
@@ -62,6 +64,8 @@ pub enum PointerRegion {
     Transcript,
     /// 垂直 scrollbar。
     Scrollbar,
+    /// 右侧边栏（§用户诉求）：点击大纲行跳转；拖拽不发起文本选择。
+    Sidebar,
     /// 其它（header/footer/空白/弹层）。
     Other,
 }
@@ -102,6 +106,24 @@ impl PointerHit {
             text: None,
             action: None,
             region: PointerRegion::Scrollbar,
+        }
+    }
+
+    /// 侧边栏大纲行（§用户诉求）：有动作、无文本选择、区域 = Sidebar。
+    pub fn sidebar_jump(entry: EntryId) -> Self {
+        Self {
+            text: None,
+            action: Some(PointerAction::SidebarJump(entry)),
+            region: PointerRegion::Sidebar,
+        }
+    }
+
+    /// 侧边栏空白（无动作，区域 = Sidebar）。
+    pub fn sidebar_blank() -> Self {
+        Self {
+            text: None,
+            action: None,
+            region: PointerRegion::Sidebar,
         }
     }
 
@@ -224,6 +246,11 @@ impl PointerGesture {
                             *self = PointerGesture::DraggingScrollbar;
                             Vec::new()
                         }
+                        PointerRegion::Sidebar => {
+                            // 侧边栏：拖拽不发起文本选择（纯控件区）；保持 Pressed，
+                            // 抬起时若位移未超阈值 → Click（跳转）。
+                            Vec::new()
+                        }
                         PointerRegion::Transcript => {
                             // 按下点在转录区：从**按下点**的文本位置开始选。
                             // （tool 主行同时是文本+动作——拖动即选择，不点动作。）
@@ -283,6 +310,12 @@ impl PointerGesture {
                             {
                                 // §成熟化：链接文本轻点 → 打开 Link Overlay。
                                 vec![UiEvent::ClickLink(u)]
+                            }
+                            (
+                                Some(PointerAction::SidebarJump(id)),
+                                Some(PointerAction::SidebarJump(u)),
+                            ) if id == u => {
+                                vec![UiEvent::SidebarJump(u)]
                             }
                             _ => Vec::new(),
                         }
@@ -745,5 +778,53 @@ mod tests {
             "新按压必须清除旧选区: {events:?}"
         );
         assert!(matches!(g, PointerGesture::Pressed { .. }));
+    }
+
+    /// §用户诉求：侧边栏大纲行轻点 → 只发 SidebarJump（不产生 selection），
+    /// 且拖拽超阈值不触发跳转（纯控件区，不进入文本选择）。
+    #[test]
+    fn tap_sidebar_outline_jumps_without_selection() {
+        let mut g = PointerGesture::Idle;
+        let entry = EntryId(42);
+        let hit = PointerHit::sidebar_jump(entry);
+        // Down：清除旧选区（与其它区域一致），不产生 selection。
+        assert_eq!(
+            g.feed(down(60, 5, hit.clone())),
+            vec![UiEvent::SelectionClear]
+        );
+        // 抬起（无位移）→ 只发 SidebarJump。
+        let events = g.feed(up(60, 5, hit));
+        assert!(
+            events.contains(&UiEvent::SidebarJump(entry)),
+            "轻点大纲行必须发 SidebarJump: {events:?}"
+        );
+        assert!(!events.contains(&UiEvent::SelectionStart(TextPosition {
+            entry_id: EntryId(0),
+            offset: 0
+        })));
+    }
+
+    /// §用户诉求：侧边栏内拖拽超阈值不发起文本选择（无 text，纯控件区）。
+    #[test]
+    fn drag_in_sidebar_does_not_select() {
+        let mut g = PointerGesture::Idle;
+        let entry = EntryId(7);
+        let _ = g.feed(down(60, 5, PointerHit::sidebar_jump(entry)));
+        // 拖拽超阈值（4 > 2）：Sidebar 区域不进入 Selecting。
+        let events = g.feed(drag(64, 5, PointerHit::sidebar_blank()));
+        assert!(
+            !events.contains(&UiEvent::SelectionStart(TextPosition {
+                entry_id: EntryId(0),
+                offset: 0
+            })),
+            "Sidebar 拖拽不得发起文本选择: {events:?}"
+        );
+        assert!(matches!(g, PointerGesture::Pressed { .. }));
+        // 抬起（位移超阈值 → 非 click）→ 不跳转。
+        let events = g.feed(up(64, 5, PointerHit::sidebar_blank()));
+        assert!(
+            !events.contains(&UiEvent::SidebarJump(entry)),
+            "拖拽后抬起不得触发跳转: {events:?}"
+        );
     }
 }

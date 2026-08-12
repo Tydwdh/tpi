@@ -137,6 +137,41 @@ mod tests {
     }
 
     #[test]
+    fn retry_discards_only_partial_after_last_durable_boundary() {
+        let mut view = ViewModel::default();
+        view.push_line(LineKind::User, "检查项目");
+        view.push_line(LineKind::Assistant, "先读取文件");
+        view.begin_tool("read-1", "read", Some("README.md".into()), None);
+        view.finish_tool(
+            ("read-1", "read"),
+            ToolStatus::Succeeded,
+            5,
+            None,
+            "文件内容",
+            None,
+        );
+        view.push_stream_delta(LineKind::Reasoning, "未完成思考");
+        view.push_stream_delta(LineKind::Assistant, "连接中断的半截回答");
+        view.finalize_live();
+        view.push_line(LineKind::System, "模型连接中断");
+
+        assert!(view.discard_last_interrupted_attempt());
+
+        let messages: Vec<_> = view
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Message { line, .. } => Some((line.kind, line.text.as_str())),
+                Entry::Tool { .. } => None,
+            })
+            .collect();
+        assert!(messages.iter().any(|(_, text)| *text == "先读取文件"));
+        assert!(messages.iter().any(|(_, text)| *text == "模型连接中断"));
+        assert!(!messages.iter().any(|(_, text)| text.contains("半截回答")));
+        assert!(!messages.iter().any(|(_, text)| text.contains("未完成思考")));
+    }
+
+    #[test]
     fn new_output_returns_to_follow_mode() {
         // 整改 C + TUI v2：scroll lock 期间新输出不再强制拉回底部，只计数。
         let mut view = ViewModel::default();
@@ -468,6 +503,59 @@ mod p1_message_cap_tests {
         }
         let msg = view.live.reasoning.as_ref().expect("live 区必须有消息");
         assert!(msg.text.len() <= MAX_MESSAGE_CHARS + 32);
+    }
+
+    /// §用户诉求：侧边栏开关 toggle 与滚动 clamp（默认关闭，启动时 app 打开）。
+    #[test]
+    fn sidebar_toggle_and_scroll_clamp() {
+        let mut s = SidebarState::default();
+        assert!(!s.open, "default 关闭（启动时 app 打开）");
+        s.toggle();
+        assert!(s.open);
+        s.toggle();
+        assert!(!s.open && s.scroll == 0, "关闭重置滚动");
+        // 滚动 clamp。
+        s.open = true;
+        s.total_rows = 3;
+        s.scroll = 0;
+        s.scroll_by(5);
+        assert_eq!(s.scroll, 2, "clamp 到末尾");
+        s.scroll_by(-5);
+        assert_eq!(s.scroll, 0, "clamp 到顶部");
+    }
+
+    /// §用户诉求：侧边栏滚动条点击按比例跳转。
+    #[test]
+    fn sidebar_scrollbar_click_jumps_by_ratio() {
+        let mut s = SidebarState {
+            open: true,
+            total_rows: 30,
+            area_height: 10,
+            ..Default::default()
+        };
+        // 点击中间（第 5 行）→ 30*5/10 = 15。
+        s.scroll_to_ratio(5);
+        assert_eq!(s.scroll, 15);
+        // 内容不超区域：不滚动。
+        s.total_rows = 5;
+        s.scroll_to_ratio(9);
+        assert_eq!(s.scroll, 15, "内容不超区域不滚动");
+    }
+
+    /// §用户诉求：sidebar_outline 只含 User 消息，换行折叠为空格。
+    #[test]
+    fn sidebar_outline_lists_user_messages_only() {
+        let mut view = ViewModel::default();
+        view.push_line(LineKind::Assistant, "助手一\n第二行");
+        view.push_line(LineKind::User, "用户一\n续行");
+        view.push_line(LineKind::Tool, "工具输出");
+        view.push_line(LineKind::User, "用户二");
+        let outline = view.sidebar_outline();
+        assert_eq!(outline.len(), 2, "只有 User 消息");
+        assert_eq!(outline[0].1, "用户一 续行", "换行折叠为空格");
+        assert_eq!(outline[1].1, "用户二");
+        // 条目 id 单调递增（对应 transcript 顺序）。
+        assert!(outline[0].0 < outline[1].0);
     }
 }
 
@@ -802,7 +890,12 @@ mod p2_card_nav_tests {
     fn live_tool_selection_survives_finalize() {
         use crate::tui::interaction::TextPosition;
         use crate::tui::scroll::EntryId;
-        let mut view = ViewModel::default();
+        // P0-1：body 必须可见才可选中——collapsed_lines=0（默认折叠）时
+        // 渲染只显示主行，语义文本也只有主行（渲染与复制同窗口）。
+        let mut view = ViewModel {
+            collapsed_lines: 10,
+            ..Default::default()
+        };
         view.begin_tool("c1", "bash", Some("cargo test".into()), None);
         view.append_tool_output("c1", "running tests...");
         // 运行中 tool 有独立 id（不是 assistant/reasoning 的，也不是哨兵）。
@@ -816,33 +909,38 @@ mod p2_card_nav_tests {
             entry_id: live_id,
             offset: 7,
         });
-        // tool 语义文本 = "bash cargo test\nrunning tests..."；offset 0..7 = "bash ca"。
+        // P0-1：语义文本与渲染同源（card_semantic_header 含 Running 态动态
+        // elapsed meta）——header 前缀不受 meta 影响，offset 0..7 = "bash ca"。
         assert_eq!(view.selected_text(), "bash ca");
-        // 选 body 部分：offset 跳过 "bash cargo test\n"（16 chars）后到 "running"。
+        // Running 态 header 的 elapsed 是动态的（随帧变化），无法静态断言
+        // body 的精确 offset；选中全文验证 body 内容整体可达即可。
         view.selection_start(TextPosition {
             entry_id: live_id,
-            offset: 16,
+            offset: 0,
         });
         view.selection_update(TextPosition {
             entry_id: live_id,
-            offset: 23,
+            offset: usize::MAX,
         });
-        assert_eq!(view.selected_text(), "running");
+        assert!(
+            view.selected_text().ends_with("running tests..."),
+            "Running 态 body 必须可选中（含 meta 后仍以 body 结尾）: {:?}",
+            view.selected_text()
+        );
         // finish_tool：沿用同一 id，选区不悬空。
         view.finish_tool(("c1", "bash"), ToolStatus::Succeeded, 10, None, "", None);
         let finalized = view.transcript.last().expect("finish 后必须提交").id();
         assert_eq!(finalized, live_id, "finish_tool 必须沿用 begin 的稳定 id");
         // §修复：header 语义含 meta（与渲染 card_semantic_header 一致）。
-        // Running（无 meta）→ Done（+ " 10ms"）：header 从 16 chars 变 21，
-        // body 起始偏移后移——这是内容真实变化（meta 加入），选区 offset
-        // 不再指向旧位置。验证新 offset 正确落到 body："bash cargo test 10ms"
-        // (21 chars) + "running"。
-        assert_eq!(
-            view.selected_text(),
-            "10ms\nru",
-            "finalize 后 header 语义加入 meta，偏移指向新内容（预期变化）"
+        // Done 态 meta 固定（+ " 10ms"），Running→Done 是内容真实变化；
+        // 当前选区覆盖全文，finalize 后 body 仍可达（结尾不变）。
+        assert!(
+            view.selected_text().ends_with("running tests..."),
+            "finalize 后 body 内容必须可达: {:?}",
+            view.selected_text()
         );
-        // 用新 offset 重新选中 body 的 "running"：内容正确定位。
+        // 用固定 offset 重新选中 body 的 "running"：Done header = "bash cargo
+        // test 10ms"（20 chars）+ '\n' = 21，offset 21..28 = "running"。
         view.selection_start(TextPosition {
             entry_id: live_id,
             offset: 21,

@@ -99,6 +99,14 @@ async fn p1_1_cancel_keeps_history_consistent_with_session() {
         "outcome.messages 必须包含已提交的 assistant 内容（与 session 一致）: {:?}",
         outcome.messages
     );
+
+    // P0-3：runtime history 必须与 session 事实源投影完全一致——app 层
+    // 统一 refresh_from_log 重建，杜绝 Cancel/ProviderInterrupted 后分叉。
+    let projected = tpi::session::replay_messages(session.path()).unwrap();
+    assert_eq!(
+        outcome.messages, projected,
+        "outcome.messages 必须等于 session 投影（Cancel 后 runtime 与 log 一致）"
+    );
 }
 
 /// P1-2：工具调用预算超限必须是独立的 MaxToolCalls reason。
@@ -531,8 +539,12 @@ impl Provider for RecoverThenSucceedProvider {
                 }),
                 "recovery instruction 不得伪装成 User 消息"
             );
+            // 模拟真实 provider 常见行为：忽略“不重复”指令，从回答开头
+            // 重放 partial，再继续新内容。agent 必须在投影到 TUI/session 前去重。
             events
-                .send(ProviderEvent::TextDelta("因为 target_exists 分支".into()))
+                .send(ProviderEvent::TextDelta(
+                    "问题在 src/tool/files.rs 的 write...因为 target_exists 分支".into(),
+                ))
                 .await
                 .map_err(|_| ProviderError::Protocol("closed".into()))?;
             return Ok(ProviderResponse {
@@ -1067,6 +1079,60 @@ async fn retry_with_empty_user_message_does_not_repeat_submission() {
         user_count, 1,
         "retry 不得追加新 User 消息: {:?}",
         outcome.messages
+    );
+}
+
+#[tokio::test]
+async fn retry_after_committed_partial_uses_ephemeral_continue_instruction() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = FakeProvider::new(vec![FakeResponse::text("续写部分")]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .unwrap();
+    let history = vec![
+        ChatMessage::User("给出很长的回答".into()),
+        ChatMessage::Assistant {
+            content: "已经提交但被长度截断的部分".into(),
+            tool_calls: Vec::new(),
+        },
+    ];
+    let (tx, mut rx) = mpsc::channel(16);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &history,
+            user_message: String::new(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+        },
+    )
+    .await
+    .unwrap();
+    drain.abort();
+
+    let request = provider.requests.first().expect("retry request");
+    assert!(request.messages.iter().any(|message| {
+        matches!(message, ChatMessage::System(text) if text.contains("Do not restart") && text.contains("Continue"))
+    }));
+    assert_eq!(
+        request
+            .messages
+            .iter()
+            .filter(|message| matches!(message, ChatMessage::User(_)))
+            .count(),
+        1,
+        "控制指令不得伪装成新的 User 消息"
     );
 }
 

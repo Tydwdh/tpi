@@ -235,7 +235,8 @@ async fn edit_and_edit_same_file_are_serialized() {
     assert_eq!(outcome.reason, CompletionReason::Stop);
     let life = lifecycle(&events);
     assert_strictly_serial(&life, "edit+edit 同文件");
-    // 第一个成功、第二个 stale 失败（预期：模型需重新 read）。
+    // §修复 #1：两个 edit 的 old_text 互不重叠（line one / line two），第二个
+    // 用旧 revision 但 old_text 仍唯一存在 → 宽松应用成功（目标未变，安全）。
     let completed: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
@@ -245,19 +246,11 @@ async fn edit_and_edit_same_file_are_serialized() {
         .collect();
     assert_eq!(completed.len(), 2);
     assert_eq!(completed[0], tpi::tool::outcome::ToolStatus::Succeeded);
-    assert_eq!(completed[1], tpi::tool::outcome::ToolStatus::Failed);
-    // 模型可见 stale 原因。
-    let second_output = events
-        .iter()
-        .filter_map(|e| match e {
-            SessionEvent::ToolCompleted { outcome, .. } => {
-                Some(outcome.model_payload.output.clone())
-            }
-            _ => None,
-        })
-        .nth(1)
-        .unwrap();
-    assert!(second_output.contains("stale"), "{second_output}");
+    assert_eq!(completed[1], tpi::tool::outcome::ToolStatus::Succeeded);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
+        "line ONE\nline TWO\n"
+    );
 }
 
 /// §15：bash 是隔离点——同轮 bash + read 必须串行。

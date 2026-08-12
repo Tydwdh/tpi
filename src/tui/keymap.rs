@@ -82,6 +82,8 @@ pub enum KeyAction {
     Undo,
     /// 重做撤销的编辑（Ctrl+Y）。
     Redo,
+    /// 切换右侧边栏（§用户诉求；默认 Ctrl+B）。
+    ToggleSidebar,
     /// 插入一个字符（普通字符键的动态回退；不入绑定表）。
     TypedChar(char),
 }
@@ -122,6 +124,7 @@ impl KeyAction {
             Self::CycleToolNext => "cycle_tool_next",
             Self::Undo => "undo",
             Self::Redo => "redo",
+            Self::ToggleSidebar => "toggle_sidebar",
             Self::TypedChar(_) => "insert_char",
         }
     }
@@ -161,6 +164,7 @@ impl KeyAction {
             "cycle_tool_next" => Self::CycleToolNext,
             "undo" => Self::Undo,
             "redo" => Self::Redo,
+            "toggle_sidebar" => Self::ToggleSidebar,
             _ => return None,
         })
     }
@@ -334,6 +338,8 @@ impl Keymap {
         // TPI 成熟化：编辑器撤销/重做（此前未映射）。
         bind("ctrl+z", KeyAction::Undo);
         bind("ctrl+y", KeyAction::Redo);
+        // §用户诉求：右侧边栏（todo + 用户消息大纲）。
+        bind("ctrl+b", KeyAction::ToggleSidebar);
         km
     }
 
@@ -359,11 +365,63 @@ impl Keymap {
             .contains_key(&(key.code, normalized_mods(key.modifiers)))
     }
 
+    /// 某动作是否至少有 1 个绑定（P0-5 关键键校验）。
+    pub fn has_action(&self, action: KeyAction) -> bool {
+        self.bindings.values().any(|a| *a == action)
+    }
+
+    /// 某动作的全部绑定（格式化；/doctor 展示用）。
+    pub fn keys_for(&self, action: KeyAction) -> String {
+        let mut keys: Vec<String> = self
+            .bindings
+            .iter()
+            .filter(|(_, a)| **a == action)
+            .map(|((code, mods), _)| format_key(KeyEvent::new(*code, *mods)))
+            .collect();
+        keys.sort();
+        keys.join(" / ")
+    }
+
+    /// P0-5：关键动作必须各有至少一个绑定（否则用户可能无法提交/换行/退出）。
+    ///
+    /// 覆盖语义会移除动作的原默认键——若用户误配置导致 `submit`/`insert_newline`/
+    /// `escape` 完全没有绑定，这里补回内置默认键并返回被恢复的动作名。
+    /// 检查顺序：escape（退出/取消最重要）> submit > insert_newline。
+    /// 被占用的默认键会被重新绑定（关键动作优先于误配的冲突绑定）。
+    pub fn ensure_critical_bindings(&mut self) -> Vec<&'static str> {
+        let defaults = Keymap::builtin();
+        let mut restored: Vec<&'static str> = Vec::new();
+        for action in [
+            KeyAction::Escape,
+            KeyAction::Submit,
+            KeyAction::InsertNewline,
+        ] {
+            if self.has_action(action) {
+                continue;
+            }
+            let default_keys: Vec<(KeyCode, KeyModifiers)> = defaults
+                .bindings
+                .iter()
+                .filter(|(_, a)| **a == action)
+                .map(|((code, mods), _)| (*code, *mods))
+                .collect();
+            for chord in default_keys {
+                self.bindings.insert(chord, action);
+            }
+            restored.push(action.name());
+        }
+        restored
+    }
+
     /// 从 `[ui.keymap]` 表构建：以默认绑定为基底，覆盖项替换动作的全部绑定。
     ///
     /// 覆盖语义：用户为某动作指定新键后，该动作的原默认键一并移除
-    /// （避免同一动作多键导致 Esc 等高频键歧义）；键冲突时后者覆盖前者。
+    /// （避免同一动作多键导致 Esc 等高频键歧义）；键冲突时后者覆盖前者
+    /// 并记日志（P0-5：冲突提示）。
     /// 未知动作名/非法按键字符串跳过并记日志，不阻断启动。
+    ///
+    /// P0-5：构建后校验关键动作（submit/insert_newline/escape）——缺失时
+    /// 补回内置默认键并记警告，杜绝"普通 Enter 不再提交 / 无法换行 / 无法退出"。
     pub fn from_config(table: &toml::Table) -> Self {
         let mut km = Keymap::builtin();
         for (action_name, value) in table {
@@ -401,8 +459,24 @@ impl Keymap {
             km.bindings.retain(|_, a| *a != action);
             for key in parsed {
                 let chord = (key.code, normalized_mods(key.modifiers));
+                // P0-5：冲突提示——该键已被其他动作占用（后者覆盖前者，但告知用户）。
+                if let Some(other) = km.bindings.get(&chord)
+                    && *other != action
+                {
+                    tracing::warn!(
+                        action = %action_name,
+                        key = %format_key(key),
+                        occupied_by = %other.name(),
+                        "tui keymap: 按键冲突，新绑定覆盖原动作"
+                    );
+                }
                 km.bindings.insert(chord, action);
             }
+        }
+        // P0-5：关键绑定兜底（缺失补默认键）。
+        let restored = km.ensure_critical_bindings();
+        for action in restored {
+            tracing::warn!(action, "tui keymap: 关键动作没有绑定，已回退内置默认键");
         }
         km
     }
@@ -479,6 +553,13 @@ mod tests {
         assert_eq!(km.action(key("esc")), Some(KeyAction::Escape));
         assert_eq!(km.action(key("ctrl+z")), Some(KeyAction::Undo));
         assert_eq!(km.action(key("ctrl+y")), Some(KeyAction::Redo));
+        // §用户诉求：右侧边栏默认 Ctrl+B 绑定。
+        assert_eq!(km.action(key("ctrl+b")), Some(KeyAction::ToggleSidebar));
+        assert_eq!(
+            KeyAction::ToggleSidebar.name(),
+            "toggle_sidebar",
+            "配置名必须稳定"
+        );
         // 普通字符回退为插入。
         assert_eq!(km.action(key("h")), Some(KeyAction::TypedChar('h')));
         assert_eq!(km.action(key("ctrl+h")), None, "Ctrl+h 未绑定则应忽略");
@@ -521,5 +602,64 @@ mod tests {
         assert!(shown.iter().any(|(name, _)| *name == "open_search"));
         let (_, keys) = shown.iter().find(|(n, _)| *n == "open_search").unwrap();
         assert_eq!(keys, "ctrl+f");
+    }
+
+    /// P0-5：关键动作（submit/insert_newline/escape）缺失绑定 → 补回默认键。
+    /// 构造：escape 被 submit 的键冲突覆盖后无绑定，ensure 必须恢复 esc。
+    #[test]
+    fn critical_bindings_restored_when_overridden_away() {
+        // `submit = "esc"` 会移除 escape 的默认键并占用 esc：
+        // 覆盖语义下 escape 无绑定（用户无法退出/取消 run）。
+        let table: toml::Table = toml::from_str("submit = \"esc\"").unwrap();
+        let km = Keymap::from_config(&table);
+        // submit 有绑定（esc 被它占用），不缺失；但 escape 必须先于 submit 恢复。
+        assert!(
+            km.has_action(KeyAction::Submit),
+            "submit 仍应可用（esc 已被它占用）"
+        );
+        assert!(
+            km.has_action(KeyAction::Escape),
+            "escape 必须被兜底恢复（不能没有退出键）"
+        );
+        assert_eq!(
+            km.action(key("esc")),
+            Some(KeyAction::Escape),
+            "esc 应恢复为 escape（关键动作优先于冲突占用）"
+        );
+        // submit 的兜底键（enter）也应恢复——不能把 submit 挤没。
+        assert_eq!(km.action(key("enter")), Some(KeyAction::Submit));
+        assert!(km.has_action(KeyAction::InsertNewline));
+    }
+
+    /// P0-5：insert_newline 被覆盖移除后必须补回默认换行键。
+    #[test]
+    fn insert_newline_restored_when_config_removes_it() {
+        // 配置把 insert_newline 换成与 submit 相同的键 → 后者覆盖前者 →
+        // insert_newline 无绑定（用户无法换行）。
+        let table: toml::Table =
+            toml::from_str("insert_newline = \"enter\"\nsubmit = \"enter\"").unwrap();
+        let km = Keymap::from_config(&table);
+        assert!(
+            km.has_action(KeyAction::InsertNewline),
+            "insert_newline 必须被兜底恢复（否则无法换行）"
+        );
+        assert_eq!(
+            km.action(key("shift+enter")),
+            Some(KeyAction::InsertNewline),
+            "shift+enter 默认换行键应恢复"
+        );
+    }
+
+    /// P0-5：keys_for / has_action 供 doctor 展示关键绑定。
+    #[test]
+    fn keys_for_lists_bindings_for_action() {
+        let km = Keymap::builtin();
+        assert_eq!(km.keys_for(KeyAction::Submit), "enter");
+        assert!(km.keys_for(KeyAction::Escape).contains("esc"));
+        assert!(
+            km.keys_for(KeyAction::InsertNewline)
+                .contains("shift+enter")
+        );
+        assert!(km.has_action(KeyAction::Escape));
     }
 }

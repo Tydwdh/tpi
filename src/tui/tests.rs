@@ -1068,6 +1068,78 @@ fn menu_clears_background_before_rendering() {
     );
 }
 
+/// §用户诉求：右侧边栏——打开时主区让出 SIDEBAR_WIDTH 列、边栏内容渲染、
+/// 大纲行可点、滚动条存在。
+#[test]
+fn sidebar_renders_todo_outline_and_shrinks_main() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::User, "第一条用户消息");
+    view.push_line(LineKind::Assistant, "回复一");
+    view.push_line(LineKind::User, "第二条用户消息更长一些用于测试截断");
+    // 计划项（todo 段）。
+    view.plan = Some(crate::tool::plan::Plan {
+        explanation: None,
+        items: vec![
+            crate::tool::plan::PlanItem {
+                text: "实现侧边栏".into(),
+                status: crate::tool::plan::PlanStatus::InProgress,
+            },
+            crate::tool::plan::PlanItem {
+                text: "写测试".into(),
+                status: crate::tool::plan::PlanStatus::Pending,
+            },
+        ],
+    });
+    // 打开侧边栏（模拟 Ctrl+B 后的状态）。
+    view.sidebar.open = true;
+    let width: u16 = 80;
+    let buf = draw_to_test_backend(&mut view, width, 24);
+    let sidebar_w = crate::tui::model::SIDEBAR_WIDTH;
+    // 边栏右对齐：占据最右 SIDEBAR_WIDTH 列。
+    let sidebar_start_x = width.saturating_sub(sidebar_w);
+    // 边栏出现 todo 标题。
+    let mut sidebar_text = String::new();
+    for y in 0..24u16 {
+        for x in sidebar_start_x..width {
+            sidebar_text.push_str(buf[(x, y)].symbol());
+        }
+        sidebar_text.push('\n');
+    }
+    assert!(
+        sidebar_text.contains("Todo"),
+        "边栏必须显示 Todo: {sidebar_text}"
+    );
+    // CJK 占 2 cells，逐 cell 拼接时字符间会有空格；去空格后再断言。
+    let compact: String = sidebar_text.chars().filter(|c| *c != ' ').collect();
+    assert!(
+        compact.contains("实现侧边栏"),
+        "边栏必须显示计划项: {sidebar_text}"
+    );
+    assert!(
+        compact.contains("用户消息"),
+        "边栏必须显示用户消息标题: {sidebar_text}"
+    );
+    // 主区收窄：边栏首列是竖线分隔（draw_sidebar 每行第一个 span）。
+    assert_eq!(
+        buf[(sidebar_start_x, 1)].symbol(),
+        "│",
+        "主区与边栏之间应有竖线分隔"
+    );
+}
+
+/// §用户诉求：侧边栏关闭时不占用任何宽度——主区占满全宽，无边栏内容。
+#[test]
+fn sidebar_closed_does_not_shrink_main() {
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::User, "一条消息");
+    let buf = draw_to_test_backend(&mut view, 80, 24);
+    let sidebar_w = crate::tui::model::SIDEBAR_WIDTH;
+    let sidebar_start_x = 80u16.saturating_sub(sidebar_w);
+    // 边栏区域不应出现边栏竖线（未打开）。
+    let cell = buf[(sidebar_start_x, 1)].symbol();
+    assert_ne!(cell, "│", "边栏未打开不得有竖线分隔: {cell:?}");
+}
+
 /// Reasoning overlay must show its own border title, not "Tool details".
 #[test]
 fn reasoning_overlay_uses_thinking_border_title() {
@@ -2119,6 +2191,78 @@ fn selecting_part_of_tool_card_highlights_only_that_row() {
     );
     // 复制内容 = "第一"（offset 对齐：渲染 char_start == selected_text 同 offset）。
     assert_eq!(view.selected_text(), "第一", "复制内容必须与高亮一致");
+}
+
+/// P0-1：失败卡片折叠态只显示 tail 尾部 ≤4 行——selected_text 必须与**可见行**
+/// 对齐（此前用全量 body，选中可见行 offset 与复制内容错位）。
+/// 验证：在可见 tail 行内选中一小段，复制内容与语义文本同窗口 offset 精确。
+#[test]
+fn failed_tool_card_tail_window_selection_aligns_with_visible_rows() {
+    use crate::tui::interaction::TextPosition;
+    use crate::tui::scroll::EntryId;
+    // 10 行输出，失败：折叠态渲染只显示末尾 4 行（FAILED_LINES）。
+    let output = (0..10)
+        .map(|i| format!("第{i}行输出"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut view = ViewModel {
+        collapsed_lines: 0, // 折叠态：失败卡只显示 tail 尾部 ≤4 行。
+        ..Default::default()
+    };
+    view.begin_tool("c1", "bash", Some("cmd".into()), None);
+    view.finish_tool(
+        ("c1", "bash"),
+        crate::tool::outcome::ToolStatus::Failed,
+        10,
+        Some(1),
+        output.clone(),
+        None,
+    );
+    let mut cache = HashMap::new();
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 20, 0, false, &mut cache);
+    // 可见行只有末尾 4 行（第6..第9行输出）+ 主行；前面 6 行不可见。
+    let visible_rows: Vec<String> = plan
+        .semantic_rows
+        .iter()
+        .filter_map(|r| r.as_ref().map(|s| s.text.clone()))
+        .filter(|t| !t.is_empty())
+        .collect();
+    assert!(
+        visible_rows.iter().any(|t| t.contains("第9行输出")),
+        "失败 tail 必须包含最后一行: {visible_rows:?}"
+    );
+    assert!(
+        visible_rows.iter().all(|t| !t.contains("第0行输出")),
+        "失败 tail 不得包含首行: {visible_rows:?}"
+    );
+    // 找到可见的 "第9行输出" 语义行，选中其中 "输出" 两个字。
+    let (_, tail_row) = plan
+        .semantic_rows
+        .iter()
+        .enumerate()
+        .find_map(|(i, r)| {
+            r.as_ref()
+                .and_then(|s| s.text.contains("第9行输出").then_some((i, s.char_start)))
+        })
+        .expect("第9行输出必须在可见窗口");
+    let line = "第9行输出";
+    let prefix = tail_row; // char_start
+    // offset 是**字符**偏移（非字节）："第9行输出" 中 "输出" 在 char 3。
+    let char_off = line.chars().take_while(|c| *c != '输').count();
+    view.selection_start(TextPosition {
+        entry_id: EntryId(1),
+        offset: prefix + char_off,
+    });
+    view.selection_update(TextPosition {
+        entry_id: EntryId(1),
+        offset: prefix + char_off + 2,
+    });
+    view.selection_end();
+    assert_eq!(
+        view.selected_text(),
+        "输出",
+        "复制必须与可见 tail 行精确对齐"
+    );
 }
 
 /// §用户诉求：默认 collapsed_lines=0 → 工具卡片折叠态只显示主行，

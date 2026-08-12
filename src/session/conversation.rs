@@ -11,7 +11,7 @@ use camino::Utf8PathBuf;
 use crate::ids::{RunId, SessionId, ToolCallId};
 use crate::provider::ChatMessage;
 
-use super::{SessionLog, recovery, replay_messages, workspace_id_for};
+use super::{Plan, SessionLog, latest_plan, recovery, replay_messages, workspace_id_for};
 
 /// 一个会话的 durable log 与当前模型上下文投影。
 ///
@@ -20,6 +20,7 @@ use super::{SessionLog, recovery, replay_messages, workspace_id_for};
 pub struct Conversation {
     log: Option<SessionLog>,
     history: Vec<ChatMessage>,
+    plan: Option<Plan>,
 }
 
 impl Default for Conversation {
@@ -33,6 +34,7 @@ impl Conversation {
         Self {
             log: None,
             history: Vec::new(),
+            plan: None,
         }
     }
 
@@ -54,8 +56,18 @@ impl Conversation {
 
         // 先取得单写者锁，再检查 pending tool。否则另一个进程可能在 recover 与
         // open 之间提交 ToolCompleted，当前进程随后会错误追加第二个 Interrupted 终态。
+        // P0-2：中间坏行会导致 open 整体失败——提示用户用 `tpi sessions repair` 修复。
         let mut log = SessionLog::open(sessions_root, workspace_root.as_std_path(), session_id)
-            .map_err(|error| format!("打开 session 失败: {error}"))?;
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::InvalidData {
+                    format!(
+                        "打开 session 失败: {error}\n该 session 可能损坏（中间坏行）；\
+                         用 `tpi sessions repair` 诊断并修复（会自动备份并隔离坏行）"
+                    )
+                } else {
+                    format!("打开 session 失败: {error}")
+                }
+            })?;
         let recovered =
             recovery::recover(&path).map_err(|error| format!("恢复 session 失败: {error}"))?;
         for (call_id, _provider_id, outcome) in &recovered.interrupted {
@@ -69,9 +81,11 @@ impl Conversation {
             .map_err(|error| format!("同步 session 失败: {error}"))?;
 
         let history = replay_messages(&path).map_err(|error| format!("重建历史失败: {error}"))?;
+        let plan = latest_plan(&path).map_err(|error| format!("重建计划失败: {error}"))?;
         Ok(Self {
             log: Some(log),
             history,
+            plan,
         })
     }
 
@@ -94,6 +108,7 @@ impl Conversation {
     pub fn reset(&mut self) {
         self.log = None;
         self.history.clear();
+        self.plan = None;
     }
 
     pub fn log(&self) -> Option<&SessionLog> {
@@ -102,6 +117,10 @@ impl Conversation {
 
     pub fn history(&self) -> &[ChatMessage] {
         &self.history
+    }
+
+    pub fn plan(&self) -> Option<&Plan> {
+        self.plan.as_ref()
     }
 
     /// agent run 所需的两个一致视图。
@@ -122,10 +141,13 @@ impl Conversation {
     pub fn refresh_from_log(&mut self) -> Result<(), String> {
         let Some(log) = self.log.as_ref() else {
             self.history.clear();
+            self.plan = None;
             return Ok(());
         };
         self.history = replay_messages(log.path())
             .map_err(|error| format!("run 失败后重建历史失败: {error}"))?;
+        self.plan =
+            latest_plan(log.path()).map_err(|error| format!("run 结束后重建计划失败: {error}"))?;
         Ok(())
     }
 }
@@ -136,6 +158,7 @@ mod tests {
     use crate::ids::ToolCallId;
     use crate::provider::ToolCall;
     use crate::session::{AssistantMessage, SessionEvent};
+    use crate::tool::plan::{Plan, PlanItem, PlanStatus};
 
     fn workspace() -> (tempfile::TempDir, Utf8PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -222,5 +245,45 @@ mod tests {
             .filter(|event| matches!(event, SessionEvent::ToolCompleted { .. }))
             .count();
         assert_eq!(completed, 1, "重复 resume 不得再次合成终态");
+    }
+
+    #[test]
+    fn resume_and_refresh_restore_latest_plan_separately_from_chat() {
+        let (dir, workspace) = workspace();
+        let sessions = dir.path().join("sessions");
+        let mut log =
+            SessionLog::create(&sessions, workspace.as_std_path(), RunId::new_v7()).unwrap();
+        let session_id = log.session_id();
+        let plan = Plan {
+            explanation: None,
+            items: vec![PlanItem {
+                text: "继续当前修复".into(),
+                status: PlanStatus::InProgress,
+            }],
+        };
+        log.append_event(&SessionEvent::PlanReplaced { plan: plan.clone() })
+            .unwrap();
+        log.sync_data().unwrap();
+        drop(log);
+
+        let mut conversation = Conversation::resume(&sessions, &workspace, session_id).unwrap();
+        assert_eq!(conversation.plan(), Some(&plan));
+        assert!(conversation.history().is_empty(), "plan 不应伪装成聊天消息");
+
+        let replacement = Plan {
+            explanation: Some("下一阶段".into()),
+            items: vec![PlanItem {
+                text: "跑完整验证".into(),
+                status: PlanStatus::InProgress,
+            }],
+        };
+        let (log, _) = conversation.parts_for_run().unwrap();
+        log.append_event(&SessionEvent::PlanReplaced {
+            plan: replacement.clone(),
+        })
+        .unwrap();
+        log.sync_data().unwrap();
+        conversation.refresh_from_log().unwrap();
+        assert_eq!(conversation.plan(), Some(&replacement));
     }
 }

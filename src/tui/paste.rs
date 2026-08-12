@@ -1,9 +1,16 @@
-//! 粘贴突发检测：bracketed paste 不可用时的降级路径（§用户诉求）。
+//! 粘贴突发检测：bracketed paste 序列解析 + 不可用时的降级路径（§用户诉求）。
 //!
-//! 支持 bracketed paste 的终端会把整段粘贴作为单个 `Event::Paste` 送达，
-//! 多行文本里的换行由 reducer 原样插入，不会触发提交。不支持的终端
-//! （旧 conhost、部分 SSH/嵌入终端）则把粘贴内容拆成连续 `KeyEvent` 流，
-//! 其中的 Enter 会命中 `submit` 绑定，造成「粘贴多行文本时换行直接发送」。
+//! **主路径（支持 bracketed paste 的终端）**：`EnableBracketedPaste` 下，
+//! 终端把粘贴注入为 `\x1b[200~ … \x1b[201~` 按键流。crossterm Windows 后端
+//! 不解析该序列（parse.rs 逐键产生 `KeyEvent`），因此 app 键盘线程按
+//! `Esc + '['` 检测粘贴开始、消费前缀 `[200~`、把内容按键全部缓冲，直到
+//! `[201~` 结束，整段作为一次 `Event::Paste` 上屏——不依赖间隔猜测、不读
+//! 剪贴板，行尾 Enter 经 [`paste_char`] 转 `\n`，不会命中 `submit`。
+//! 空闲超时 [`PASTE_IDLE_TIMEOUT`] 见底异常/误判。
+//!
+//! **降级路径（旧 conhost/部分 SSH/嵌入终端）**：不发送 bracketed 序列，
+//! 粘贴内容被拆成连续 `KeyEvent` 流，其中的 Enter 会命中 `submit` 绑定，
+//! 造成「粘贴多行文本时换行直接发送」。
 //!
 //! 本模块提供**间隔感知**的洪流判定（[`is_dense`]）+ **分块流式 flush**：
 //! - 普通按键（与上一键间隔 ≥ [`DENSE_GAP`]）由键盘线程**立即转发，0 等待**——
@@ -20,6 +27,8 @@
 //! 人类打字不可能达到——所以打字 0 延迟、粘贴（现代终端）走 Paste 快路径
 //! 也 0 延迟，两者互不干扰。
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -40,6 +49,64 @@ pub const FLUSH_GAP: Duration = Duration::from_millis(40);
 /// 单块缓冲字符数上限：防异常长流无限累积（超限先 flush 再继续，语义不变）。
 pub const MAX_BUF: usize = 8192;
 
+/// Esc 后探测下一键的窗口：`[`（bracketed paste 前缀 `\x1b[200~` 的第 2 键）
+/// 与结束序列 `\x1b[201~`（Esc 后紧接 `2,0,1,~`）。终端逐键注入时序列内
+/// 间隔 <1ms；40ms 只影响 Esc 后的等待——普通 Esc（低频）无后续键时
+/// poll 超时即转发，感知为零。
+pub const BRACKETED_PROBE_GAP: Duration = Duration::from_millis(40);
+/// bracketed paste 内容收集的空闲超时：连续无新键这么久即视为粘贴流结束
+/// （终端异常/误判兜底；真粘贴批间间隔远小于此）。
+pub const PASTE_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 大粘贴判定阈值（§用户诉求：大粘贴用占位符代替真实渲染）。
+///
+/// 超过 [`LARGE_PASTE_LINES`] 行（含换行）或达到 [`LARGE_PASTE_CHARS`] 字符时，
+/// 真实内容不插入输入框，而是以 `[Pasted Text: N chars #id]` 占位符上屏，
+/// 全文存入旁路（`UiState.pasted`），提交时一次性展开发送——避免大文本
+/// 在输入框内分块渲染、被 `MAX_INPUT_BYTES` 截断、以及行尾 Enter 在
+/// 批次边界被误判提交。阈值来自用户指定（5 行 / 300 字符，gemini-cli 同款）。
+pub const LARGE_PASTE_LINES: usize = 5;
+pub const LARGE_PASTE_CHARS: usize = 300;
+
+/// 是否大粘贴：`text` 超过 5 行 或 ≥300 字符。
+pub fn is_large_paste(text: &str) -> bool {
+    let mut chars = 0usize;
+    let mut lines = 1usize;
+    for c in text.chars() {
+        chars += 1;
+        if c == '\n' {
+            lines += 1;
+        }
+    }
+    chars >= LARGE_PASTE_CHARS || lines > LARGE_PASTE_LINES
+}
+
+/// 大粘贴占位符文本：输入框只渲染它；`id` 是 [`UiState::store_paste`] 返回的自增 id。
+pub fn paste_placeholder(id: u64, text: &str) -> String {
+    format!("[Pasted Text: {} chars #{id}]", text.chars().count())
+}
+
+/// 占位符正则（`[Pasted Text: N chars #<id>]`；捕获 id）。
+fn placeholder_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\[Pasted Text: \d+ chars #(\d+)\]").unwrap())
+}
+
+/// 提交时把文本中的大粘贴占位符展开为真实内容（§用户诉求：发送时一起发送）。
+///
+/// 占位符 id 在 `pasted` 中查不到（被清理等异常）时保留原样，不吞内容。
+pub fn expand_paste_placeholders(text: &str, pasted: &HashMap<u64, String>) -> String {
+    placeholder_regex()
+        .replace_all(text, |caps: &regex::Captures| {
+            let id: u64 = caps[1].parse().unwrap_or(0);
+            match pasted.get(&id) {
+                Some(content) => content.clone(),
+                None => caps[0].to_string(),
+            }
+        })
+        .into_owned()
+}
+
 /// 相邻两次按键间隔是否构成粘贴洪流（间隔 < [`DENSE_GAP`]）。
 ///
 /// `last_press = None`（首次按键、或被 Paste/Mouse/Resize 打断后）不构成
@@ -57,6 +124,13 @@ pub fn is_dense(last_press: Option<Instant>, now: Instant) -> bool {
 pub fn is_plain_enter(key: &KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
         && key.code == KeyCode::Enter
+        && key.modifiers == KeyModifiers::NONE
+}
+
+/// 无修饰 Esc（bracketed paste 前缀探测起点；粘贴内容不含修饰键）。
+pub fn is_plain_escape(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Esc
         && key.modifiers == KeyModifiers::NONE
 }
 
@@ -155,6 +229,20 @@ mod tests {
     }
 
     #[test]
+    fn is_plain_escape_only_unmodified_esc() {
+        assert!(is_plain_escape(&press(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!is_plain_escape(&press(
+            KeyCode::Esc,
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_plain_escape(&press(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_plain_escape(&press(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    #[test]
     fn paste_char_rejects_modifier_and_special_keys() {
         // Ctrl 组合 / 特殊键不是粘贴内容：None 终止收集并逐键转发。
         assert_eq!(
@@ -175,5 +263,52 @@ mod tests {
         let repeat =
             KeyEvent::new_with_kind(KeyCode::Char('b'), KeyModifiers::NONE, KeyEventKind::Repeat);
         assert_eq!(paste_char(&repeat), None);
+    }
+
+    #[test]
+    fn large_paste_threshold_boundary() {
+        // 短文本 / 少行：不触发占位符。
+        assert!(!is_large_paste("hello"));
+        assert!(!is_large_paste("line1\nline2\nline3\nline4\nline5"));
+        // 恰好 300 字符：触发。
+        assert!(is_large_paste(&"x".repeat(300)));
+        // 5 行不触发；6 行触发。
+        assert!(!is_large_paste("a\nb\nc\nd\ne"));
+        assert!(is_large_paste("a\nb\nc\nd\ne\nf"));
+        // 长度与行数都不足但组合接近：以各自独立阈值判定。
+        assert!(!is_large_paste(&"a\n".repeat(4)));
+    }
+
+    #[test]
+    fn paste_placeholder_contains_id_and_counts() {
+        let text = "第一行\n第二行";
+        let p = paste_placeholder(7, text);
+        assert_eq!(p, "[Pasted Text: 7 chars #7]");
+    }
+
+    #[test]
+    fn expand_replaces_all_placeholders() {
+        let mut pasted = HashMap::new();
+        pasted.insert(1, "很长的内容".to_string());
+        pasted.insert(2, "second".to_string());
+        let text = "前缀[Pasted Text: 5 chars #1]中缀[Pasted Text: 6 chars #2]后缀";
+        assert_eq!(
+            expand_paste_placeholders(text, &pasted),
+            "前缀很长的内容中缀second后缀"
+        );
+    }
+
+    #[test]
+    fn expand_keeps_missing_id_verbatim() {
+        // id 不在 pasted 中（已清理/序列重置）：保留占位符原样，不吞内容。
+        let pasted = HashMap::new();
+        let text = "[Pasted Text: 5 chars #99]";
+        assert_eq!(expand_paste_placeholders(text, &pasted), text);
+    }
+
+    #[test]
+    fn expand_no_placeholder_is_noop() {
+        let pasted = HashMap::new();
+        assert_eq!(expand_paste_placeholders("普通输入", &pasted), "普通输入");
     }
 }

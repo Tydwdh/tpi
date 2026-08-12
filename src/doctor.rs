@@ -1,4 +1,4 @@
-﻿//! 环境诊断（P2：`tpi doctor` / `/doctor`）。
+//! 环境诊断（P2：`tpi doctor` / `/doctor`）。
 //!
 //! 检查项集中在单个函数，CLI 与 TUI 共用同一份报告，
 //! 避免两处维护不同的检查逻辑。
@@ -178,6 +178,77 @@ fn doctor_report_with_home(
         },
     });
 
+    // 6. 关键键位（P0-5）：submit/insert_newline/escape 必须各有至少一个绑定。
+    // from_config 已做兜底（缺失回退默认键），这里展示当前生效绑定供排查。
+    let keymap = loaded_config
+        .as_ref()
+        .ok()
+        .map(|config| config.ui_keymap.clone())
+        .unwrap_or_else(crate::tui::keymap::Keymap::builtin);
+    use crate::tui::keymap::KeyAction;
+    let critical = [
+        ("submit", KeyAction::Submit),
+        ("insert_newline", KeyAction::InsertNewline),
+        ("escape", KeyAction::Escape),
+    ];
+    let all_present = critical
+        .iter()
+        .all(|(_, action)| keymap.has_action(*action));
+    let detail = critical
+        .iter()
+        .map(|(name, action)| format!("{name}: {}", keymap.keys_for(*action)))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    checks.push(DoctorCheck {
+        name: "keymap",
+        ok: all_present,
+        detail: if all_present {
+            detail
+        } else {
+            format!("{detail}（关键动作缺失，已回退默认键）")
+        },
+    });
+
+    // 7. session 完整性（P0-2）：中间坏行会导致 resume 失败；报告坏行位置。
+    let workspace_id = crate::session::workspace_id_for(workspace_root.as_std_path());
+    let session_dir = home.join("sessions").join(&workspace_id);
+    let mut corrupted: Vec<(String, usize, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&session_dir) {
+        let mut files: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "jsonl").unwrap_or(false))
+            .collect();
+        files.sort();
+        for path in files {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if uuid::Uuid::parse_str(stem).is_err() {
+                continue; // 附属文件（.bak-* / .quarantine）非 session 本体。
+            }
+            if let Ok(bad) = crate::session::repair::diagnose(&path) {
+                for line in bad {
+                    corrupted.push((stem.to_string(), line.line, line.reason));
+                }
+            }
+        }
+    }
+    checks.push(DoctorCheck {
+        name: "session_integrity",
+        ok: corrupted.is_empty(),
+        detail: if corrupted.is_empty() {
+            "当前 workspace 的 session 文件全部健康".into()
+        } else {
+            let mut detail = format!("{} 个坏行（`tpi sessions repair` 修复）:", corrupted.len());
+            for (id, line, reason) in corrupted.iter().take(5) {
+                detail.push_str(&format!("\n  {id} L{line}: {reason}"));
+            }
+            if corrupted.len() > 5 {
+                detail.push_str(&format!("\n  …等 {} 条", corrupted.len()));
+            }
+            detail
+        },
+    });
+
     checks
 }
 
@@ -251,5 +322,55 @@ mod tests {
         assert!(config.ok, "{config:?}");
         assert!(model.ok, "{model:?}");
         assert!(config.detail.contains("workspace"), "{}", config.detail);
+    }
+
+    /// P0-2：doctor 报告损坏 session 的坏行位置（不含附属文件）。
+    #[test]
+    fn doctor_reports_corrupted_session_lines() {
+        use crate::ids::RunId;
+        use crate::session::{SessionEvent, SessionLog};
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = Utf8PathBuf::from_path_buf(root.path().join("workspace")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sessions_root = home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let workspace_id = crate::session::workspace_id_for(workspace.as_std_path());
+        let session_id = crate::ids::SessionId::new_v7();
+        let path = sessions_root
+            .join(&workspace_id)
+            .join(format!("{session_id}.jsonl"));
+        let mut log = SessionLog::create_with_id(
+            &sessions_root,
+            workspace.as_std_path(),
+            RunId::new_v7(),
+            session_id,
+        )
+        .unwrap();
+        log.append_event(&SessionEvent::UserSubmitted {
+            content: "a".into(),
+        })
+        .unwrap();
+        drop(log);
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.extend_from_slice(b"broken-line\n");
+        std::fs::write(&path, raw).unwrap();
+
+        let report = doctor_report_with_home(&workspace, &home);
+        let sessions = report
+            .iter()
+            .find(|check| check.name == "session_integrity")
+            .unwrap();
+        assert!(!sessions.ok, "损坏 session 必须报错: {sessions:?}");
+        assert!(
+            sessions.detail.contains("tpi sessions repair"),
+            "{}",
+            sessions.detail
+        );
+        assert!(
+            sessions.detail.contains("L2"),
+            "应报告坏行行号: {}",
+            sessions.detail
+        );
     }
 }

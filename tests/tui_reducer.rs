@@ -407,18 +407,37 @@ fn ctrl_c_running_cancels_run_when_no_selection() {
     assert!(s.view.input.is_empty(), "Ctrl-C 不得写入输入框");
 }
 
-/// §用户诉求：空闲 Ctrl-C 静默忽略（不退出；退出用 /quit）。
+/// P0-4：空闲 Ctrl+C 连按两次退出（终端习惯）。
+/// 第一次：不退出，记录按压时刻并提示；2 秒内第二次：退出。
 #[test]
-fn ctrl_c_idle_is_ignored() {
+fn ctrl_c_idle_double_press_quits() {
     let mut s = state();
-    let effects = reducer::update(
-        &mut s,
-        UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+    let ctrl_c = || UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    // 第一次：不退出，提示「再按一次退出」。
+    let effects1 = reducer::update(&mut s, ctrl_c());
+    assert!(
+        !effects1.contains(&UiEffect::Quit),
+        "第一次空闲 Ctrl-C 不得直接退出: {effects1:?}"
     );
     assert!(
-        !effects.contains(&UiEffect::Quit),
-        "空闲 Ctrl-C 不得退出（只用于复制）: {effects:?}"
+        s.ctrl_c_exit_armed.is_some(),
+        "第一次必须记录双击窗口起始时刻"
     );
+    assert!(
+        s.view
+            .transient_hint
+            .as_deref()
+            .is_some_and(|h| h.contains("Ctrl+C")),
+        "必须给出可发现的提示: {:?}",
+        s.view.transient_hint
+    );
+    // 第二次（测试内瞬时连续，必然在 2 秒窗口内）：退出。
+    let effects2 = reducer::update(&mut s, ctrl_c());
+    assert!(
+        effects2.contains(&UiEffect::Quit),
+        "2 秒内第二次 Ctrl-C 必须退出: {effects2:?}"
+    );
+    assert!(s.ctrl_c_exit_armed.is_none(), "退出后双击窗口清零");
 }
 
 /// §用户诉求：Ctrl-C 静默忽略——不关闭 Overlay（Esc 负责关闭弹层）。
@@ -1250,4 +1269,116 @@ fn click_tool_expands_without_hover_state() {
         _ => false,
     };
     assert!(expanded, "点击卡片必须展开");
+}
+
+/// §用户诉求：大粘贴（≥300 字符或 >5 行）不真实渲染——输入框只放占位符，
+/// 真实内容存入 `UiState.pasted`，提交时一次性展开成全文发送。
+#[test]
+fn large_paste_becomes_placeholder_and_expands_on_submit() {
+    let mut s = state();
+    let big = format!("第一行内容\n{}", "x".repeat(400));
+    reducer::update(&mut s, UiEvent::Paste(big.clone()));
+    // 输入框渲染的是占位符，不是全文。
+    let text = s.editor.text().to_string();
+    assert!(
+        text.starts_with("[Pasted Text: ") && text.contains(" chars #1]"),
+        "大粘贴必须是占位符，实际: {text:?}"
+    );
+    assert_eq!(s.pasted.len(), 1, "真实内容存入旁路");
+    // 提交 → pending 是展开后的全文。
+    reducer::update(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        s.pop_pending().as_deref(),
+        Some(big.as_str()),
+        "提交时占位符必须展开为完整原文"
+    );
+    assert!(s.editor.text().is_empty(), "提交后编辑区清空");
+}
+
+/// §用户诉求：小粘贴（低于阈值）保持直接插入输入框，不产生占位符。
+#[test]
+fn small_paste_inserts_verbatim() {
+    let mut s = state();
+    reducer::update(&mut s, UiEvent::Paste("short text".into()));
+    assert_eq!(s.editor.text(), "short text");
+    assert!(s.pasted.is_empty(), "小粘贴不进入占位符存储");
+}
+
+/// §用户诉求：大粘贴占位符与普通输入混排时，提交展开不吞普通文本。
+#[test]
+fn placeholder_expands_among_typed_text() {
+    let mut s = state();
+    reducer::update(&mut s, UiEvent::Paste("a\nb\nc\nd\ne\nf".into()));
+    reducer::update(&mut s, key(KeyCode::Char(' ')));
+    reducer::update(&mut s, key(KeyCode::Char('尾')));
+    reducer::update(&mut s, key(KeyCode::Enter));
+    let pending = s.pop_pending().unwrap();
+    assert!(
+        pending.ends_with(" 尾"),
+        "占位符展开后保留后续输入，实际: {pending:?}"
+    );
+    assert!(
+        pending.starts_with("a\nb\nc\nd\ne\nf"),
+        "占位符展开为原文开头"
+    );
+}
+
+/// §用户诉求：右侧边栏——Ctrl+B 切换开关（default 关闭，启动时 app 打开）；
+/// 关闭时滚动无效果。
+#[test]
+fn toggle_sidebar_via_key_and_scroll_guarded_by_open() {
+    let mut s = state();
+    assert!(!s.view.sidebar.open, "default 关闭");
+    // Ctrl+B 切换打开。
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+    );
+    assert!(s.view.sidebar.open, "Ctrl+B 必须打开侧边栏");
+    // 再按一次关闭。
+    reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+    );
+    assert!(!s.view.sidebar.open, "Ctrl+B 再按关闭");
+    // 关闭时滚动事件无效果。
+    s.view.sidebar.scroll = 3;
+    reducer::update(&mut s, UiEvent::SidebarScroll(false));
+    assert_eq!(s.view.sidebar.scroll, 3, "关闭时滚动无效");
+}
+
+/// §用户诉求：侧边栏滚动——滚动条点击按比例跳转、滚轮增量滚动。
+#[test]
+fn sidebar_scroll_and_ratio_jump() {
+    let mut s = state();
+    s.view.sidebar.open = true;
+    s.view.sidebar.total_rows = 20;
+    s.view.sidebar.area_height = 5;
+    // 滚轮向下：增量 +5，clamp 到 19。
+    reducer::update(&mut s, UiEvent::SidebarScroll(false));
+    assert_eq!(s.view.sidebar.scroll, 5);
+    // 滚动条点击：点击第 1 行（0-based）→ 按比例跳到 20*1/5 = 4。
+    reducer::update(&mut s, UiEvent::SidebarScrollbarClick(1));
+    assert_eq!(s.view.sidebar.scroll, 4);
+    // 滚轮向上：-5，clamp 到 0。
+    reducer::update(&mut s, UiEvent::SidebarScroll(true));
+    assert_eq!(s.view.sidebar.scroll, 0);
+}
+
+/// §用户诉求：大纲行点击跳转到该用户消息，侧边栏保持打开（连续浏览）。
+#[test]
+fn sidebar_jump_locks_to_user_entry_and_keeps_open() {
+    let mut s = state();
+    s.view.push_line(LineKind::Assistant, "助手回复一\n第二行");
+    s.view.push_line(LineKind::User, "用户消息一");
+    s.view.push_line(LineKind::Assistant, "助手回复二");
+    let user_id = s.view.sidebar_outline()[0].0;
+    s.view.sidebar.open = true;
+    reducer::update(&mut s, UiEvent::SidebarJump(user_id));
+    // 锁定到该 entry，侧边栏保持打开（用户可 Ctrl+B 自行关闭）。
+    assert!(matches!(
+        s.view.scroll_mode,
+        ScrollMode::Locked(anchor) if anchor.entry_id == user_id
+    ));
+    assert!(s.view.sidebar.open, "跳转后侧边栏应保持打开");
 }

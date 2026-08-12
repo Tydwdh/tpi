@@ -15,6 +15,74 @@ use crate::tool::plan::Plan;
 use crate::tui::interaction::TextPosition;
 use crate::tui::scroll::{EntryId, ScrollAnchor, ScrollMode};
 
+/// 右侧边栏（§用户诉求：todo + 用户消息大纲，opencode 式）。
+///
+/// 布局：主区（transcript/plan/input/footer）右侧固定宽度竖栏；内容为
+/// 上方 Todo（`view.plan` 项）与下方用户消息大纲（单行摘要），整栏一个
+/// 滚动偏移 + 右侧 1 列滚动条。点击大纲行 → 锁定 transcript 到该 entry。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarState {
+    pub open: bool,
+    /// 侧边栏内容滚动偏移（0 = 顶部）。
+    pub scroll: usize,
+    /// 侧边栏内容总行数（渲染端写回；reducer 用它 clamp 滚动，§用户诉求）。
+    pub total_rows: usize,
+    /// 侧边栏可视高度（渲染端写回；滚动条点击按比例跳转用）。
+    pub area_height: usize,
+}
+
+impl Default for SidebarState {
+    fn default() -> Self {
+        Self {
+            // 默认关闭；§用户诉求：TPI 启动时由 app 层设为打开（Ctrl+B 切换）。
+            // 不硬编码在这里——否则所有用 `ViewModel::default()` 的布局测试
+            // 都被侧边栏收窄主区破坏。
+            open: false,
+            scroll: 0,
+            total_rows: 0,
+            area_height: 1,
+        }
+    }
+}
+
+impl SidebarState {
+    /// 切换开关（关闭时重置滚动）。
+    pub fn toggle(&mut self) {
+        self.open = !self.open;
+        if !self.open {
+            self.scroll = 0;
+        }
+    }
+
+    /// 按增量滚动（负 = 向上；clamp 到 [0, total-1]）。
+    pub fn scroll_by(&mut self, delta: isize) {
+        let max = self.total_rows.saturating_sub(1);
+        self.scroll = if delta < 0 {
+            self.scroll.saturating_sub(delta.unsigned_abs()).min(max)
+        } else {
+            self.scroll.saturating_add(delta as usize).min(max)
+        };
+    }
+
+    /// 按比例跳转（滚动条点击/拖拽；`row` 是点击行在侧边栏内的 0-based 偏移）。
+    pub fn scroll_to_ratio(&mut self, row: usize) {
+        let max = self.total_rows.saturating_sub(1);
+        if self.total_rows > self.area_height {
+            let target = self
+                .total_rows
+                .saturating_mul(row)
+                .saturating_div(self.area_height.max(1));
+            self.scroll = target.min(max);
+        }
+    }
+
+    /// 大纲跳转后关闭（快捷定位一次，回主视图看内容）。
+    pub fn close(&mut self) {
+        self.open = false;
+        self.scroll = 0;
+    }
+}
+
 /// 转录行类型（§16.2：普通工具可见、plan call 隐藏由 UI 策略决定）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptLine {
@@ -523,6 +591,8 @@ pub struct ViewModel {
     pub modal: Option<ModalState>,
     /// 转录搜索（None = 关闭；§14 Ctrl+F）。
     pub search: Option<SearchState>,
+    /// 右侧边栏（§用户诉求）：todo + 用户消息大纲；关闭时主区占满全宽。
+    pub sidebar: SidebarState,
     pub next_version: u64,
     pub next_entry_id: u64,
     /// transcript 结构版本（§性能：任何会改变 wrap 输出的 transcript 修改
@@ -567,12 +637,16 @@ impl Default for ViewModel {
             overlay: None,
             modal: None,
             search: None,
+            sidebar: SidebarState::default(),
             next_version: 1,
             next_entry_id: 1,
             transcript_revision: 0,
         }
     }
 }
+
+/// 侧边栏宽度（列）：右侧竖栏固定宽度；打开时主区让出该宽度。
+pub const SIDEBAR_WIDTH: u16 = 30;
 
 impl ViewModel {
     /// 标记 transcript 结构变化（wrap 缓存失效依据；§性能）。
@@ -840,6 +914,44 @@ impl ViewModel {
         self.trim_transcript();
     }
 
+    /// 用户重试 `ProviderInterrupted` 时移除上一 attempt 的未提交文本。
+    ///
+    /// durable 对话投影本来就不包含 `AssistantAttemptInterrupted`；若 TUI 仍保留
+    /// partial，下一次完整生成会在视觉上形成“半截 + 整段”的重复。只删除最后
+    /// 一个 User/Tool 边界之后的 Assistant/Reasoning，已提交的早期工具轮不动，
+    /// 失败提示和 retry 标记也继续保留。
+    pub fn discard_last_interrupted_attempt(&mut self) -> bool {
+        let Some(boundary) = self.transcript.iter().rposition(|entry| {
+            matches!(entry, Entry::Tool { .. })
+                || matches!(
+                    entry,
+                    Entry::Message { line, .. } if line.kind == LineKind::User
+                )
+        }) else {
+            return false;
+        };
+        let mut index = 0usize;
+        let before = self.transcript.len();
+        self.transcript.retain(|entry| {
+            let remove = index > boundary
+                && matches!(
+                    entry,
+                    Entry::Message { line, .. }
+                        if matches!(line.kind, LineKind::Assistant | LineKind::Reasoning)
+                );
+            index += 1;
+            !remove
+        });
+        if self.transcript.len() != before {
+            self.selection = None;
+            self.active_hit = None;
+            self.entry_heights.clear();
+            self.bump_transcript();
+            return true;
+        }
+        false
+    }
+
     /// 丢弃当前 attempt 的流式内容（§4.3 第三阶段：partial tool-call restart）。
     /// 整个 model turn 重新生成，已显示的 partial 不进 transcript；
     /// partial 文本由 session 的 `AssistantAttemptInterrupted` 记录（durable 事实）。
@@ -910,6 +1022,26 @@ impl ViewModel {
     pub fn follow_tail(&mut self) {
         self.scroll_mode = ScrollMode::Follow;
         self.pending_below = 0;
+    }
+
+    /// 切换侧边栏开关（§用户诉求）。
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar.toggle();
+    }
+
+    /// 侧边栏用户消息大纲：transcript 中所有 User 消息，条目 id + 单行摘要
+    /// （换行折叠为空格；渲染端按侧边栏宽度截断）。
+    pub fn sidebar_outline(&self) -> Vec<(EntryId, String)> {
+        self.transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Message { id, line, .. } if line.kind == LineKind::User => {
+                    let text = line.text.replace(['\n', '\r'], " ");
+                    Some((*id, text))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// 打开搜索（§14）；Esc 关闭时不强制跳回底部。
@@ -1921,44 +2053,14 @@ fn user_visible_output(name: &str, text: &str) -> (String, Option<usize>) {
 }
 
 /// 工具卡片的语义文本（§PointerHit：copy 从内容提取，不反推渲染结果）。
-/// 主行必须与渲染的 `card_semantic_header` **完全一致**（name target meta）——
-/// §修复：此前漏了 meta，主行语义比渲染短，selected_text 的 offset 与
-/// 渲染 char_start 错位（卡片内选中会选错字符/整卡全选）。
+///
+/// P0-1：与渲染行**同一窗口**——基于 [`crate::tui::tool_card::card_semantic_rows`]
+/// （主行 + 折叠窗口内内容行的 canonical 文本）按 `\n` 拼接。
+/// 此前用完整 body（diff/output/tail 全量），collapsed/failed tail/running tail
+/// 状态下渲染只显示部分行，`RowSemantic.char_start` 与这里 offset 错位，
+/// 卡片内选中/复制会错选。改为与渲染同源后 offset 恒对齐。
 fn card_semantic_text(card: &ToolCard) -> String {
-    let mut out = card.name.clone();
-    if let Some(target) = &card.target
-        && !target.is_empty()
-    {
-        out.push(' ');
-        out.push_str(target);
-    }
-    // 与 tool_card.rs 的 tool_card_meta 一致（duration · exit code）。
-    if let ToolCardState::Done {
-        status,
-        duration_ms,
-        exit_code,
-        ..
-    } = &card.state
-    {
-        out.push(' ');
-        out.push_str(&fmt_duration(*duration_ms));
-        if *status != ToolStatus::Succeeded
-            && let Some(code) = exit_code
-        {
-            out.push_str(&format!(" · exit {code}"));
-        }
-    }
-    let body = card
-        .diff
-        .as_deref()
-        .or(card.output.as_deref())
-        .or(card.tail.as_deref())
-        .unwrap_or_default();
-    if !body.is_empty() {
-        out.push('\n');
-        out.push_str(body.trim_end());
-    }
-    out
+    crate::tui::tool_card::card_semantic_rows(card).join("\n")
 }
 
 /// 卡片输出有界化（保留尾部；完整输出仍可通过 read @artifact 读取）。

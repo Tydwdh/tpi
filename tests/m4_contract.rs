@@ -327,8 +327,8 @@ async fn update_plan_and_compaction_integration() {
         if current > 0 {
             let last = request.messages.last().unwrap();
             assert!(
-                matches!(last, tpi::provider::ChatMessage::User(text) if text.contains("当前计划")),
-                "每次 model request 的 runtime snapshot 必须包含计划（§13，尾部 user 消息）: {last:?}"
+                matches!(last, tpi::provider::ChatMessage::User(text) if text.contains("当前焦点")),
+                "每次 model request 的 runtime snapshot 必须包含紧凑焦点（§13，尾部 user 消息）: {last:?}"
             );
         }
         if current == 0 {

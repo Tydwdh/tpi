@@ -202,6 +202,12 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.sync_input();
                 state.editor.submit()
             };
+            // §用户诉求：提交前把大粘贴占位符展开为全文，一起发送。
+            let text = if text.is_empty() {
+                text
+            } else {
+                crate::tui::paste::expand_paste_placeholders(&text, &state.pasted)
+            };
             if !text.is_empty() {
                 // §PointerHit：运行中提交立即在 footer 提示（不写 transcript，
                 // 避免消费时重复显示；实际 User 消息在消费时入 transcript）。
@@ -371,14 +377,28 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             }
         }
         KeyAction::CopyOrInterrupt => {
-            // Ctrl+C 语义（§PointerHit 统一）：
-            // - 有选区：复制到剪贴板；
-            // - 运行中无选区：取消 run（与 Esc 一致）；
-            // - 空闲无选区：忽略（退出走 /quit 或独立 signal handler）。
+            // Ctrl+C 语义（§PointerHit 统一 + P0-4 双击退出）：
+            // - 有选区：复制到剪贴板（清掉双击计数）；
+            // - 运行中无选区：取消 run（与 Esc 一致；不清双击计数）；
+            // - 空闲无选区：第一次提示"再按一次退出"，2 秒内第二次退出。
+            //   （终端习惯：空闲 Ctrl+C 连按两次退出，避免一次误触直接退出。）
             if state.view.selection.is_some() {
+                state.ctrl_c_exit_armed = None;
                 effects.push(UiEffect::CopySelection);
             } else if state.running {
+                state.ctrl_c_exit_armed = None;
                 effects.push(UiEffect::CancelRun);
+            } else {
+                let now = std::time::Instant::now();
+                if let Some(first) = state.ctrl_c_exit_armed
+                    && now.duration_since(first) < std::time::Duration::from_secs(2)
+                {
+                    state.ctrl_c_exit_armed = None;
+                    effects.push(UiEffect::Quit);
+                } else {
+                    state.ctrl_c_exit_armed = Some(now);
+                    state.view.transient_hint = Some("再按一次 Ctrl+C 退出 TPI（空闲状态）".into());
+                }
             }
         }
         KeyAction::ClearInput => {
@@ -425,6 +445,10 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
         KeyAction::Redo => {
             state.editor.redo();
             state.sync_input();
+            refresh_menus(state);
+        }
+        KeyAction::ToggleSidebar => {
+            state.view.toggle_sidebar();
             refresh_menus(state);
         }
         KeyAction::TypedChar(c) => {
@@ -542,6 +566,15 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
                 let keep = crate::tui::text::floor_char_boundary(&text, room.min(text.len()));
                 query.push_str(&text[..keep]);
                 state.view.update_search_query(&query);
+            } else if crate::tui::paste::is_large_paste(&text) {
+                // §用户诉求：大粘贴不真实渲染——全文存入旁路，输入框只放
+                // 占位符；提交时一次性展开（避免分块上屏/MAX_INPUT_BYTES 截断/
+                // 行尾 Enter 批次边界误判提交）。
+                let id = state.store_paste(text);
+                let placeholder = crate::tui::paste::paste_placeholder(id, &state.pasted[&id]);
+                state.editor.insert_str(&placeholder);
+                state.sync_input();
+                refresh_menus(state);
             } else {
                 let truncated = state.editor.text().len().saturating_add(text.len())
                     > crate::tui::editor::MAX_INPUT_BYTES;
@@ -626,6 +659,32 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
                 return Vec::new();
             }
             state.view.overlay = Some(crate::tui::model::OverlayState::for_link(&url));
+            Vec::new()
+        }
+        UiEvent::SidebarJump(entry) => {
+            // §用户诉求：点击大纲行 → 锁定到该用户消息；侧边栏保持打开
+            //（连续浏览/跳转多段对话；用户可自行 Ctrl+B 关闭）。
+            if state.view.modal.is_some() || state.view.overlay.is_some() {
+                return Vec::new();
+            }
+            state.view.lock_to(entry, 0);
+            Vec::new()
+        }
+        UiEvent::SidebarScroll(up) => {
+            if state.view.sidebar.open {
+                state.view.sidebar.scroll_by(if up { -5 } else { 5 });
+            }
+            Vec::new()
+        }
+        UiEvent::SidebarScrollbarClick(row) => {
+            if state.view.sidebar.open {
+                state.view.sidebar.scroll_to_ratio(row as usize);
+            }
+            Vec::new()
+        }
+        UiEvent::ToggleSidebar => {
+            state.view.toggle_sidebar();
+            refresh_menus(state);
             Vec::new()
         }
         UiEvent::ScrollbarClick(row) => {

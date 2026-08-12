@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 pub mod artifact;
 pub mod conversation;
 pub mod recovery;
+pub mod repair;
 
 /// 模型引用（§7.2 模型角色；M1 只有 primary）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -669,6 +670,20 @@ impl SessionLog {
 /// 读取 session 的全部事件（含残行丢弃）。
 pub fn read_events(path: &Path) -> std::io::Result<Vec<SessionEvent>> {
     Ok(read_events_and_max_seq(path)?.0)
+}
+
+/// 返回 session 中最后一次完整计划替换。
+///
+/// Plan 是 durable harness state，但不属于聊天消息投影；恢复 run/TUI 时必须从
+/// 事件流单独读取，否则跨 run 会静默丢失 Todo，模型也无法继续当前焦点。
+pub fn latest_plan(path: &Path) -> std::io::Result<Option<Plan>> {
+    Ok(read_events(path)?
+        .into_iter()
+        .rev()
+        .find_map(|event| match event {
+            SessionEvent::PlanReplaced { plan } => Some(plan),
+            _ => None,
+        }))
 }
 
 /// 读取全部事件并保留 envelope seq（P0-3/§19B：中间存在损坏行时

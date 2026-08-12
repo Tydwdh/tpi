@@ -44,7 +44,7 @@ use std::time::Instant;
 use markdown::{LinkRange, RenderedMarkdown, render_markdown, render_markdown_detailed};
 use model::{Entry, LineKind, StatusLine, ToolCard, ViewModel};
 use scroll::{EntryId, ScrollMode};
-use tool_card::{card_semantic_content, card_semantic_header, tool_card_lines};
+use tool_card::{card_semantic_rows, tool_card_lines};
 
 /// 帧合并间隔（§16.1：100-500 deltas/s 时按 16 ms 合并，而不是 delta 数量等于 draw 次数）。
 pub const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
@@ -109,6 +109,10 @@ struct FramePlan {
     transcript_rect: Rect,
     /// scrollbar 屏幕矩形（fullscreen 1 列；§24）。
     scrollbar_rect: Option<Rect>,
+    /// 右侧边栏屏幕矩形（§用户诉求：大纲行 hit-test）。
+    sidebar_rect: Option<Rect>,
+    /// 边栏每个可视行对应的大纲 entry id（§用户诉求：点击跳转）。
+    sidebar_hits: Vec<Option<EntryId>>,
     /// 当前窗口起始全局行（scrollbar 比例用，§24）。
     window_start: usize,
     /// 内容总 visual 行数（scrollbar 比例用，§24）。
@@ -148,6 +152,10 @@ pub struct Renderer {
     hits_valid: bool,
     /// 最近一帧 scrollbar 矩形（§24 鼠标点击/拖拽 hit-test）。
     last_scrollbar_rect: Option<Rect>,
+    /// 最近一帧右侧边栏矩形（§用户诉求：大纲行 hit-test）。
+    last_sidebar_rect: Option<Rect>,
+    /// 边栏每个可视行对应的大纲 entry id（§用户诉求：点击跳转）。
+    last_sidebar_hits: Vec<Option<EntryId>>,
     /// 最近一帧窗口内每行的语义信息（§InteractionRefactor：Ctrl+C 复制源，
     /// 从语义文本提取，不反推渲染结果）。与窗口行一一对应（§成熟化：
     /// 含可点击链接范围）。
@@ -175,8 +183,26 @@ impl Renderer {
             last_row_hits: Vec::new(),
             hits_valid: false,
             last_scrollbar_rect: None,
+            last_sidebar_rect: None,
+            last_sidebar_hits: Vec::new(),
             semantic_rows: Vec::new(),
         })
+    }
+
+    /// §用户诉求：最近一帧右侧边栏矩形（鼠标 hit-test；无 = 边栏关闭）。
+    pub fn sidebar_rect(&self) -> Option<Rect> {
+        self.last_sidebar_rect
+    }
+
+    /// §用户诉求：屏幕坐标 → 边栏大纲 entry id（命中大纲行返回可跳转目标）。
+    /// 仅在边栏矩形内有效；行内任意列都算命中（整行可点）。
+    pub fn sidebar_hit(&self, column: u16, row: u16) -> Option<EntryId> {
+        let rect = self.last_sidebar_rect?;
+        if column < rect.x || row < rect.y || row >= rect.y + rect.height {
+            return None;
+        }
+        let index = (row - rect.y) as usize;
+        self.last_sidebar_hits.get(index).cloned().flatten()
     }
 
     /// 鼠标点击 hit-test：命中工具卡片/reasoning 行返回目标（Overlay 用）。
@@ -290,6 +316,8 @@ impl Renderer {
                 row_hits,
                 transcript_rect,
                 scrollbar_rect,
+                sidebar_rect,
+                sidebar_hits,
                 semantic_rows,
                 overflow: frame_overflow,
                 committed_after,
@@ -314,6 +342,8 @@ impl Renderer {
                 row_hits,
                 transcript_rect,
                 scrollbar_rect,
+                sidebar_rect,
+                sidebar_hits,
                 window_start: 0,
                 total_rows: 0,
                 semantic_rows,
@@ -327,6 +357,8 @@ impl Renderer {
             self.last_row_hits = plan.row_hits;
             self.hits_valid = true;
             self.last_scrollbar_rect = plan.scrollbar_rect;
+            self.last_sidebar_rect = plan.sidebar_rect;
+            self.last_sidebar_hits = plan.sidebar_hits;
             // §InteractionRefactor：保存每窗口行的语义文本（复制源）。
             // 从语义文本提取复制，不反推渲染结果（无 padding/装饰污染）。
             self.semantic_rows = plan.semantic_rows;
@@ -413,17 +445,36 @@ fn render_frame(
         mode,
     } = context;
     let area = frame.area();
-    // 宽度变化 → Markdown 渲染缓存失效，提交位置重置为当前窗口起点
-    // （§16.1：已提交到 scrollback 的历史 immutable，resize 后只重排活动区）。
-    let reset_committed = *cache_width != area.width;
+    // §用户诉求：右侧边栏（todo + 用户消息大纲）。打开时横向切分——主区让出
+    // SIDEBAR_WIDTH 列，边栏占右侧整列高（贯穿 transcript 到 footer）。
+    let (main_area, sidebar_area) = if view.sidebar.open {
+        let main_w = area
+            .width
+            .saturating_sub(crate::tui::model::SIDEBAR_WIDTH)
+            .max(1);
+        (
+            Rect::new(area.x, area.y, main_w, area.height),
+            Some(Rect::new(
+                area.x + main_w,
+                area.y,
+                area.width - main_w,
+                area.height,
+            )),
+        )
+    } else {
+        (area, None)
+    };
+    // 宽度变化（resize 或 sidebar 开关）→ Markdown 渲染缓存失效，提交位置重置
+    // 为当前窗口起点（§16.1：已提交到 scrollback 的历史 immutable，resize 后只重排活动区）。
+    let reset_committed = *cache_width != main_area.width;
     if reset_committed {
         cache.clear();
         // §性能：wrap 结果按宽度缓存，resize 后一并失效（key 含 width）。
         wrap_cache.clear();
-        *cache_width = area.width;
+        *cache_width = main_area.width;
     }
 
-    let input_rows = input_area_rows(view, area.width);
+    let input_rows = input_area_rows(view, main_area.width);
     let plan_rows = plan_area_rows(view);
 
     // §视觉瘦身：去掉常驻 Header（信息与 footer 重复），transcript 上移到顶部。
@@ -439,7 +490,7 @@ fn render_frame(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .split(area);
+        .split(main_area);
     let mut idx = 0;
     let trans_area = chunks[idx];
     idx += 1;
@@ -579,10 +630,21 @@ fn render_frame(
     }
 
     draw_input(frame, input_area, view, theme);
+
+    // §用户诉求：右侧边栏（todo + 用户消息大纲）。贯穿整个主区高度。
+    // sidebar_rect = 整个边栏矩形（供鼠标 hit-test）；draw_sidebar 返回
+    // 可视行 → 大纲 entry id（点击跳转）。
+    let sidebar_hits = match sidebar_area {
+        Some(rect) => draw_sidebar(frame, rect, view, theme),
+        None => Vec::new(),
+    };
+    let sidebar_rect = sidebar_area;
     FramePlan {
         window: Vec::new(),
         row_hits: plan.row_hits,
         scrollbar_rect,
+        sidebar_rect,
+        sidebar_hits,
         transcript_rect: trans_area,
         window_start: plan.window_start,
         total_rows: plan.total_rows,
@@ -888,6 +950,9 @@ fn plan_window(
         transcript_rect: Rect::default(),
         // §24：scrollbar 矩形由 render_frame 计算（需要屏幕坐标）。
         scrollbar_rect: None,
+        // §用户诉求：边栏矩形/命中由 render_frame 计算（需要屏幕坐标）。
+        sidebar_rect: None,
+        sidebar_hits: Vec::new(),
         window_start,
         total_rows: heights.iter().sum(),
         semantic_rows,
@@ -1636,22 +1701,14 @@ fn build_transcript_text(
             Entry::Tool { card, .. } => {
                 let card_id = card.id.clone();
                 let card_lines = tool_card_lines(card, view.anim_tick, theme, width);
+                // §PointerHit：语义文本与渲染行一一对应（P0-1：同一窗口）。
+                let semantic_rows = card_semantic_rows(card);
                 // §美化：整卡可点击——主行与内容行都带 Tool hit（轻点任意行
                 // 展开/收缩；拖选仍是文本选择，不冲突）。内容行如有链接，
                 // pointer_target 里链接优先于工具命中。
                 for (i, line) in card_lines.into_iter().enumerate() {
                     let hit = Some((HitTarget::Tool(card_id.clone()), width as u16));
-                    // 语义文本：主行去 icon 前缀（首个 "✓ " 等），内容行原样。
-                    let semantic_text = if i == 0 {
-                        card_semantic_header(card)
-                    } else {
-                        let raw = line
-                            .spans
-                            .iter()
-                            .map(|s| s.content.as_ref())
-                            .collect::<String>();
-                        card_semantic_content(card, i, &raw)
-                    };
+                    let semantic_text = semantic_rows.get(i).cloned().unwrap_or_default();
                     push_hit(
                         &mut out,
                         &mut hits,
@@ -1972,20 +2029,18 @@ fn build_live_group(
             }
             let card_id = card.id.clone();
             let card_lines = tool_card_lines(card, view.anim_tick, theme, width);
+            // §PointerHit：语义文本与渲染行一一对应（P0-1：同一窗口）。
+            let semantic_rows = card_semantic_rows(card);
             for (i, line) in card_lines.into_iter().enumerate() {
                 // §美化：整卡可点击（与历史卡片一致）——主行与内容行都带
                 // Tool hit；拖选仍是文本选择。
                 let hit = Some((HitTarget::Tool(card_id.clone()), line.width() as u16));
+                let semantic_text = semantic_rows.get(i).cloned().unwrap_or_default();
                 let raw_text = line
                     .spans
                     .iter()
                     .map(|s| s.content.as_ref())
                     .collect::<String>();
-                let semantic_text = if i == 0 {
-                    card_semantic_header(card)
-                } else {
-                    card_semantic_content(card, i, &raw_text)
-                };
                 let line_width = unicode_width::UnicodeWidthStr::width(raw_text.as_str());
                 let text_width = unicode_width::UnicodeWidthStr::width(semantic_text.as_str());
                 let rail = line.spans.first().cloned();
@@ -2140,6 +2195,139 @@ fn draw_plan(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: th
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// 右侧边栏（§用户诉求：opencode 式）。上方 Todo（`view.plan` 项），
+/// 下方用户消息大纲（单行摘要）；整栏一个滚动偏移 + 右侧 1 列滚动条。
+///
+/// 返回 `(矩形, 可视行 → 大纲 entry id)`：矩形供鼠标 hit-test，命中表
+/// 供点击跳转（仅大纲行有 entry；todo/标题/空白为 None）。
+///
+/// 内容行数 = todo（标题 + 项）+ 大纲（标题 + 用户消息），超区域高度时
+/// 可滚动；写回 `view.sidebar.total_rows`（reducer 用它 clamp 滚动偏移）。
+fn draw_sidebar(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    view: &mut ViewModel,
+    theme: theme::Theme,
+) -> Vec<Option<EntryId>> {
+    let title_style = Style::default()
+        .fg(theme.primary)
+        .bg(theme.surface)
+        .add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(theme.muted).bg(theme.surface);
+
+    // 组装内容行（逻辑行）：todo 段 + 大纲段。
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut hits: Vec<Option<EntryId>> = Vec::new();
+    // —— Todo ——
+    lines.push(Line::from(vec![Span::styled(" ☑ Todo", title_style)]));
+    hits.push(None);
+    match &view.plan {
+        Some(plan) if !plan.items.is_empty() => {
+            for item in plan_display_items(plan) {
+                let (marker, style) = match item.status {
+                    crate::tool::plan::PlanStatus::Completed => (
+                        "[x]",
+                        Style::default()
+                            .fg(theme.muted)
+                            .bg(theme.surface)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                    crate::tool::plan::PlanStatus::InProgress => {
+                        ("[>]", Style::default().fg(theme.warning).bg(theme.surface))
+                    }
+                    crate::tool::plan::PlanStatus::Pending => {
+                        ("[ ]", Style::default().fg(theme.muted).bg(theme.surface))
+                    }
+                };
+                let text = crate::tui::text::truncate_middle_utf8(
+                    &item.text,
+                    area.width.saturating_sub(3) as usize,
+                    "…",
+                );
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{marker} {text}"),
+                    style,
+                )]));
+                hits.push(None);
+            }
+        }
+        _ => {
+            lines.push(Line::from(vec![Span::styled("(无活动计划)", muted)]));
+            hits.push(None);
+        }
+    }
+    // —— 用户消息大纲 ——
+    lines.push(Line::from(vec![Span::styled(" ┋ 用户消息", title_style)]));
+    hits.push(None);
+    let outline = view.sidebar_outline();
+    if outline.is_empty() {
+        lines.push(Line::from(vec![Span::styled("(无用户消息)", muted)]));
+        hits.push(None);
+    } else {
+        for (entry_id, text) in &outline {
+            let shown = crate::tui::text::truncate_middle_utf8(
+                text,
+                area.width.saturating_sub(1) as usize,
+                "…",
+            );
+            // 大纲行可点击：整行用 hover 色提示可跳转。
+            lines.push(Line::from(vec![Span::styled(
+                format!(" {shown}"),
+                Style::default().fg(theme.info).bg(theme.surface),
+            )]));
+            hits.push(Some(*entry_id));
+        }
+    }
+    let total_rows = lines.len();
+    view.sidebar.total_rows = total_rows;
+
+    // 滚动窗口：内容超出区域高度时按 scroll 偏移取可视段。
+    let area_h = area.height.max(1) as usize;
+    let max_start = total_rows.saturating_sub(area_h);
+    let start = view.sidebar.scroll.min(max_start);
+    let window_lines: Vec<Line<'static>> = lines.iter().skip(start).take(area_h).cloned().collect();
+    let window_hits: Vec<Option<EntryId>> = hits.iter().skip(start).take(area_h).cloned().collect();
+
+    // 渲染：左侧竖线分隔主区，内容区 surface 背景，右侧 1 列滚动条。
+    let content_w = area.width.saturating_sub(1) as usize;
+    let bg = Style::default().bg(theme.surface);
+    let mut rendered: Vec<Line<'static>> = Vec::with_capacity(window_lines.len());
+    for line in window_lines.iter() {
+        let mut spans: Vec<Span<'static>> = vec![Span::styled("│", bg)];
+        // 每行内容补空格到 content_w（视觉上整栏 panel）。
+        let mut content = line.clone();
+        let cur = unicode_width::UnicodeWidthStr::width(
+            content
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .as_str(),
+        );
+        if cur < content_w {
+            content
+                .spans
+                .push(Span::styled(" ".repeat(content_w - cur), bg));
+        }
+        spans.extend(content.spans);
+        rendered.push(Line::from(spans));
+    }
+    // 不足一屏时补空白行到满高。
+    while rendered.len() < area_h {
+        rendered.push(Line::from(vec![Span::styled(
+            "│".to_string() + &" ".repeat(content_w),
+            bg,
+        )]));
+    }
+    // 滚动条单独画（比例 thumb），不混入内容行。
+    if area.width >= 2 {
+        let rect = Rect::new(area.x + area.width - 1, area.y, 1, area.height);
+        draw_scrollbar(frame, rect, theme, start, total_rows);
+    }
+    frame.render_widget(Paragraph::new(rendered), area);
+    window_hits
 }
 
 /// 状态栏（§16.2：workspace、model、turn、token usage、运行状态）。

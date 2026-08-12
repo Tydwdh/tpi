@@ -140,8 +140,9 @@ fn consecutive_edits_use_current_revision_without_read() {
         "第二次 edit 生效: {final_text}"
     );
 
-    // 旧 revision 会 stale（证明必须用最新 current_revision，而非磁盘快照外旧值）。
-    let stale = apply_edit(
+    // §修复 #1：旧 revision + old_text 仍唯一匹配 → 宽松应用（免重新 read）。
+    // （外部空白改动后目标 old_text 仍唯一存在，无需因 revision 过期重读。）
+    let relaxed = apply_edit(
         &path,
         &rev1,
         &[Replacement {
@@ -149,9 +150,21 @@ fn consecutive_edits_use_current_revision_without_read() {
             new_text: "x = 4".into(),
         }],
     )
+    .expect("旧 revision 但 old_text 仍唯一匹配应宽松应用");
+    assert_eq!(relaxed.applied, 1);
+
+    // 旧 revision + old_text 不再匹配 → 仍 stale（内容失效才需重新 read）。
+    let stale = apply_edit(
+        &path,
+        &rev1,
+        &[Replacement {
+            old_text: "x = 99".into(),
+            new_text: "x = 4".into(),
+        }],
+    )
     .unwrap_err();
     assert!(
         matches!(stale, tpi::tool::edit::EditError::StaleRevision { .. }),
-        "旧 revision 必须 stale: {stale:?}"
+        "old_text 失效时旧 revision 必须 stale: {stale:?}"
     );
 }

@@ -60,6 +60,11 @@ pub const MAX_PLAN_ITEMS: usize = 7;
 pub const MAX_PLAN_HISTORY: usize = 7;
 pub const MAX_PLAN_ITEM_BYTES: usize = 500;
 pub const MAX_PLAN_EXPLANATION_BYTES: usize = 2_000;
+/// 模型每轮真正需要关注的计划项：当前项 + 最近的两个下一步。
+/// 完整计划仍保留在 session/TUI；这里只约束 runtime context，避免远期 Todo
+/// 稀释当前任务，也避免频繁更新把大块动态文本塞进 prompt 尾部。
+pub const MAX_PLAN_CONTEXT_ITEMS: usize = 3;
+pub const MAX_PLAN_CONTEXT_TEXT_BYTES: usize = 240;
 
 /// update_plan 参数（§13：每次提交完整计划）。
 ///
@@ -367,6 +372,11 @@ pub fn update_plan(
 }
 
 /// 计划的模型可见投影（每次 model request 注入，§13：runtime snapshot）。
+///
+/// 这是“焦点投影”，不是完整历史：只包含当前项和最多两个下一步，完成项只给
+/// 计数。完整 [`Plan`] 仍由 `PlanReplaced` 持久化并供 TUI 展示。这样长任务不会
+/// 因早已完成/很远期的 Todo 分散注意力，计划频繁变化时也只改变 prompt 尾部的
+/// 一小段，稳定历史仍可命中 provider prompt cache。
 pub fn plan_snapshot(plan: Option<&Plan>) -> String {
     let Some(plan) = plan else {
         return String::new();
@@ -374,20 +384,62 @@ pub fn plan_snapshot(plan: Option<&Plan>) -> String {
     if plan.items.is_empty() {
         return String::new();
     }
-    let mut out = String::from("当前计划：");
+    let mut out = String::from("当前焦点：");
     if let Some(explanation) = &plan.explanation {
-        out.push_str(&format!("（{explanation}）"));
+        out.push_str(&format!(
+            "（{}）",
+            truncate_context_text(explanation, MAX_PLAN_CONTEXT_TEXT_BYTES)
+        ));
     }
     out.push('\n');
-    for item in &plan.items {
+    let mut visible = 0usize;
+    for item in plan
+        .items
+        .iter()
+        .filter(|item| item.status != PlanStatus::Completed)
+        .take(MAX_PLAN_CONTEXT_ITEMS)
+    {
         let marker = match item.status {
-            PlanStatus::Completed => "[x]",
             PlanStatus::InProgress => "[>]",
             PlanStatus::Pending => "[ ]",
+            PlanStatus::Completed => continue,
         };
-        out.push_str(&format!("{marker} {}\n", item.text));
+        out.push_str(&format!(
+            "{marker} {}\n",
+            truncate_context_text(&item.text, MAX_PLAN_CONTEXT_TEXT_BYTES)
+        ));
+        visible += 1;
+    }
+    let completed = plan
+        .items
+        .iter()
+        .filter(|item| item.status == PlanStatus::Completed)
+        .count();
+    let remaining = plan
+        .items
+        .iter()
+        .filter(|item| item.status != PlanStatus::Completed)
+        .count()
+        .saturating_sub(visible);
+    if completed > 0 || remaining > 0 {
+        out.push_str(&format!(
+            "进度：已完成 {completed}，另有 {remaining} 个后续项\n"
+        ));
     }
     out
+}
+
+fn truncate_context_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let marker = "…";
+    let budget = max_bytes.saturating_sub(marker.len());
+    let mut end = budget.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{marker}", &text[..end])
 }
 
 #[cfg(test)]
@@ -654,5 +706,57 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, PlanError::TooManyItems { count: 8 }));
+    }
+
+    #[test]
+    fn context_snapshot_keeps_only_current_and_two_next_items() {
+        let plan = Plan {
+            explanation: Some("聚焦当前阶段".into()),
+            items: vec![
+                PlanItem {
+                    text: "已经完成".into(),
+                    status: PlanStatus::Completed,
+                },
+                PlanItem {
+                    text: "当前工作".into(),
+                    status: PlanStatus::InProgress,
+                },
+                PlanItem {
+                    text: "下一步一".into(),
+                    status: PlanStatus::Pending,
+                },
+                PlanItem {
+                    text: "下一步二".into(),
+                    status: PlanStatus::Pending,
+                },
+                PlanItem {
+                    text: "遥远步骤".into(),
+                    status: PlanStatus::Pending,
+                },
+            ],
+        };
+
+        let snapshot = plan_snapshot(Some(&plan));
+
+        assert!(snapshot.contains("当前工作"));
+        assert!(snapshot.contains("下一步一"));
+        assert!(snapshot.contains("下一步二"));
+        assert!(!snapshot.contains("已经完成"), "完成历史不应抢占模型注意力");
+        assert!(!snapshot.contains("遥远步骤"), "远期项只保留计数");
+        assert!(snapshot.contains("已完成 1，另有 1 个后续项"));
+    }
+
+    #[test]
+    fn context_snapshot_truncates_utf8_without_splitting_characters() {
+        let plan = Plan {
+            explanation: Some("说明".repeat(MAX_PLAN_CONTEXT_TEXT_BYTES)),
+            items: vec![PlanItem {
+                text: "当前任务".repeat(MAX_PLAN_CONTEXT_TEXT_BYTES),
+                status: PlanStatus::InProgress,
+            }],
+        };
+        let snapshot = plan_snapshot(Some(&plan));
+        assert!(snapshot.contains('…'));
+        assert!(snapshot.is_char_boundary(snapshot.len()));
     }
 }
