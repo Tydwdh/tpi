@@ -178,12 +178,15 @@ pub async fn run(
         return Ok(());
     }
 
+    // README2 Phase 3：MCP server 生命周期由 interactive_loop 管理。
+    let mut mcp_manager = crate::mcp::manager::McpManager::new();
     interactive_loop(
         &mut provider,
         &mut conversation,
         &config,
         prompt,
         current_cancel.clone(),
+        &mut mcp_manager,
     )
     .await
 }
@@ -248,6 +251,7 @@ async fn interactive_loop<P: Provider>(
     config: &Config,
     initial_prompt: &str,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    mcp_manager: &mut crate::mcp::manager::McpManager,
 ) -> Result<(), String> {
     use crate::tui::event::UiEvent;
     use crate::tui::model::LineKind;
@@ -281,6 +285,17 @@ async fn interactive_loop<P: Provider>(
         LineKind::System,
         "TPI：/help 查看命令与快捷键 · Esc 取消当前 run · 空闲 Ctrl+C 连按两次退出",
     );
+    // README2 Phase 3：启动 MCP servers（从 ~/.tpi/config.toml；无配置则无操作）。
+    {
+        let mut registry = crate::tool::registry::ToolRegistry::new();
+        let started = mcp_manager.start_from_config(&mut registry).await;
+        if started > 0 {
+            view.push_line(
+                LineKind::System,
+                format!("MCP: {started} 个 server 已启动（/mcp 查看状态）"),
+            );
+        }
+    }
     // §26-27：UiState 是 UI 单一事实源；交互循环只做
     // event → reducer → effects → draw（T3）。
     // §成熟化：注入 `[ui.keymap]` 生效键位（未配置动作保持内建默认）。
@@ -867,6 +882,7 @@ async fn interactive_loop<P: Provider>(
                 conversation,
                 &current_cancel,
                 &mut last_failed,
+                mcp_manager,
             )? {
                 SlashAction::Quit => break,
                 SlashAction::Consumed => continue,
@@ -944,6 +960,8 @@ async fn interactive_loop<P: Provider>(
         }
     }
 
+    // README2 Phase 3：退出前关闭所有 MCP server（不留孤儿进程，§9）。
+    mcp_manager.shutdown_all().await;
     renderer.restore().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -960,10 +978,21 @@ fn handle_slash_command(
     conversation: &mut Conversation,
     current_cancel: &Arc<Mutex<Option<CancellationToken>>>,
     last_failed: &mut Option<RetryTarget>,
+    mcp_manager: &mut crate::mcp::manager::McpManager,
 ) -> Result<SlashAction, String> {
     use crate::tui::SLASH_COMMANDS;
     match message {
         "/quit" | "/exit" => Ok(SlashAction::Quit),
+        // README2 Phase 3：/mcp 状态页（Server/Status/Tools）+ restart。
+        // 交互式环境无 registry 传入；McpManager 内部持有运行时状态。
+        msg if msg == "/mcp" || msg.starts_with("/mcp ") => {
+            let body = render_mcp_status(mcp_manager);
+            ui_state.view.open_modal("/mcp", body);
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+            Ok(SlashAction::Consumed)
+        }
         "/settings" => {
             let shell = config
                 .shell_path
@@ -1309,6 +1338,30 @@ workspace: {}
 
 /// 输入 crossterm MouseEvent + renderer + 状态机，输出语义化 UiEvent。
 /// `overlay_open`：弹层打开时点击不动作。
+/// README2 Phase 3：/mcp 状态页文本（Server/Status/Tools 表）。
+fn render_mcp_status(mcp_manager: &crate::mcp::manager::McpManager) -> String {
+    let statuses = mcp_manager.statuses();
+    if statuses.is_empty() {
+        return "未配置 MCP server。\n\n在 ~/.tpi/config.toml 添加：\n[mcp.servers.<name>]\ncommand = \"...\"\nargs = []\nenabled = true".to_string();
+    }
+    let mut out = String::from("Server     Status            Tools\n");
+    out.push_str("---------  ----------------  -----\n");
+    for (name, status) in statuses {
+        match status {
+            crate::mcp::manager::McpServerStatus::Connected { tool_count } => {
+                out.push_str(&format!("{name:<10} connected         {tool_count}\n"));
+            }
+            crate::mcp::manager::McpServerStatus::Failed(detail) => {
+                out.push_str(&format!("{name:<10} failed            -\n  {detail}\n"));
+            }
+            crate::mcp::manager::McpServerStatus::Stopped => {
+                out.push_str(&format!("{name:<10} stopped           0\n"));
+            }
+        }
+    }
+    out
+}
+
 fn handle_mouse(
     mouse: ratatui::crossterm::event::MouseEvent,
     renderer: &Renderer,

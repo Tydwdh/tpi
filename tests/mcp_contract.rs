@@ -154,3 +154,34 @@ async fn lifecycle_no_orphan_process() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let _ = pid;
 }
+
+/// Phase 3：McpManager 注册工具到 registry，statuses() 显示 connected。
+#[tokio::test]
+async fn manager_registers_tools_and_reports_status() {
+    let mut manager = McpManager::new();
+    let mut registry = ToolRegistry::new();
+    let config = test_server_config("ui-server");
+    let count = manager.start_server(config, &mut registry).await.unwrap();
+    assert_eq!(count, 4);
+    assert!(registry.get("mcp::ui-server::echo").is_some());
+    assert!(registry.get("mcp::ui-server::add").is_some());
+
+    let statuses = manager.statuses();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].0, "ui-server");
+    match &statuses[0].1 {
+        tpi::mcp::manager::McpServerStatus::Connected { tool_count } => assert_eq!(*tool_count, 4),
+        other => panic!("应 connected: {other:?}"),
+    }
+
+    // restart：工具重新注册。
+    let configs = vec![test_server_config("ui-server")];
+    let again = manager
+        .restart_server("ui-server", &mut registry, &configs)
+        .await
+        .unwrap();
+    assert_eq!(again, 4);
+    assert!(registry.get("mcp::ui-server::echo").is_some());
+
+    manager.shutdown_all().await;
+}
