@@ -387,12 +387,14 @@ impl SshClient {
     /// 执行一条远端命令（§38：fresh exec channel，不持久 shell 进程）。
     ///
     /// `cwd`/`env` 由调用方决定如何注入（R1 起由 ShellSessionState 驱动，
-    /// 通过命令前缀或 env 传递）。
+    /// 通过命令前缀或 env 传递）。`cancel` 可选：取消时 best-effort 关闭
+    /// channel（§39：无法保证远端 descendants 已终止，如实记录）。
     pub async fn exec(
         &mut self,
         command: &str,
         cwd: Option<&str>,
         env: &std::collections::HashMap<String, String>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<ExecResult, SshError> {
         let session = self
             .session
@@ -420,7 +422,23 @@ impl SshClient {
             stdout: Vec::new(),
             stderr: Vec::new(),
         };
-        while let Some(msg) = channel.wait().await {
+        loop {
+            let msg = if let Some(cancel) = cancel {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        // §39：best-effort 取消——关闭 channel 通知远端，
+                        // 但不保证远端 descendants 已终止。
+                        drop(channel);
+                        return Err(SshError::Exec("cancelled".into()));
+                    }
+                    msg = channel.wait() => msg,
+                }
+            } else {
+                channel.wait().await
+            };
+            let Some(msg) = msg else {
+                break;
+            };
             use russh::ChannelMsg;
             match msg {
                 ChannelMsg::Data { ref data } => result.stdout.extend_from_slice(data),

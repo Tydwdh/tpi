@@ -70,6 +70,7 @@ impl LocalWorkspace {
 #[derive(Debug, Clone)]
 pub enum Workspace {
     Local(LocalWorkspace),
+    Remote(crate::remote::RemoteWorkspace),
 }
 
 /// 当前激活的 Workspace + runtime 状态（§50 ConnectionState 后续加入）。
@@ -85,15 +86,23 @@ impl ActiveWorkspace {
         }
     }
 
+    pub fn remote(remote: crate::remote::RemoteWorkspace) -> Self {
+        Self {
+            workspace: Workspace::Remote(remote),
+        }
+    }
+
     pub fn kind(&self) -> WorkspaceKind {
         match &self.workspace {
             Workspace::Local(_) => WorkspaceKind::Local,
+            Workspace::Remote(_) => WorkspaceKind::Remote,
         }
     }
 
     pub fn id(&self) -> WorkspaceId {
         match &self.workspace {
             Workspace::Local(local) => local.id(),
+            Workspace::Remote(remote) => remote.id(),
         }
     }
 
@@ -101,6 +110,7 @@ impl ActiveWorkspace {
     pub fn shell(&self) -> &Arc<Mutex<ShellSessionState>> {
         match &self.workspace {
             Workspace::Local(local) => &local.shell,
+            Workspace::Remote(remote) => &remote.shell,
         }
     }
 }

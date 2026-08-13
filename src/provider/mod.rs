@@ -107,8 +107,8 @@ pub struct ProviderResponse {
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     /// 传输层失败（连接被拒/超时/未收到任何语义内容前断流）。provider 内部
-    /// 已重试 `MAX_ATTEMPTS` 次仍失败；agent 不再自动续写（续写请求大概率
-    /// 同样失败，只增加噪音）。
+    /// 已重试 `MAX_ATTEMPTS` 次仍失败；agent 层再做 turn 级重启（§4.3 第四
+    /// 阶段，无内容重启不重复任何东西）。
     #[error("connection failed: {0}")]
     Connection(String),
     /// 连接已建立、流中途截断且已收到部分语义内容（§4.3）。不可重发原请求

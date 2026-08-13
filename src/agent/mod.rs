@@ -701,6 +701,26 @@ pub async fn run<P: Provider>(
                                 saw_tool_calls = false;
                                 continue 'attempt;
                             }
+                            // §4.3 第四阶段：无任何语义内容的**瞬时传输类失败**
+                            // （Connection/Http/RateLimited）→ 自动重启整个 turn。
+                            // 此时 content 为空，重启不会重复任何内容，完全安全。
+                            // provider 内部已对无内容失败重试 MAX_ATTEMPTS 次；
+                            // 这里再做 turn 级重启（每次 = 全新 provider 请求），
+                            // 额度 MAX_TURN_RESTARTS——网络抖动/服务端瞬时错误
+                            // 不应让整个任务失败、逼用户盯着重来（§用户诉求：
+                            // 任何失败都应自动重试）。
+                            if !saw_any_semantic
+                                && is_transient_transport_error(&e)
+                                && turn_restarts < MAX_TURN_RESTARTS
+                            {
+                                let _ = ui
+                                    .send(RuntimeEvent::TurnRestarting {
+                                        attempt: turn_restarts + 1,
+                                    })
+                                    .await;
+                                turn_restarts += 1;
+                                continue 'attempt;
+                            }
                                 // §4.3：区分"未收到任何语义事件"（连接不可用）与
                                 // "已收到部分内容后断联"（记录 interrupted attempt）。
                                 // partial content 已发给 UI 但不是一个完整 turn：
@@ -1066,6 +1086,16 @@ fn interrupt_cause(error: &crate::provider::ProviderError) -> crate::session::In
 /// 与 UI 噪音（§用户诉求：修复"大量 run 失败"刷屏）。
 fn recoverable_stream_interrupt(error: &crate::provider::ProviderError) -> bool {
     matches!(error, crate::provider::ProviderError::StreamInterrupted(_))
+}
+
+/// §4.3：瞬时传输类失败（网络抖动/服务端瞬时错误/限流）——重试可能成功，
+/// 值得自动重启 turn；协议/认证错误是确定性问题，重试无意义（不重试）。
+fn is_transient_transport_error(error: &crate::provider::ProviderError) -> bool {
+    use crate::provider::ProviderError;
+    matches!(
+        error,
+        ProviderError::Connection(_) | ProviderError::Http(_) | ProviderError::RateLimited(_)
+    )
 }
 
 /// compaction 一轮（§15.4）。

@@ -8,6 +8,7 @@
 )]
 
 pub mod fake_provider;
+pub mod remote_server;
 
 use camino::Utf8PathBuf;
 use tpi::config::{Config, LimitsConfig, ModelConfig};

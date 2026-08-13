@@ -81,13 +81,7 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
     };
     match kind {
         crate::workspace::WorkspaceKind::Local => local_bash(args, ctx).await,
-        crate::workspace::WorkspaceKind::Remote => {
-            // R1 实现 SshShellExecutor 前，Remote 明确不可用（不伪造执行）。
-            rejected_bash(
-                "remote_not_supported",
-                "当前 workspace 是 Remote（SSH）；Remote bash 尚未实现（Phase R1）。",
-            )
-        }
+        crate::workspace::WorkspaceKind::Remote => crate::remote::executor::remote_bash(args, ctx).await,
     }
 }
 
