@@ -32,7 +32,7 @@ async fn bash_pipefail_makes_pipeline_failure_visible() {
     let outcome = bash(
         BashArgs {
             command: "false | echo hello".into(),
-            cwd: ".".into(),
+            cwd: None,
             timeout_ms: 30_000,
         },
         &ctx,
@@ -49,7 +49,7 @@ async fn bash_pipefail_makes_pipeline_failure_visible() {
     let outcome = bash(
         BashArgs {
             command: "echo hello".into(),
-            cwd: ".".into(),
+            cwd: None,
             timeout_ms: 30_000,
         },
         &ctx,
@@ -77,7 +77,7 @@ async fn cancellation_kills_entire_process_tree() {
     );
     let args = BashArgs {
         command: script,
-        cwd: ".".into(),
+        cwd: None,
         timeout_ms: 60_000,
     };
     let run_ctx = ToolContext {
@@ -91,6 +91,7 @@ async fn cancellation_kills_entire_process_tree() {
         shell_path: ctx.shell_path.clone(),
         snapshot_store: ctx.snapshot_store.clone(),
         current_plan: ctx.current_plan.clone(),
+        shell: ctx.shell.clone(),
         interactive: true,
         allow_outside_workspace: ctx.allow_outside_workspace,
     };
@@ -128,7 +129,7 @@ async fn is_process_alive(pid: u32, _ctx: &ToolContext) -> bool {
             command: format!(
                 "powershell.exe -NoProfile -Command \"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}\""
             ),
-            cwd: ".".into(),
+            cwd: None,
             timeout_ms: 10_000,
         };
         let outcome = bash(args, &check_ctx).await;
@@ -244,7 +245,7 @@ async fn bash_output_lands_in_artifact_and_readable_via_opaque_ref() {
     let args = BashArgs {
         command: "powershell.exe -NoProfile -Command \"1..50 | ForEach-Object { 'line-' + \\$_ }\""
             .into(),
-        cwd: ".".into(),
+        cwd: None,
         timeout_ms: 30_000,
     };
     let outcome = bash(args, &ctx).await;
@@ -295,7 +296,7 @@ async fn bash_streams_live_output_through_output_tx() {
 
     let args = BashArgs {
         command: r#"powershell.exe -NoProfile -Command "1..20 | ForEach-Object { Write-Output ('s-' + \$_); Start-Sleep -Milliseconds 50 }""#.into(),
-        cwd: ".".into(),
+        cwd: None,
         timeout_ms: 30_000,
     };
     let call_id = ctx.call_id;
@@ -347,7 +348,7 @@ async fn bash_does_not_block_when_stream_channel_full() {
 
     let args = BashArgs {
         command: "for i in $(seq 1 200); do echo line-$i; done".into(),
-        cwd: ".".into(),
+        cwd: None,
         timeout_ms: 30_000,
     };
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), bash(args, &ctx))

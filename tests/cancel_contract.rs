@@ -21,7 +21,7 @@ async fn cancellation_terminates_running_command_with_cancelled_status() {
     ctx.cancel = cancel.clone();
     let args = BashArgs {
         command: "powershell.exe -NoProfile -Command 'Start-Sleep -Seconds 30'".into(),
-        cwd: ".".into(),
+        cwd: None,
         timeout_ms: 60_000,
     };
 
@@ -48,7 +48,7 @@ async fn timeout_terminates_command_with_timed_out_status() {
     let ctx = fixtures::test_tool_context(&workspace);
     let args = BashArgs {
         command: "powershell.exe -NoProfile -Command 'Start-Sleep -Seconds 30'".into(),
-        cwd: ".".into(),
+        cwd: None,
         timeout_ms: 500,
     };
 

@@ -3,6 +3,7 @@
 //! M1：direct process（tokio Command）。
 //! M2：单二进制 process-host handshake + Job Object 进程树取消（§11.5）+ 受控 launcher。
 
+pub mod capture;
 pub mod host;
 
 use std::path::PathBuf;
@@ -46,6 +47,9 @@ pub struct HostRunOutput {
     pub ended_by: EndReason,
     /// 实际使用的 launcher（§11.1：`.cmd/.bat` 标记 `cmd-script`）。
     pub launcher: Option<&'static str>,
+    /// 状态捕获段内容（`capture_nonce` 指定时；BEGIN..END 之间的原始字节，
+    /// 已从 stdout/artifact/UI 剥离，任务书 §22）。
+    pub capture: Option<Vec<u8>>,
 }
 
 fn terminal_without_start(ended_by: EndReason, launcher: Option<&'static str>) -> HostRunOutput {
@@ -57,6 +61,7 @@ fn terminal_without_start(ended_by: EndReason, launcher: Option<&'static str>) -
         stderr_total: 0,
         ended_by,
         launcher,
+        capture: None,
     }
 }
 
@@ -101,6 +106,9 @@ pub struct HostRunRequest<'a> {
     pub output_budget: usize,
     pub artifact: Option<&'a mut crate::session::artifact::ArtifactWriter>,
     pub stream_sink: Option<&'a StreamSink>,
+    /// 可选：状态捕获 nonce（§22）。设置后从 stdout 剥离 BEGIN/END 包裹的
+    /// 捕获段到 [`HostRunOutput::capture`]，不进模型输出/artifact/UI。
+    pub capture_nonce: Option<&'a str>,
 }
 
 pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, String> {
@@ -113,6 +121,7 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
         output_budget,
         mut artifact,
         stream_sink,
+        capture_nonce,
     } = request;
     if output_budget == 0 || output_budget > MAX_OUTPUT_BUDGET {
         return Err(format!(
@@ -184,6 +193,7 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
         "args": args.args,
         "cwd": args.cwd,
         "env": args.env,
+        "env_remove": args.env_remove,
     });
     let payload = serde_json::to_vec(&spec).map_err(|e| format!("spec json: {e}"))?;
     let payload_len = u32::try_from(payload.len())
@@ -213,9 +223,12 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
         stderr_total: 0,
         ended_by: EndReason::Exited,
         launcher,
+        capture: None,
     };
     let mut exited = false;
     let mut terminated = false;
+    // 捕获段剥离（§22）：capture_nonce 设置时从 stdout 剥离 control 段。
+    let mut capture_scanner = capture_nonce.map(capture::CaptureScanner::new);
 
     // 读取 framed 消息：Output / Exit。取消/超时 → TerminateJobObject（§11.5 第 5 步）。
     loop {
@@ -244,9 +257,26 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
                             return Err(format!("invalid process-host stream id {stream}"));
                         }
                         let bytes = &payload[1..];
+                        // §22：stdout 先过捕获段剥离器，control 段不进用户数据。
+                        // `owned` 延迟初始化，仅在剥离分支使用（stderr 直接用 `bytes`）。
+                        let owned;
+                        let user_bytes: &[u8] = if stream == STREAM_STDOUT {
+                            match capture_scanner.as_mut() {
+                                Some(scanner) => {
+                                    owned = scanner.feed(bytes);
+                                    if owned.is_empty() {
+                                        continue;
+                                    }
+                                    &owned
+                                }
+                                None => bytes,
+                            }
+                        } else {
+                            bytes
+                        };
                         if let Some(sink) = stream_sink {
                             // 实时转发（bash 执行中 UI 可见增量输出；同步回调不阻塞读循环）。
-                            sink(stream, bytes);
+                            sink(stream, user_bytes);
                         }
                         if let Some(writer) = artifact.as_mut() {
                             writer.write(
@@ -255,20 +285,20 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
                                 } else {
                                     "stderr"
                                 },
-                                bytes,
+                                user_bytes,
                             )
                             .map_err(|error| format!("write command artifact: {error}"))?;
                         }
                         if stream == STREAM_STDOUT {
                             output.stdout_total = output
                                 .stdout_total
-                                .saturating_add(bytes.len() as u64);
-                            append_bounded(&mut output.stdout, bytes, output_budget);
+                                .saturating_add(user_bytes.len() as u64);
+                            append_bounded(&mut output.stdout, user_bytes, output_budget);
                         } else {
                             output.stderr_total = output
                                 .stderr_total
-                                .saturating_add(bytes.len() as u64);
-                            append_bounded(&mut output.stderr, bytes, output_budget);
+                                .saturating_add(user_bytes.len() as u64);
+                            append_bounded(&mut output.stderr, user_bytes, output_budget);
                         }
                     }
                     Ok(Some((MSG_EXIT, payload))) if payload.len() == 4 => {
@@ -306,6 +336,23 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
     let _ = host.wait().await;
     if !terminated && !exited {
         return Err("process-host exited without an Exit frame".into());
+    }
+    // 命令结束：flush 滞留的 stdout 用户数据（跨帧检测的尾部），再取捕获段。
+    if let Some(scanner) = capture_scanner.as_mut() {
+        let tail = scanner.finish();
+        if !tail.is_empty() {
+            if let Some(sink) = stream_sink {
+                sink(STREAM_STDOUT, &tail);
+            }
+            if let Some(writer) = artifact.as_mut() {
+                writer
+                    .write("stdout", &tail)
+                    .map_err(|error| format!("write command artifact: {error}"))?;
+            }
+            output.stdout_total = output.stdout_total.saturating_add(tail.len() as u64);
+            append_bounded(&mut output.stdout, &tail, output_budget);
+        }
+        output.capture = scanner.take_capture();
     }
     Ok(output)
 }

@@ -621,6 +621,7 @@ async fn run_verify_bash(
         cwd: cwd.to_string(),
         timeout_ms: 60_000,
         env: Default::default(),
+        env_remove: Vec::new(),
     };
     let resolved_program = PathBuf::from(shell);
     crate::process::run_in_host(crate::process::HostRunRequest {
@@ -632,6 +633,7 @@ async fn run_verify_bash(
         output_budget: MAX_VERIFY_OUTPUT_BYTES,
         artifact: None,
         stream_sink: None,
+        capture_nonce: None,
     })
     .await
 }

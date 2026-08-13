@@ -30,6 +30,7 @@ pub(super) struct ToolRuntime {
     scan_snapshots: Arc<Mutex<HashMap<String, ScanSnapshot>>>,
     snapshot_store: Arc<Mutex<SnapshotStore>>,
     current_plan: Arc<Mutex<Option<Plan>>>,
+    shell: Arc<Mutex<crate::shell::ShellSessionState>>,
 }
 
 #[derive(Clone)]
@@ -61,6 +62,9 @@ impl ToolRuntime {
             scan_snapshots: Default::default(),
             snapshot_store: Default::default(),
             current_plan: Arc::new(Mutex::new(initial_plan)),
+            shell: Arc::new(Mutex::new(crate::shell::ShellSessionState::new(
+                config.workspace_root.clone(),
+            ))),
         }
     }
 
@@ -85,6 +89,7 @@ impl ToolRuntime {
             shell_path: self.config.shell_path.clone(),
             snapshot_store: self.snapshot_store.clone(),
             current_plan: self.current_plan.clone(),
+            shell: self.shell.clone(),
             interactive: self.interactive,
         }
     }

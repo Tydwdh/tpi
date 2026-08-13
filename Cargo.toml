@@ -33,7 +33,7 @@ unicode-width = "0.2"
 pulldown-cmark = "0.13"
 html2text = "0.17"
 keyring = { version = "4.1", features = ["windows-native-keyring-store"] }
-camino = "1"
+camino = { version = "1", features = ["serde1"] }
 ignore = "0.4"
 regex = "1"
 # search 内核（ripgrep 同源：grep-searcher 逐行搜索、自带 binary/行号处理）。

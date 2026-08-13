@@ -28,9 +28,11 @@ pub struct BashArgs {
     /// Bash 命令（Bash 语法；wrapper 统一启用 `set -o pipefail`）。
     /// 示例："cargo test"、"git status"、"python -c \"print(1)\""。
     pub command: String,
-    /// 工作目录（默认 workspace root；每次调用都是新 shell，cwd 不跨调用保留）。
-    #[serde(default = "default_cwd")]
-    pub cwd: String,
+    /// 工作目录（可选，任务书 §15/§16）：未传 → 使用当前逻辑 shell cwd
+    /// （`cd` 跨调用保持）；显式传入 → 仅本次 invocation 生效的 override，
+    /// 不改变 session cwd（除非命令自身执行了 `cd`）。
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// 超时毫秒（默认 120000，上限 24h）。长任务（构建/测试）显式调大。
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
@@ -46,10 +48,8 @@ pub struct RunArgs {
     pub timeout_ms: u64,
     /// 附加环境变量（值按字面传递）。
     pub env: HashMap<String, String>,
-}
-
-fn default_cwd() -> String {
-    ".".to_string()
+    /// 需从 target 环境中移除的变量（§S3：unset 注入）。
+    pub env_remove: Vec<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -106,17 +106,45 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
     };
 
     // §11.1：wrapper 统一启用 pipefail，不要求模型每次重复书写。
+    // §22：命令后追加高熵 nonce 包裹的状态捕获段（control plane）——
+    // 捕获执行后的真实 cwd（cygpath -w 转 Windows 路径，可作下次 current_dir）；
+    // 读端（process 层）剥离，不进模型输出/artifact/UI。
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
     let wrapped = format!(
         "set -o pipefail
-{}",
+{}
+__tpi_status=$?
+printf '\\n__TPI_CAPTURE_BEGIN_{nonce}__\\n'
+printf '%s\\n' \"$(cygpath -w \"$PWD\" 2>/dev/null || printf '%s' \"$PWD\")\"
+env
+printf '__TPI_CAPTURE_END_{nonce}__\\n'
+exit $__tpi_status",
         args.command
     );
-    let exec_cwd = match crate::tool::resolve_tool_path(ctx, &args.cwd) {
-        Ok(path) => path.to_string(),
-        Err(error) => {
-            return crate::tool::path_rejected_outcome("bash", error);
-        }
+    // 执行起点（任务书 §15/§16）：未传 cwd → 逻辑 shell cwd；显式 → 本次 override。
+    let session_cwd = {
+        let state = crate::util::lock_mutex(&ctx.shell, "shell");
+        state.cwd.clone()
     };
+    let exec_cwd = match &args.cwd {
+        Some(path) => match crate::tool::resolve_tool_path(ctx, path) {
+            Ok(path) => path.to_string(),
+            Err(error) => return crate::tool::path_rejected_outcome("bash", error),
+        },
+        None => session_cwd.to_string(),
+    };
+    // §20：首次执行前捕获 Workspace 初始环境（baseline）。之后每次
+    // diff(baseline, new) 得到 overlay。baseline 只存内存（可能含 secret，
+    // 不落盘 §21）；捕获失败则跳过 env 跟踪（cwd 仍工作），下次重试。
+    {
+        let need_baseline = {
+            let state = crate::util::lock_mutex(&ctx.shell, "shell");
+            state.baseline.is_none()
+        };
+        if need_baseline {
+            capture_baseline(ctx, &bash_exe, &exec_cwd).await;
+        }
+    }
     let mut artifact = match crate::session::artifact::ArtifactWriter::create(
         &ctx.artifacts_root,
         &ctx.session_id,
@@ -141,12 +169,21 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
             );
         }
     };
+    // overlay 注入（§S3）：set → env，unset → env_remove（process-host 移除）。
+    let (overlay_set, overlay_unset) = {
+        let state = crate::util::lock_mutex(&ctx.shell, "shell");
+        (
+            state.env_overlay.set.clone(),
+            state.env_overlay.unset.clone(),
+        )
+    };
     let run_args = RunArgs {
         program: bash_exe,
         args: vec!["--noprofile".into(), "--norc".into(), "-c".into(), wrapped],
-        cwd: exec_cwd,
+        cwd: exec_cwd.clone(),
         timeout_ms: args.timeout_ms,
-        env: Default::default(),
+        env: overlay_set,
+        env_remove: overlay_unset.into_iter().collect(),
     };
     // 实时输出：进程层读帧时转发到 UI 通道（call_id 匹配工具卡片）。
     let stream_sink = ctx.output_tx.as_ref().map(|tx| {
@@ -174,6 +211,7 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
         stream_sink: stream_sink
             .as_ref()
             .map(|sink| sink as &(dyn Fn(u8, &[u8]) + Sync)),
+        capture_nonce: Some(&nonce),
     })
     .await;
     let result = match result {
@@ -199,6 +237,45 @@ error: process_execution_failed
             );
         }
     };
+    // §12-§14 事务：仅正常结束（Exited，无论 exit code）且捕获有效时 commit。
+    // timeout / cancellation / capture 失败 → discard，保持 last confirmed 状态。
+    // §15/§16：只有命令**实际改变**了 cwd（终点 != 执行起点）才 commit——
+    // 显式 cwd override 的调用（如 `pwd` 在 override 目录执行）不得把 override
+    // 的执行终点误写成 session cwd；命令自身 `cd` 才构成 state mutation。
+    // §20：env 用 diff(baseline, new) 得到新 overlay；无 baseline（捕获失败）
+    // 时跳过 env 更新。cwd 或 env 任一变化才递增 version。
+    if result.ended_by == crate::process::EndReason::Exited {
+        if let Some(capture) = result.capture.as_deref() {
+            let (new_cwd, captured_env) = parse_capture(capture);
+            let mut state = crate::util::lock_mutex(&ctx.shell, "shell");
+            let mut changed = false;
+            if let Some(new_cwd) = new_cwd {
+                let changed_cwd =
+                    norm_path_for_compare(&new_cwd) != norm_path_for_compare(&exec_cwd);
+                if changed_cwd {
+                    match validate_session_cwd(ctx, &new_cwd) {
+                        Ok(validated) => {
+                            state.cwd = validated;
+                            changed = true;
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "shell cwd 越界；保持 last confirmed cwd");
+                        }
+                    }
+                }
+            }
+            if let Some(baseline) = &state.baseline {
+                let overlay = crate::shell::diff_env(baseline, &captured_env);
+                if overlay != state.env_overlay {
+                    state.env_overlay = overlay;
+                    changed = true;
+                }
+            }
+            if changed {
+                state.version += 1;
+            }
+        }
+    }
     let artifact_result = artifact.finish();
     let tool_status = match result.ended_by {
         crate::process::EndReason::Cancelled => ToolStatus::Cancelled,
@@ -213,9 +290,10 @@ error: process_execution_failed
         args: RunArgs {
             program: "bash".into(),
             args: vec![],
-            cwd: args.cwd.clone(),
+            cwd: exec_cwd.clone(),
             timeout_ms: args.timeout_ms,
             env: Default::default(),
+            env_remove: Vec::new(),
         },
         exit_code: result.exit_code,
         elapsed: start.elapsed(),
@@ -264,6 +342,132 @@ fn rejected_bash(code: &str, detail: impl std::fmt::Display) -> ToolOutcome {
             artifact: None,
         },
     )
+}
+
+/// 解析状态捕获段（任务书 §22）：第一行 = cwd（cygpath -w 输出的 Windows
+/// 绝对路径；cygpath 不可用时为 bash `PWD`，msys POSIX 路径如 `/c/foo`，
+/// 此处转回 Windows 风格供下次 current_dir 使用）；其余行 = `env` 输出的
+/// `KEY=value`（value 可能含 `=`，按第一个 `=` 分割）。
+fn parse_capture(capture: &[u8]) -> (Option<String>, std::collections::HashMap<String, String>) {
+    let text = String::from_utf8_lossy(capture);
+    let mut lines = text.lines();
+    let cwd = lines
+        .next()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(msys_path_to_windows);
+    let mut env = std::collections::HashMap::new();
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            env.insert(key.to_string(), value.to_string());
+        }
+    }
+    (cwd, env)
+}
+
+/// 捕获 Workspace 初始环境（baseline，§20）：跑一次**不注入 overlay** 的
+/// fresh bash，只输出 env（控制段剥离，不进模型/artifact）。结果存入
+/// `ctx.shell.baseline`（仅内存，可能含 secret，不落盘 §21）。
+/// 失败（进程异常/capture 无效）只记 warn，不阻塞调用方；下次 bash 重试。
+async fn capture_baseline(ctx: &ToolContext, bash_exe: &str, cwd: &str) {
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    // 与用户命令 wrapper 的 capture 格式完全一致（第一行 cwd，其余 env），
+    // 否则 parse_capture 会把 env 首行误当 cwd 导致 baseline 缺变量（§20）。
+    let wrapped = format!(
+        "printf '\\n__TPI_CAPTURE_BEGIN_{nonce}__\\n'
+printf '%s\\n' \"$(cygpath -w \"$PWD\" 2>/dev/null || printf '%s' \"$PWD\")\"
+env
+printf '__TPI_CAPTURE_END_{nonce}__\\n'"
+    );
+    let run_args = RunArgs {
+        program: bash_exe.to_string(),
+        args: vec!["--noprofile".into(), "--norc".into(), "-c".into(), wrapped],
+        cwd: cwd.to_string(),
+        timeout_ms: DEFAULT_TIMEOUT_MS,
+        env: Default::default(),
+        env_remove: Vec::new(),
+    };
+    let resolved = std::path::PathBuf::from(&run_args.program);
+    let result = crate::process::run_in_host(crate::process::HostRunRequest {
+        args: &run_args,
+        resolved_program: &resolved,
+        launcher: Some("git-bash"),
+        cancel: ctx.cancel.clone(),
+        timeout: std::time::Duration::from_millis(DEFAULT_TIMEOUT_MS),
+        output_budget: crate::process::OUTPUT_BUDGET,
+        artifact: None,
+        stream_sink: None,
+        capture_nonce: Some(&nonce),
+    })
+    .await;
+    let Ok(result) = result else {
+        tracing::warn!("baseline capture 执行失败；env 跟踪跳过（cwd 仍工作）");
+        return;
+    };
+    if result.ended_by != crate::process::EndReason::Exited {
+        tracing::warn!("baseline capture 未正常结束；env 跟踪跳过");
+        return;
+    }
+    let Some(capture) = result.capture.as_deref() else {
+        tracing::warn!("baseline capture 无有效捕获段；env 跟踪跳过");
+        return;
+    };
+    let (_, env) = parse_capture(capture);
+    let mut state = crate::util::lock_mutex(&ctx.shell, "shell");
+    state.baseline = Some(env);
+}
+
+/// msys POSIX 路径 → Windows 路径：`/c/foo` → `C:\\foo`；已是 Windows
+/// 风格（含盘符冒号）或 UNC 则原样返回。
+fn msys_path_to_windows(path: &str) -> String {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b'/'
+    {
+        let mut out = String::with_capacity(path.len());
+        out.push(bytes[1].to_ascii_uppercase() as char);
+        out.push(':');
+        out.push('\\');
+        out.push_str(&path[3..].replace('/', "\\"));
+        out
+    } else {
+        path.to_string()
+    }
+}
+
+/// session cwd 边界校验（任务书 §17）：严格模式（`allow_outside_workspace=false`）
+/// 下逻辑 cwd 必须位于 workspace root 内（大小写不敏感 + 分隔符边界，防 `C:\\proj2`
+/// 误匹配 `C:\\proj`）；自由模式（默认）接受任意绝对路径。
+fn validate_session_cwd(ctx: &ToolContext, candidate: &str) -> Result<camino::Utf8PathBuf, String> {
+    let path = camino::Utf8PathBuf::from(candidate);
+    if ctx.allow_outside_workspace {
+        return Ok(path);
+    }
+    let root = norm_path_for_compare(&ctx.workspace_root.as_str());
+    let cand = norm_path_for_compare(candidate);
+    if cand.starts_with(&root) {
+        let rest = &cand[root.len()..];
+        if rest.is_empty() || rest.starts_with('/') {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "shell cwd 逃出 workspace（strict sandbox）：{candidate} ∉ {}",
+        ctx.workspace_root
+    ))
+}
+
+/// 路径比较归一化：转小写 + `\`→`/` + 剥离 `\\?\` 前缀（Windows UNC）。
+fn norm_path_for_compare(path: &str) -> String {
+    let lower = path.to_lowercase();
+    let lower = lower.strip_prefix("\\\\?\\").unwrap_or(&lower);
+    lower.replace('\\', "/")
 }
 
 /// Git Bash 定位（§11.2 解析顺序固定且记录实际选择）。
@@ -494,6 +698,7 @@ mod tests {
                 cwd: ".".into(),
                 timeout_ms: 1000,
                 env: Default::default(),
+                env_remove: Vec::new(),
             },
             exit_code: Some(1),
             elapsed: std::time::Duration::from_millis(1),

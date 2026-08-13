@@ -927,6 +927,9 @@ mod tests {
                 crate::tool::edit::SnapshotStore::new(16, 4),
             )),
             current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            shell: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::shell::ShellSessionState::new(root.clone()),
+            )),
             interactive: false,
             allow_outside_workspace: true,
         }

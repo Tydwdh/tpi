@@ -22,6 +22,9 @@ struct StartSpec {
     cwd: String,
     #[serde(default)]
     env: std::collections::HashMap<String, String>,
+    /// 需从 target 环境中移除的变量（§S3：unset 注入）。
+    #[serde(default)]
+    env_remove: Vec<String>,
 }
 
 /// 运行 process-host（返回进程退出码）。
@@ -41,6 +44,9 @@ pub fn run_host() -> i32 {
         .stderr(Stdio::piped());
     for (key, value) in &spec.env {
         command.env(key, value);
+    }
+    for key in &spec.env_remove {
+        command.env_remove(key);
     }
     #[cfg(windows)]
     {

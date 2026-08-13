@@ -597,7 +597,10 @@ mod tests {
         std::fs::write(path.as_std_path(), &content).unwrap();
 
         let ctx = ToolContext {
-            workspace_root: workspace,
+            workspace_root: workspace.clone(),
+            shell: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::shell::ShellSessionState::new(workspace.clone()),
+            )),
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),
             session_id: "test-session".into(),
@@ -651,7 +654,10 @@ mod tests {
         std::fs::write(path.as_std_path(), b"old").unwrap();
         let revision = crate::tool::edit::revision_of(b"old");
         let ctx = ToolContext {
-            workspace_root: workspace,
+            workspace_root: workspace.clone(),
+            shell: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::shell::ShellSessionState::new(workspace.clone()),
+            )),
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),
             session_id: "test-session".into(),
@@ -700,7 +706,10 @@ mod tests {
         let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("new.txt")).unwrap();
         let ctx = ToolContext {
-            workspace_root: workspace,
+            workspace_root: workspace.clone(),
+            shell: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::shell::ShellSessionState::new(workspace.clone()),
+            )),
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),
             session_id: "test-session".into(),

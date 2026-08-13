@@ -112,6 +112,9 @@ fn doctor_report_with_home(
             crate::tool::edit::SnapshotStore::new(64, 8),
         )),
         current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        shell: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::shell::ShellSessionState::new(workspace_root.clone()),
+        )),
         interactive: false,
     };
     let bash = crate::tool::command::locate_git_bash(&ctx);

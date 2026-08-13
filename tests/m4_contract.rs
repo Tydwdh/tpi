@@ -81,7 +81,7 @@ fn bash_serializes_all_following_tools() {
         tool: tpi::tool::BuiltinTool::Bash,
         args: tpi::tool::ValidatedArgs::Bash(tpi::tool::command::BashArgs {
             command: "echo hi".into(),
-            cwd: ".".into(),
+            cwd: None,
             timeout_ms: 1000,
         }),
         access: ToolAccess::WorkspaceUnknown,

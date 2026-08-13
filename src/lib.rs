@@ -15,6 +15,7 @@ pub mod ids;
 pub mod process;
 pub mod provider;
 pub mod session;
+pub mod shell;
 pub mod tool;
 pub mod tui;
 pub mod util;

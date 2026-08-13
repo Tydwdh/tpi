@@ -314,7 +314,10 @@ failure — check status/exit_code). This is the only execution tool: use it for
 builds, tests, git, pipelines, redirection and compound commands. \
 Output: status/program/exit_code + bounded stdout/stderr tail; the full output is saved as \
 an @artifact/... reference (read it for the complete result). \
-Each invocation is a fresh shell — no persistent cwd/env across calls; set cwd explicitly. \
+Logical shell state persists across calls: `cd` changes the session cwd; `export`/`unset` \
+change the session environment (both auto-inherited by later calls). The optional `cwd` field, \
+if given, overrides the working directory for this call only (it does not change the session \
+cwd unless the command itself runs `cd`). \
 Cost: real execution time, capped by timeout_ms (default 120s, max 24h). \
 Example: bash command=\"cargo test\" timeout_ms=180000"
             }
@@ -485,6 +488,8 @@ pub struct ToolContext {
     pub snapshot_store: std::sync::Arc<std::sync::Mutex<crate::tool::edit::SnapshotStore>>,
     /// 当前原子短计划（§13；agent loop 持有，update_plan 原子替换）。
     pub current_plan: std::sync::Arc<std::sync::Mutex<Option<crate::tool::plan::Plan>>>,
+    /// Logical Shell Session（任务书 §S1：属于 Workspace；bash 工具读写）。
+    pub shell: std::sync::Arc<std::sync::Mutex<crate::shell::ShellSessionState>>,
     /// 交互模式（`-p` 为 false；§11 移除 ask_user 后仅保留供未来交互原语使用）。
     pub interactive: bool,
 }
@@ -877,7 +882,10 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.txt")).unwrap();
         std::fs::write(path.as_std_path(), "hello 世界\n").unwrap();
         let ctx = ToolContext {
-            workspace_root: workspace,
+            workspace_root: workspace.clone(),
+            shell: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::shell::ShellSessionState::new(workspace.clone()),
+            )),
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),
             session_id: "test-session".into(),

@@ -72,6 +72,9 @@ pub fn test_tool_context(workspace_root: &Utf8PathBuf) -> tpi::tool::ToolContext
             tpi::tool::edit::SnapshotStore::default(),
         )),
         current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        shell: std::sync::Arc::new(std::sync::Mutex::new(tpi::shell::ShellSessionState::new(
+            workspace_root.clone(),
+        ))),
         interactive: true,
         allow_outside_workspace: true,
     }
