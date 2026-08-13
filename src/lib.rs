@@ -14,6 +14,7 @@ pub mod eval;
 pub mod ids;
 pub mod process;
 pub mod provider;
+pub mod remote;
 pub mod session;
 pub mod shell;
 pub mod tool;
