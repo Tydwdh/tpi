@@ -417,6 +417,22 @@ pub fn apply_edit(
     apply_edit_to_snapshot(snapshot, &revision, replacements)
 }
 
+/// 纯内存版 apply（R2：远端 edit 复用同一 semantic contract，§41/§42）。
+///
+/// 基于原始字节构建 snapshot（`build_snapshot`）后应用 replacement，
+/// 不触碰本地磁盘；revision 校验、原子批、diff 语义与本地 `apply_edit`
+/// 完全一致。远端提交由 SFTP temp+rename 完成。
+#[allow(dead_code)] // 远端工具接线后移除
+pub fn apply_edit_bytes(
+    path: &Utf8PathBuf,
+    raw: Vec<u8>,
+    revision: &str,
+    replacements: &[Replacement],
+) -> Result<EditResult, EditError> {
+    let snapshot = build_snapshot(path.clone(), raw)?;
+    apply_edit_to_snapshot(snapshot, revision, replacements)
+}
+
 fn apply_edit_to_snapshot(
     snapshot: FileSnapshot,
     expected_revision: &str,

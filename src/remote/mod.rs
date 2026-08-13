@@ -5,6 +5,7 @@
 //!   ShellSessionState 与 LocalWorkspace 共享同一套语义（§36）。
 
 pub mod executor;
+pub mod files;
 pub mod ssh;
 
 use std::sync::{Arc, Mutex};

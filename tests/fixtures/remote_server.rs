@@ -24,6 +24,7 @@ pub const TEST_PASSWORD: &str = "test-pw";
 #[derive(Clone)]
 struct TestServer {
     root: Arc<PathBuf>,
+    posix_root: String,
 }
 
 impl russh::server::Server for TestServer {
@@ -31,6 +32,7 @@ impl russh::server::Server for TestServer {
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self::Handler {
         TestHandler {
             root: self.root.clone(),
+            posix_root: self.posix_root.clone(),
             channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -39,6 +41,7 @@ impl russh::server::Server for TestServer {
 #[derive(Clone)]
 struct TestHandler {
     root: Arc<PathBuf>,
+    posix_root: String,
     channels: Arc<tokio::sync::Mutex<HashMap<ChannelId, Channel<Msg>>>>,
 }
 
@@ -112,6 +115,7 @@ impl russh::server::Handler for TestHandler {
             let _ = session.channel_success(channel_id);
             let handler = SftpBackend {
                 root: self.root.clone(),
+                posix_root: self.posix_root.clone(),
                 handles: std::collections::HashMap::new(),
             };
             russh_sftp::server::run(channel.into_stream(), handler).await;
@@ -123,15 +127,28 @@ impl russh::server::Handler for TestHandler {
 }
 
 /// SFTP 文件系统后端（临时目录，测试用）。
+///
+/// 模拟一个远端 FS：虚拟根 = tempdir。客户端可能用相对路径（"data.txt"）
+/// 或绝对 POSIX 路径（"/tmp/.tmpXXX/data.txt"，其前缀即 tempdir 的 POSIX
+/// 形式）——两者都要映射到 tempdir 内。
 struct SftpBackend {
     root: Arc<PathBuf>,
+    posix_root: String,
     handles: std::collections::HashMap<String, (PathBuf, OpenFlags, u64)>,
 }
 
 impl SftpBackend {
     fn join_root(&self, path: &str) -> PathBuf {
-        let p = path.trim_start_matches('/');
-        self.root.join(p)
+        let trimmed = path.trim_start_matches('/');
+        // 绝对 POSIX 路径且以虚拟根开头 → 去掉前缀（远端视角的绝对路径）。
+        if let Some(rest) = trimmed.strip_prefix(self.posix_root.trim_start_matches('/')) {
+            let rest = rest.trim_start_matches('/');
+            if rest.is_empty() {
+                return self.root.as_path().to_path_buf();
+            }
+            return self.root.join(rest);
+        }
+        self.root.join(trimmed)
     }
 }
 
@@ -372,6 +389,13 @@ pub async fn start_test_server() -> (u16, tempfile::TempDir, PathBuf) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let root_path = Arc::new(root.path().to_path_buf());
+    // 远端 POSIX root（msys 形式，供绝对路径映射）。
+    let posix_out = std::process::Command::new("cygpath")
+        .arg("-u")
+        .arg(root.path())
+        .output()
+        .expect("cygpath");
+    let posix_root = String::from_utf8(posix_out.stdout).expect("utf8").trim().to_string();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -379,6 +403,7 @@ pub async fn start_test_server() -> (u16, tempfile::TempDir, PathBuf) {
             };
             let mut server = TestServer {
                 root: root_path.clone(),
+                posix_root: posix_root.clone(),
             };
             let handler = server.new_client(None);
             let config = config.clone();
