@@ -18,6 +18,7 @@ pub mod provider;
 pub mod remote;
 pub mod session;
 pub mod shell;
+pub mod skills;
 pub mod tool;
 pub mod tui;
 pub mod util;

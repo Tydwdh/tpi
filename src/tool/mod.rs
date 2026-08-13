@@ -163,6 +163,7 @@ pub enum BuiltinTool {
     UpdatePlan,
     WebSearch,
     WebFetch,
+    ActivateSkill,
 }
 
 /// 工具对调度器和崩溃恢复真正重要的执行语义。
@@ -219,6 +220,7 @@ impl BuiltinTool {
             BuiltinTool::UpdatePlan => "update_plan",
             BuiltinTool::WebSearch => "web_search",
             BuiltinTool::WebFetch => "web_fetch",
+            BuiltinTool::ActivateSkill => "activate_skill",
         }
     }
 
@@ -235,6 +237,7 @@ impl BuiltinTool {
             "update_plan" => Some(Self::UpdatePlan),
             "web_search" => Some(Self::WebSearch),
             "web_fetch" => Some(Self::WebFetch),
+            "activate_skill" => Some(Self::ActivateSkill),
             _ => None,
         }
     }
@@ -246,7 +249,9 @@ impl BuiltinTool {
             Self::List | Self::Search | Self::Glob => ToolExecutionClass::FileReadRecursive,
             Self::Edit | Self::Write => ToolExecutionClass::FileWriteExact,
             Self::Bash => ToolExecutionClass::WorkspaceUnknown,
-            Self::UpdatePlan | Self::WebSearch | Self::WebFetch => ToolExecutionClass::Pure,
+            Self::UpdatePlan | Self::WebSearch | Self::WebFetch | Self::ActivateSkill => {
+                ToolExecutionClass::Pure
+            }
         }
     }
 
@@ -355,6 +360,15 @@ Use to read the actual source found by web_search. \
 Cost: network round-trip, ~1-15s depending on site. \
 Example: web_fetch url=\"https://docs.rs/tokio\""
             }
+            BuiltinTool::ActivateSkill => {
+                "Activate a skill by name (progressive disclosure, Level 2): reads the \
+full SKILL.md body and returns it (with references/scripts listings). \
+Available skills are listed in the system prompt's Available skills section. \
+Skills teach the Agent how to combine existing tools (bash/read/MCP) for a \
+workflow — they are NOT tools themselves. \
+Use when the task matches a skill's description. \
+Example: activate_skill name=\"rust-review\""
+            }
         }
     }
 
@@ -371,6 +385,9 @@ Example: web_fetch url=\"https://docs.rs/tokio\""
             BuiltinTool::UpdatePlan => schema_value::<plan::UpdatePlanArgs>("update_plan"),
             BuiltinTool::WebSearch => schema_value::<web::WebSearchArgs>("web_search"),
             BuiltinTool::WebFetch => schema_value::<web::WebFetchArgs>("web_fetch"),
+            BuiltinTool::ActivateSkill => {
+                schema_value::<crate::skills::activate::ActivateSkillArgs>("activate_skill")
+            }
         };
         ToolDef {
             name: self.name().to_string(),
@@ -398,6 +415,11 @@ Example: web_fetch url=\"https://docs.rs/tokio\""
             BuiltinTool::WebFetch => {
                 parse_args_typed("web_fetch", arguments, ValidatedArgs::WebFetch)
             }
+            BuiltinTool::ActivateSkill => parse_args_typed(
+                "activate_skill",
+                arguments,
+                ValidatedArgs::ActivateSkill,
+            ),
         }
     }
 }
@@ -415,6 +437,7 @@ pub enum ValidatedArgs {
     UpdatePlan(plan::UpdatePlanArgs),
     WebSearch(web::WebSearchArgs),
     WebFetch(web::WebFetchArgs),
+    ActivateSkill(crate::skills::activate::ActivateSkillArgs),
 }
 
 impl ValidatedArgs {
@@ -432,6 +455,7 @@ impl ValidatedArgs {
             Self::UpdatePlan(_) => BuiltinTool::UpdatePlan,
             Self::WebSearch(_) => BuiltinTool::WebSearch,
             Self::WebFetch(_) => BuiltinTool::WebFetch,
+            Self::ActivateSkill(_) => BuiltinTool::ActivateSkill,
         }
     }
 
@@ -445,7 +469,11 @@ impl ValidatedArgs {
             Self::Glob(args) => Some(&args.path),
             Self::Edit(args) => Some(&args.path),
             Self::Write(args) => Some(&args.path),
-            Self::Bash(_) | Self::UpdatePlan(_) | Self::WebSearch(_) | Self::WebFetch(_) => None,
+            Self::Bash(_)
+            | Self::UpdatePlan(_)
+            | Self::WebSearch(_)
+            | Self::WebFetch(_)
+            | Self::ActivateSkill(_) => None,
         }
     }
 }
@@ -712,6 +740,10 @@ pub async fn execute(
             web::web_search(args, ctx).await
         }
         (BuiltinTool::WebFetch, ValidatedArgs::WebFetch(args)) => web::web_fetch(args, ctx).await,
+        // §Skills：activate_skill 是同步控制操作（读 SKILL.md）。
+        (BuiltinTool::ActivateSkill, ValidatedArgs::ActivateSkill(args)) => {
+            crate::skills::activate::activate_skill(args, ctx)
+        }
         // §11/BUG-009：同步工具（文件 IO/正则扫描）挪到 blocking 池，避免大目录扫描、
         // 大文件读取、网络盘遍历阻塞 Tokio worker——并行 4 个工具时可能占满全部
         // worker，导致 TUI 事件循环（ui_rx/ticker/键盘）明显卡顿。
@@ -783,6 +815,7 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
         BuiltinTool::UpdatePlan,
         BuiltinTool::WebSearch,
         BuiltinTool::WebFetch,
+        BuiltinTool::ActivateSkill,
     ]
 }
 

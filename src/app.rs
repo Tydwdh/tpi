@@ -84,6 +84,9 @@ pub async fn run(
     no_session: bool,
 ) -> Result<(), String> {
     let mut config = config;
+    // README2 Phase 4：启动时发现 skills（metadata-only；~/.tpi/skills +
+    // <workspace>/.agent/skills）。
+    crate::skills::manager::refresh_global(&config.workspace_root);
     let _ephemeral_root = if no_session {
         let root =
             std::env::temp_dir().join(format!("tpi-ephemeral-{}", crate::ids::EventId::new_v7()));

@@ -1270,6 +1270,19 @@ fn system_prompt_text(config: &Config, ephemeral_system: Option<&str>) -> String
         system.push_str("\n\n");
         system.push_str(extra);
     }
+    // §Skills（README2 §20）：模型需要先看到 Available skills（metadata-only，
+    // 不加载 body）才会调用 activate_skill。
+    let available = crate::skills::SkillManager::global()
+        .lock()
+        .map(|manager| manager.available())
+        .unwrap_or_default();
+    if !available.is_empty() {
+        system.push_str("\n\n[Available skills]（metadata-only；用 activate_skill 激活后获取完整说明）：\n");
+        for skill in available {
+            system.push_str(&format!("  {} — {}\n", skill.name, skill.description));
+        }
+        system.push_str("\nSkill 是 Instructions/Workflow/Knowledge，不是工具；激活后按其中步骤组合现有工具完成任务。");
+    }
     if let Some(ephemeral) = ephemeral_system {
         system.push_str("\n\n");
         system.push_str(ephemeral);
