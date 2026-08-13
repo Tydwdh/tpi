@@ -73,6 +73,7 @@ async fn p1_1_cancel_keeps_history_consistent_with_session() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -146,6 +147,7 @@ async fn p1_2_max_tool_calls_has_own_reason() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -205,6 +207,7 @@ async fn p1_4_context_overflow_stops_run_cleanly() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -299,6 +302,7 @@ async fn p1_10_manual_compaction_runs_at_next_boundary() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: true,
+            workspace: None,
         },
     )
     .await
@@ -376,6 +380,7 @@ async fn interrupted_attempt_records_partial_and_keeps_session_consistent() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -466,6 +471,7 @@ async fn unavailable_connect_fails_without_recorded_attempt() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await;
@@ -601,6 +607,7 @@ async fn text_only_interrupt_auto_continues_and_merges() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -687,6 +694,7 @@ async fn protocol_error_after_delta_is_recorded_without_automatic_retry() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -737,6 +745,7 @@ async fn distinct_model_turns_use_distinct_request_ids() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -807,6 +816,7 @@ async fn recovery_capped_after_max_attempts() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -903,6 +913,7 @@ async fn tool_delta_interrupt_restarts_whole_turn() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -998,6 +1009,7 @@ async fn tool_delta_restart_is_capped() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -1049,6 +1061,7 @@ async fn retry_with_empty_user_message_does_not_repeat_submission() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -1121,6 +1134,7 @@ async fn retry_after_committed_partial_uses_ephemeral_continue_instruction() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -1211,6 +1225,7 @@ async fn force_compaction_success_notifies_ui() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: true,
+            workspace: None,
         },
     )
     .await
@@ -1261,6 +1276,7 @@ async fn force_compaction_too_short_notifies_ui() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: true,
+            workspace: None,
         },
     )
     .await
@@ -1324,6 +1340,7 @@ async fn force_compaction_invalid_summary_notifies_ui() {
             cancel: CancellationToken::new(),
             interactive: false,
             force_compaction: true,
+            workspace: None,
         },
     )
     .await

@@ -49,13 +49,15 @@ impl ToolRuntime {
         cancel: CancellationToken,
         interactive: bool,
         initial_plan: Option<Plan>,
+        active_workspace: crate::workspace::ActiveWorkspace,
     ) -> Self {
-        // §W0：LocalWorkspace 拥有 shell 状态；ctx.shell 与 workspace 共享同一 Arc。
-        let local = crate::workspace::LocalWorkspace::new(
-            config.workspace_root.clone(),
-            config.allow_outside_workspace,
-        );
-        let workspace = Arc::new(Mutex::new(crate::workspace::ActiveWorkspace::local(local.clone())));
+        // §W0/R4：workspace 由调用方注入（默认 Local；测试可传 remote）。
+        // ctx.shell 与 workspace 内 shell 共享同一 Arc。
+        let workspace = Arc::new(Mutex::new(active_workspace));
+        let shell = {
+            let ws = workspace.lock().unwrap();
+            ws.shell().clone()
+        };
         Self {
             config: RuntimeConfig {
                 workspace_root: config.workspace_root.clone(),
@@ -69,13 +71,19 @@ impl ToolRuntime {
             scan_snapshots: Default::default(),
             snapshot_store: Default::default(),
             current_plan: Arc::new(Mutex::new(initial_plan)),
-            shell: local.shell.clone(),
+            shell,
             workspace,
         }
     }
 
     pub(super) fn plan_snapshot(&self) -> Option<Plan> {
         crate::util::lock_mutex(&self.current_plan, "current_plan").clone()
+    }
+
+    /// 当前 workspace 快照（§R4：build_context 注入 identity 用；clone 避免
+    /// 返回指向 MutexGuard 临时值的引用）。
+    pub(super) fn workspace_snapshot(&self) -> crate::workspace::ActiveWorkspace {
+        crate::util::lock_mutex(&self.workspace, "workspace").clone()
     }
 
     pub(super) fn context(

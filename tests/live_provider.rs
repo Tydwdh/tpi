@@ -56,6 +56,7 @@ async fn live_provider_smoke_opt_in() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -122,6 +123,7 @@ async fn live_canary_2_real_tool_call_loop() {
                 cancel: CancellationToken::new(),
                 interactive: true,
                 force_compaction: false,
+                workspace: None,
             },
         ),
     )

@@ -708,6 +708,7 @@ async fn invalid_tool_args_produce_observation_without_breaking_session() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await

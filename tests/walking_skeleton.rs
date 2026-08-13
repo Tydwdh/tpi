@@ -112,6 +112,7 @@ async fn fake_provider_drives_full_read_edit_verify_loop() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await

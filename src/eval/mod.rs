@@ -501,6 +501,7 @@ pub async fn run_task(
                 cancel,
                 interactive: false,
                 force_compaction: false,
+                workspace: None,
             },
         ),
     )

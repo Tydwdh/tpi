@@ -216,6 +216,7 @@ pub async fn run_prompt_once<P: Provider>(
             cancel: cancel.clone(),
             interactive: false,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await;
@@ -1581,6 +1582,7 @@ async fn run_interactive<P: Provider>(
             cancel: cancel.clone(),
             interactive: true,
             force_compaction: force,
+            workspace: None,
         },
     );
     tokio::pin!(run_future);

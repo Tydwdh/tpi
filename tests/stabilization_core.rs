@@ -129,6 +129,7 @@ async fn p0_2_empty_text_tool_call_replays_legal_protocol() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -193,6 +194,7 @@ async fn p0_3_runtime_projection_matches_resume_projection() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -263,6 +265,7 @@ impl ReplayHarness {
                 cancel: CancellationToken::new(),
                 interactive: true,
                 force_compaction: false,
+                workspace: None,
             },
         )
         .await
@@ -482,6 +485,7 @@ async fn replay_cancelled_run_matches_runtime() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -546,6 +550,7 @@ async fn replay_after_compaction_matches_runtime() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await

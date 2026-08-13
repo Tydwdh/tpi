@@ -41,6 +41,7 @@ async fn finish_stop_without_tool_calls_completes_run_without_second_request() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -108,6 +109,7 @@ async fn tool_call_loop_terminates_and_reports_completion() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -172,6 +174,7 @@ async fn todo_state_is_not_reinjected_as_a_user_message() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -273,6 +276,7 @@ async fn usage_accumulates_across_turns() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -323,6 +327,7 @@ async fn context_usage_event_sent_before_requests() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -379,6 +384,7 @@ async fn zero_max_turns_is_unlimited() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -425,6 +431,7 @@ async fn final_turn_injects_wrapup_instruction() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await

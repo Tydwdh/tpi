@@ -409,6 +409,7 @@ async fn update_plan_and_compaction_integration() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -482,6 +483,7 @@ async fn repeated_failing_action_blocked_in_agent_loop() {
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await

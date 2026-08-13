@@ -97,6 +97,9 @@ pub struct RunInput<'a> {
     pub interactive: bool,
     /// P1-10：手动 `/compact`——无条件在第一个完整边界执行一次压缩。
     pub force_compaction: bool,
+    /// ActiveWorkspace（§26-§30）：None = Local（默认）；Some = 远端/自定义
+    /// workspace（R4：agent 测试注入 remote workspace，bash/file 按此分发）。
+    pub workspace: Option<crate::workspace::ActiveWorkspace>,
 }
 
 /// 不可恢复的 run 失败（§19.1）。
@@ -212,6 +215,7 @@ pub async fn run<P: Provider>(
         cancel,
         interactive,
         force_compaction,
+        workspace,
     } = input;
     let run_id = session.begin_run();
     let span = tracing::info_span!("agent.run", %run_id);
@@ -362,12 +366,21 @@ pub async fn run<P: Provider>(
             .await;
     }
     // 工具共享状态与 ToolContext 构造由 run-scoped runtime 统一管理。
+    // §R4：workspace 由调用方注入（测试可传 remote）；None = Local。
+    let active_workspace = workspace.unwrap_or_else(|| {
+        let local = crate::workspace::LocalWorkspace::new(
+            config.workspace_root.clone(),
+            config.allow_outside_workspace,
+        );
+        crate::workspace::ActiveWorkspace::local(local)
+    });
     let tool_runtime = ToolRuntime::new(
         config,
         session.session_id().to_string(),
         cancel.clone(),
         interactive,
         initial_plan,
+        active_workspace,
     );
 
     let mut turn = 0u32;
@@ -506,6 +519,7 @@ pub async fn run<P: Provider>(
             // 整个回答开头重放；若边收边直接 push 到 TUI，去重时已经太晚。
             let recovering_text = stream_recoveries > 0;
             let mut recovery_content = String::new();
+            let ws_snapshot = tool_runtime.workspace_snapshot();
             let request = ModelRequest {
                 model: config.model.name.clone(),
                 messages: build_context(
@@ -513,6 +527,7 @@ pub async fn run<P: Provider>(
                     &messages,
                     ephemeral_system.as_deref(),
                     tool_runtime.plan_snapshot().as_ref(),
+                    Some(&ws_snapshot),
                 ),
                 tools: tool_defs.clone(),
                 max_output_tokens: config.model.max_output_tokens,
@@ -1289,12 +1304,26 @@ fn build_context(
     messages: &[ChatMessage],
     ephemeral_system: Option<&str>,
     plan: Option<&crate::tool::plan::Plan>,
+    workspace: Option<&crate::workspace::ActiveWorkspace>,
 ) -> Vec<ChatMessage> {
     let mut out = Vec::with_capacity(messages.len() + 3);
     out.push(ChatMessage::System(system_prompt_text(
         config,
         ephemeral_system,
     )));
+    // §53：workspace identity 属于 Harness Context——每轮注入一条 system
+    // 消息让模型知道当前工作区（Local/Remote）与 shell cwd，但不在每个
+    // ToolOutcome 重复。
+    if let Some(workspace) = workspace {
+        let id = workspace.id().to_string();
+        let cwd = {
+            let shell = workspace.shell().lock().unwrap();
+            shell.cwd.to_string()
+        };
+        out.push(ChatMessage::System(format!(
+            "[当前 workspace]\nWorkspace: {id}\nShell cwd: {cwd}\n\n（工作区状态由 harness 管理，无需模型自行执行 ssh/cd 确认。）"
+        )));
+    }
     out.extend_from_slice(messages);
     // 尾部注入当前计划快照（system 角色；无 plan 或空 plan 不注入）。
     // §用户诉求：明确同步节奏——每完成一个步骤或方向改变就 update_plan。
@@ -1474,7 +1503,7 @@ mod tests {
         };
         let config = unit_config();
         let messages = vec![ChatMessage::User("hello".into())];
-        let ctx = build_context(&config, &messages, None, Some(&plan));
+        let ctx = build_context(&config, &messages, None, Some(&plan), None);
         // 首条 = system prompt；中间 = 原 messages；尾部 = plan 快照（system 角色）。
         assert!(
             matches!(&ctx[0], ChatMessage::System(_)),
@@ -1509,7 +1538,7 @@ mod tests {
         };
         let config = unit_config();
         let messages = vec![ChatMessage::User("hi".into())];
-        let ctx = build_context(&config, &messages, None, Some(&plan));
+        let ctx = build_context(&config, &messages, None, Some(&plan), None);
         assert_eq!(ctx.len(), 2, "全部完成后的计划不再注入尾部");
     }
 
@@ -1518,7 +1547,7 @@ mod tests {
     fn build_context_without_plan_injects_nothing() {
         let config = unit_config();
         let messages = vec![ChatMessage::User("hi".into())];
-        let ctx = build_context(&config, &messages, None, None);
+        let ctx = build_context(&config, &messages, None, None, None);
         assert_eq!(ctx.len(), 2, "无 plan 时只有 system + 原消息");
         assert!(matches!(&ctx[1], ChatMessage::User(_)));
     }

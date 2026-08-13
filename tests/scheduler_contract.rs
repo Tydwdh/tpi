@@ -84,6 +84,7 @@ async fn run_with(
             cancel: CancellationToken::new(),
             interactive: true,
             force_compaction: false,
+            workspace: None,
         },
     )
     .await
@@ -424,6 +425,7 @@ async fn cancellation_during_parallel_bash_cancels_all() {
                 cancel: cancel_in_run,
                 interactive: true,
                 force_compaction: false,
+                workspace: None,
             },
         )
         .await

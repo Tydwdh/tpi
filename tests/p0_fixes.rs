@@ -146,6 +146,7 @@ async fn p0_2_compaction_survives_delta_flood() {
                 cancel: CancellationToken::new(),
                 interactive: false,
                 force_compaction: false,
+                workspace: None,
             },
         ),
     )
