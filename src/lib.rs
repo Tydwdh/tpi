@@ -12,6 +12,7 @@ pub mod context;
 pub mod doctor;
 pub mod eval;
 pub mod ids;
+pub mod mcp;
 pub mod process;
 pub mod provider;
 pub mod remote;
