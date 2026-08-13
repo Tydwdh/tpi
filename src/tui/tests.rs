@@ -116,10 +116,9 @@ fn tool_card_only_header_clickable() {
     }
 }
 
-/// §用户诉求（修复计划技能锁死）：整体替换后 Completed 历史在 items 前，
-/// 计划条必须优先显示活跃项，不能把进行中的计划挤出屏。
+/// 侧边栏 Todo 显示全部项目，活跃项优先、完成历史沉底。
 #[test]
-fn plan_strip_prefers_active_items_over_history() {
+fn sidebar_plan_shows_all_active_items_before_history() {
     use crate::tool::plan::{Plan, PlanItem, PlanStatus};
     let plan = Plan {
         explanation: None,
@@ -146,10 +145,13 @@ fn plan_strip_prefers_active_items_over_history() {
             },
         ],
     };
-    let shown = plan_display_items(&plan);
+    let shown = sidebar_plan_items(&plan);
     let texts: Vec<&str> = shown.iter().map(|i| i.text.as_str()).collect();
-    assert_eq!(texts, vec!["new1", "new2", "new3"], "活跃项优先于历史");
-    // 活跃不足 3 条时用 Completed 补齐（沉底）。
+    assert_eq!(
+        texts,
+        vec!["new1", "new2", "new3", "old1", "old2"],
+        "全部活跃项优先，完成历史沉底"
+    );
     let plan2 = Plan {
         explanation: None,
         items: vec![
@@ -163,12 +165,12 @@ fn plan_strip_prefers_active_items_over_history() {
             },
         ],
     };
-    let texts2: Vec<&str> = plan_display_items(&plan2)
+    let texts2: Vec<&str> = sidebar_plan_items(&plan2)
         .iter()
         .map(|i| i.text.as_str())
         .collect();
     assert_eq!(texts2, vec!["new1", "old1"]);
-    // 全部完成：只显示最近的完成历史。
+    // 全部完成：侧边栏仍显示全部已保留的完成历史。
     let plan3 = Plan {
         explanation: None,
         items: vec![
@@ -186,7 +188,7 @@ fn plan_strip_prefers_active_items_over_history() {
             },
         ],
     };
-    assert_eq!(plan_display_items(&plan3).len(), 3);
+    assert_eq!(sidebar_plan_items(&plan3).len(), 3);
 }
 
 #[test]
@@ -499,6 +501,29 @@ fn markdown_table_degrades_to_records_on_narrow_width() {
     assert!(
         text.contains("名称") && text.contains("42"),
         "records 模式仍应保留内容: {text}"
+    );
+    for line in &lines {
+        let width: usize = line
+            .spans
+            .iter()
+            .map(|span| crate::tui::text::display_width(span.content.as_ref()))
+            .sum();
+        assert!(width <= 8, "records 行不得超宽: {line:?}");
+    }
+}
+
+#[test]
+fn markdown_table_uses_compact_box_without_body_row_noise() {
+    let theme = theme::Theme::omp();
+    let md = "| name | value |\n| --- | --- |\n| a | 1 |\n| b | 2 |";
+    let lines = render_markdown(md, theme, Some(40));
+    let rendered: Vec<String> = lines.iter().map(Line::to_string).collect();
+    assert!(rendered.first().is_some_and(|line| line.starts_with('┌')));
+    assert!(rendered.last().is_some_and(|line| line.starts_with('└')));
+    assert_eq!(
+        rendered.iter().filter(|line| line.starts_with('├')).count(),
+        1,
+        "只在表头下画分隔线，数据行之间不重复画横线: {rendered:?}"
     );
 }
 
@@ -1768,6 +1793,67 @@ fn highlighted_code_block_has_background() {
             span
         );
     }
+}
+
+#[test]
+fn extended_syntax_pack_supports_common_agent_languages() {
+    for language in ["tsx", "toml", "go", "kotlin", "terraform", "vue", "svelte"] {
+        assert!(
+            highlight::supports_language(language),
+            "扩展语法包应支持 {language}"
+        );
+    }
+}
+
+#[test]
+fn read_tool_card_highlights_source_without_polluting_semantics() {
+    let theme = theme::Theme::onedarkpro();
+    let card = ToolCard {
+        id: "read-1".into(),
+        name: "read".into(),
+        target: Some("read src/main.rs".into()),
+        command: None,
+        state: ToolCardState::Done {
+            status: crate::tool::outcome::ToolStatus::Succeeded,
+            duration_ms: 1,
+            exit_code: None,
+        },
+        output: Some("fn main() { let answer = 42; }".into()),
+        diff: None,
+        output_truncated: false,
+        expanded: true,
+        tail: None,
+        line_number_start: Some(1),
+        collapsed_lines: 10,
+        started_at_ms: None,
+    };
+    let lines = tool_card_lines(&card, 0, theme, 100);
+    let source = lines
+        .iter()
+        .find(|line| line.spans.iter().any(|span| span.content.contains("42")))
+        .expect("read 正文可见");
+    assert!(
+        source
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(theme.orange)),
+        "工具卡源码数字应有语法色: {source:?}"
+    );
+    assert!(
+        source
+            .spans
+            .iter()
+            .filter(|span| !span.content.is_empty())
+            .all(|span| span.style.bg == Some(theme.panel)),
+        "工具卡高亮应沿用 panel 背景"
+    );
+    let semantic = card_semantic_rows(&card);
+    assert!(
+        semantic
+            .iter()
+            .any(|row| row == "fn main() { let answer = 42; }")
+    );
+    assert!(!semantic.iter().any(|row| row.starts_with("1 │")));
 }
 
 /// §用户诉求：onedarkpro 语法高亮——关键字=蓝（primary）、数字/常量=橙

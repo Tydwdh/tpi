@@ -17,7 +17,7 @@ pub mod scheduler;
 mod tool_runtime;
 use self::tool_runtime::{BatchEnd, ToolBatchExecutor, ToolRuntime};
 use crate::ids::{EventId, RequestId, ToolCallId};
-use crate::provider::{ChatMessage, ModelRequest, Provider, ProviderEvent};
+use crate::provider::{ChatMessage, ModelRequest, Provider, ProviderEvent, ToolCall};
 use crate::session::{
     self, AssistantMessage, CompletionReason, ModelRef, RunLimits, SessionEvent, SessionLog, Usage,
 };
@@ -246,6 +246,11 @@ pub async fn run<P: Provider>(
 
     let mut usage_total = Usage::default();
     let mut messages: Vec<ChatMessage> = history.to_vec();
+    let initial_plan = crate::session::latest_plan(session.path())
+        .map_err(|e| RunFailure::Session(format!("restore plan: {e}")))?;
+    // 恢复态只补一次并留在本轮 runtime history 中；不能在每次 request 构造时
+    // 都把计划重新追加到尾部，否则即使改成 Tool 角色也会持续抢占最新上下文。
+    ensure_plan_state_messages(&mut messages, initial_plan.as_ref());
     let manual_retry_continuation = user_message.is_empty()
         && matches!(
             history.last(),
@@ -267,14 +272,12 @@ pub async fn run<P: Provider>(
         )
         .await
         {
-            Ok(()) => {}
+            Ok(()) => ensure_plan_state_messages(&mut messages, initial_plan.as_ref()),
             Err(error @ RunFailure::Session(_)) => return Err(error),
             Err(error) => tracing::warn!(error = %error, "manual compaction failed"),
         }
     }
     // 工具共享状态与 ToolContext 构造由 run-scoped runtime 统一管理。
-    let initial_plan = crate::session::latest_plan(session.path())
-        .map_err(|e| RunFailure::Session(format!("restore plan: {e}")))?;
     let tool_runtime = ToolRuntime::new(
         config,
         session.session_id().to_string(),
@@ -311,7 +314,7 @@ pub async fn run<P: Provider>(
         let _ = ui.send(RuntimeEvent::TurnStarted { turn }).await;
 
         // §15.4：compaction 检查（只在下一次请求前；完整 boundary 之后）。
-        // P0-9：投影用请求级估算（system prompt + 计划快照 + 工具 schema），
+        // P0-9：投影用请求级估算（system prompt + 计划工具轮 + 工具 schema），
         // 只算 messages 会低估实际请求，导致 compaction 触发过晚。
         if let Some(context_window) = config.model.context_window {
             let usable = crate::context::usable_input(
@@ -319,16 +322,8 @@ pub async fn run<P: Provider>(
                 config.model.max_output_tokens.unwrap_or(0) as u64,
                 config.safety_reserve_tokens,
             );
-            let plan = tool_runtime.plan_snapshot();
-            let plan_text = crate::tool::plan::plan_snapshot(plan.as_ref());
             let system_prompt = system_prompt_text(config, None);
-            let request_history = model_context_messages(&messages);
-            let projected = crate::context::estimate_request(
-                &system_prompt,
-                &request_history,
-                &tool_defs,
-                Some(&plan_text),
-            );
+            let projected = crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
             if crate::context::should_compact(projected, usable) && !compaction_failed {
                 match compact_turn(
                     provider,
@@ -341,18 +336,13 @@ pub async fn run<P: Provider>(
                 .await
                 {
                     Ok(()) => {
+                        let plan = tool_runtime.plan_snapshot();
+                        ensure_plan_state_messages(&mut messages, plan.as_ref());
                         // P1-4：compaction 成功后若仍无法容纳（窗口过小），
                         // 不再发起普通请求（必然 length error），明确结束并提示用户。
-                        let plan = tool_runtime.plan_snapshot();
-                        let plan_text = crate::tool::plan::plan_snapshot(plan.as_ref());
                         let system_prompt = system_prompt_text(config, None);
-                        let request_history = model_context_messages(&messages);
-                        let after = crate::context::estimate_request(
-                            &system_prompt,
-                            &request_history,
-                            &tool_defs,
-                            Some(&plan_text),
-                        );
+                        let after =
+                            crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
                             session
                                 .append_event(&SessionEvent::RunCompleted {
@@ -371,17 +361,12 @@ pub async fn run<P: Provider>(
                         tracing::warn!(error = %error, "compaction failed; not retrying in this band");
                         // 确定性 prune 兜底（§15.3：只影响投影）。
                         messages = crate::context::prune_messages(messages);
-                        // P1-4：prune 后仍超窗口（如 user 消息本身巨大）→ 明确结束。
                         let plan = tool_runtime.plan_snapshot();
-                        let plan_text = crate::tool::plan::plan_snapshot(plan.as_ref());
+                        ensure_plan_state_messages(&mut messages, plan.as_ref());
+                        // P1-4：prune 后仍超窗口（如 user 消息本身巨大）→ 明确结束。
                         let system_prompt = system_prompt_text(config, None);
-                        let request_history = model_context_messages(&messages);
-                        let after = crate::context::estimate_request(
-                            &system_prompt,
-                            &request_history,
-                            &tool_defs,
-                            Some(&plan_text),
-                        );
+                        let after =
+                            crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
                             session
                                 .append_event(&SessionEvent::RunCompleted {
@@ -423,15 +408,9 @@ pub async fn run<P: Provider>(
             // 整个回答开头重放；若边收边直接 push 到 TUI，去重时已经太晚。
             let recovering_text = stream_recoveries > 0;
             let mut recovery_content = String::new();
-            let plan = tool_runtime.plan_snapshot();
             let request = ModelRequest {
                 model: config.model.name.clone(),
-                messages: build_context(
-                    config,
-                    &messages,
-                    plan.as_ref(),
-                    ephemeral_system.as_deref(),
-                ),
+                messages: build_context(config, &messages, ephemeral_system.as_deref()),
                 tools: tool_defs.clone(),
                 max_output_tokens: config.model.max_output_tokens,
                 reasoning: config.model.reasoning.clone(),
@@ -444,16 +423,9 @@ pub async fn run<P: Provider>(
                     config.model.max_output_tokens.unwrap_or(0) as u64,
                     config.safety_reserve_tokens,
                 );
-                let plan = tool_runtime.plan_snapshot();
-                let plan_text = crate::tool::plan::plan_snapshot(plan.as_ref());
                 let system_prompt = system_prompt_text(config, ephemeral_system.as_deref());
-                let request_history = model_context_messages(&messages);
-                let projected = crate::context::estimate_request(
-                    &system_prompt,
-                    &request_history,
-                    &tool_defs,
-                    Some(&plan_text),
-                );
+                let projected =
+                    crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                 let _ = ui
                     .send(RuntimeEvent::ContextUsage { projected, usable })
                     .await;
@@ -1138,17 +1110,17 @@ fn system_prompt_text(config: &Config, ephemeral_system: Option<&str>) -> String
 
 /// 构造上下文 projection（§15.1 顺序：system → 用户目标 → 历史 turns → 当前输入在尾部）。
 ///
-/// §13：每次 model request 的 runtime snapshot 都包含规范化计划（compaction 或
-/// 长对话不会让模型只靠记忆遵循 Todo）。plan 快照不进 system prompt——
-/// 它随每次 update 变化，放 system 会破坏 system 前缀缓存（长上下文下
-/// 每次请求都要重算 system 部分）；改为以 user 消息追加轨迹尾部。
+/// §13：计划通过正常的 `assistant(update_plan) → tool result` 协议事实进入上下文。
+/// 不能把计划伪造成尾部 User 消息，否则模型会把每次请求都理解成用户再次要求
+/// “按 Todo 继续”，反复确认/复述计划。runtime 只补一次合法的 synthetic tool
+/// round 恢复被 compaction 移除的状态；正常计划轮保持原始时序，由 compaction
+/// 在窗口压力下统一归纳，避免日常更新改写历史前缀、破坏 prompt cache。
 ///
 /// `ephemeral_system`：本次 request 的 harness control metadata（§4.3 续写指令），
 /// 以 system 指令注入，不进入对话投影。
 fn build_context(
     config: &Config,
     messages: &[ChatMessage],
-    plan: Option<&crate::tool::plan::Plan>,
     ephemeral_system: Option<&str>,
 ) -> Vec<ChatMessage> {
     let mut out = Vec::with_capacity(messages.len() + 3);
@@ -1156,68 +1128,59 @@ fn build_context(
         config,
         ephemeral_system,
     )));
-    out.extend(model_context_messages(messages));
-    if let Some(plan) = plan {
-        let snapshot = crate::tool::plan::plan_snapshot(Some(plan));
-        if !snapshot.is_empty() {
-            out.push(ChatMessage::User(snapshot));
-        }
-    }
+    out.extend_from_slice(messages);
     out
 }
 
-/// 从 provider 请求投影里删除“纯 update_plan 控制轮”。
-///
-/// 完整 Assistant/Tool 事实仍保留在 session，保证审计与协议恢复；当前计划另以
-/// 一个紧凑尾部快照注入。若还把每次 update_plan 的参数和结果永久重放给模型，
-/// 高频更新会同时膨胀历史并降低缓存利用率。混合工具轮或带正文的 assistant 轮
-/// 不删除，避免丢失真实工作上下文。
-fn model_context_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    let mut projected = Vec::with_capacity(messages.len());
-    let mut index = 0usize;
-    while index < messages.len() {
-        let ChatMessage::Assistant {
-            content,
-            tool_calls,
-        } = &messages[index]
-        else {
-            projected.push(messages[index].clone());
-            index += 1;
-            continue;
-        };
-        if !content.trim().is_empty()
-            || tool_calls.is_empty()
-            || tool_calls.iter().any(|call| call.name != "update_plan")
-        {
-            projected.push(messages[index].clone());
-            index += 1;
-            continue;
-        }
+fn tool_result_succeeded(content: &str) -> bool {
+    content
+        .lines()
+        .any(|line| line.trim() == "status: succeeded")
+}
 
-        let expected: std::collections::HashSet<&str> = tool_calls
-            .iter()
-            .map(|call| call.provider_id.as_str())
-            .collect();
-        let mut seen = std::collections::HashSet::new();
-        let mut end = index + 1;
-        while let Some(ChatMessage::Tool {
-            tool_call_id, name, ..
-        }) = messages.get(end)
-        {
-            if name != "update_plan" || !expected.contains(tool_call_id.as_str()) {
-                break;
-            }
-            seen.insert(tool_call_id.as_str());
-            end += 1;
-        }
-        if seen.len() == expected.len() {
-            index = end;
-        } else {
-            projected.push(messages[index].clone());
-            index += 1;
-        }
+/// 确保当前 runtime history 至少包含一次成功计划结果。只在恢复/压缩边界调用，
+/// 补入的消息随后随真实 assistant/tool 事实向后增长，不会每轮重新占据尾部。
+fn ensure_plan_state_messages(
+    messages: &mut Vec<ChatMessage>,
+    plan: Option<&crate::tool::plan::Plan>,
+) {
+    let already_present = messages.iter().any(|message| {
+        matches!(
+            message,
+            ChatMessage::Tool { name, content, .. }
+                if name == "update_plan" && tool_result_succeeded(content)
+        )
+    });
+    if already_present {
+        return;
     }
-    projected
+    if let Some(plan) = plan {
+        append_restored_plan_round(messages, plan);
+    }
+}
+
+/// Compaction 可能只留下 summary 与独立持久化的 PlanReplaced。此时用合法的
+/// assistant/tool 配对恢复运行时计划，避免重新伪造一条 User 指令。
+fn append_restored_plan_round(messages: &mut Vec<ChatMessage>, plan: &crate::tool::plan::Plan) {
+    let snapshot = crate::tool::plan::plan_snapshot(Some(plan));
+    if snapshot.is_empty() {
+        return;
+    }
+    let provider_id = "tpi-restored-plan".to_string();
+    messages.push(ChatMessage::Assistant {
+        content: String::new(),
+        tool_calls: vec![ToolCall {
+            call_id: ToolCallId::new_v7(),
+            provider_id: provider_id.clone(),
+            name: "update_plan".into(),
+            arguments: serde_json::to_string(plan).unwrap_or_else(|_| "{\"items\":[]}".into()),
+        }],
+    });
+    messages.push(ChatMessage::Tool {
+        tool_call_id: provider_id,
+        name: "update_plan".into(),
+        content: format!("status: succeeded\ntool: update_plan\n{snapshot}"),
+    });
 }
 
 /// 恢复一个中断 session 后继续：把 Interrupted outcome 注入历史（§4.3）。
@@ -1247,9 +1210,9 @@ pub fn session_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{AbortTaskOnDrop, model_context_messages, recovery_overlap_bytes};
-    use crate::ids::ToolCallId;
-    use crate::provider::{ChatMessage, ToolCall};
+    use super::{AbortTaskOnDrop, ensure_plan_state_messages, recovery_overlap_bytes};
+    use crate::provider::ChatMessage;
+    use crate::tool::plan::{Plan, PlanItem, PlanStatus};
 
     struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
@@ -1284,64 +1247,44 @@ mod tests {
         );
     }
 
-    fn plan_call(provider_id: &str) -> ToolCall {
-        ToolCall {
-            call_id: ToolCallId::new_v7(),
-            provider_id: provider_id.into(),
-            name: "update_plan".into(),
-            arguments: r#"{"items":["one"]}"#.into(),
-        }
-    }
-
     #[test]
-    fn pure_plan_control_turns_do_not_pollute_model_history() {
-        let messages = vec![
-            ChatMessage::User("修复项目".into()),
-            ChatMessage::Assistant {
-                content: String::new(),
-                tool_calls: vec![plan_call("plan-1")],
-            },
-            ChatMessage::Tool {
-                tool_call_id: "plan-1".into(),
-                name: "update_plan".into(),
-                content: "status: succeeded".into(),
-            },
-            ChatMessage::Assistant {
-                content: "开始处理".into(),
-                tool_calls: Vec::new(),
-            },
-        ];
+    fn restored_plan_uses_tool_protocol_instead_of_fake_user_message() {
+        let plan = Plan {
+            explanation: None,
+            items: vec![PlanItem {
+                text: "检查 gcodes".into(),
+                status: PlanStatus::InProgress,
+            }],
+        };
+        let mut messages = Vec::new();
+        ensure_plan_state_messages(&mut messages, Some(&plan));
+        messages.push(ChatMessage::User("继续审查".into()));
 
-        let projected = model_context_messages(&messages);
-
-        assert_eq!(projected.len(), 2);
-        assert!(matches!(&projected[0], ChatMessage::User(text) if text == "修复项目"));
+        assert_eq!(messages.len(), 3);
         assert!(
-            matches!(&projected[1], ChatMessage::Assistant { content, .. } if content == "开始处理")
+            matches!(&messages[0], ChatMessage::Assistant { content, tool_calls }
+            if content.is_empty() && tool_calls.len() == 1 && tool_calls[0].name == "update_plan")
         );
+        assert!(
+            matches!(&messages[1], ChatMessage::Tool { name, content, .. }
+            if name == "update_plan" && content.contains("检查 gcodes"))
+        );
+        assert!(matches!(messages.last(), Some(ChatMessage::User(text)) if text == "继续审查"));
     }
 
     #[test]
-    fn mixed_or_incomplete_control_turns_are_preserved() {
-        let mixed = vec![ChatMessage::Assistant {
-            content: String::new(),
-            tool_calls: vec![
-                plan_call("plan-1"),
-                ToolCall {
-                    call_id: ToolCallId::new_v7(),
-                    provider_id: "read-1".into(),
-                    name: "read".into(),
-                    arguments: r#"{"path":"README.md"}"#.into(),
-                },
-            ],
-        }];
-        assert_eq!(model_context_messages(&mixed), mixed);
-
-        let incomplete = vec![ChatMessage::Assistant {
-            content: String::new(),
-            tool_calls: vec![plan_call("plan-2")],
-        }];
-        assert_eq!(model_context_messages(&incomplete), incomplete);
+    fn restored_plan_is_inserted_only_once() {
+        let plan = Plan {
+            explanation: None,
+            items: vec![PlanItem {
+                text: "检查 gcodes".into(),
+                status: PlanStatus::InProgress,
+            }],
+        };
+        let mut messages = Vec::new();
+        ensure_plan_state_messages(&mut messages, Some(&plan));
+        ensure_plan_state_messages(&mut messages, Some(&plan));
+        assert_eq!(messages.len(), 2, "恢复态不能在每次请求尾部重复注入");
     }
 
     #[test]

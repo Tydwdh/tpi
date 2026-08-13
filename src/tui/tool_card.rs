@@ -4,7 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::model::{ToolCard, ToolCardState};
-use super::{SPINNER_FRAMES, fmt_duration, theme};
+use super::{SPINNER_FRAMES, fmt_duration, highlight, theme};
 
 /// 工具名语义色（§16.2 增强）：bash=info（执行）、edit/write=success（写文件）、
 /// read/list/search=accent（读/检索）、web_*=warning（网络）、其余=text。
@@ -30,6 +30,95 @@ pub(super) fn tool_name_style(name: &str, theme: theme::Theme) -> Style {
 struct CardContentRow {
     line: Line<'static>,
     semantic: String,
+}
+
+/// 工具输出的语言提示。文件读取按路径识别；其余工具只探测 JSON/diff/
+/// HTML/XML 等结构明确的内容。bash 只有在命令本身是“查看文件”时才从路径
+/// 推断，避免把编译器日志错涂成源代码。
+pub(super) fn tool_output_language(card: &ToolCard, body: &str) -> Option<String> {
+    if card.name == "read" || card.line_number_start.is_some() {
+        let target = card.target.as_deref()?.trim();
+        let path = target
+            .strip_prefix("read ")
+            .unwrap_or(target)
+            .split(" (lines ")
+            .next()
+            .unwrap_or(target);
+        if let Some(language) = highlight::language_from_path(path) {
+            return Some(language);
+        }
+    }
+
+    if matches!(card.name.as_str(), "bash" | "run")
+        && let Some(command) = card.command.as_deref()
+    {
+        let lower = command.trim_start().to_ascii_lowercase();
+        let reads_file = ["cat ", "type ", "get-content ", "gc ", "head ", "tail "]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix));
+        if reads_file {
+            for token in command.split_whitespace().rev() {
+                let token = token
+                    .trim_matches(|c| matches!(c, '`' | '"' | '\'' | ',' | ';' | '|' | '(' | ')'));
+                if let Some(language) = highlight::language_from_path(token) {
+                    return Some(language);
+                }
+            }
+        }
+    }
+
+    highlight::structured_language(body).map(str::to_string)
+}
+
+/// 将工具输出追加为渲染/语义成对的行。高亮只改变 span 样式；语义文本、
+/// 复制偏移和 read 行号装饰仍沿用原始文本。
+fn push_output_rows(
+    rows: &mut Vec<CardContentRow>,
+    card: &ToolCard,
+    body: &str,
+    theme: theme::Theme,
+) {
+    let language = tool_output_language(card, body);
+    let highlighted = language
+        .as_deref()
+        .and_then(|language| highlight::highlight_code_block(body, Some(language), theme).ok());
+    let numbered = card.line_number_start.map(|start| {
+        let total = body.lines().count();
+        let last = start + total.saturating_sub(1);
+        (start, last.to_string().len())
+    });
+
+    for (i, raw) in body.lines().enumerate() {
+        let semantic = raw.trim_end().to_string();
+        let mut spans = highlighted
+            .as_ref()
+            .and_then(|lines| lines.get(i))
+            .map(|line| line.spans.clone())
+            .unwrap_or_else(|| {
+                vec![Span::styled(
+                    semantic.clone(),
+                    Style::default().fg(theme.text),
+                )]
+            });
+        // Markdown code fences use surface_subtle; inside a tool card the card panel is
+        // the owning surface, so replace only the background while preserving syntax fg.
+        for span in &mut spans {
+            span.style = span.style.bg(theme.panel);
+        }
+        if let Some((start, width)) = numbered {
+            spans.insert(
+                0,
+                Span::styled(
+                    format!("{:>width$} │ ", start + i),
+                    Style::default().fg(theme.muted).bg(theme.panel),
+                ),
+            );
+        }
+        rows.push(CardContentRow {
+            line: Line::from(spans),
+            semantic,
+        });
+    }
 }
 
 /// 构建卡片内容行（正文区，不含主行）。
@@ -68,9 +157,7 @@ fn card_content_rows(card: &ToolCard, theme: theme::Theme) -> Vec<CardContentRow
             }
             return rows;
         } else if let Some(body) = card.output.as_deref() {
-            for s in body.lines() {
-                push_text(&mut rows, s, text_style);
-            }
+            push_output_rows(&mut rows, card, body, theme);
             return rows;
         } else {
             for s in tail.lines() {
@@ -92,32 +179,8 @@ fn card_content_rows(card: &ToolCard, theme: theme::Theme) -> Vec<CardContentRow
             }
             return rows;
         }
-        // §用户诉求：read 卡片正文显示真实文件行号（纯视觉装饰，语义文本
-        // 仍是行原文——复制/选中不携带行号；decor 由 push_hit 按视觉宽-语义宽
-        // 自动计算）。
-        let numbered = card.line_number_start.map(|start| {
-            let total = body.lines().count();
-            let last = start + total.saturating_sub(1);
-            (start, last.to_string().len())
-        });
-        for (i, s) in body.lines().enumerate() {
-            let text = s.trim_end().to_string();
-            let line = if let Some((start, width)) = numbered {
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:>width$} │ ", start + i),
-                        Style::default().fg(theme.muted),
-                    ),
-                    Span::styled(text.clone(), text_style),
-                ])
-            } else {
-                Line::styled(text.clone(), text_style)
-            };
-            rows.push(CardContentRow {
-                line,
-                semantic: text,
-            });
-        }
+        // read 行号是纯视觉装饰；高亮只改变样式，不污染复制语义。
+        push_output_rows(&mut rows, card, body, theme);
         return rows;
     }
     if let Some(tail) = card.tail.as_deref() {

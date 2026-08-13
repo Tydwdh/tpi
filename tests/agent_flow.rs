@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tpi::agent;
 use tpi::ids::RunId;
+use tpi::provider::ChatMessage;
 use tpi::session::{CompletionReason, SessionEvent, SessionLog, read_events};
 
 #[tokio::test]
@@ -128,6 +129,71 @@ async fn tool_call_loop_terminates_and_reports_completion() {
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].status, tpi::tool::outcome::ToolStatus::Failed);
     assert!(completed[0].model_payload.output.contains("not_found"));
+}
+
+#[tokio::test]
+async fn todo_state_is_not_reinjected_as_a_user_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = FakeProvider::new(vec![
+        FakeResponse::with_tool_calls(vec![fixtures::fake_provider::tool_call(
+            "update_plan",
+            serde_json::json!({
+                "explanation": "审查顺序",
+                "items": ["检查 gcodes", "检查组件层"]
+            }),
+        )]),
+        FakeResponse::with_tool_calls(vec![fixtures::fake_provider::tool_call(
+            "read",
+            serde_json::json!({"path": "missing.txt"}),
+        )]),
+        FakeResponse::text("审查完成"),
+    ]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, _rx) = mpsc::channel(32);
+
+    agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "继续审查".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+        },
+    )
+    .await
+    .expect("run succeeds");
+
+    assert_eq!(provider.requests.len(), 3);
+    for request in &provider.requests {
+        let users: Vec<_> = request
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::User(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec!["继续审查"], "Todo 不得伪装成额外 User 消息");
+    }
+    assert!(matches!(
+        provider.requests[1].messages.last(),
+        Some(ChatMessage::Tool { name, .. }) if name == "update_plan"
+    ));
+    assert!(matches!(
+        provider.requests[2].messages.last(),
+        Some(ChatMessage::Tool { name, .. }) if name == "read"
+    ));
 }
 
 /// §2.2/§12.4：多轮 tool-call 循环的 usage 必须跨请求累加（RunCompleted 记录总用量）。

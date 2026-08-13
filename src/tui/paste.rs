@@ -12,13 +12,13 @@
 //! 粘贴内容被拆成连续 `KeyEvent` 流，其中的 Enter 会命中 `submit` 绑定，
 //! 造成「粘贴多行文本时换行直接发送」。
 //!
-//! 本模块提供**间隔感知**的洪流判定（[`is_dense`]）+ **分块流式 flush**：
+//! 本模块提供**间隔感知**的洪流判定（[`is_dense`]）+ **整次 burst 合并**：
 //! - 普通按键（与上一键间隔 ≥ [`DENSE_GAP`]）由键盘线程**立即转发，0 等待**——
 //!   打字路径不承担任何粘贴检测开销。人最快打字也 ≥50ms/键，[`DENSE_GAP`]=16ms
 //!   只有终端批量转发（conhost/conpty 节流、SSH 粘贴注入）能达到；
 //! - 一旦某键与上一键间隔 < [`DENSE_GAP`]（粘贴洪流信号），键盘线程把后续
-//!   可插入按键收进缓冲区，**相邻批次间隔 > [`FLUSH_GAP`] 即 flush 为一次
-//!   `Event::Paste` 上屏**——字符连续流入、无「整批等超时后一起出现」的顿感；
+//!   可插入按键收进缓冲区，跨过终端短暂节流间隔后再作为一次
+//!   `Event::Paste` 上屏；
 //!   洪流中的 Enter 经 [`paste_char`] 转字面 `\n`（不触发提交）；
 //! - 缓冲区内出现修饰键组合、特殊键或 Repeat 事件即停止收集，先把已收内容
 //!   flush，再按原样转发该键——不吞掉任何合法输入。
@@ -39,18 +39,23 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 /// 间隔更大；16ms 只有终端批量转发（conhost/conpty 节流、SSH 客户端粘贴
 /// 注入）能达到。普通输入永远不会进入收集 → 打字路径零等待。
 pub const DENSE_GAP: Duration = Duration::from_millis(16);
-/// 洪流内 flush 间隔：收集中的相邻按键间隔超过该值，视为一批结束，立即把
-/// 已收内容 flush 为一次 `Event::Paste` 上屏。
-///
-/// 旧终端按批次/节流转发按键流，批次内间隔 <16ms（洪流），批次间间隔
-/// 30~50ms（节流）。40ms 会把 1~2 个批次收进同一块（每块约 10~20 字符，
-/// 每次 flush 一次 draw），同时比「整批等 80ms 超时」连续得多，感知无停顿。
+/// 普通 Enter 的短前瞻窗口。仅用于判定一个孤立 Enter 后是否紧跟粘贴字符。
 pub const FLUSH_GAP: Duration = Duration::from_millis(40);
-/// 单块缓冲字符数上限：防异常长流无限累积（超限先 flush 再继续，语义不变）。
-pub const MAX_BUF: usize = 8192;
+/// 降级粘贴 burst 的空闲边界。大于常见 conhost/SSH 30~50ms 批间节流，
+/// 避免把一个大粘贴拆小，导致换行落到两个 Paste 事件之间而触发提交。
+pub const FALLBACK_IDLE_GAP: Duration = Duration::from_millis(140);
+/// 单块缓冲上限。正常大粘贴尽量保持为一个事件，使 reducer 能统一走占位符。
+pub const MAX_BUF: usize = 512 * 1024;
+/// 降级 burst flush 后的提交保护窗。该窗只由“按键洪流”路径武装；现代终端
+/// 的 Event::Paste 与 Ctrl+V 剪贴板快路径不会影响用户随后按 Enter 提交。
+pub const FALLBACK_ENTER_GUARD: Duration = Duration::from_millis(750);
+
+/// bracketed paste 在初始 `Esc [` 之后剩余的前缀，以及完整结束尾串。
+pub const BRACKETED_START_TAIL: [char; 4] = ['2', '0', '0', '~'];
+pub const BRACKETED_END_TAIL: [char; 5] = ['[', '2', '0', '1', '~'];
 
 /// Esc 后探测下一键的窗口：`[`（bracketed paste 前缀 `\x1b[200~` 的第 2 键）
-/// 与结束序列 `\x1b[201~`（Esc 后紧接 `2,0,1,~`）。终端逐键注入时序列内
+/// 与结束序列 `\x1b[201~`（Esc 后紧接 `[,2,0,1,~`）。终端逐键注入时序列内
 /// 间隔 <1ms；40ms 只影响 Esc 后的等待——普通 Esc（低频）无后续键时
 /// poll 超时即转发，感知为零。
 pub const BRACKETED_PROBE_GAP: Duration = Duration::from_millis(40);
@@ -132,6 +137,36 @@ pub fn is_plain_escape(key: &KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
         && key.code == KeyCode::Esc
         && key.modifiers == KeyModifiers::NONE
+}
+
+/// bracketed paste 控制序列按字符匹配。终端注入的 `~` 等键可能携带 Shift，
+/// 因此这里只检查 Press 与字符码。
+pub fn is_sequence_char(key: &KeyEvent, expected: char) -> bool {
+    key.kind == KeyEventKind::Press && key.code == KeyCode::Char(expected)
+}
+
+/// 降级粘贴结束后的 Enter 保护。防止终端把最后一个换行延迟到 burst flush
+/// 之后，随后被 reducer 当成 submit。保护只消费一次又一次落在窗内的 Enter；
+/// 超时后自动恢复正常提交。
+#[derive(Debug, Default)]
+pub struct FallbackPasteGuard {
+    until: Option<Instant>,
+}
+
+impl FallbackPasteGuard {
+    pub fn arm(&mut self, now: Instant) {
+        self.until = Some(now + FALLBACK_ENTER_GUARD);
+    }
+
+    pub fn absorb_enter(&mut self, now: Instant) -> bool {
+        if self.until.is_some_and(|until| now <= until) {
+            self.arm(now);
+            true
+        } else {
+            self.until = None;
+            false
+        }
+    }
 }
 
 /// 按键 → 可插入字符；不可插入（非 Press / Ctrl+Alt 组合 / 特殊键）返回 `None`。
@@ -240,6 +275,40 @@ mod tests {
             KeyModifiers::NONE
         )));
         assert!(!is_plain_escape(&press(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn bracketed_sequences_include_the_bracket_and_are_exact() {
+        assert_eq!(BRACKETED_START_TAIL, ['2', '0', '0', '~']);
+        assert_eq!(BRACKETED_END_TAIL, ['[', '2', '0', '1', '~']);
+        for expected in BRACKETED_END_TAIL {
+            assert!(is_sequence_char(
+                &press(KeyCode::Char(expected), KeyModifiers::SHIFT),
+                expected
+            ));
+        }
+        assert!(!is_sequence_char(
+            &press(KeyCode::Char('0'), KeyModifiers::NONE),
+            '1'
+        ));
+    }
+
+    #[test]
+    fn fallback_guard_absorbs_delayed_enter_but_expires() {
+        let start = Instant::now();
+        let mut guard = FallbackPasteGuard::default();
+        assert!(
+            !guard.absorb_enter(start),
+            "未发生兜底粘贴时 Enter 正常提交"
+        );
+        guard.arm(start);
+        assert!(
+            guard.absorb_enter(start + Duration::from_millis(300)),
+            "burst 后迟到的 Enter 必须作为粘贴换行"
+        );
+        assert!(!guard.absorb_enter(
+            start + Duration::from_millis(300) + FALLBACK_ENTER_GUARD + Duration::from_millis(1)
+        ));
     }
 
     #[test]

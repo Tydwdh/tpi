@@ -1,8 +1,8 @@
 //! 代码块语法高亮（TPI 成熟化：基于 syntect 的 scope 着色）。
 //!
 //! 设计：
-//! - syntect（`default-fancy`）加载内建语法集，纯 Rust（fancy-regex），
-//!   无 oniguruma C 依赖；`SyntaxSet` 用 `OnceLock` 全局懒加载一次。
+//! - syntect + two-face（bat 同源语法包）加载扩展语法集，纯 Rust
+//!   （fancy-regex），无 oniguruma C 依赖；`SyntaxSet` 全局懒加载一次。
 //! - 着色不直接用 syntect 主题色，而是把 scope 名称映射到 tpi 语义色
 //!   （跟随用户主题：keyword→primary、string→success、comment→muted italic…）。
 //! - 每个代码块渲染时新建 `ParseState` 逐行 parse（跨行状态如多行字符串/
@@ -18,7 +18,7 @@ use super::theme::Theme;
 /// 全局语法集（内建 packdump，懒加载一次；线程安全只读）。
 fn syntax_set() -> &'static SyntaxSet {
     static SYNTAXES: std::sync::OnceLock<SyntaxSet> = std::sync::OnceLock::new();
-    SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines)
+    SYNTAXES.get_or_init(two_face::syntax::extra_newlines)
 }
 
 /// 代码块语言 → 语法集 token（未知语言返回 None → 回退纯文本）。
@@ -27,19 +27,83 @@ fn syntax_for(language: &str) -> Option<syntect::parsing::SyntaxReference> {
     let token = language.trim().to_ascii_lowercase();
     // 常见别名规范化（syntect token 名与 markdown fence 名差异）。
     let token = match token.as_str() {
-        "js" | "javascript" => "js".to_string(),
+        "js" | "javascript" | "node" => "js".to_string(),
+        "jsx" | "javascriptreact" => "jsx".to_string(),
         "ts" | "typescript" => "ts".to_string(),
+        "tsx" | "typescriptreact" => "tsx".to_string(),
         "py" | "python" => "py".to_string(),
-        "sh" | "shell" | "bash" | "zsh" => "sh".to_string(),
+        "sh" | "shell" | "bash" | "zsh" | "shellscript" => "sh".to_string(),
+        "ps1" | "powershell" => "ps1".to_string(),
         "yml" | "yaml" => "yaml".to_string(),
         "c++" | "cpp" | "cxx" => "cpp".to_string(),
         "c#" | "cs" | "csharp" => "cs".to_string(),
         "md" | "markdown" => "md".to_string(),
         "rs" | "rust" => "rs".to_string(),
         "json" | "jsonc" => "json".to_string(),
+        "docker" | "dockerfile" => "Dockerfile".to_string(),
+        "make" | "makefile" => "Makefile".to_string(),
+        "tf" | "terraform" | "hcl" => "Terraform".to_string(),
+        "proto" | "protobuf" => "proto".to_string(),
         other => other.to_string(),
     };
-    set.find_syntax_by_token(&token).cloned()
+    set.find_syntax_by_token(&token)
+        .or_else(|| set.find_syntax_by_extension(&token))
+        .or_else(|| {
+            set.syntaxes()
+                .iter()
+                .find(|syntax| syntax.name.eq_ignore_ascii_case(&token))
+        })
+        .cloned()
+}
+
+/// 从文件路径提取可交给 syntect 的语言 token。特殊文件名（Dockerfile、
+/// Makefile 等）保留文件名，其余使用扩展名。仅在语法集确实支持时返回。
+pub(crate) fn language_from_path(path: &str) -> Option<String> {
+    let path = path
+        .trim()
+        .trim_matches(|c| matches!(c, '`' | '"' | '\'' | ',' | ':' | ';'));
+    let file = std::path::Path::new(path).file_name()?.to_str()?;
+    let lower = file.to_ascii_lowercase();
+    let candidate = match lower.as_str() {
+        "dockerfile" | "containerfile" => "dockerfile".to_string(),
+        "makefile" | "gnumakefile" => "makefile".to_string(),
+        "cmakelists.txt" => "cmake".to_string(),
+        ".gitignore" | ".dockerignore" => "gitignore".to_string(),
+        _ => std::path::Path::new(file)
+            .extension()?
+            .to_str()?
+            .to_ascii_lowercase(),
+    };
+    syntax_for(&candidate).map(|_| candidate)
+}
+
+/// 对没有路径信息的工具输出做保守探测。只识别结构明确的格式，避免把普通
+/// 日志误当源码而产生花哨但错误的颜色。
+pub(crate) fn structured_language(text: &str) -> Option<&'static str> {
+    let trimmed = text.trim_start();
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+    {
+        return Some("json");
+    }
+    if trimmed.starts_with("diff --git ") || trimmed.starts_with("@@ ") {
+        return Some("diff");
+    }
+    if trimmed.starts_with("<!DOCTYPE html")
+        || trimmed.starts_with("<!doctype html")
+        || trimmed.starts_with("<html")
+    {
+        return Some("html");
+    }
+    if trimmed.starts_with("<?xml") {
+        return Some("xml");
+    }
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn supports_language(language: &str) -> bool {
+    syntax_for(language).is_some()
 }
 
 /// scope 名 → tpi 语义色 + 修饰（后缀匹配，优先级从高到低）。

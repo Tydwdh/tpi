@@ -17,7 +17,7 @@ use crate::tui::scroll::{EntryId, ScrollAnchor, ScrollMode};
 
 /// 右侧边栏（§用户诉求：todo + 用户消息大纲，opencode 式）。
 ///
-/// 布局：主区（transcript/plan/input/footer）右侧固定宽度竖栏；内容为
+/// 布局：主区（transcript/input/footer）右侧固定宽度竖栏；内容为
 /// 上方 Todo（`view.plan` 项）与下方用户消息大纲（单行摘要），整栏一个
 /// 滚动偏移 + 右侧 1 列滚动条。点击大纲行 → 锁定 transcript 到该 entry。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +292,8 @@ pub struct OverlayState {
     pub command: Option<String>,
     /// 正文（输出或 reasoning 原文；有界）。
     pub body: String,
+    /// 工具正文的语法提示；reasoning/link 为 None。
+    pub body_language: Option<String>,
     /// 正文被截断。
     pub body_truncated: bool,
     /// Overlay 内滚动偏移（行）。
@@ -329,11 +331,13 @@ impl OverlayState {
             }
         }
         let body = card.output.clone().unwrap_or_default();
+        let body_language = super::tool_card::tool_output_language(card, &body);
         Self {
             title,
             command: card.command.clone(),
             body_truncated: card.output_truncated,
             body,
+            body_language,
             scroll: 0,
             tool_id: Some(card.id.clone()),
             kind: OverlayKind::Tool,
@@ -346,6 +350,7 @@ impl OverlayState {
             title: "思考（reasoning）".into(),
             command: None,
             body: bound_message(text),
+            body_language: None,
             body_truncated: false,
             scroll: 0,
             tool_id: None,
@@ -359,6 +364,7 @@ impl OverlayState {
             title: "链接".into(),
             command: None,
             body: url.to_string(),
+            body_language: None,
             body_truncated: false,
             scroll: 0,
             tool_id: None,

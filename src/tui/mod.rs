@@ -10,7 +10,7 @@
 //! - 信息层级：用户消息细紫红左 rail + `you` 标签；assistant 无填充卡片；
 //!   thinking dim italic 可折叠（Alt+T）；工具调用单行卡片
 //!   `icon name duration status`（运行中 spinner 动画，失败保留红色关键 tail）；
-//!   plan 独立紧凑区域；footer 展示 workspace/model/usage/状态；编辑器硬件光标。
+//!   plan 集中在右侧 Todo；footer 展示 workspace/model/usage/状态；编辑器硬件光标。
 //! - OMP 语义主题集中在 `theme` 模块。
 //! - Markdown 渲染（pulldown-cmark）：assistant/用户消息的加粗、行内代码、
 //!   代码块、列表、引用、链接；按条目版本缓存渲染结果，流式增量只失效最后一条。
@@ -37,7 +37,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::widgets::{Paragraph, Widget};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -52,7 +52,7 @@ pub const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// 活动区高度：约 2/5 屏，随终端行数自适应。
 ///
 /// - 下限 12 行（小终端仍可读）；
-/// - 上限为 `rows - 12`（给 plan/footer/input 区域留空间），大终端自动拓展。
+/// - 上限为 `rows - 12`（给 footer/input 区域留空间），大终端自动拓展。
 pub fn activity_height(rows: u16) -> u16 {
     if rows < 12 {
         return rows.max(1);
@@ -418,7 +418,7 @@ impl Drop for Renderer {
 
 /// 布局并渲染一帧（Renderer 与测试后端共用；纯布局逻辑集中在 plan_window）。
 ///
-/// 自下而上：输入区（多行，≤4 行）→ footer（1 行）→ 计划条（0..4 行）→ 转录区。
+/// 自下而上：输入区（多行）→ footer → 转录区；计划只在右侧栏展示。
 struct RenderContext<'a> {
     markdown_cache: &'a mut HashMap<(u64, u16), RenderedMarkdown>,
     /// wrap 结果缓存（§性能：历史 entry 折叠/内容不变 → 跨帧复用，
@@ -475,14 +475,9 @@ fn render_frame(
     }
 
     let input_rows = input_area_rows(view, main_area.width);
-    let plan_rows = plan_area_rows(view);
-
     // §视觉瘦身：去掉常驻 Header（信息与 footer 重复），transcript 上移到顶部。
-    // 自下而上 = footer(1) → input(1..8) → plan(0..N) → transcript(Min)。
+    // 自下而上 = footer(1) → input(1..8) → transcript(Min)。Todo 只占侧边栏。
     let mut constraints: Vec<Constraint> = vec![Constraint::Min(1)];
-    if plan_rows > 0 {
-        constraints.push(Constraint::Length(plan_rows));
-    }
     constraints.push(Constraint::Length(input_rows));
     // §美化：footer 上方 1-cell 分隔线，把底部状态栏锚定成独立区域。
     constraints.push(Constraint::Length(1)); // footer 分隔线
@@ -494,13 +489,6 @@ fn render_frame(
     let mut idx = 0;
     let trans_area = chunks[idx];
     idx += 1;
-    let plan_area = if plan_rows > 0 {
-        let a = chunks[idx];
-        idx += 1;
-        Some(a)
-    } else {
-        None
-    };
     let input_area = chunks[idx];
     idx += 1;
     let footer_rule_area = chunks[idx];
@@ -515,9 +503,6 @@ fn render_frame(
         trans_area.width
     };
 
-    if let Some(pa) = plan_area {
-        draw_plan(frame, pa, view, theme);
-    }
     // footer 分隔线（muted 横线；与左竖线语言一致，只作锚定不喧宾）。
     frame.render_widget(
         Paragraph::new(Line::styled(
@@ -2095,106 +2080,21 @@ fn cached_markdown(
     (lines, links)
 }
 
-/// 计划条显示的行（§用户诉求：修复计划技能锁死）：活跃项（Pending/InProgress）
-/// 优先——整体替换后 Completed 历史排在 items 前，不能把进行中的计划挤出屏；
-/// 活跃不足 3 条时用 Completed 历史补齐（沉底）。
-fn plan_display_items(plan: &crate::tool::plan::Plan) -> Vec<&crate::tool::plan::PlanItem> {
+/// 侧边栏 Todo 项：全部展示，活跃项置顶、完成历史沉底。侧边栏自身可滚动，
+/// 不再像旧底部计划条那样只截取三项。
+fn sidebar_plan_items(plan: &crate::tool::plan::Plan) -> Vec<&crate::tool::plan::PlanItem> {
     use crate::tool::plan::PlanStatus;
-    let active: Vec<_> = plan
+    let mut out: Vec<_> = plan
         .items
         .iter()
-        .filter(|i| i.status != PlanStatus::Completed)
+        .filter(|item| item.status != PlanStatus::Completed)
         .collect();
-    if active.is_empty() {
-        return plan
-            .items
+    out.extend(
+        plan.items
             .iter()
-            .filter(|i| i.status == PlanStatus::Completed)
-            .take(3)
-            .collect();
-    }
-    let mut out: Vec<_> = active.into_iter().take(3).collect();
-    if out.len() < 3 {
-        out.extend(
-            plan.items
-                .iter()
-                .filter(|i| i.status == PlanStatus::Completed)
-                .take(3 - out.len()),
-        );
-    }
-    out
-}
-
-/// 计划条（§16.2：编辑器上方独立紧凑区域，不出现在 transcript）。
-fn plan_area_rows(view: &ViewModel) -> u16 {
-    match &view.plan {
-        Some(plan) if !plan.items.is_empty() => (1 + plan_display_items(plan).len()) as u16,
-        _ => 0,
-    }
-}
-
-fn draw_plan(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: theme::Theme) {
-    let Some(plan) = &view.plan else {
-        return;
-    };
-    // §美化：plan 面板化——左竖线 + panel 背景 + 补空格到满宽（独立面板）。
-    let rail = Style::default()
-        .fg(theme.accent)
-        .bg(theme.panel)
-        .add_modifier(Modifier::BOLD);
-    let mut lines = vec![Line::from(vec![
-        Span::styled("┃ ", rail),
-        Span::styled(
-            "计划",
-            Style::default()
-                .fg(theme.primary)
-                .bg(theme.panel)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ])];
-    for item in plan_display_items(plan) {
-        let (marker, style) = match item.status {
-            crate::tool::plan::PlanStatus::Completed => (
-                "[x]",
-                Style::default()
-                    .fg(theme.muted)
-                    .bg(theme.panel)
-                    .add_modifier(Modifier::DIM),
-            ),
-            crate::tool::plan::PlanStatus::InProgress => {
-                ("[>]", Style::default().fg(theme.warning).bg(theme.panel))
-            }
-            crate::tool::plan::PlanStatus::Pending => {
-                ("[ ]", Style::default().fg(theme.muted).bg(theme.panel))
-            }
-        };
-        lines.push(Line::from(vec![
-            Span::styled("   ", Style::default().bg(theme.panel)),
-            Span::styled(format!("{marker} {}", item.text), style),
-        ]));
-    }
-    // 补空格到满宽（与 plan_window 的补空格逻辑一致）。
-    let width = area.width as usize;
-    for line in lines.iter_mut() {
-        let cur = unicode_width::UnicodeWidthStr::width(
-            line.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-                .as_str(),
-        );
-        if cur < width {
-            let pad = width - cur;
-            line.spans.push(Span::styled(
-                " ".repeat(pad),
-                Style::default().bg(theme.panel),
-            ));
-        }
-    }
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
-        area,
+            .filter(|item| item.status == PlanStatus::Completed),
     );
+    out
 }
 
 /// 右侧边栏（§用户诉求：opencode 式）。上方 Todo（`view.plan` 项），
@@ -2225,7 +2125,7 @@ fn draw_sidebar(
     hits.push(None);
     match &view.plan {
         Some(plan) if !plan.items.is_empty() => {
-            for item in plan_display_items(plan) {
+            for item in sidebar_plan_items(plan) {
                 let (marker, style) = match item.status {
                     crate::tool::plan::PlanStatus::Completed => (
                         "[x]",
@@ -2783,12 +2683,17 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
                 .fg(theme.muted)
                 .add_modifier(Modifier::BOLD),
         ));
-        for line in command.split('\n') {
-            content.push(Line::styled(
-                line.to_string(),
-                Style::default().fg(theme.text),
-            ));
-        }
+        let command_language = if cfg!(windows) { "powershell" } else { "bash" };
+        content.extend(
+            highlight::highlight_code_block(command, Some(command_language), theme).unwrap_or_else(
+                |_| {
+                    command
+                        .split('\n')
+                        .map(|line| Line::styled(line.to_string(), Style::default().fg(theme.text)))
+                        .collect()
+                },
+            ),
+        );
         content.push(Line::default());
     }
     // §成熟化：Link Overlay 正文显示 URL（info 色可读）。
@@ -2808,11 +2713,26 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
                 .fg(theme.muted)
                 .add_modifier(Modifier::BOLD),
         ));
-        for line in overlay.body.split('\n') {
-            content.push(Line::styled(
-                line.to_string(),
-                Style::default().fg(theme.text),
-            ));
+        if let Some(language) = overlay.body_language.as_deref() {
+            content.extend(
+                highlight::highlight_code_block(&overlay.body, Some(language), theme)
+                    .unwrap_or_else(|_| {
+                        overlay
+                            .body
+                            .split('\n')
+                            .map(|line| {
+                                Line::styled(line.to_string(), Style::default().fg(theme.text))
+                            })
+                            .collect()
+                    }),
+            );
+        } else {
+            for line in overlay.body.split('\n') {
+                content.push(Line::styled(
+                    line.to_string(),
+                    Style::default().fg(theme.text),
+                ));
+            }
         }
     } else {
         content.push(Line::styled("（无输出）", Style::default().fg(theme.muted)));

@@ -539,9 +539,8 @@ fn render_table(
         a
     };
 
-    const GAP: usize = 2;
     const PADDING: usize = 1;
-    const MIN_COL: usize = 3;
+    const MIN_COL: usize = 2;
     let border = Style::default().fg(theme.muted);
     let header_style = Style::default().fg(theme.text).add_modifier(Modifier::BOLD);
 
@@ -599,13 +598,16 @@ fn render_table(
     // 列宽分配（§codex compute_column_widths：收缩到 available_width 内）。
     let floor_for = |m: &TableColMetric| -> usize {
         let target = match m.kind {
-            TableColKind::Narrative | TableColKind::TokenHeavy => 16,
-            TableColKind::Compact => m.header_token.max(m.body_token.min(16)),
+            TableColKind::Narrative => 8,
+            TableColKind::TokenHeavy => 6,
+            TableColKind::Compact => m.header_token.max(m.body_token.min(12)),
         };
         target.max(MIN_COL).min(m.max_width)
     };
     let available = width.map(|w| {
-        let reserved = (cols + 1) + cols.saturating_sub(1) * GAP + cols * PADDING * 2;
+        // 真正的 box-drawing 表格：每列左右 padding + cols+1 条竖边，
+        // 不再在列之间额外塞两个空格，窄屏能多留出有效内容宽度。
+        let reserved = (cols + 1) + cols * PADDING * 2;
         w.saturating_sub(reserved)
     });
     let mut widths: Vec<usize> = metrics.iter().map(|m| m.max_width.max(MIN_COL)).collect();
@@ -613,7 +615,7 @@ fn render_table(
         let min_total = cols * MIN_COL;
         if max_w < min_total {
             // 窄屏：退化为 records（label: value，逐行）。§codex table_key_value。
-            return render_table_records(&header, &body, theme);
+            return render_table_records(&header, &body, theme, width.unwrap_or(1));
         }
         let mut floors: Vec<usize> = metrics.iter().map(floor_for).collect();
         let floor_total: usize = floors.iter().sum();
@@ -625,18 +627,22 @@ fn render_table(
         if total > max_w {
             let remaining = shrink_columns(&mut widths, &floors, &metrics, total - max_w);
             if remaining > 0 {
-                return render_table_records(&header, &body, theme);
+                return render_table_records(&header, &body, theme, width.unwrap_or(1));
             }
         }
     }
 
     // 生成表格行（§codex render_table_separator / render_table_row）。
-    let sep = |ch: char| -> Line<'static> {
-        let text = widths
-            .iter()
-            .map(|w| ch.to_string().repeat(*w + PADDING * 2))
-            .collect::<Vec<_>>()
-            .join(&" ".repeat(GAP));
+    let sep = |left: char, join: char, right: char, ch: char| -> Line<'static> {
+        let mut text = String::from(left);
+        for (index, width) in widths.iter().enumerate() {
+            text.push_str(&ch.to_string().repeat(*width + PADDING * 2));
+            text.push(if index + 1 == widths.len() {
+                right
+            } else {
+                join
+            });
+        }
         Line::styled(text, border)
     };
     let row_line = |cells: &[String], style: Style| -> Vec<Line<'static>> {
@@ -661,9 +667,6 @@ fn render_table(
                 spans.push(Span::raw(" ".repeat(PADDING + left)));
                 spans.push(Span::styled(cell_text, style));
                 spans.push(Span::raw(" ".repeat(right + PADDING)));
-                if col + 1 < cols {
-                    spans.push(Span::raw(" ".repeat(GAP)));
-                }
                 spans.push(Span::styled("│", border));
             }
             out.push(Line::from(spans));
@@ -671,17 +674,14 @@ fn render_table(
         out
     };
 
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(2 + body.len() * 2);
-    out.push(sep('━'));
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(4 + body.len());
+    out.push(sep('┌', '┬', '┐', '─'));
     out.extend(row_line(&header, header_style));
-    out.push(sep('─'));
-    for (i, row) in body.iter().enumerate() {
+    out.push(sep('├', '┼', '┤', '─'));
+    for row in &body {
         out.extend(row_line(row, Style::default().fg(theme.text)));
-        if i + 1 < body.len() {
-            out.push(sep('─'));
-        }
     }
-    out.push(sep('━'));
+    out.push(sep('└', '┴', '┘', '─'));
     out
 }
 
@@ -787,14 +787,41 @@ fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
-    for ch in text.chars() {
-        let w = crate::tui::text::char_cell_width(ch);
-        if cur_w + w > width && !cur.is_empty() {
+    for word in text.split_whitespace() {
+        let word_w = crate::tui::text::display_width(word);
+        if word_w <= width {
+            let separator = usize::from(!cur.is_empty());
+            if cur_w + separator + word_w <= width {
+                if separator > 0 {
+                    cur.push(' ');
+                    cur_w += 1;
+                }
+                cur.push_str(word);
+                cur_w += word_w;
+                continue;
+            }
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.push_str(word);
+            cur_w = word_w;
+            continue;
+        }
+
+        // URL、路径、CJK 长句等不可按词拆的 token 做 display-width 硬换行。
+        if !cur.is_empty() {
             out.push(std::mem::take(&mut cur));
             cur_w = 0;
         }
-        cur.push(ch);
-        cur_w += w;
+        for ch in word.chars() {
+            let char_w = crate::tui::text::char_cell_width(ch);
+            if cur_w + char_w > width && !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            cur.push(ch);
+            cur_w += char_w;
+        }
     }
     if !cur.is_empty() {
         out.push(cur);
@@ -810,22 +837,58 @@ fn render_table_records(
     header: &[String],
     body: &[Vec<String>],
     theme: theme::Theme,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
-    for row in body {
+    let width = width.max(1);
+    for (row_index, row) in body.iter().enumerate() {
         for (col, cell) in row.iter().enumerate() {
             let label = header.get(col).cloned().unwrap_or_default();
-            let line = if label.is_empty() {
+            let combined = if label.is_empty() {
                 cell.clone()
             } else {
                 format!("{label}: {cell}")
             };
-            out.push(Line::styled(line, Style::default().fg(theme.text)));
+            if crate::tui::text::display_width(&combined) <= width {
+                let mut spans = Vec::new();
+                if !label.is_empty() {
+                    spans.push(Span::styled(
+                        format!("{label}:"),
+                        Style::default()
+                            .fg(theme.muted)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    if !cell.is_empty() {
+                        spans.push(Span::raw(" "));
+                    }
+                }
+                if !cell.is_empty() || label.is_empty() {
+                    spans.push(Span::styled(cell.clone(), Style::default().fg(theme.text)));
+                }
+                out.push(Line::from(spans));
+            } else {
+                if !label.is_empty() {
+                    for label_line in wrap_cell_text(&format!("{label}:"), width) {
+                        out.push(Line::styled(
+                            label_line,
+                            Style::default()
+                                .fg(theme.muted)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                }
+                let indent = usize::from(width >= 4) * 2;
+                for value_line in wrap_cell_text(cell, width.saturating_sub(indent).max(1)) {
+                    out.push(Line::from(vec![
+                        Span::raw(" ".repeat(indent)),
+                        Span::styled(value_line, Style::default().fg(theme.text)),
+                    ]));
+                }
+            }
         }
-        out.push(Line::styled(
-            "─".repeat(20),
-            Style::default().fg(theme.muted),
-        ));
+        if row_index + 1 < body.len() {
+            out.push(Line::default());
+        }
     }
     out
 }

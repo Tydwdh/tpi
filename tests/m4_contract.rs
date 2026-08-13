@@ -281,7 +281,7 @@ fn plan_invariants_enforced() {
     assert!(cleared.items.is_empty());
 }
 
-/// §13 + §15.4 集成：update_plan 替换完整计划、计划注入后续请求；
+/// §13 + §15.4 集成：update_plan 替换完整计划、计划以工具事实进入后续请求；
 /// 长会话触发 compaction（无工具请求）后继续准确执行。
 #[tokio::test]
 async fn update_plan_and_compaction_integration() {
@@ -293,7 +293,7 @@ async fn update_plan_and_compaction_integration() {
     // 9000 保证首轮不触发、多轮 read 累积后触发且 history 足够大。
     let mut config = test_config(&workspace);
     // 动态基线：先用 agent 同款估算算「空会话请求」的系统开销（system prompt +
-    // 计划快照 + 工具 schema），窗口设在该基线之上，保证首轮不触发压缩、
+    // 工具 schema），窗口设在该基线之上，保证首轮不触发压缩、
     // 多次 read 累积后触发。工具集/系统提示变化自动适应，无需手调 magic number。
     // 当前基线实测 ~3393 tokens（含 glob/search 参数 schema）；窗口 = 基线 + 800，
     // 8 轮 read 累积后触发 compaction，compaction 后回到基线+summary 仍能继续。
@@ -304,7 +304,6 @@ async fn update_plan_and_compaction_integration() {
             .iter()
             .map(tpi::tool::BuiltinTool::schema)
             .collect::<Vec<_>>(),
-        None,
     );
     // 空会话 + 无计划时基线即系统开销；window = 基线 + 预留增长空间。
     // 每轮 read 的结果会进入 messages（累计增长），window 只须容纳约 8 轮 +
@@ -322,13 +321,25 @@ async fn update_plan_and_compaction_integration() {
             );
         }
         let current = step.get();
-        // §13：计划建立后（step > 0）plan snapshot 以 user 消息追加轨迹尾部，
-        // 不进 system prompt（避免每次 update 破坏 system 前缀缓存）。
+        // §13：计划建立后保持为正常的 assistant → update_plan Tool 协议事实；
+        // 绝不能伪装成每轮最后一条 User 消息，否则模型会持续“回复 Todo”。
         if current > 0 {
-            let last = request.messages.last().unwrap();
             assert!(
-                matches!(last, tpi::provider::ChatMessage::User(text) if text.contains("当前焦点")),
-                "每次 model request 的 runtime snapshot 必须包含紧凑焦点（§13，尾部 user 消息）: {last:?}"
+                !request.messages.iter().any(|message| matches!(
+                    message,
+                    tpi::provider::ChatMessage::User(text) if text.contains("当前焦点")
+                )),
+                "计划快照不得伪装成 User 消息: {:?}",
+                request.messages
+            );
+            assert!(
+                request.messages.iter().any(|message| matches!(
+                    message,
+                    tpi::provider::ChatMessage::Tool { name, content, .. }
+                        if name == "update_plan" && content.contains("当前焦点")
+                )),
+                "计划必须以 update_plan Tool 结果保留: {:?}",
+                request.messages
             );
         }
         if current == 0 {

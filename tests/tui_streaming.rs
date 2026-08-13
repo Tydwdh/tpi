@@ -325,9 +325,9 @@ fn command_menu_pops_up_with_matches() {
     );
 }
 
-/// §16.2：计划条不出现在 transcript 流水，而是独立区域。
+/// Todo 只在侧边栏显示，主区底部不再重复渲染计划条。
 #[test]
-fn plan_renders_as_compact_strip() {
+fn plan_renders_only_in_sidebar() {
     use tpi::tool::plan::{Plan, PlanItem, PlanStatus};
     let mut view = ViewModel::default();
     view.push_line(LineKind::User, "请实现功能");
@@ -344,8 +344,16 @@ fn plan_renders_as_compact_strip() {
             },
         ],
     });
+    view.sidebar.open = true;
     let buffer = draw_to_test_backend(&mut view, 80, 14);
     let rendered = buffer_text(&buffer);
-    assert!(rendered.contains("计划"), "计划条必须渲染: {rendered:?}");
+    assert!(
+        rendered.contains("Todo"),
+        "侧边栏 Todo 必须渲染: {rendered:?}"
+    );
     assert!(rendered.contains("第一步"));
+    assert!(
+        !rendered.contains("┃ 计划"),
+        "主区不得再显示第二份计划: {rendered:?}"
+    );
 }
