@@ -194,6 +194,18 @@ pub fn builtin_registry() -> ToolRegistry {
     registry
 }
 
+/// 进程级共享 ToolRegistry（README2 Phase 5）：McpManager 启动时注册 MCP
+/// 工具，agent 的 ToolRuntime 读取同一目录——MCP 工具自动进入 agent loop。
+pub fn global_registry() -> Arc<std::sync::Mutex<ToolRegistry>> {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<Arc<std::sync::Mutex<ToolRegistry>>> = OnceLock::new();
+    REGISTRY
+        .get_or_init(|| {
+            Arc::new(std::sync::Mutex::new(builtin_registry()))
+        })
+        .clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

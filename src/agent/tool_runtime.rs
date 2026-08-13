@@ -32,6 +32,9 @@ pub(super) struct ToolRuntime {
     current_plan: Arc<Mutex<Option<Plan>>>,
     shell: Arc<Mutex<crate::shell::ShellSessionState>>,
     workspace: Arc<Mutex<crate::workspace::ActiveWorkspace>>,
+    /// ToolRegistry（builtin + MCP；agent 工具目录，README2 Phase 5）。
+    /// Mutex：Phase 3 的 McpManager 运行时注册 MCP 工具。
+    registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
 }
 
 #[derive(Clone)]
@@ -58,6 +61,9 @@ impl ToolRuntime {
             let ws = workspace.lock().unwrap();
             ws.shell().clone()
         };
+        // §Phase 5：工具目录 = 进程级共享 registry（builtin + McpManager 注册的
+        // MCP 工具）。
+        let registry = crate::tool::registry::global_registry();
         Self {
             config: RuntimeConfig {
                 workspace_root: config.workspace_root.clone(),
@@ -73,11 +79,34 @@ impl ToolRuntime {
             current_plan: Arc::new(Mutex::new(initial_plan)),
             shell,
             workspace,
+            registry,
         }
     }
 
     pub(super) fn plan_snapshot(&self) -> Option<Plan> {
         crate::util::lock_mutex(&self.current_plan, "current_plan").clone()
+    }
+
+    /// 发给模型的工具定义（Phase 5：builtin + 已注册 MCP 工具，经 ToolSelector
+    /// 按上下文选择——MCP 大量工具不一次塞给 LLM，README2 §14）。
+    pub(super) fn active_tool_defs(&self, context: &str) -> Vec<crate::provider::ToolDef> {
+        let registry = self.registry.lock().unwrap();
+        let selector = crate::tool::selector::ToolSelector::default();
+        selector
+            .select(registry.descriptors(), context)
+            .into_iter()
+            .map(|d| crate::provider::ToolDef {
+                name: d.name,
+                description: d.description,
+                parameters: d.parameters,
+            })
+            .collect()
+    }
+
+    /// 注册外部工具（MCP manager 调用；Phase 5 交付时由 app 接线）。
+    #[allow(dead_code)]
+    pub(super) fn register_tool(&self, tool: std::sync::Arc<dyn crate::tool::registry::Tool>) {
+        self.registry.lock().unwrap().register(tool);
     }
 
     /// 当前 workspace 快照（§R4：build_context 注入 identity 用；clone 避免
@@ -175,7 +204,8 @@ async fn execute_batch<P: Provider>(
     usage_total: &mut Usage,
 ) -> Result<BatchEnd, RunFailure> {
     use crate::agent::scheduler::{
-        PreparedCall, action_key, build_waves, stable_observation, state_stamp_from_ctx,
+        PreparedCall, ToolAccess, action_key, action_key_from_name, build_waves,
+        stable_observation, state_stamp_from_ctx,
     };
     use futures_util::future::join_all;
     use std::collections::HashMap;
@@ -200,37 +230,53 @@ async fn execute_batch<P: Provider>(
             // 并持久化——否则 assistant.tool_calls 有 call 但无对应 tool result，
             // 下一轮/resume 的 history 是非法消息序列（provider 可能拒绝）。
             for skipped in &calls[index..] {
-                if let Some(tool) = BuiltinTool::from_name(&skipped.name) {
-                    let outcome = ToolOutcome::failed(
-                        tool.name(),
-                        crate::tool::outcome::ModelPayload {
-                            status: ToolStatus::Rejected,
-                            program: None,
-                            exit_code: None,
-                            duration_ms: 0,
-                            output: "status: rejected
-tool: {tool}
-error: tool_budget_exceeded
-
-工具调用预算（max_tool_calls）已耗尽，本批剩余调用未执行。"
-                                .replace("{tool}", tool.name()),
-                            effect: None,
-                            artifact: None,
-                        },
-                    )
-                    .into_stored();
-                    session
-                        .append_event(&SessionEvent::ToolRequested {
-                            call: skipped.clone(),
-                        })
-                        .and_then(|_| session.complete_tool(skipped.call_id, &outcome))
-                        .map_err(|e| RunFailure::Session(e.to_string()))?;
-                }
+                // builtin 或外部（MCP）工具都生成标准化拒绝（history 合法）。
+                let name = skipped.name.clone();
+                let tool_label = BuiltinTool::from_name(&name)
+                    .map(|t| t.name().to_string())
+                    .unwrap_or(name.clone());
+                let outcome = ToolOutcome::failed(
+                    &tool_label,
+                    crate::tool::outcome::ModelPayload {
+                        status: ToolStatus::Rejected,
+                        program: None,
+                        exit_code: None,
+                        duration_ms: 0,
+                        output: format!(
+                            "status: rejected\ntool: {tool_label}\nerror: tool_budget_exceeded\n\n工具调用预算（max_tool_calls）已耗尽，本批剩余调用未执行。"
+                        ),
+                        effect: None,
+                        artifact: None,
+                    },
+                )
+                .into_stored();
+                session
+                    .append_event(&SessionEvent::ToolRequested {
+                        call: skipped.clone(),
+                    })
+                    .and_then(|_| session.complete_tool(skipped.call_id, &outcome))
+                    .map_err(|e| RunFailure::Session(e.to_string()))?;
             }
             return Ok(BatchEnd::BudgetExceeded);
         }
         *tool_calls_total += 1;
+        // §Phase 5：先按 builtin 解析；失败则查 ToolRegistry（MCP 工具）。
         let Some(tool) = BuiltinTool::from_name(&call.name) else {
+            // 外部工具（MCP adapter）？
+            if let Some(adapter) = tool_runtime.registry.lock().unwrap().get(&call.name) {
+                prepared.push(PreparedCall {
+                    source_index: index,
+                    kind: crate::agent::scheduler::PreparedKind::External {
+                        name: call.name.clone(),
+                        args_json: call.arguments.clone(),
+                        adapter,
+                    },
+                    access: ToolAccess::WorkspaceUnknown,
+                    action_key: action_key_from_name(&call.name, &call.arguments),
+                    plan: None,
+                });
+                continue;
+            }
             // §30 第 9 条：rejected 的 observation 必须持久化——runtime messages
             // 有 Tool 消息而 session 无 ToolRequested/ToolCompleted 时，restart 后
             // observation 丢失（P0-3 不变量违反）。
@@ -259,8 +305,7 @@ error: tool_budget_exceeded
                 );
                 prepared.push(PreparedCall {
                     source_index: index,
-                    tool,
-                    args,
+                    kind: crate::agent::scheduler::PreparedKind::Builtin { tool, args },
                     access,
                     action_key: action_key(tool, &call.arguments),
                     plan,
@@ -311,17 +356,32 @@ error: invalid_arguments
         }
 
         // write-ahead（§14.2）：wave 内写工具先持久化 ToolStarted。
+        // 外部（MCP）工具无 write-ahead（非本地文件/进程副作用工具）。
         for call in &wave {
             let source = &calls[call.source_index];
+            let requires_wa = match &call.kind {
+                crate::agent::scheduler::PreparedKind::Builtin { tool, .. } => {
+                    tool.requires_write_ahead()
+                }
+                crate::agent::scheduler::PreparedKind::External { .. } => false,
+            };
             // §10.7：复用预检阶段生成的同一 plan（temp/backup 路径一致）。
-            let recovery = recovery_metadata(
-                call.tool,
-                source,
-                call.plan.as_ref(),
-                &config.workspace_root,
-                config.allow_outside_workspace,
-            );
-            if call.tool.requires_write_ahead() {
+            let recovery = if requires_wa {
+                if let crate::agent::scheduler::PreparedKind::Builtin { tool, .. } = call.kind {
+                    recovery_metadata(
+                        tool,
+                        source,
+                        call.plan.as_ref(),
+                        &config.workspace_root,
+                        config.allow_outside_workspace,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if requires_wa {
                 session
                     .write_ahead_tool(source.call_id, recovery)
                     .map_err(|e| RunFailure::Session(e.to_string()))?;
@@ -360,8 +420,7 @@ error: invalid_arguments
         let mut futures = Vec::with_capacity(wave.len());
         for call in &wave {
             let source_index = call.source_index;
-            let tool = call.tool;
-            let args = call.args.clone();
+            let kind = call.kind.clone();
             let action_key = call.action_key.clone();
             let access = call.access.clone();
             let ctx = tool_runtime.context(calls[source_index].call_id, Some(output_tx.clone()));
@@ -376,7 +435,8 @@ error: invalid_arguments
                 && progress.should_block(&action_key, &state_stamp);
 
             // 工具真正启动前通知 TUI；长命令不再等执行结束才出现反馈。
-            if tool != BuiltinTool::UpdatePlan {
+            let kind_name = kind.name().to_string();
+            if kind_name != "update_plan" {
                 let (target, command) = tool_target(&calls[source_index]);
                 let _ = ui
                     .send(RuntimeEvent::ToolStarted {
@@ -396,10 +456,19 @@ error: invalid_arguments
             }
             futures.push(async move {
                 if blocked {
-                    let outcome = repeated_outcome(tool.name(), &action_key);
+                    let outcome = repeated_outcome(&kind_name, &action_key);
                     (source_index, outcome.into_stored())
                 } else {
-                    let outcome = tool::execute(tool, args, &ctx, plan.as_ref()).await;
+                    let outcome = match kind {
+                        crate::agent::scheduler::PreparedKind::Builtin { tool, args } => {
+                            tool::execute(tool, args, &ctx, plan.as_ref()).await
+                        }
+                        crate::agent::scheduler::PreparedKind::External {
+                            name: _,
+                            args_json,
+                            adapter,
+                        } => adapter.execute(&args_json, &ctx).await,
+                    };
                     (source_index, outcome.into_stored())
                 }
             });

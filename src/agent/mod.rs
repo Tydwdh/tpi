@@ -22,7 +22,6 @@ use crate::session::{
     self, AssistantMessage, CompletionReason, ModelRef, RunLimits, SessionEvent, SessionLog, Usage,
 };
 use crate::tool::outcome::{StoredToolOutcome, ToolStatus};
-use crate::tool::{self, BuiltinTool};
 
 /// Tokio 的 JoinHandle 在 drop 时会脱离而不是取消；run 的 watchdog 必须随
 /// 任意返回路径终止，避免失败后仍发送警告或取消已结束的 token。
@@ -385,8 +384,9 @@ pub async fn run<P: Provider>(
 
     let mut turn = 0u32;
     let mut tool_calls_total = 0u32;
-    let tools = tool::implemented_tools();
-    let tool_defs: Vec<crate::provider::ToolDef> = tools.iter().map(BuiltinTool::schema).collect();
+    // §Phase 5：工具定义来自 ToolRegistry（builtin + MCP），经 ToolSelector
+    // 按用户消息选择——MCP 大量工具不一次塞给 LLM（README2 §14）。
+    let tool_defs: Vec<crate::provider::ToolDef> = tool_runtime.active_tool_defs(&user_message);
 
     let mut assistant_text = String::new();
     // §12.3：确定性无进展检测（不调用额外模型）。

@@ -13,6 +13,7 @@ pub mod outcome;
 pub mod plan;
 pub mod registry;
 pub mod search;
+pub mod selector;
 pub mod web;
 
 use camino::Utf8PathBuf;

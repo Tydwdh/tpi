@@ -24,12 +24,14 @@ use tpi::tool::outcome::ToolStatus;
 fn waves_parallelize_reads_and_serialize_writes() {
     let mk = |index: usize, access: ToolAccess| PreparedCall {
         source_index: index,
-        tool: tpi::tool::BuiltinTool::Read,
-        args: tpi::tool::ValidatedArgs::Read(tpi::tool::files::ReadArgs {
-            path: format!("f{index}.txt"),
-            start_line: 1,
-            line_count: 10,
-        }),
+        kind: tpi::agent::scheduler::PreparedKind::Builtin {
+            tool: tpi::tool::BuiltinTool::Read,
+            args: tpi::tool::ValidatedArgs::Read(tpi::tool::files::ReadArgs {
+                path: format!("f{index}.txt"),
+                start_line: 1,
+                line_count: 10,
+            }),
+        },
         access,
         action_key: format!("k{index}"),
         plan: None,
@@ -78,24 +80,28 @@ fn waves_parallelize_reads_and_serialize_writes() {
 fn bash_serializes_all_following_tools() {
     let bash_call = |index: usize| PreparedCall {
         source_index: index,
-        tool: tpi::tool::BuiltinTool::Bash,
-        args: tpi::tool::ValidatedArgs::Bash(tpi::tool::command::BashArgs {
-            command: "echo hi".into(),
-            cwd: None,
-            timeout_ms: 1000,
-        }),
+        kind: tpi::agent::scheduler::PreparedKind::Builtin {
+            tool: tpi::tool::BuiltinTool::Bash,
+            args: tpi::tool::ValidatedArgs::Bash(tpi::tool::command::BashArgs {
+                command: "echo hi".into(),
+                cwd: None,
+                timeout_ms: 1000,
+            }),
+        },
         access: ToolAccess::WorkspaceUnknown,
         action_key: format!("b{index}"),
         plan: None,
     };
     let file_read = |index: usize, path: &str| PreparedCall {
         source_index: index,
-        tool: tpi::tool::BuiltinTool::Read,
-        args: tpi::tool::ValidatedArgs::Read(tpi::tool::files::ReadArgs {
-            path: path.into(),
-            start_line: 1,
-            line_count: 10,
-        }),
+        kind: tpi::agent::scheduler::PreparedKind::Builtin {
+            tool: tpi::tool::BuiltinTool::Read,
+            args: tpi::tool::ValidatedArgs::Read(tpi::tool::files::ReadArgs {
+                path: path.into(),
+                start_line: 1,
+                line_count: 10,
+            }),
+        },
         access: ToolAccess::Resources(vec![tpi::agent::scheduler::ResourceLock {
             resource: tpi::agent::scheduler::ResourceId::File(
                 tpi::agent::scheduler::FileScope::Exact(camino::Utf8PathBuf::from(path)),
@@ -132,15 +138,17 @@ fn bash_serializes_all_following_tools() {
 fn file_write(index: usize, path: &str) -> PreparedCall {
     PreparedCall {
         source_index: index,
-        tool: tpi::tool::BuiltinTool::Edit,
-        args: tpi::tool::ValidatedArgs::Edit(tpi::tool::edit::EditArgs {
-            path: path.into(),
-            revision: "b3:0000000000000000000000000000000000000000000000000000000000000000".into(),
-            replacements: vec![tpi::tool::edit::Replacement {
-                old_text: "x".into(),
-                new_text: "y".into(),
-            }],
-        }),
+        kind: tpi::agent::scheduler::PreparedKind::Builtin {
+            tool: tpi::tool::BuiltinTool::Edit,
+            args: tpi::tool::ValidatedArgs::Edit(tpi::tool::edit::EditArgs {
+                path: path.into(),
+                revision: "b3:0000000000000000000000000000000000000000000000000000000000000000".into(),
+                replacements: vec![tpi::tool::edit::Replacement {
+                    old_text: "x".into(),
+                    new_text: "y".into(),
+                }],
+            }),
+        },
         access: ToolAccess::Resources(vec![tpi::agent::scheduler::ResourceLock {
             resource: tpi::agent::scheduler::ResourceId::File(
                 tpi::agent::scheduler::FileScope::Exact(camino::Utf8PathBuf::from(path)),

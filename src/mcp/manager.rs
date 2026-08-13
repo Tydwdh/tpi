@@ -141,13 +141,16 @@ impl Default for McpManager {
 
 impl McpManager {
     /// 从 `~/.tpi/config.toml` 加载并启动所有 enabled MCP servers（Phase 3）。
-    /// 注册的工具并入 `registry`（供 agent loop / Phase 5 使用）。
-    pub async fn start_from_config(&mut self, registry: &mut ToolRegistry) -> usize {
+    /// 注册的工具并入**进程级共享 registry**（ToolRuntime 读取 → agent loop
+    /// 可调用，README2 Phase 5）。
+    pub async fn start_from_config(&mut self) -> usize {
         let home = crate::config::tpi_home();
         let configs = crate::mcp::config::load_enabled(&home);
         let mut started = 0usize;
+        let registry = crate::tool::registry::global_registry();
         for config in configs {
-            match self.start_server(config, registry).await {
+            let mut guard = registry.lock().unwrap();
+            match self.start_server(config, &mut guard).await {
                 Ok(_) => started += 1,
                 Err(error) => {
                     tracing::warn!(error = %error, "MCP server 启动失败");

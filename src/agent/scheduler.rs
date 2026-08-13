@@ -147,8 +147,7 @@ pub fn locks_conflict(a: &ResourceLock, b: &ResourceLock) -> bool {
 #[derive(Debug)]
 pub struct PreparedCall {
     pub source_index: usize,
-    pub tool: BuiltinTool,
-    pub args: ValidatedArgs,
+    pub kind: PreparedKind,
     pub access: ToolAccess,
     /// §12.3：ActionKey = hash(tool_name + canonical_json(args))。
     pub action_key: String,
@@ -156,6 +155,45 @@ pub struct PreparedCall {
     /// 预检阶段生成一次，write-ahead 持久化与真正执行**必须复用同一 plan**，
     /// 否则 recovery metadata 指向的路径与实际执行不一致，崩溃恢复判定失效。
     pub plan: Option<crate::tool::edit::CommitPlan>,
+}
+
+/// 已预检的工具种类：builtin（类型化）或外部（MCP adapter，README2 §2.1）。
+/// 不 derive Debug：`Arc<dyn Tool>` 不实现 Debug。
+#[derive(Clone)]
+pub enum PreparedKind {
+    /// 内建工具（类型化 args + commit plan 语义）。
+    Builtin {
+        tool: BuiltinTool,
+        args: ValidatedArgs,
+    },
+    /// 外部工具（MCP 等；JSON args，经 Tool trait 执行）。
+    External {
+        name: String,
+        args_json: String,
+        adapter: std::sync::Arc<dyn crate::tool::registry::Tool>,
+    },
+}
+
+impl PreparedKind {
+    pub fn name(&self) -> &str {
+        match self {
+            PreparedKind::Builtin { tool, .. } => tool.name(),
+            PreparedKind::External { name, .. } => name,
+        }
+    }
+}
+
+impl std::fmt::Debug for PreparedKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PreparedKind::Builtin { tool, .. } => {
+                write!(f, "Builtin({})", tool.name())
+            }
+            PreparedKind::External { name, .. } => {
+                write!(f, "External({name})")
+            }
+        }
+    }
 }
 
 /// 构建 execution waves（§12.2 第 3-4 条）。
@@ -233,11 +271,16 @@ fn push_with_conflict_check(
 
 /// ActionKey（§12.3）：hash(tool_name + canonical_json(args))。
 pub fn action_key(tool: BuiltinTool, args_json: &str) -> String {
+    action_key_from_name(tool.name(), args_json)
+}
+
+/// ActionKey（外部工具版，README2 Phase 5）。
+pub fn action_key_from_name(name: &str, args_json: &str) -> String {
     // serde_json 的 Map 默认有序（BTreeMap），canonical 序列化可复现。
     let canonical = serde_json::from_str::<serde_json::Value>(args_json)
         .map(|value| value.to_string())
         .unwrap_or_else(|_| args_json.to_string());
-    let digest = blake3::hash(format!("{}|{canonical}", tool.name()).as_bytes());
+    let digest = blake3::hash(format!("{name}|{canonical}").as_bytes());
     digest.to_hex()[..16].to_string()
 }
 

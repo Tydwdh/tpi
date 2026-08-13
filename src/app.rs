@@ -290,8 +290,7 @@ async fn interactive_loop<P: Provider>(
     );
     // README2 Phase 3：启动 MCP servers（从 ~/.tpi/config.toml；无配置则无操作）。
     {
-        let mut registry = crate::tool::registry::ToolRegistry::new();
-        let started = mcp_manager.start_from_config(&mut registry).await;
+        let started = mcp_manager.start_from_config().await;
         if started > 0 {
             view.push_line(
                 LineKind::System,
