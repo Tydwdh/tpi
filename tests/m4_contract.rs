@@ -190,18 +190,24 @@ async fn watchdog_cancels_at_wall_deadline() {
     assert!(cancel.is_cancelled(), "watchdog 必须主动取消 run（§12.4）");
 }
 
-/// §13：update_plan 不变量（≤7 项、唯一 InProgress、完整替换、拒绝无效）。
+/// §13：update_plan 不变量（≤7 项、显式状态、完整替换、拒绝无效）。
 #[test]
 fn plan_invariants_enforced() {
-    use tpi::tool::plan::{PlanItemArg, UpdatePlanArgs, build_plan, validate_invariants};
-    // 合法：3 项，唯一 InProgress。
+    use tpi::tool::plan::{
+        PlanItemArg, PlanStatus, UpdatePlanArgs, build_plan, validate_invariants,
+    };
+    let item = |text: &str, status| PlanItemArg {
+        text: text.into(),
+        status,
+    };
+    // 合法：完整显式快照。
     let plan = build_plan(
         &UpdatePlanArgs {
             explanation: Some("fix".into()),
             items: vec![
-                PlanItemArg::Text("a".into()),
-                PlanItemArg::Text("b".into()),
-                PlanItemArg::Text("c".into()),
+                item("a", PlanStatus::InProgress),
+                item("b", PlanStatus::Pending),
+                item("c", PlanStatus::Blocked),
             ],
         },
         None,
@@ -211,7 +217,7 @@ fn plan_invariants_enforced() {
     let in_progress = plan
         .items
         .iter()
-        .filter(|i| i.status == tpi::tool::plan::PlanStatus::InProgress)
+        .filter(|i| i.status == PlanStatus::InProgress)
         .count();
     assert_eq!(in_progress, 1);
 
@@ -220,7 +226,10 @@ fn plan_invariants_enforced() {
         &UpdatePlanArgs {
             explanation: None,
             items: (0..8)
-                .map(|i| PlanItemArg::Text(format!("item{i}")))
+                .map(|i| PlanItemArg {
+                    text: format!("item{i}"),
+                    status: PlanStatus::Pending,
+                })
                 .collect(),
         },
         None,
@@ -233,8 +242,8 @@ fn plan_invariants_enforced() {
         &UpdatePlanArgs {
             explanation: None,
             items: vec![
-                PlanItemArg::Text("same".into()),
-                PlanItemArg::Text("same".into()),
+                item("same", PlanStatus::InProgress),
+                item("same", PlanStatus::Pending),
             ],
         },
         None,
@@ -242,13 +251,13 @@ fn plan_invariants_enforced() {
     .unwrap_err();
     assert!(error.to_string().contains("重复"));
 
-    // 完整替换：新计划不含旧项时，消失的旧项保留并标记 Completed（§13 注释语义）。
+    // 完整替换：不提交的旧项不会被猜测为 completed，也不会残留在快照中。
     let previous = build_plan(
         &UpdatePlanArgs {
             explanation: None,
             items: vec![
-                PlanItemArg::Text("old1".into()),
-                PlanItemArg::Text("old2".into()),
+                item("old1", PlanStatus::InProgress),
+                item("old2", PlanStatus::Pending),
             ],
         },
         None,
@@ -257,19 +266,15 @@ fn plan_invariants_enforced() {
     let next = build_plan(
         &UpdatePlanArgs {
             explanation: None,
-            items: vec![PlanItemArg::Text("new1".into())],
+            items: vec![item("new1", PlanStatus::InProgress)],
         },
         Some(&previous),
     )
     .unwrap();
-    assert_eq!(next.items.len(), 3);
-    assert_eq!(next.items[0].status, tpi::tool::plan::PlanStatus::Completed);
-    assert_eq!(next.items[1].status, tpi::tool::plan::PlanStatus::Completed);
-    assert_eq!(
-        next.items[2].status,
-        tpi::tool::plan::PlanStatus::InProgress
-    );
-    // 空 items 清空计划（不保留 Completed）。
+    assert_eq!(next.items.len(), 1);
+    assert_eq!(next.items[0].text, "new1");
+    assert_eq!(next.items[0].status, PlanStatus::InProgress);
+    // 空 items 清空计划。
     let cleared = build_plan(
         &UpdatePlanArgs {
             explanation: None,
@@ -327,18 +332,30 @@ async fn update_plan_and_compaction_integration() {
             assert!(
                 !request.messages.iter().any(|message| matches!(
                     message,
-                    tpi::provider::ChatMessage::User(text) if text.contains("当前焦点")
+                    tpi::provider::ChatMessage::User(text) if text.contains("当前计划（完整快照）")
                 )),
                 "计划快照不得伪装成 User 消息: {:?}",
+                request.messages
+            );
+            // §注入可靠性：update_plan 的 Tool 结果已精简（不再内嵌快照，避免
+            // 历史堆积过期计划文本）——这里只要求 update_plan 以合法 Tool 消息
+            // 存在于历史；当前计划的权威文本由尾部 System 快照提供。
+            assert!(
+                request.messages.iter().any(|message| matches!(
+                    message,
+                    tpi::provider::ChatMessage::Tool { name, .. }
+                        if name == "update_plan"
+                )),
+                "update_plan 必须以 Tool 消息保留在历史: {:?}",
                 request.messages
             );
             assert!(
                 request.messages.iter().any(|message| matches!(
                     message,
-                    tpi::provider::ChatMessage::Tool { name, content, .. }
-                        if name == "update_plan" && content.contains("当前焦点")
+                    tpi::provider::ChatMessage::System(text)
+                        if text.contains("[当前计划·唯一权威") && text.contains("当前计划（完整快照）")
                 )),
-                "计划必须以 update_plan Tool 结果保留: {:?}",
+                "每轮请求尾部必须注入带权威标记的当前计划快照: {:?}",
                 request.messages
             );
         }
@@ -346,7 +363,14 @@ async fn update_plan_and_compaction_integration() {
             step.set(1);
             fake_provider::FakeResponse::with_tool_calls(vec![fake_provider::tool_call(
                 "update_plan",
-                serde_json::json!({"explanation": "fix", "items": ["a", "b", "c"]}),
+                serde_json::json!({
+                    "explanation": "fix",
+                    "items": [
+                        {"text": "a", "status": "in_progress"},
+                        {"text": "b", "status": "pending"},
+                        {"text": "c", "status": "pending"}
+                    ]
+                }),
             )])
         } else if current <= 8 {
             step.set(current + 1);
@@ -423,7 +447,9 @@ async fn update_plan_and_compaction_integration() {
 async fn repeated_failing_action_blocked_in_agent_loop() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-    let config = test_config(&workspace);
+    let mut config = test_config(&workspace);
+    // §用户诉求：默认不限制（0）；本测试专门验证无进展拦截，需显式开启。
+    config.limits.max_identical_no_progress = 2;
     let missing_read = || {
         fake_provider::FakeResponse::with_tool_calls(vec![fake_provider::tool_call(
             "read",

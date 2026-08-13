@@ -74,6 +74,11 @@ pub struct WebFetchArgs {
     /// 目标 URL（仅 http/https；拒绝 loopback/私网/链路本地，禁止内嵌凭据）。
     /// 示例："https://docs.rs/tokio"。
     pub url: String,
+    /// 可选：希望从页面获得什么（§用户诉求：web_fetch 摘要化）。
+    /// 提供后 agent 会用摘要模型按此问题提炼页面，而非把全文塞进上下文。
+    /// 省略时也做摘要，指令退化为“总结页面要点”。
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 #[derive(Clone, Copy)]

@@ -319,12 +319,17 @@ Cost: real execution time, capped by timeout_ms (default 120s, max 24h). \
 Example: bash command=\"cargo test\" timeout_ms=180000"
             }
             BuiltinTool::UpdatePlan => {
-                "Replace the whole short plan atomically (max 7 active items; completed items are \
-kept as history, last 7). Items accept either plain text (status inferred by diff) or an \
-explicit object {\"text\": ..., \"status\": \"completed|in_progress|pending\"}. \
-Only for complex multi-step tasks; simple tasks do not need a plan. It is a progress \
-state, not an extra workflow. \
-Example: update_plan items=[{\"text\": \"fix build\", \"status\": \"in_progress\"}, \"run tests\"]"
+                "Update the plan with a complete explicit snapshot (max 7 total items). Every item \
+MUST be an object {\"text\": ..., \"status\": \"pending|in_progress|completed|cancelled|blocked\"}; \
+never infer status from omitted items. Each call replaces the whole plan, so include every \
+item you want to retain; an empty list clears it. At most one item may be in_progress. \
+Simple tasks do not need a plan. Once a plan exists, update it promptly after EVERY completed \
+step or direction change — do not batch updates until the end. Mark items completed one by \
+one as each is actually done; never mark all remaining items completed at once — a plan with \
+no pending items is finished and stops being injected. If you need a user decision or \
+an external condition, mark the relevant item blocked before asking. \
+Example: update_plan items=[{\"text\": \"inspect build\", \"status\": \"completed\"}, \
+{\"text\": \"fix error\", \"status\": \"in_progress\"}, {\"text\": \"run tests\", \"status\": \"pending\"}]"
             }
             BuiltinTool::WebSearch => {
                 "Search the web (DuckDuckGo HTML endpoint, free, no API key) to discover sources. \
@@ -340,6 +345,8 @@ Example: web_search query=\"rust tokio select\" count=5"
 Output: <external_content source=\"URL\"> wrapping final url/status/content_type/title + \
 body; the full body is saved as an @artifact/... reference. \
 Rejects loopback/private/link-local targets (SSRF guard). \
+IMPORTANT: the `url` MUST come from a web_search result (or the user's explicit link) — \
+never guess or invent URLs; hallucinated URLs 404 or point at the wrong page. \
 Use to read the actual source found by web_search. \
 Cost: network round-trip, ~1-15s depending on site. \
 Example: web_fetch url=\"https://docs.rs/tokio\""

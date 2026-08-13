@@ -78,6 +78,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("model", "查看当前模型"),
     ("session", "查看会话与成本"),
     ("sessions", "浏览并恢复历史会话"),
+    ("theme", "切换主题（UI + 代码高亮）"),
     ("new", "开始新会话"),
     ("cancel", "取消当前 run"),
     ("thinking", "查看推理设置"),
@@ -165,6 +166,13 @@ pub struct Renderer {
     semantic_rows: Vec<Option<RowSemantic>>,
 }
 impl Renderer {
+    /// 运行时切换主题（/theme 菜单）：更新主题并清空渲染缓存——
+    /// md_cache/wrap_cache 的 key 不含 theme，颜色随主题变化必须失效。
+    pub fn set_theme(&mut self, theme: theme::Theme) {
+        self.theme = theme;
+        self.md_cache.clear();
+        self.wrap_cache.clear();
+    }
     /// 初始化终端（§29-30：raw mode + alternate screen（fullscreen）+ bracketed
     /// paste + mouse capture + hide cursor）。P2：主题由配置注入（`[ui] theme`）。
     /// 默认全屏（§1）；inline 仅兼容模式。
@@ -516,6 +524,10 @@ fn render_frame(
     );
     draw_footer(frame, footer_area, view, theme, scrollback, mode);
 
+    // §用户诉求（表格后文字复制）：把本次渲染的 markdown 内容宽度写回 view——
+    // canonical_semantic_text 用它渲染语义文本，与 renderer 的 hit 坐标系
+    // 同宽才不 offset 错位（表格渲染宽度敏感）。
+    view.semantic_width = Some((transcript_width as usize).saturating_sub(RAIL_WIDTH));
     let plan = plan_window(
         view,
         theme,
@@ -546,22 +558,23 @@ fn render_frame(
     };
 
     // 操作型 Modal（§42：/help /settings /doctor 等；覆盖显示，Esc 关闭）。
-    // §用户诉求：/sessions 悬浮窗（Modal）显示选中会话的对话预览——靠上小窗
-    // （标题 + ≤6 行预览），与底部菜单列表错开；其余 Modal 保持居中大框。
+    // §用户诉求：/sessions、/theme 悬浮窗（Modal）是“说明/预览小窗”——靠上
+    // 小框，与底部菜单列表错开；其余 Modal 保持居中大框。
+    // §侧边栏：浮层横向布局一律基于 main_area，打开侧边栏时不覆盖边栏区域。
     // 先画 Modal 再画菜单：菜单浮在最上，列表永不被悬浮窗盖住。
-    let is_session_menu = matches!(
+    let is_menu_browser = matches!(
         view.menu.as_ref().map(|m| m.kind),
-        Some(model::MenuKind::Session)
+        Some(model::MenuKind::Session) | Some(model::MenuKind::Theme)
     );
     if view.modal.is_some() {
-        let w = modal_width(area.width);
-        let h = if is_session_menu {
+        let w = modal_width(main_area.width);
+        let h = if is_menu_browser {
             (10u16).min(trans_area.height.saturating_sub(2).max(1))
         } else {
             modal_height(trans_area.height)
         };
-        let x = area.x + (area.width.saturating_sub(w)) / 2;
-        let y = if is_session_menu {
+        let x = main_area.x + (main_area.width.saturating_sub(w)) / 2;
+        let y = if is_menu_browser {
             trans_area.y + 1
         } else {
             trans_area.y + trans_area.height.saturating_sub(h) / 2
@@ -570,22 +583,26 @@ fn render_frame(
     }
 
     // 命令补全菜单浮层（覆盖在转录区上方，§16.2 之外的小浮层）。
+    // §用户诉求：菜单美化——高度含 2 边框 + 1 快捷键提示行；宽度按内容
+    // 自适应（会话/主题菜单宽，命令/文件菜单窄）。
+    // §用户诉求（菜单滚动）：菜单内容有合理上限（8 项 + 上下 `…` 滚动，
+    // fzf 式标准行为）——命令菜单 14 项、/sessions 几十项时滚动而非撑满
+    // 屏幕；项少（如 3 个文件）时全显示无省略号。draw_menu 内部已有
+    // 窗口跟随选中项的滚动逻辑，这里只定高度。
     if let Some(menu) = &view.menu {
-        let h = (menu.items.len() as u16 + 1).min(9);
-        // §用户诉求（恢复会话可判断）：会话列表比命令/文件补全宽得多
-        // （名字 + 时间 + 事件数 + 短 id），48 列会截断会话名；其余菜单保持窄。
-        let w = match menu.kind {
-            model::MenuKind::Session => area.width.min(96),
-            _ => area.width.min(48),
-        };
+        let h = (menu.items.len() as u16 + 1)
+            .min(8)
+            .saturating_add(3)
+            .min(trans_area.height.max(4));
+        let w = menu_floating_width(menu, main_area.width);
         let y = trans_area.y + trans_area.height.saturating_sub(h);
-        draw_menu(frame, Rect::new(area.x, y, w, h), view, theme);
+        draw_menu(frame, Rect::new(main_area.x, y, w, h), view, theme);
     }
 
     // 搜索框（§14：Ctrl+F；悬浮在转录区顶部）。
     if let Some(search) = &view.search {
-        let w = area.width.clamp(1, 56);
-        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let w = main_area.width.clamp(1, 56);
+        let x = main_area.x + (main_area.width.saturating_sub(w)) / 2;
         let y = trans_area.y;
         let hit_info = if search.query.is_empty() {
             String::from("输入关键词搜索 transcript")
@@ -610,9 +627,9 @@ fn render_frame(
 
     // 详情 Overlay（整改 B：覆盖显示，不重写 scrollback；Esc 关闭）。
     if view.overlay.is_some() {
-        let w = modal_width(area.width);
+        let w = modal_width(main_area.width);
         let h = modal_height(trans_area.height);
-        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let x = main_area.x + (main_area.width.saturating_sub(w)) / 2;
         let y = trans_area.y + trans_area.height.saturating_sub(h) / 2;
         draw_overlay(frame, Rect::new(x, y, w, h), view, theme);
     }
@@ -833,9 +850,8 @@ fn plan_window(
     // §用户诉求：卡片整行背景填满——有背景色（卡片/surface 或 diff 红绿）的
     // 行补空格到满宽，避免「只有文字处有背景」的碎片感。
     // BUG 修复：背景只取**行首 span**（rail/icon/prompt 前缀的 panel 底）或
-    // **Line 级样式**（diff 行的红绿底）。行内元素背景（inline code 的
-    // surface_subtle 等）绝不能被用来填 padding——否则 assistant 裸文本行
-    // 含行内 code 时，行尾空白会泄漏 code 的深色底一直铺到右缘。
+    // **Line 级样式**（diff 行的红绿底）。行内元素背景绝不能被用来填
+    // padding——否则行尾空白会泄漏行内元素的底色一直铺到右缘。
     for line in window.iter_mut() {
         let bg = line
             .spans
@@ -1627,7 +1643,8 @@ fn build_transcript_text(
                                     .bg(theme.panel)
                                     .add_modifier(Modifier::ITALIC),
                             ));
-                            // md 行 span 烙 panel 底（与卡片面一致；保留 inline code 底色）。
+                            // md 行 span 烙 panel 底（与卡片面一致；inline code
+                            // 无背景也随正文烙 panel，仅保留前景色）。
                             for s in &rendered_line.spans {
                                 let mut style = s.style;
                                 if style.bg.is_none() {
@@ -2146,20 +2163,18 @@ fn cached_markdown(
     (lines, links)
 }
 
-/// 侧边栏 Todo 项：全部展示，活跃项置顶、完成历史沉底。侧边栏自身可滚动，
-/// 不再像旧底部计划条那样只截取三项。
+/// 侧边栏 Todo 项：当前项优先，其余开放项随后，终态项沉底。侧边栏自身可滚动。
 fn sidebar_plan_items(plan: &crate::tool::plan::Plan) -> Vec<&crate::tool::plan::PlanItem> {
     use crate::tool::plan::PlanStatus;
-    let mut out: Vec<_> = plan
-        .items
-        .iter()
-        .filter(|item| item.status != PlanStatus::Completed)
-        .collect();
-    out.extend(
-        plan.items
-            .iter()
-            .filter(|item| item.status == PlanStatus::Completed),
-    );
+    let rank = |status| match status {
+        PlanStatus::InProgress => 0,
+        PlanStatus::Pending => 1,
+        PlanStatus::Blocked => 2,
+        PlanStatus::Completed => 3,
+        PlanStatus::Cancelled => 4,
+    };
+    let mut out: Vec<_> = plan.items.iter().collect();
+    out.sort_by_key(|item| rank(item.status));
     out
 }
 
@@ -2182,6 +2197,8 @@ fn draw_sidebar(
         .bg(theme.surface)
         .add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(theme.muted).bg(theme.surface);
+    // 内容列宽 = 整栏 - 左侧竖线 1 列（滚动条单独绘制，不占内容列）。
+    let content_w = area.width.saturating_sub(1) as usize;
 
     // 组装内容行（逻辑行）：todo 段 + 大纲段。
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -2206,10 +2223,22 @@ fn draw_sidebar(
                     crate::tool::plan::PlanStatus::Pending => {
                         ("[ ]", Style::default().fg(theme.muted).bg(theme.surface))
                     }
+                    crate::tool::plan::PlanStatus::Blocked => {
+                        ("[!]", Style::default().fg(theme.error).bg(theme.surface))
+                    }
+                    crate::tool::plan::PlanStatus::Cancelled => (
+                        "[-]",
+                        Style::default()
+                            .fg(theme.muted)
+                            .bg(theme.surface)
+                            .add_modifier(Modifier::DIM),
+                    ),
                 };
-                let text = crate::tui::text::truncate_middle_utf8(
+                // §用户诉求：todo 项按显示列宽截断而非字节——CJK 双宽字符
+                // 不会被严重提前截断；保留头部信息（marker 前缀占 4 列）。
+                let text = crate::tui::text::truncate_head_to_cell_width(
                     &item.text,
-                    area.width.saturating_sub(3) as usize,
+                    content_w.saturating_sub(4),
                     "…",
                 );
                 lines.push(Line::from(vec![Span::styled(
@@ -2233,11 +2262,8 @@ fn draw_sidebar(
         hits.push(None);
     } else {
         for (entry_id, text) in &outline {
-            let shown = crate::tui::text::truncate_middle_utf8(
-                text,
-                area.width.saturating_sub(1) as usize,
-                "…",
-            );
+            let shown =
+                crate::tui::text::truncate_to_cell_width(text, content_w.saturating_sub(1), "…");
             // 大纲行可点击：整行用 hover 色提示可跳转。
             lines.push(Line::from(vec![Span::styled(
                 format!(" {shown}"),
@@ -2248,16 +2274,16 @@ fn draw_sidebar(
     }
     let total_rows = lines.len();
     view.sidebar.total_rows = total_rows;
-
-    // 滚动窗口：内容超出区域高度时按 scroll 偏移取可视段。
+    // §修复：写回可视高度——滚动条点击按比例跳转（scroll_to_ratio）依赖
+    // area_height；此前从未写回（默认 1），点击侧边栏滚动条必跳到底部。
     let area_h = area.height.max(1) as usize;
+    view.sidebar.area_height = area_h;
     let max_start = total_rows.saturating_sub(area_h);
     let start = view.sidebar.scroll.min(max_start);
     let window_lines: Vec<Line<'static>> = lines.iter().skip(start).take(area_h).cloned().collect();
     let window_hits: Vec<Option<EntryId>> = hits.iter().skip(start).take(area_h).cloned().collect();
 
     // 渲染：左侧竖线分隔主区，内容区 surface 背景，右侧 1 列滚动条。
-    let content_w = area.width.saturating_sub(1) as usize;
     let bg = Style::default().bg(theme.surface);
     let mut rendered: Vec<Line<'static>> = Vec::with_capacity(window_lines.len());
     for line in window_lines.iter() {
@@ -2850,7 +2876,67 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
     );
 }
 
-/// 命令补全菜单（输入以 `/` 开头时弹出；↑/↓ 选择、Tab 补全、Enter 选中）。
+/// 菜单项的 (主列 label, 辅助列 desc) 文本（§用户诉求：菜单美化）。
+fn menu_item_texts(menu: &model::MenuView, name: &str, desc: &str) -> (String, String) {
+    match menu.kind {
+        model::MenuKind::SlashCommand => (format!("/{name}"), desc.to_string()),
+        model::MenuKind::File => (name.to_string(), desc.to_string()),
+        // §用户诉求（恢复会话可判断）：会话菜单主列显示名字（首条消息摘要
+        // + 时间 + 事件数），UUID 缩短为辅助列。
+        model::MenuKind::Session => (
+            desc.to_string(),
+            format!("(id {}…)", name.chars().take(13).collect::<String>()),
+        ),
+        model::MenuKind::Theme => (name.to_string(), desc.to_string()),
+    }
+}
+
+/// 菜单浮层宽度：主列（label）按内容自适应，辅助列（sub）给固定预算并在
+/// 行内截断——避免最长 desc 把命令菜单撑得比 transcript 还宽。会话/主题
+/// 菜单预算更大，命令/文件菜单保持窄。
+fn menu_floating_width(menu: &model::MenuView, max_w: u16) -> u16 {
+    let label_w = menu
+        .items
+        .iter()
+        .map(|(name, desc)| crate::tui::text::display_width(&menu_item_texts(menu, name, desc).0))
+        .max()
+        .unwrap_or(0);
+    // §用户诉求（菜单截断怪相）：辅助列按**最长描述自适应**，不再用固定
+    // cap 截断——命令/会话/主题菜单的描述都是短句，完整显示比截断更重要；
+    // 极端长内容（文件路径等）仍由行内 truncate_head 兜底。
+    let sub_w = menu
+        .items
+        .iter()
+        .map(|(name, desc)| crate::tui::text::display_width(&menu_item_texts(menu, name, desc).1))
+        .max()
+        .unwrap_or(0);
+    // ▸+空格(2) + 两列间距(2) + 左右边框(2)。
+    let w = label_w as u16 + 6 + sub_w as u16;
+    w.clamp(28, max_w.min(96))
+}
+
+/// 菜单边框标题（按类型）。
+fn menu_title(kind: model::MenuKind) -> &'static str {
+    match kind {
+        model::MenuKind::SlashCommand => " 命令 ",
+        model::MenuKind::File => " 文件 ",
+        model::MenuKind::Session => " 会话 ",
+        model::MenuKind::Theme => " 主题 ",
+    }
+}
+
+/// 菜单底部快捷键提示（按类型）。
+fn menu_hint(kind: model::MenuKind) -> &'static str {
+    match kind {
+        model::MenuKind::Session | model::MenuKind::Theme => "↑/↓ 选择 · Enter 应用 · Esc 取消",
+        _ => "↑/↓ 选择 · Enter 选中 · Esc 取消",
+    }
+}
+
+/// 命令补全/选择菜单（/命令、@文件、/sessions、/theme）。
+///
+/// §用户诉求：菜单美化——带边框 + 类型标题、选中行整行高亮、主列/辅助列
+/// 对齐、底部快捷键提示；宽度按内容自适应（不再裸文本浮在 transcript 上）。
 fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: theme::Theme) {
     let Some(menu) = &view.menu else {
         return;
@@ -2861,14 +2947,43 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
     if total == 0 {
         return;
     }
-    // §防御：selected 可能因 items 刷新指向旧索引——clamp 到有效范围。
     let selected = menu.selected.min(total - 1);
-    let visible = (rect.height as usize).max(1);
-    // 长菜单（如 /sessions 多会话）：可视窗口跟随选中项，上下用 … 表示有更多；
-    // 否则选中项超出可视区时用户看不到当前选择。
-    let top_ellipsis = total > visible;
-    let bottom_ellipsis = total > visible;
-    let window_rows = visible
+    // 边框内宽（左右各 1 列）与内容高（上下边框 + 底部 hint）。
+    let inner_w = rect.width.saturating_sub(2).max(1) as usize;
+    let inner_h = rect.height.saturating_sub(3).max(1) as usize; // 2 边框 + 1 hint
+
+    // 两列内容宽度（用于对齐：主列 label 左对齐，辅助列从同一列开始）。
+    let mut label_w = 0usize;
+    let mut sub_w = 0usize;
+    let mut texts: Vec<(String, String)> = Vec::with_capacity(total);
+    for (name, desc) in &menu.items {
+        let (label, sub) = menu_item_texts(menu, name, desc);
+        label_w = label_w.max(crate::tui::text::display_width(&label));
+        sub_w = sub_w.max(crate::tui::text::display_width(&sub));
+        texts.push((label, sub));
+    }
+    // 每行前缀（选中标记 ▸ + 空格）占 2 列；两列间距 2 列。
+    let content_w = label_w
+        .saturating_add(2)
+        .saturating_add(sub_w)
+        .saturating_add(4);
+    let inner_w = inner_w.min(content_w.max(2)); // 窄屏不溢出（内容超宽时截断）
+
+    // 长菜单：可视窗口跟随选中项。
+    // §用户诉求（菜单滚动）：`…` 只在对应方向**确实有未显示项**时出现——
+    // 两次计算：先估窗口范围判断省略号（start>0 → 顶部，end<total → 底部），
+    // 再把省略号行数从窗口扣除，重算精确 start/end。避免滚动菜单顶部/底部
+    // 永远挂着 `…`，也避免省略号行溢出 rect。
+    let first_window = inner_h.min(total);
+    let est_start = if total > first_window {
+        (selected.saturating_sub(first_window / 2)).min(total - first_window)
+    } else {
+        0
+    };
+    let est_end = (est_start + first_window).min(total);
+    let top_ellipsis = est_start > 0;
+    let bottom_ellipsis = est_end < total;
+    let window_rows = inner_h
         .saturating_sub(usize::from(top_ellipsis) + usize::from(bottom_ellipsis))
         .max(1);
     let start = if total > window_rows {
@@ -2877,48 +2992,106 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
         0
     };
     let end = (start + window_rows).min(total);
-    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // 行样式：未选中行整行 surface_subtle 底色（菜单浮层面），选中行提亮为
+    // surface + primary 加粗（§用户诉求：菜单选中清晰可见）。
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(window_rows + 2);
     if top_ellipsis {
-        lines.push(Line::styled("…", Style::default().fg(theme.muted)));
+        lines.push(Line::styled(
+            "…",
+            Style::default().fg(theme.muted).bg(theme.surface_subtle),
+        ));
     }
-    for (i, (name, desc)) in menu.items.iter().enumerate().skip(start).take(end - start) {
-        let selected = i == selected;
-        let (glyph, style) = if selected {
-            (
-                "▸",
-                Style::default()
-                    .fg(theme.primary)
-                    .add_modifier(Modifier::BOLD)
-                    .bg(theme.surface),
-            )
+    for (i, (label, sub)) in texts.iter().enumerate().skip(start).take(end - start) {
+        let is_selected = i == selected;
+        let bg = if is_selected {
+            theme.surface
         } else {
-            (" ", Style::default().fg(theme.text))
+            theme.surface_subtle
         };
-        let label = match menu.kind {
-            model::MenuKind::SlashCommand => format!("/{name}"),
-            model::MenuKind::File => name.clone(),
-            // §用户诉求（恢复会话可判断）：会话菜单主列显示名字（首条消息摘要
-            // + 时间 + 事件数），UUID 缩短为辅助列——不再让完整哈希抢视觉主体。
-            model::MenuKind::Session => desc.to_string(),
-        };
-        let sub = match menu.kind {
-            model::MenuKind::Session => {
-                let short: String = name.chars().take(13).collect();
-                format!("  (id {short}…)")
-            }
-            _ => format!("  {desc}"),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{glyph} {label}"), style),
-            Span::styled(sub, Style::default().fg(theme.muted)),
-        ]));
+        let mut spans = vec![
+            Span::styled(
+                if is_selected { "▸ " } else { "  " },
+                if is_selected {
+                    Style::default()
+                        .fg(theme.primary)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(bg)
+                } else {
+                    Style::default().fg(theme.muted).bg(bg)
+                },
+            ),
+            Span::styled(
+                label.clone(),
+                if is_selected {
+                    Style::default()
+                        .fg(theme.primary)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(bg)
+                } else {
+                    Style::default().fg(theme.text).bg(bg)
+                },
+            ),
+        ];
+        // 辅助列对齐：sub 从固定列（▸ 2 + label_w + 间距 2）开始，不足
+        // 对齐宽度时补空格；sub 超宽截断到剩余空间（room 只扣固定前缀，
+        // 否则短 label 行会因 pad 大而把 sub 挤没）。
+        // §用户诉求（菜单截断怪相）：描述是短句，超宽用**尾部截断**
+        // （保留开头 + …）——中段截断会保留孤立的尾字符（如“…代码高亮）”，
+        // 读起来残缺。
+        let pad = label_w.saturating_sub(crate::tui::text::display_width(label)) + 2;
+        let room = inner_w.saturating_sub(label_w + 4);
+        let sub_shown = crate::tui::text::truncate_head_to_cell_width(sub, room, "…");
+        spans.push(Span::styled(
+            format!("{}{sub_shown}", " ".repeat(pad)),
+            Style::default().fg(theme.muted).bg(bg),
+        ));
+        // 补白到内宽：整行背景连续（浮层不露出底下的 transcript）。
+        let cur = unicode_width::UnicodeWidthStr::width(
+            spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .as_str(),
+        );
+        if cur < inner_w {
+            spans.push(Span::styled(
+                " ".repeat(inner_w - cur),
+                Style::default().bg(bg),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
     if bottom_ellipsis {
-        lines.push(Line::styled("…", Style::default().fg(theme.muted)));
+        lines.push(Line::styled(
+            "…",
+            Style::default().fg(theme.muted).bg(theme.surface_subtle),
+        ));
     }
-    // Menu also floats over the transcript: clear the area first so unselected rows do not bleed background text.
+
+    // 边框 + 标题 + hint。整个浮层背景统一为 surface_subtle（§用户诉求：
+    // 背景一致）——Block.style 覆盖边框与标题，hint 行显式补背景，
+    // 选中行才提亮为 surface。
+    let block = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_style(Style::default().fg(theme.border).bg(theme.surface_subtle))
+        .title(menu_title(menu.kind))
+        .style(Style::default().bg(theme.surface_subtle));
+    lines.push(Line::styled(
+        format!("  {}", menu_hint(menu.kind)),
+        Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::DIM)
+            .bg(theme.surface_subtle),
+    ));
+    // 内容区固定背景：无背景的段落会透出底下 transcript（颜色不一致）。
+    let content = Text::from(lines);
+    let styled = Paragraph::new(content)
+        .block(block)
+        .scroll((0, 0))
+        .style(Style::default().bg(theme.surface_subtle));
     frame.render_widget(ratatui::widgets::Clear, rect);
-    frame.render_widget(Paragraph::new(Text::from(lines)), rect);
+    frame.render_widget(styled, rect);
 }
 
 fn fmt_duration(ms: u64) -> String {

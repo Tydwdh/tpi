@@ -18,13 +18,14 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-/// 最大尝试次数（含首次请求；§7.3：指数退避，最多 4 次）。
-const MAX_ATTEMPTS: u32 = 4;
-/// 重试等待总预算（§7.3：只计「重试等待」的累计，不计单次请求耗时——
-/// 防止服务端持续 Retry-After 时无限重试；单次请求本身由 connect_timeout
-/// 和 cancel 约束，SSE 流读取无总超时）。
-const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
-/// 首次退避基准（第 0 次重试）；每次尝试翻倍：500ms → 1s → 2s。
+/// 最大尝试次数（含首次请求；§7.3：指数退避，最多 10 次 = 9 次重试）。
+const MAX_ATTEMPTS: u32 = 10;
+/// 重试等待总预算（§7.3：只计「重试等待」的累计，不计单次请求耗时）。
+/// 值取“9 次重试全按翻倍退避 + jitter 上限 1.4x”的累计上界（约 358s），
+/// 保证本地退避下 10 次尝试都能跑满；同时防止服务端超长 Retry-After
+/// （如 1 小时）导致单次等待无限长。
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(360);
+/// 首次退避基准（第 0 次重试）；每次尝试翻倍：500ms → 1s → 2s → …
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 /// 单个响应允许的 tool call 槽位上限，防止稀疏/恶意 index 触发巨量分配。
 const MAX_STREAM_TOOL_CALLS: usize = 256;
@@ -441,7 +442,9 @@ impl Provider for OpenAiCompatClient {
 /// - `retry_after`（服务端 `Retry-After`）大于本地退避时尊重服务端；
 /// - 否则指数退避 `500ms * 2^attempt` + 随机 jitter（±40%）。
 fn backoff_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
-    let base = INITIAL_BACKOFF * (1u32 << attempt.min(3));
+    // 每次尝试翻倍且不设上限：500ms * 2^attempt（attempt ≤ MAX_ATTEMPTS-2 = 8，
+    // 峰值 2^8 = 128s 基准；u32 溢出不可能）。
+    let base = INITIAL_BACKOFF * (1u32 << attempt);
     let jitter = if cfg!(test) {
         1.0
     } else {
@@ -1217,15 +1220,20 @@ fn sse_transport_error_retryable_only_before_any_event() {
     );
 }
 
-/// §7.3：指数退避，测试环境 jitter=1.0（确定性）。
+/// §7.3：指数退避，测试环境 jitter=1.0（确定性）。每次尝试持续翻倍、
+/// 不设上限（§用户诉求：10 次尝试每次等待翻倍）。
 #[test]
 fn backoff_doubles_per_attempt() {
     let first = backoff_delay(0, None);
     let second = backoff_delay(1, None);
     let third = backoff_delay(2, None);
+    let fourth = backoff_delay(3, None);
+    let ninth = backoff_delay(8, None);
     assert_eq!(first, INITIAL_BACKOFF, "attempt 0 = 初始退避");
     assert_eq!(second, INITIAL_BACKOFF * 2, "attempt 1 翻倍");
     assert_eq!(third, INITIAL_BACKOFF * 4, "attempt 2 再翻倍");
+    assert_eq!(fourth, INITIAL_BACKOFF * 8, "attempt 3 继续翻倍（无上限）");
+    assert_eq!(ninth, INITIAL_BACKOFF * 256, "attempt 8 峰值 128s");
 }
 
 /// §7.3：服务端 Retry-After 大于本地退避时尊重服务端；否则用本地退避。
@@ -1240,17 +1248,25 @@ fn retry_after_respected_when_larger() {
 
 #[test]
 fn retry_after_cannot_exceed_total_wait_budget() {
+    // 61s 在 360s 预算内：允许（区别于旧的 60s 预算）。
     assert_eq!(
         retry_delay_within_budget(0, Some(Duration::from_secs(61)), Duration::ZERO),
+        Some(Duration::from_secs(61))
+    );
+    // 累计已超预算：拒绝（30s 延迟 + 已等 331s > 360s）。
+    assert_eq!(
+        retry_delay_within_budget(0, Some(Duration::from_secs(30)), Duration::from_secs(331)),
         None
     );
+    // 累计恰好等于预算：允许。
     assert_eq!(
-        retry_delay_within_budget(0, Some(Duration::from_secs(30)), Duration::from_secs(31)),
-        None
-    );
-    assert_eq!(
-        retry_delay_within_budget(0, Some(Duration::from_secs(30)), Duration::from_secs(30)),
+        retry_delay_within_budget(0, Some(Duration::from_secs(30)), Duration::from_secs(330)),
         Some(Duration::from_secs(30))
+    );
+    // 超长 Retry-After（> 预算）直接拒绝。
+    assert_eq!(
+        retry_delay_within_budget(0, Some(Duration::from_secs(361)), Duration::ZERO),
+        None
     );
 }
 

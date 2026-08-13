@@ -388,9 +388,10 @@ pub enum Entry {
         line: TranscriptLine,
         /// 搜索用小写 haystack 缓存（惰性；§成熟化避免每键全量 to_lowercase）。
         search_cache: Option<String>,
-        /// 选区文本用的语义文本缓存（键为 line.version；§成熟化避免每次
-        /// 复制都重新跑 markdown 渲染）。
-        semantic_cache: Option<(u64, String)>,
+        /// 选区文本用的语义文本缓存（键为 (line.version, width)；§成熟化避免
+        /// 每次复制都重新跑 markdown 渲染；宽度参与键——表格渲染宽度敏感，
+        /// 宽度变化必须失效（§用户诉求：表格后文字复制）。
+        semantic_cache: Option<(u64, Option<usize>, String)>,
     },
     Tool {
         id: EntryId,
@@ -489,6 +490,8 @@ pub enum MenuKind {
     File,
     /// `/sessions` 会话列表：Enter 恢复选中 session。
     Session,
+    /// `/theme` 主题列表：Enter 应用选中主题（UI + 代码高亮）。
+    Theme,
 }
 
 /// 流式消息（TUI v2 §7.2：live 区，finalize 前不进 transcript）。
@@ -555,6 +558,11 @@ pub struct ViewModel {
     pub layout_top: Option<(EntryId, usize)>,
     /// 各 entry 最近一次布局的 visual 高度（renderer 写回；滚动跨 entry 用）。
     pub entry_heights: HashMap<EntryId, usize>,
+    /// §用户诉求（表格后文字复制）：最近一次渲染的内容宽度（renderer 写回）。
+    /// canonical_semantic_text 用它渲染语义文本——表格渲染对宽度敏感
+    /// （列宽收缩/退化），与 renderer 的 hit 坐标系同宽才不 offset 错位。
+    /// None（尚未渲染）→ 用 width=None（表格自然宽），语义仍可用。
+    pub semantic_width: Option<usize>,
     /// 最近一次布局的转录区高度（PageUp/PageDown 按 viewport-2 移动，§10）。
     pub transcript_rows: u16,
     /// 排队中的待提交消息数（footer 提示；由 UiState 同步）。
@@ -624,6 +632,7 @@ impl Default for ViewModel {
             pending_below: 0,
             layout_top: None,
             entry_heights: HashMap::new(),
+            semantic_width: None,
             transcript_rows: 0,
             pending_queue_len: 0,
             reasoning_expanded: std::collections::HashSet::new(),
@@ -652,7 +661,9 @@ impl Default for ViewModel {
 }
 
 /// 侧边栏宽度（列）：右侧竖栏固定宽度；打开时主区让出该宽度。
-pub const SIDEBAR_WIDTH: u16 = 30;
+/// §用户诉求：加宽到 40——todo/大纲长文本可见更多（30 列只能显示约 9 个
+/// CJK 字符，多数项被截断到几乎不可读）。
+pub const SIDEBAR_WIDTH: u16 = 40;
 
 impl ViewModel {
     /// 标记 transcript 结构变化（wrap 缓存失效依据；§性能）。
@@ -1500,18 +1511,20 @@ impl ViewModel {
                 } => {
                     // ③ Canonical Semantic Text：与 renderer hit 坐标系一致——
                     // 用渲染后纯文本（markdown 去样式），而非原始 markdown。
-                    // 缓存键 = line.version（文本变化 → 缓存失效）。
-                    if let Some((version, cached)) = semantic_cache {
-                        if *version == line.version {
+                    // 缓存键 = (line.version, width)：表格渲染宽度敏感，
+                    // 宽度变化必须重新渲染（§用户诉求：表格后文字复制）。
+                    let width = self.semantic_width;
+                    if let Some((version, w, cached)) = semantic_cache {
+                        if *version == line.version && *w == width {
                             cached.clone()
                         } else {
-                            let fresh = canonical_semantic_text(line.kind, &line.text);
-                            *semantic_cache = Some((line.version, fresh.clone()));
+                            let fresh = canonical_semantic_text(line.kind, &line.text, width);
+                            *semantic_cache = Some((line.version, width, fresh.clone()));
                             fresh
                         }
                     } else {
-                        let fresh = canonical_semantic_text(line.kind, &line.text);
-                        *semantic_cache = Some((line.version, fresh.clone()));
+                        let fresh = canonical_semantic_text(line.kind, &line.text, width);
+                        *semantic_cache = Some((line.version, width, fresh.clone()));
                         fresh
                     }
                 }
@@ -1519,16 +1532,17 @@ impl ViewModel {
             };
             candidates.push((entry_id, text));
         }
+        let width = self.semantic_width;
         if let Some(msg) = &self.live.assistant {
             candidates.push((
                 msg.entry_id,
-                canonical_semantic_text(LineKind::Assistant, &msg.text),
+                canonical_semantic_text(LineKind::Assistant, &msg.text, width),
             ));
         }
         if let Some(msg) = &self.live.reasoning {
             candidates.push((
                 msg.entry_id,
-                canonical_semantic_text(LineKind::Reasoning, &msg.text),
+                canonical_semantic_text(LineKind::Reasoning, &msg.text, width),
             ));
         }
         // §PointerHit ⑤：运行中工具卡片也在候选（独立稳定 id）。
@@ -1855,6 +1869,10 @@ impl ViewModel {
                 // 会话选择由 app 层处理（需要重建 SessionLog/history），这里只关闭菜单。
                 self.menu = None;
             }
+            MenuKind::Theme => {
+                // 主题选择由 app 层处理（应用主题 + 写配置），这里只关闭菜单。
+                self.menu = None;
+            }
         }
     }
 
@@ -1917,11 +1935,11 @@ fn entry_memory_bytes(entry: &Entry) -> usize {
 /// ③ Canonical Semantic Text：消息的「用户看到的纯文本」（markdown 渲染后
 /// 去样式）。renderer 的 hit-test 与 ViewModel::selected_text 必须基于同一份
 /// 文本，否则鼠标 offset 与复制内容分叉（一个用 rendered、一个用 raw）。
-fn canonical_semantic_text(kind: LineKind, raw: &str) -> String {
+fn canonical_semantic_text(kind: LineKind, raw: &str, width: Option<usize>) -> String {
     match kind {
         // markdown 渲染的正文：User/Assistant 走同一 renderer。
         LineKind::User | LineKind::Assistant => {
-            let rendered = crate::tui::render_markdown(raw, crate::tui::theme::Theme::omp(), None);
+            let rendered = crate::tui::render_markdown(raw, crate::tui::theme::Theme::omp(), width);
             rendered
                 .iter()
                 .map(|line| {

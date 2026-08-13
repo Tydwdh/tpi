@@ -38,13 +38,21 @@ impl<T> Drop for AbortTaskOnDrop<T> {
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
 
 /// §4.3 第二阶段：text-only attempt 断联后的最大自动续写次数。
-/// 只允许一次（防无限续写循环）；已出现 tool delta 的 attempt 不自动续。
-pub const MAX_STREAM_RECOVERIES: u32 = 1;
+/// §用户诉求：与第 1 层传输层重试一致提升到 10 次（每次续写注入 recovery
+/// instruction，从断点继续且不复述）；已出现 tool delta 的 attempt 不自动续。
+pub const MAX_STREAM_RECOVERIES: u32 = 10;
 
 /// §4.3 第三阶段：partial tool-call 后整个 model turn 重新生成的最大次数。
-/// 只允许一次（防无限 restart）；tool-call 场景风险更大，恢复一次后仍失败
-/// 就如实上报 ProviderInterrupted。
-pub const MAX_TURN_RESTARTS: u32 = 1;
+/// §用户诉求：同样提升到 10 次；每次重新发起原始请求（不续接 partial JSON，
+/// 避免解析风险），全部失败后如实上报 ProviderInterrupted。
+pub const MAX_TURN_RESTARTS: u32 = 10;
+
+/// §用户诉求（软着陆）：达到 max_model_turns 前的最后一轮注入收尾指令——
+/// 让模型总结已完成工作与剩余建议（OpenCode 式），而不是硬断。
+/// harness control metadata：不进 durable conversation，不进 session。
+const FINAL_TURN_INSTRUCTION: &str = "\
+这是本次运行的最后一个回合。请不要再调用新的工具，
+总结你已完成的工作，并给出剩余待办与建议，然后结束。";
 
 /// 续写请求注入的 recovery instruction（§4.3：harness control metadata，
 /// 不进 durable conversation，不进 session）。
@@ -102,6 +110,19 @@ pub enum RunFailure {
     Session(String),
     #[error("budget exceeded: {0}")]
     BudgetExceeded(BudgetKind),
+}
+
+/// compaction 失败的细分原因（§用户诉求：手动 /compact 失败时 UI 区分提示）。
+#[derive(Debug)]
+enum CompactionFailure {
+    /// 模型未返回有效摘要（空输出或极短无内容；raw 为原始输出供 UI 诊断）。
+    SummaryInvalid { raw: String },
+    /// 摘要解析成功但缩小比例不显著（is_significant_shrink 不满足）。
+    NotSignificant,
+    /// provider 层失败（连接/响应异常）。
+    Provider(String),
+    /// session 持久化失败。
+    Session(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +187,9 @@ pub enum RuntimeEvent {
     /// partial tool-call 后整个 model turn 重新生成（第三阶段 §4.3）。
     /// UI 应丢弃当前 attempt 的 partial 展示（不进 transcript）。
     TurnRestarting { attempt: u32 },
+    /// 手动 /compact 的结果反馈（§用户诉求：压缩未生效时用户可见，
+    /// 此前只写日志、界面无感知）。
+    CompactionNotice { message: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,23 +250,31 @@ pub async fn run<P: Provider>(
     let cancel_cause = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
         crate::agent::limits::CANCEL_CAUSE_USER,
     ));
-    let warn_ui = ui.clone();
-    let cause_for_watchdog = cancel_cause.clone();
-    let (watchdog, _wall) = crate::agent::limits::spawn_watchdog(
-        &config.limits,
-        cancel.clone(),
-        move || {
-            cause_for_watchdog.store(
-                crate::agent::limits::CANCEL_CAUSE_WALL_TIME,
-                std::sync::atomic::Ordering::SeqCst,
-            );
-        },
-        move || {
-            tracing::info!("run approaching wall-time budget");
-            let _ = warn_ui.try_send(RuntimeEvent::BudgetWarning);
-        },
-    );
-    let watchdog = AbortTaskOnDrop(watchdog);
+    // §用户诉求：max_wall_time_minutes=0（默认）不启动 watchdog——不限制。
+    // 占位任务立即结束，AbortTaskOnDrop 包装类型一致、drop 无副作用。
+    let watchdog = if config.limits.max_wall_time_minutes > 0 {
+        let warn_ui = ui.clone();
+        let cause_for_watchdog = cancel_cause.clone();
+        let (watchdog, _wall) = crate::agent::limits::spawn_watchdog(
+            &config.limits,
+            cancel.clone(),
+            move || {
+                cause_for_watchdog.store(
+                    crate::agent::limits::CANCEL_CAUSE_WALL_TIME,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            },
+            move || {
+                tracing::info!("run approaching wall-time budget");
+                let _ = warn_ui.try_send(RuntimeEvent::BudgetWarning);
+            },
+        );
+        AbortTaskOnDrop(watchdog)
+    } else {
+        AbortTaskOnDrop(tokio::spawn(async {
+            crate::agent::limits::BudgetEnd::None
+        }))
+    };
 
     let mut usage_total = Usage::default();
     let mut messages: Vec<ChatMessage> = history.to_vec();
@@ -260,7 +292,8 @@ pub async fn run<P: Provider>(
         messages.push(ChatMessage::User(user_message.clone()));
     }
     // P1-10：手动 /compact——在第一个完整边界无条件执行一次压缩。
-    // 失败（历史不足/不显著）不中断 run，只记录日志。
+    // 结果（成功/跳过）反馈到 UI（§用户诉求）：压缩成功、无收益、历史不足
+    // 都明确提示，不再只写日志。
     if force_compaction && messages.len() > 1 {
         match compact_turn(
             provider,
@@ -272,10 +305,61 @@ pub async fn run<P: Provider>(
         )
         .await
         {
-            Ok(()) => ensure_plan_state_messages(&mut messages, initial_plan.as_ref()),
-            Err(error @ RunFailure::Session(_)) => return Err(error),
-            Err(error) => tracing::warn!(error = %error, "manual compaction failed"),
+            Ok(()) => {
+                ensure_plan_state_messages(&mut messages, initial_plan.as_ref());
+                let _ = ui
+                    .send(RuntimeEvent::CompactionNotice {
+                        message: "手动压缩完成：旧历史已压缩为摘要，上下文已精简".into(),
+                    })
+                    .await;
+            }
+            // §用户诉求：细分失败原因——模型未按格式返回 / 无显著收益 /
+            // provider 失败 / session 失败，分别提示，不再笼统一句。
+            Err(CompactionFailure::SummaryInvalid { raw }) => {
+                tracing::warn!("manual compaction: summary invalid");
+                // §用户诉求：失败可见——带模型原文前缀，用户能判断是格式
+                // 问题还是模型没干活。
+                let preview: String = raw.chars().take(120).collect();
+                let preview = if raw.chars().count() > 120 {
+                    format!("{preview}…")
+                } else {
+                    preview
+                };
+                let _ = ui
+                    .send(RuntimeEvent::CompactionNotice {
+                        message: format!(
+                            "手动压缩未生效：模型未返回有效摘要。模型输出：{preview:?}"
+                        ),
+                    })
+                    .await;
+            }
+            Err(CompactionFailure::NotSignificant) => {
+                tracing::warn!("manual compaction: not significant");
+                let _ = ui
+                    .send(RuntimeEvent::CompactionNotice {
+                        message: "手动压缩未生效：摘要无显著收益（历史本身已较精简或摘要过长）"
+                            .into(),
+                    })
+                    .await;
+            }
+            Err(CompactionFailure::Provider(error)) => {
+                tracing::warn!(error = %error, "manual compaction: provider failed");
+                let _ = ui
+                    .send(RuntimeEvent::CompactionNotice {
+                        message: format!("手动压缩未生效：压缩请求失败（{error}）"),
+                    })
+                    .await;
+            }
+            Err(CompactionFailure::Session(error)) => {
+                return Err(RunFailure::Session(error));
+            }
         }
+    } else if force_compaction {
+        let _ = ui
+            .send(RuntimeEvent::CompactionNotice {
+                message: "手动压缩未生效：没有可压缩的历史（当前对话过短）".into(),
+            })
+            .await;
     }
     // 工具共享状态与 ToolContext 构造由 run-scoped runtime 统一管理。
     let tool_runtime = ToolRuntime::new(
@@ -297,7 +381,8 @@ pub async fn run<P: Provider>(
     // §15.4：同一阈值区间内 compaction 失败后不反复调用模型。
     let mut compaction_failed = false;
     let final_reason: CompletionReason = 'run_loop: loop {
-        if turn >= config.limits.max_model_turns {
+        // §用户诉求：max_model_turns=0 = 不限制（默认）。
+        if config.limits.max_model_turns > 0 && turn >= config.limits.max_model_turns {
             session
                 .append_event(&SessionEvent::RunCompleted {
                     reason: CompletionReason::MaxTurns,
@@ -354,11 +439,13 @@ pub async fn run<P: Provider>(
                             break 'run_loop CompletionReason::ContextOverflow;
                         }
                     }
-                    Err(error @ RunFailure::Session(_)) => return Err(error),
+                    Err(CompactionFailure::Session(error)) => {
+                        return Err(RunFailure::Session(error));
+                    }
                     Err(error) => {
                         // §15.4 第 6 条：失败不循环；继续确定性 prune，仍无法容纳则明确停止。
                         compaction_failed = true;
-                        tracing::warn!(error = %error, "compaction failed; not retrying in this band");
+                        tracing::warn!(error = ?error, "compaction failed; not retrying in this band");
                         // 确定性 prune 兜底（§15.3：只影响投影）。
                         messages = crate::context::prune_messages(messages);
                         let plan = tool_runtime.plan_snapshot();
@@ -397,20 +484,36 @@ pub async fn run<P: Provider>(
             // 续写 attempt 的 recovery instruction 是 harness control metadata：
             // 作为 ephemeral system instruction 注入 build_context（不进 session、
             // 不进对话投影），而不是伪装成 User 消息。
-            let ephemeral_system = if stream_recoveries > 0 {
+            let mut ephemeral_system = if stream_recoveries > 0 {
                 Some(STREAM_RECOVERY_INSTRUCTION.replace("{partial}", &content))
             } else if manual_retry_continuation && turn == 1 {
                 Some(MANUAL_CONTINUE_INSTRUCTION.to_string())
             } else {
                 None
             };
+            // §用户诉求（软着陆）：max_model_turns 已配且这是最后一轮时，
+            // 在既有 ephemeral 指令上追加收尾提示（turn 在循环开头已 ++，
+            // 第 max 轮检查通过后 ++ 到 max = 最后一轮）。
+            if config.limits.max_model_turns > 0 && turn == config.limits.max_model_turns {
+                let base = ephemeral_system.take().unwrap_or_default();
+                ephemeral_system = Some(if base.is_empty() {
+                    FINAL_TURN_INSTRUCTION.to_string()
+                } else {
+                    format!("{base}\n\n{FINAL_TURN_INSTRUCTION}")
+                });
+            }
             // 自动续写的文本先在 attempt 缓冲区聚合。provider 常会从上一段或
             // 整个回答开头重放；若边收边直接 push 到 TUI，去重时已经太晚。
             let recovering_text = stream_recoveries > 0;
             let mut recovery_content = String::new();
             let request = ModelRequest {
                 model: config.model.name.clone(),
-                messages: build_context(config, &messages, ephemeral_system.as_deref()),
+                messages: build_context(
+                    config,
+                    &messages,
+                    ephemeral_system.as_deref(),
+                    tool_runtime.plan_snapshot().as_ref(),
+                ),
                 tools: tool_defs.clone(),
                 max_output_tokens: config.model.max_output_tokens,
                 reasoning: config.model.reasoning.clone(),
@@ -707,7 +810,12 @@ pub async fn run<P: Provider>(
                 &tool_runtime,
                 &ui,
             )
-            .execute(response.tool_calls, &mut tool_calls_total)
+            .execute(
+                provider,
+                response.tool_calls,
+                &mut tool_calls_total,
+                &mut usage_total,
+            )
             .await?;
             if batch == BatchEnd::BudgetExceeded {
                 // P1-2：工具预算超限用独立 reason（此前归为 Error，
@@ -968,7 +1076,7 @@ async fn compact_turn<P: Provider>(
     config: &Config,
     cancel: &CancellationToken,
     usage_total: &mut Usage,
-) -> Result<(), RunFailure> {
+) -> Result<(), CompactionFailure> {
     // 1. 先 prune 大 tool output（§15.3）。
     // P0-3：以 runtime messages 计算压缩内容（与调用方看到的上下文一致）；
     // 用 session 投影计算 covered 边界——正常路径下两者消息数一致，
@@ -996,9 +1104,9 @@ async fn compact_turn<P: Provider>(
     let seq = session.seq();
     let next_seq = seq
         .checked_add(1)
-        .ok_or_else(|| RunFailure::Session("session seq 已耗尽".into()))?;
+        .ok_or_else(|| CompactionFailure::Session("session seq 已耗尽".into()))?;
     let events = crate::session::read_events_with_seq(session.path())
-        .map_err(|e| RunFailure::Session(e.to_string()))?;
+        .map_err(|e| CompactionFailure::Session(e.to_string()))?;
     let projected = crate::session::project_messages_with_ranges(&events);
     let recent_start_seq = if projected.len() == pruned.len() {
         projected[split..]
@@ -1022,7 +1130,9 @@ async fn compact_turn<P: Provider>(
         model: config.model.name.clone(),
         messages: crate::context::compaction_request_messages(&history),
         tools: Vec::new(), // §15.4：compaction request 不提供任何工具 schema。
-        max_output_tokens: Some(1024),
+        // §用户诉求：摘要输出预算 1024 → 2048——大历史（300k 窗口）下
+        // 1024 token 偏小，摘要被截断更容易丢核心字段。
+        max_output_tokens: Some(2048),
         reasoning: config.model.reasoning.clone(),
         context_window: config.model.context_window,
     };
@@ -1037,7 +1147,7 @@ async fn compact_turn<P: Provider>(
                 }
             }
             result = &mut stream => {
-                break result.map_err(|e| RunFailure::Provider(e.to_string()))?;
+                break result.map_err(|e| CompactionFailure::Provider(e.to_string()))?;
             }
         }
     };
@@ -1051,12 +1161,13 @@ async fn compact_turn<P: Provider>(
     if response.finish_reason != crate::provider::FinishReason::Stop
         || !response.tool_calls.is_empty()
     {
-        return Err(RunFailure::Provider(format!(
+        return Err(CompactionFailure::Provider(format!(
             "invalid compaction response: finish={:?}, tool_calls={}",
             response.finish_reason,
             response.tool_calls.len()
         )));
     }
+    let raw_summary = summary_text.clone(); // 保留原始输出（诊断用）
     let summary_text = crate::context::parse_summary(&summary_text);
     let summary_tokens = crate::context::estimate_tokens(&summary_text);
     let original_tokens = crate::context::estimate_messages(&history);
@@ -1069,12 +1180,12 @@ async fn compact_turn<P: Provider>(
     );
 
     // 4. 校验必填字段和压缩后估算；只有明显缩小才提交（§15.4 第 5 条）。
-    if summary_text.is_empty()
-        || !crate::context::is_significant_shrink(original_tokens, summary_tokens)
-    {
-        return Err(RunFailure::ToolInfrastructure(
-            "compaction summary invalid or not significant".into(),
-        ));
+    // §用户诉求：细分失败原因（SummaryInvalid vs NotSignificant）。
+    if summary_text.is_empty() {
+        return Err(CompactionFailure::SummaryInvalid { raw: raw_summary });
+    }
+    if !crate::context::is_significant_shrink(original_tokens, summary_tokens) {
+        return Err(CompactionFailure::NotSignificant);
     }
     session
         .append_event(&SessionEvent::CompactionCommitted {
@@ -1084,7 +1195,7 @@ async fn compact_turn<P: Provider>(
             },
         })
         .and_then(|_| session.sync_data())
-        .map_err(|e| RunFailure::Session(e.to_string()))?;
+        .map_err(|e| CompactionFailure::Session(e.to_string()))?;
 
     // 5. 重建投影：最新 summary + 保留的最近 turns（§15.4：旧 raw 不重复注入）。
     *messages = Vec::with_capacity(recent.len() + 1);
@@ -1123,11 +1234,23 @@ fn system_prompt_text(config: &Config, ephemeral_system: Option<&str>) -> String
 
 /// 构造上下文 projection（§15.1 顺序：system → 用户目标 → 历史 turns → 当前输入在尾部）。
 ///
-/// §13：计划通过正常的 `assistant(update_plan) → tool result` 协议事实进入上下文。
-/// 不能把计划伪造成尾部 User 消息，否则模型会把每次请求都理解成用户再次要求
-/// “按 Todo 继续”，反复确认/复述计划。runtime 只补一次合法的 synthetic tool
-/// round 恢复被 compaction 移除的状态；正常计划轮保持原始时序，由 compaction
-/// 在窗口压力下统一归纳，避免日常更新改写历史前缀、破坏 prompt cache。
+/// §13：计划通过正常的 `assistant(update_plan) → tool result` 协议事实进入上下文，
+/// 但那只保证计划“存在过”，长任务中段 plan 会被后续工具输出挤到注意力边缘。
+/// §用户诉求：每轮在**请求尾部**注入一条 system 角色的当前计划快照（`[当前计划·唯一权威]`）——
+/// 用 system 角色（不是 User 消息）避免模型把计划当“用户再次要求按 Todo 继续”
+/// 而反复确认/复述（旧坑见下）；放**尾部**而非 system 后，保持 system + 全部
+/// 历史这个缓存前缀不变——plan 只在变化那轮打断尾部的一小段，稳定历史仍可命中
+/// provider prompt cache。
+///
+/// 不变量：
+/// - 有 plan 且非空才注入（无 plan 不打扰）；
+/// - 注入内容 = plan_snapshot（§用户诉求：全部活跃项 + 完成计数——模型
+///   每轮看到完整剩余计划才能准确增量更新），与侧边栏展示同一数据源
+///   （tool::plan::plan_snapshot）；
+/// - 不落 session、不进入对话投影（每次请求重建）。
+///
+/// 旧坑：不能把计划伪造成尾部 User 消息，否则模型反复确认/复述计划。
+/// 正常计划轮保持原始时序，由 compaction 在窗口压力下统一归纳。
 ///
 /// `ephemeral_system`：本次 request 的 harness control metadata（§4.3 续写指令），
 /// 以 system 指令注入，不进入对话投影。
@@ -1135,6 +1258,7 @@ fn build_context(
     config: &Config,
     messages: &[ChatMessage],
     ephemeral_system: Option<&str>,
+    plan: Option<&crate::tool::plan::Plan>,
 ) -> Vec<ChatMessage> {
     let mut out = Vec::with_capacity(messages.len() + 3);
     out.push(ChatMessage::System(system_prompt_text(
@@ -1142,6 +1266,17 @@ fn build_context(
         ephemeral_system,
     )));
     out.extend_from_slice(messages);
+    // 尾部注入当前计划快照（system 角色；无 plan 或空 plan 不注入）。
+    // §用户诉求：明确同步节奏——每完成一个步骤或方向改变就 update_plan。
+    // §注入可靠性（用户反馈）：历史里 update_plan 的 tool result 不再带快照，
+    // 但**必须**让模型区分“当前权威快照”与任何历史计划文本——用专属标记
+    // 前缀 + 明确“以此为准，忽略历史中的任何旧计划”，防止模型引用过期快照。
+    let snapshot = crate::tool::plan::plan_snapshot(plan);
+    if !snapshot.is_empty() {
+        out.push(ChatMessage::System(format!(
+            "[当前计划·唯一权威·完整快照·以此为准]（每次 update_plan 都提交完整显式计划；每完成一项立即单独标记 completed，未完成项保持 pending/in_progress，不要一次性把全部项标记 completed。需要用户决定或外部条件时，先标记 blocked，再提问；忽略对话历史中出现的任何旧计划）：\n{snapshot}"
+        )));
+    }
     out
 }
 
@@ -1224,11 +1359,43 @@ pub fn session_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        AbortTaskOnDrop, ensure_plan_state_messages, recoverable_stream_interrupt,
+        AbortTaskOnDrop, build_context, ensure_plan_state_messages, recoverable_stream_interrupt,
         recovery_overlap_bytes,
     };
     use crate::provider::ChatMessage;
     use crate::tool::plan::{Plan, PlanItem, PlanStatus};
+
+    /// 最小可用 Config（build_context 只读 system_prompt_extra 等字段）。
+    fn unit_config() -> crate::config::Config {
+        crate::config::Config {
+            model: crate::config::ModelConfig {
+                provider: "test".into(),
+                name: "fake-model".into(),
+                base_url: "https://example.invalid/v1".into(),
+                reasoning: None,
+                max_output_tokens: None,
+                context_window: None,
+                api_key_env: "TPI_TEST_API_KEY".into(),
+                price_input: None,
+                price_output: None,
+            },
+            limits: crate::config::LimitsConfig::default(),
+            workspace_root: camino::Utf8PathBuf::from("fake"),
+            sessions_root: std::path::PathBuf::from(".tpi-test-sessions"),
+            artifacts_root: std::path::PathBuf::from(".tpi-test-artifacts"),
+            shell_path: None,
+            safety_reserve_tokens: 8192,
+            ui_mode: crate::tui::terminal::ViewMode::default(),
+            ui_keymap: crate::tui::keymap::Keymap::builtin(),
+            ui_collapsed_lines: 10,
+            auto_open_browser: false,
+            web_summary_model: "none".into(),
+            system_prompt_extra: None,
+            source: "test".into(),
+            ui_theme: "omp".into(),
+            allow_outside_workspace: true,
+        }
+    }
 
     struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
@@ -1261,6 +1428,69 @@ mod tests {
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "guard drop 必须 abort 并销毁后台 task"
         );
+    }
+
+    /// §用户诉求：build_context 在请求尾部注入当前计划快照（system 角色）——
+    /// 模型每轮都能看到 todo，而不是只存在于历史某条 update_plan tool result。
+    /// 缓存语义：plan 不变时注入文本稳定，不破坏前缀缓存。
+    #[test]
+    fn build_context_appends_current_plan_as_system_role() {
+        let plan = Plan {
+            explanation: Some("修复侧边栏".into()),
+            items: vec![PlanItem {
+                text: "加宽侧边栏".into(),
+                status: PlanStatus::InProgress,
+            }],
+        };
+        let config = unit_config();
+        let messages = vec![ChatMessage::User("hello".into())];
+        let ctx = build_context(&config, &messages, None, Some(&plan));
+        // 首条 = system prompt；中间 = 原 messages；尾部 = plan 快照（system 角色）。
+        assert!(
+            matches!(&ctx[0], ChatMessage::System(_)),
+            "首条是 system prompt"
+        );
+        assert!(matches!(&ctx[1], ChatMessage::User(_)), "中间是原消息");
+        assert_eq!(ctx.len(), 3, "尾部追加一条 plan 快照");
+        let tail = match &ctx[2] {
+            ChatMessage::System(text) => text.clone(),
+            other => panic!("尾部必须是 system 角色: {other:?}"),
+        };
+        assert!(
+            tail.contains("[当前计划·唯一权威"),
+            "必须带唯一权威标记: {tail}"
+        );
+        assert!(tail.contains("加宽侧边栏"), "快照含计划项: {tail}");
+        assert!(
+            !tail.contains("hello"),
+            "注入不得污染原对话（不是 User 消息）: {tail}"
+        );
+    }
+
+    /// §用户诉求：全部项完成/取消后计划结束，build_context 不再注入尾部。
+    #[test]
+    fn build_context_skips_injection_when_plan_fully_completed() {
+        let plan = Plan {
+            explanation: None,
+            items: vec![PlanItem {
+                text: "done".into(),
+                status: PlanStatus::Completed,
+            }],
+        };
+        let config = unit_config();
+        let messages = vec![ChatMessage::User("hi".into())];
+        let ctx = build_context(&config, &messages, None, Some(&plan));
+        assert_eq!(ctx.len(), 2, "全部完成后的计划不再注入尾部");
+    }
+
+    /// 无 plan 时不注入尾部（不打扰、不增加 token）。
+    #[test]
+    fn build_context_without_plan_injects_nothing() {
+        let config = unit_config();
+        let messages = vec![ChatMessage::User("hi".into())];
+        let ctx = build_context(&config, &messages, None, None);
+        assert_eq!(ctx.len(), 2, "无 plan 时只有 system + 原消息");
+        assert!(matches!(&ctx[1], ChatMessage::User(_)));
     }
 
     #[test]

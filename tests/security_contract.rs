@@ -157,6 +157,7 @@ async fn production_web_fetch_blocks_localhost() {
     let outcome = web_fetch(
         WebFetchArgs {
             url: "http://127.0.0.1:1/".into(),
+            prompt: None,
         },
         &ctx,
     )
@@ -205,6 +206,7 @@ async fn private_target_policy_is_scoped_to_test_request() {
     let outcome = web_fetch_allowing_private_for_test(
         WebFetchArgs {
             url: format!("http://{addr}/page"),
+            prompt: None,
         },
         &ctx,
     )

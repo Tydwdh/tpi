@@ -142,13 +142,12 @@ pub(crate) fn render_markdown_detailed(
                     table_push_text(&mut table, &t);
                     continue;
                 }
+                // §用户诉求：行内代码与代码块一致——只做颜色变化（primary
+                // 前景色），不加背景，避免裸文本/面板里突兀。
                 push_span(
                     &mut current,
                     &mut line_chars,
-                    Span::styled(
-                        t.to_string(),
-                        Style::default().fg(theme.primary).bg(theme.surface_subtle),
-                    ),
+                    Span::styled(t.to_string(), Style::default().fg(theme.primary)),
                 );
             }
             Event::SoftBreak | Event::HardBreak => flush_line(
@@ -445,12 +444,7 @@ fn highlight_code_or_fallback(
         Ok(lines) if !lines.is_empty() => lines,
         Ok(_) | Err(_) => code
             .split('\n')
-            .map(|line| {
-                Line::styled(
-                    line.to_string(),
-                    Style::default().fg(theme.muted).bg(theme.surface_subtle),
-                )
-            })
+            .map(|line| Line::styled(line.to_string(), Style::default().fg(theme.muted)))
             .collect(),
     }
 }
@@ -541,7 +535,9 @@ fn render_table(
 
     const PADDING: usize = 1;
     const MIN_COL: usize = 2;
-    let border = Style::default().fg(theme.muted);
+    // §用户诉求：表格边框与侧边栏竖线一致——不设前景色，用终端默认前景
+    // （此前 fg(muted) 灰紫偏暗，而侧边栏竖线是默认前景亮色，观感不一致）。
+    let border = Style::default();
     let header_style = Style::default().fg(theme.text).add_modifier(Modifier::BOLD);
 
     // 列分类与指标（§codex collect_table_column_metrics）。
@@ -677,9 +673,16 @@ fn render_table(
     let mut out: Vec<Line<'static>> = Vec::with_capacity(4 + body.len());
     out.push(sep('┌', '┬', '┐', '─'));
     out.extend(row_line(&header, header_style));
+    // 表头下分隔（┌→├ 换线）：表头与表体之间的横向分割线。
     out.push(sep('├', '┼', '┤', '─'));
-    for row in &body {
+    // §用户诉求（表体行间横线）：表体**每一行之间**也插入 ├─┼─┤ 分隔——
+    // 此前只有表头下一条线，多行表体行直接相邻、看不出行边界（用户反馈
+    // “没有横线”）。行间线用与表头分隔相同的 ├┼┤ 风格，保持连续。
+    for (i, row) in body.iter().enumerate() {
         out.extend(row_line(row, Style::default().fg(theme.text)));
+        if i + 1 < body.len() {
+            out.push(sep('├', '┼', '┤', '─'));
+        }
     }
     out.push(sep('└', '┴', '┘', '─'));
     out
@@ -841,7 +844,16 @@ fn render_table_records(
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let width = width.max(1);
+    // §用户诉求（窄屏表格仍有分割）：退化 records 模式保留视觉分隔——
+    // 每行数据前加 `─` 分隔线（记录边界），替代丢失的表格横线，让
+    // “只有标题”的观感消失。首行前不加（顶边框语义由首条分隔承担）。
     for (row_index, row) in body.iter().enumerate() {
+        if row_index > 0 {
+            out.push(Line::styled(
+                "─".repeat(width),
+                Style::default().fg(theme.muted),
+            ));
+        }
         for (col, cell) in row.iter().enumerate() {
             let label = header.get(col).cloned().unwrap_or_default();
             let combined = if label.is_empty() {
@@ -989,7 +1001,8 @@ mod tests {
         assert!(styled >= 2, "关键字/类型/数字应着色: {:?}", lines[0].spans);
     }
 
-    /// §成熟化：未知语言回退纯文本（muted + 背景，不 panic）。
+    /// §成熟化：未知语言用 plain text 语法（主题默认前景）——§用户诉求：
+    /// 任何代码块文本都有颜色，不 panic。
     #[test]
     fn code_block_unknown_language_falls_back() {
         let theme = theme::Theme::omp();
@@ -998,6 +1011,72 @@ mod tests {
         let line = &lines[0];
         assert_eq!(line.spans.len(), 1, "回退为单个 span");
         assert_eq!(line.spans[0].content, "hello world");
-        assert_eq!(line.spans[0].style.fg, Some(theme.muted));
+        assert!(
+            line.spans[0].style.fg.is_some(),
+            "未知语言回退也必须有主题前景色: {:?}",
+            line.spans[0]
+        );
+    }
+
+    /// §用户诉求（窄屏表格仍有分割）：窄宽度退化为 records（label: value）
+    /// 时，行间必须有 ─ 分隔线——不能只有标题（标签）没有分割。
+    #[test]
+    fn table_records_degradation_keeps_row_separators() {
+        let theme = theme::Theme::omp();
+        // 宽表格在极窄宽度下必然退化 records。
+        let md = "| 项目 | 状态 | 负责人 | 备注 |\n|---|---|---|---|\n| 修复侧边栏 | 进行中 | 张三 | 需要窄屏也显示完整 |\n| 优化菜单 | 完成 | 李四 | 边框统一 |";
+        let rendered = render_markdown_detailed(md, theme, Some(12));
+        let texts: Vec<String> = rendered
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        eprintln!("RECORDS LINES: {texts:?}");
+        // 退化 records 模式：有 label: value 行，且行间有 ─ 分隔线。
+        let has_label = texts.iter().any(|t| t.contains(':'));
+        assert!(has_label, "退化模式必须显示 label: value: {texts:?}");
+        let separator_count = texts.iter().filter(|t| t.starts_with('─')).count();
+        assert!(
+            separator_count >= 1,
+            "退化 records 必须保留行间 ─ 分隔线: {texts:?}"
+        );
+    }
+
+    /// §用户诉求（表格横线）：表格必须包含表头下分隔行（├─┼─┤）**且表体
+    /// 每一行之间都有 ├─┼─┤ 横向分割线**——不能只有表头下一条线、多行表体
+    /// 直接相邻看不出行边界。
+    #[test]
+    fn table_renders_header_separator_and_borders() {
+        let theme = theme::Theme::omp();
+        let rendered = render_markdown_detailed(
+            "| 列A | 列B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |",
+            theme,
+            Some(40),
+        );
+        let texts: Vec<String> = rendered
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        eprintln!("TABLE LINES: {texts:?}");
+        // 第 1 行顶边框（┌），第 2 行标题，第 3 行分隔（├─┼─┤），
+        // 表体行之间也各有 ├─┼─┤，最后底边框（└）。
+        assert!(texts[0].contains('┌'), "顶边框: {texts:?}");
+        assert!(texts[1].contains("列A"), "表头: {texts:?}");
+        assert!(
+            texts[2].contains('├') && texts[2].contains('┼') && texts[2].contains('┤'),
+            "表头下必须有多列分隔行 ├┼┤: {texts:?}"
+        );
+        assert!(texts[3].contains("1"), "表体第一行: {texts:?}");
+        // 表体有 2 行（1/2、3/4），行间必须还有一条 ├┼┤（§用户诉求：行间横线）。
+        let separators = texts
+            .iter()
+            .filter(|t| t.contains('├') && t.contains('┼') && t.contains('┤'))
+            .count();
+        assert!(
+            separators >= 2,
+            "表头下 + 表体行间都应有 ├┼┤ 分隔线（现在 {separators} 条）: {texts:?}"
+        );
+        assert!(texts.last().unwrap().contains('└'), "底边框: {texts:?}");
     }
 }

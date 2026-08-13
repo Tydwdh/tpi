@@ -738,6 +738,29 @@ async fn interactive_loop<P: Provider>(
                 .map_err(|e| e.to_string())?;
         }
 
+        // 主题选择（/theme 菜单 Enter）：应用主题 + 持久化到 home 配置。
+        if let Some(theme_name) = ui_state.pending_theme.take() {
+            renderer.set_theme(crate::tui::theme::Theme::named(&theme_name));
+            match crate::config::set_ui_theme(&theme_name) {
+                Ok(path) => {
+                    ui_state.view.push_line(
+                        LineKind::System,
+                        format!("已切换主题 {theme_name}（已保存到 {}）", path.display()),
+                    );
+                }
+                Err(error) => {
+                    ui_state
+                        .view
+                        .push_line(LineKind::System, format!("主题已切换（保存失败: {error}）"));
+                }
+            }
+            ui_state.view.menu = None;
+            ui_state.view.modal = None;
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+        }
+
         // 会话恢复选择（/sessions 菜单 Enter）。
         if let Some(session_id) = ui_state.pending_session.take() {
             match parse_session_id(&session_id) {
@@ -959,7 +982,7 @@ workspace: {}
 sessions: {}
 artifacts: {}
 shell: {shell}
-主题: {}（omp / dark / light / opencode）
+主题: {}（omp / dark / light / opencode / onedarkpro；/theme 切换）
 web_search: DuckDuckGo（免费，无需 API key）
 自动打开浏览器: {}
 保留 token: {}
@@ -1140,6 +1163,39 @@ workspace: {}
                 session_previews,
             });
             ui_state.view.open_modal("/sessions", preview_body);
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+            Ok(SlashAction::Consumed)
+        }
+        "/theme" => {
+            // 主题选择菜单（Modal 说明 + Theme 菜单；↑/↓ 选择 Enter 应用）。
+            // 主题名 → 描述（含绑定的代码高亮主题；与 theme.rs 绑定保持一致）。
+            const THEME_ITEMS: &[(&str, &str)] = &[
+                ("omp", "默认 Catppuccin 系 · 高亮 base16-mocha"),
+                ("dark", "简洁深色 · 高亮 base16-ocean"),
+                ("light", "简洁浅色 · 高亮 base16-ocean light"),
+                ("opencode", "opencode 风格 · 高亮 base16-eighties"),
+                ("onedarkpro", "One Dark Pro 官方色板 · 高亮 Solarized dark"),
+            ];
+            let items: Vec<(String, String)> = THEME_ITEMS
+                .iter()
+                .map(|(name, desc)| (name.to_string(), desc.to_string()))
+                .collect();
+            ui_state.view.menu = Some(crate::tui::model::MenuView {
+                items,
+                selected: 0,
+                kind: crate::tui::model::MenuKind::Theme,
+                session_previews: Vec::new(),
+            });
+            ui_state.view.open_modal(
+                "/theme",
+                format!(
+                    "当前主题: {}（代码高亮随主题联动）\n\n↑/↓ 选择 · Enter 应用并保存到 {} · Esc 取消\n\n注：若 workspace 配置了 [ui] theme，下次启动以 workspace 为准。",
+                    config.ui_theme,
+                    crate::config::tpi_home().join("config.toml").display(),
+                ),
+            );
             renderer
                 .draw(&mut ui_state.view)
                 .map_err(|e| e.to_string())?;
@@ -1637,7 +1693,17 @@ async fn run_interactive<P: Provider>(
                     _ => {}
                 }
             }
-            result = &mut run_future => break result,
+            result = &mut run_future => {
+                // §修复：agent 返回前发出的最后几个流式 delta 可能还滞留在
+                // ui_rx（select 在 run_future 与 recv 同时 ready 时随机分支，
+                // 可能先命中 run_future 完成）。收净后再 break——否则
+                // finalize_live 提交的 live.assistant 缺最后一段，屏幕上
+                // 最后一句被截断（如“要我做”只剩“要我做”）。
+                while let Ok(event) = ui_rx.try_recv() {
+                    crate::tui::reducer::update(ui_state, UiEvent::Agent(event));
+                }
+                break result;
+            }
         }
     };
     *crate::util::lock_mutex(&current_cancel, "current_cancel") = None;
@@ -2098,7 +2164,22 @@ fn session_dialogue_preview(path: &std::path::Path) -> Vec<crate::tui::model::Me
         let Some((is_user, content)) = content else {
             continue;
         };
-        let first_line = content.lines().next().unwrap_or_default().trim();
+        // §用户诉求（菜单预览净化）：preview 是纯文本渲染，历史消息含
+        // markdown 代码围栏（```/~~~）时不得露出围栏标记或代码内容当标题。
+        // 遍历行并跟踪围栏开关：围栏行与其间的代码行都跳过，取第一条有效文本。
+        let mut in_fence = false;
+        let mut first_line = "";
+        for line in content.lines().map(str::trim) {
+            if line.starts_with("```") || line.starts_with("~~~") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence || line.is_empty() {
+                continue;
+            }
+            first_line = line;
+            break;
+        }
         if first_line.is_empty() {
             continue;
         }
@@ -2549,5 +2630,63 @@ fn session_dialogue_preview_is_bounded() {
         session_dialogue_preview(&path).len(),
         6,
         "预览最多 6 条（长会话不解析整个文件）"
+    );
+}
+
+/// §用户诉求（菜单预览净化）：历史消息以 markdown 代码围栏开头时，预览
+/// 不得露出 ``` / ~~~ 标记——跳过围栏与空行，取第一条有效文本作标题。
+#[test]
+fn session_dialogue_preview_strips_code_fences() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fence.jsonl");
+    let env = |seq: u64, ty: &str, content: &str| {
+        serde_json::json!({
+            "schema": 1,
+            "seq": seq,
+            "event_id": format!("00000000-0000-7000-8000-{:012}", seq),
+            "timestamp": "2026-01-01T00:00:00Z",
+            "session_id": "00000000-0000-7000-8000-000000000000",
+            "run_id": "00000000-0000-7000-8000-000000000001",
+            "type": ty,
+            "payload": {"content": content}
+        })
+    };
+    let mut content = String::new();
+    content.push_str(
+        &serde_json::to_string(&env(
+            1,
+            "user_submitted",
+            "```toml\n[agent.limits]\nmax_turns = 0\n```",
+        ))
+        .unwrap(),
+    );
+    content.push('\n');
+    // assistant 事件的 payload 是 {message: {content}}——需包装 message 字段。
+    let assistant_env = serde_json::json!({
+        "schema": 1,
+        "seq": 2,
+        "event_id": "00000000-0000-7000-8000-000000000002",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "session_id": "00000000-0000-7000-8000-000000000000",
+        "run_id": "00000000-0000-7000-8000-000000000001",
+        "type": "assistant_message_committed",
+        "payload": {"message": {"content": "~~~bash\necho hi\n~~~\n然后我做了 X", "tool_calls": []}}
+    });
+    content.push_str(&serde_json::to_string(&assistant_env).unwrap());
+    content.push('\n');
+    std::fs::write(&path, content).unwrap();
+
+    let preview = session_dialogue_preview(&path);
+    let texts: Vec<&str> = preview.iter().map(|l| l.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        vec!["然后我做了 X"],
+        "纯代码块消息无标题跳过，围栏标记与代码内容不得当标题: {texts:?}"
+    );
+    assert!(
+        preview
+            .iter()
+            .all(|l| !l.text.contains("```") && !l.text.contains("~~~")),
+        "预览不得含围栏标记: {texts:?}"
     );
 }

@@ -512,18 +512,21 @@ fn markdown_table_degrades_to_records_on_narrow_width() {
     }
 }
 
+/// §用户诉求（行间横线）：box 表格表头下**和表体每行之间**都有 ├┼┤ 分隔线
+/// ——数据行之间必须能看出行边界（此前只画表头下一条，多行表体直接相邻）。
 #[test]
-fn markdown_table_uses_compact_box_without_body_row_noise() {
+fn markdown_table_uses_compact_box_with_body_row_separators() {
     let theme = theme::Theme::omp();
     let md = "| name | value |\n| --- | --- |\n| a | 1 |\n| b | 2 |";
     let lines = render_markdown(md, theme, Some(40));
     let rendered: Vec<String> = lines.iter().map(Line::to_string).collect();
     assert!(rendered.first().is_some_and(|line| line.starts_with('┌')));
     assert!(rendered.last().is_some_and(|line| line.starts_with('└')));
+    // 2 行表体：表头下 1 条 + 行间 1 条 = 2 条 ├┼┤。
     assert_eq!(
         rendered.iter().filter(|line| line.starts_with('├')).count(),
-        1,
-        "只在表头下画分隔线，数据行之间不重复画横线: {rendered:?}"
+        2,
+        "表头下与表体行间都应有分隔线: {rendered:?}"
     );
 }
 
@@ -1176,6 +1179,116 @@ fn sidebar_closed_does_not_shrink_main() {
     assert_ne!(cell, "│", "边栏未打开不得有竖线分隔: {cell:?}");
 }
 
+/// §用户诉求：侧边栏打开时浮层不得覆盖边栏区域——/sessions 的 Modal + 菜单
+/// 横向布局基于主区（main_area）而非整个终端：Modal 右角（┐）必须位于主区内
+/// （修复前按整宽居中，右边框伸进边栏被最后绘制的侧边栏盖掉，┐ 消失）。
+#[test]
+fn session_modal_and_menu_stay_within_main_area_when_sidebar_open() {
+    let mut view = ViewModel::default();
+    for _ in 0..40 {
+        view.push_line(LineKind::Assistant, "背景文字X".repeat(20));
+    }
+    view.sidebar.open = true;
+    // /sessions：底部会话菜单 + 靠上 Modal 预览（同一场景，菜单也随主区收窄）。
+    view.menu = Some(crate::tui::model::MenuView {
+        items: vec![(
+            "0123456789abcdef0123456789abcdef".into(),
+            "会话A · 12-31 10:00 · 42 事件".into(),
+        )],
+        selected: 0,
+        kind: crate::tui::model::MenuKind::Session,
+        session_previews: vec![vec![crate::tui::model::MenuPreviewLine {
+            is_user: true,
+            text: "你好".into(),
+        }]],
+    });
+    view.open_modal("/sessions", "你 你好\nAI 你好");
+    let buf = draw_to_test_backend(&mut view, 80, 24);
+    let sidebar_start_x = 80u16 - crate::tui::model::SIDEBAR_WIDTH;
+    // Modal 上边框行含 ┌ 与 ┐：┐ 的 x 坐标必须 < sidebar_start_x。
+    let mut right_corner_x = None;
+    for y in 0..24u16 {
+        let mut row = String::new();
+        for x in 0..80u16 {
+            row.push_str(buf[(x, y)].symbol());
+        }
+        if row.contains('┌') {
+            right_corner_x = row.find('┐').map(|b| row[..b].chars().count() as u16);
+            break;
+        }
+    }
+    let right = right_corner_x.expect("Modal 右角 ┐ 必须渲染（不得被侧边栏盖掉）");
+    assert!(
+        right < sidebar_start_x,
+        "Modal 右角必须位于主区内: {right} >= {sidebar_start_x}"
+    );
+}
+
+/// §用户诉求：todo 项按显示列宽截断而非字节——CJK 双宽字符不被严重提前
+/// 截断：长项保留头部完整信息（旧字节实现按 width-3=27 字节 ≈ 9 汉字
+/// ≈ 18 cells 预算，而实际可用约 25 cells，内容显示不足且中段割裂）。
+#[test]
+fn sidebar_todo_truncates_by_cell_width() {
+    let mut view = ViewModel {
+        plan: Some(crate::tool::plan::Plan {
+            explanation: None,
+            items: vec![crate::tool::plan::PlanItem {
+                text: "第一项：重构侧边栏布局与渲染管线".into(),
+                status: crate::tool::plan::PlanStatus::InProgress,
+            }],
+        }),
+        sidebar: crate::tui::model::SidebarState {
+            open: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let buf = draw_to_test_backend(&mut view, 80, 24);
+    let sidebar_start_x = 80u16 - crate::tui::model::SIDEBAR_WIDTH;
+    // 找到含 todo 标记的行（逐 cell 拼接；CJK 中间插空格，过滤后断言）。
+    let mut row_text = String::new();
+    for y in 0..24u16 {
+        row_text.clear();
+        for x in sidebar_start_x..80u16 {
+            row_text.push_str(buf[(x, y)].symbol());
+        }
+        if row_text.contains("[>]") {
+            break;
+        }
+    }
+    let compact: String = row_text.chars().filter(|c| *c != ' ').collect();
+    // 行首是竖线分隔符“│”，todo 内容在其后。
+    assert!(
+        compact.contains("[>]第一项：重构侧边栏布局与"),
+        "todo 项应保留头部完整信息: {row_text:?}"
+    );
+}
+
+/// §修复：draw_sidebar 写回可视高度——滚动条点击按比例跳转依赖
+/// area_height（此前从未写回，默认 1，点击必跳底部）。
+#[test]
+fn sidebar_writes_back_area_height_for_ratio_jump() {
+    let mut view = ViewModel::default();
+    for _ in 0..40 {
+        view.push_line(LineKind::User, "一条用于撑高侧边栏的用户消息");
+    }
+    view.sidebar.open = true;
+    let _buf = draw_to_test_backend(&mut view, 80, 24);
+    // 整栏高 = 终端高（贯穿 transcript 到 footer）；高度必 > 1。
+    assert!(
+        view.sidebar.area_height > 1,
+        "area_height 必须被写回: {}",
+        view.sidebar.area_height
+    );
+    // 比例跳转按可视高度计算：点击中部应落到中间附近，而非底部。
+    let before = view.sidebar.scroll;
+    view.sidebar.scroll_to_ratio(view.sidebar.area_height / 2);
+    assert!(
+        view.sidebar.scroll < view.sidebar.total_rows.saturating_sub(1) || before > 0,
+        "点击侧边栏中部不应直接跳到底部"
+    );
+}
+
 /// Reasoning overlay must show its own border title, not "Tool details".
 #[test]
 fn reasoning_overlay_uses_thinking_border_title() {
@@ -1493,6 +1606,84 @@ fn selection_highlights_selected_window_rows() {
     );
 }
 
+/// §用户诉求：表格后文字可复制——含表格的 Assistant 消息，表格之后
+/// 的文字行必须有语义映射（否则拖选/复制触发点缺失）。
+#[test]
+fn text_after_table_is_selectable() {
+    let mut view = ViewModel::default();
+    view.push_line(
+        LineKind::Assistant,
+        "| 列A | 列B |\n|---|---|\n| 1 | 2 |\n\n表格下面的文字段落，应该可以复制。",
+    );
+    let mut cache = HashMap::new();
+    let plan = plan_window_simple(&mut view, theme::Theme::omp(), 80, 30, 0, false, &mut cache);
+    // 找到语义文本含“表格下面的文字”的行——它必须存在且有 semantic。
+    let found = plan.semantic_rows.iter().any(|row| {
+        row.as_ref()
+            .is_some_and(|r| r.text.contains("表格下面的文字"))
+    });
+    assert!(found, "表格后面的文字必须可选中（有语义映射）");
+    // 表格自身行（如 ┌──── 边框行）也应可选。
+    let mut table_found = false;
+    for row in plan.semantic_rows.iter().flatten() {
+        if row.text.contains("列A") || row.text.contains('│') {
+            table_found = true;
+        }
+    }
+    assert!(table_found, "表格行本身也应可选中");
+}
+
+/// §用户诉求：表格后文字可复制——selected_text 的提取（canonical_semantic_text
+/// 用 semantic_width 渲染）必须与 renderer 的 hit 坐标系（同一宽度）对齐。
+/// 复现：宽表格在窄 width 下列宽收缩、cell 竖排换行，width=None 与
+/// width=content_width 渲染出不同行数 → 旧实现 offset 错位，表格后文字复制不出。
+#[test]
+fn table_after_text_is_copyable() {
+    // 宽表格（真实触发宽度收缩）：width=None 渲染 7 行，width=40 渲染 22 行。
+    let wide_md = "| 项目 | 状态 | 负责人 | 备注 |\n|---|---|---|---|\n| 修复侧边栏布局 | 进行中 | 张三 | 需要在窄屏下也能显示完整 |\n| 优化菜单渲染 | 完成 | 李四 | 边框与背景统一 |\n\n表格后的总结文字。";
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::Assistant, wide_md.to_string());
+    // 模拟 renderer 写回语义宽度（RenderFrame 在真实路径里做，此处手动设）。
+    view.semantic_width = Some(40);
+    // 选中整个 entry（覆盖全文），验证复制文本包含表格后的文字。
+    use crate::tui::interaction::{TextPosition, TextSelection};
+    let entry_id = view.transcript[0].id();
+    view.selection = Some(TextSelection {
+        anchor: TextPosition {
+            entry_id,
+            offset: 0,
+        },
+        focus: TextPosition {
+            entry_id,
+            offset: 10_000, // 远超文本长，offset 会被 clamp 到实际长度
+        },
+    });
+    let text = view.selected_text();
+    assert!(
+        text.contains("表格后的总结文字"),
+        "selected_text 必须包含表格后的文字: {text:?}"
+    );
+    assert!(
+        text.contains("修复侧边栏布") || text.contains("修复侧边栏布局"),
+        "表格内容也应保留（窄宽下 cell 竖排拆行）: {text:?}"
+    );
+    // 没有 semantic_width（未渲染过）时也应有内容（width=None 自然宽）。
+    let mut view2 = ViewModel::default();
+    view2.push_line(LineKind::Assistant, wide_md.to_string());
+    let entry_id2 = view2.transcript[0].id();
+    view2.selection = Some(TextSelection {
+        anchor: TextPosition {
+            entry_id: entry_id2,
+            offset: 0,
+        },
+        focus: TextPosition {
+            entry_id: entry_id2,
+            offset: 10_000,
+        },
+    });
+    assert!(view2.selected_text().contains("表格后的总结文字"));
+}
+
 /// §InteractionRefactor：plan_window 的语义映射与视觉行必须对齐——
 /// semantic_rows 每行都能定位到对应 entry 的文本，且语义文本能命中真实内容。
 #[test]
@@ -1798,18 +1989,17 @@ fn thinking_lines_carry_icon_prefix() {
     assert_eq!(semantic.text, "先分析再动手");
 }
 
-/// §美化：代码块语法高亮路径统一 surface_subtle 背景（与 fallback 一致）。
+/// §用户诉求：代码块只做颜色变化（语法高亮前景色），不加背景。
 #[test]
-fn highlighted_code_block_has_background() {
+fn highlighted_code_block_has_no_background() {
     let theme = theme::Theme::omp();
     let lines = highlight::highlight_code_block("fn main() { let x = 1; }", Some("rust"), theme)
         .expect("rust 可解析");
     assert_eq!(lines.len(), 1);
     for span in &lines[0].spans {
-        assert_eq!(
-            span.style.bg,
-            Some(theme.surface_subtle),
-            "语法高亮 span 必须带 surface_subtle 背景: {:?}",
+        assert!(
+            span.style.bg.is_none(),
+            "语法高亮 span 不得带背景: {:?}",
             span
         );
     }
@@ -1852,12 +2042,15 @@ fn read_tool_card_highlights_source_without_polluting_semantics() {
         .iter()
         .find(|line| line.spans.iter().any(|span| span.content.contains("42")))
         .expect("read 正文可见");
+    // §用户诉求：syntect 完整主题——数字 token 有独立前景色（不再依赖
+    // 语义色映射，不断言具体色值，只断言有着色）。
     assert!(
         source
             .spans
             .iter()
-            .any(|span| span.style.fg == Some(theme.orange)),
-        "工具卡源码数字应有语法色: {source:?}"
+            .filter(|span| !span.content.is_empty())
+            .any(|span| span.style.fg.is_some()),
+        "工具卡源码应有语法前景色: {source:?}"
     );
     assert!(
         source
@@ -1876,46 +2069,49 @@ fn read_tool_card_highlights_source_without_polluting_semantics() {
     assert!(!semantic.iter().any(|row| row.starts_with("1 │")));
 }
 
-/// §用户诉求：onedarkpro 语法高亮——关键字=蓝（primary）、数字/常量=橙
-/// （orange #d19a66，One Dark Pro 标志性配色）。
+/// §用户诉求：语法高亮用 syntect 完整主题——数字与关键字等不同 token
+/// 各有独立颜色（不再是语义色映射下的少量色值）。
 #[test]
-fn onedarkpro_syntax_highlight_uses_blue_keyword_and_orange_constant() {
-    let theme = theme::Theme::onedarkpro();
-    let lines = highlight::highlight_code_block("fn main() { let x = 42; }", Some("rust"), theme)
-        .expect("rust 可解析");
-    let line = &lines[0];
-    let num_span = line
-        .spans
-        .iter()
-        .find(|s| s.content == "42")
-        .unwrap_or_else(|| panic!("数字 token 必须存在: {:?}", line.spans));
-    assert_eq!(
-        num_span.style.fg,
-        Some(theme.orange),
-        "数字/常量必须用橙色（One Dark Pro #d19a66）: {:?}",
-        num_span
-    );
-    // `fn` 是 storage.type.function → 通用映射的 info（onedarkpro = cyan），
-    // 与 One Dark Pro 的 cyan 支持类一致；这里验证它带语义色而非纯 muted。
-    let fn_span = line
-        .spans
-        .iter()
-        .find(|s| s.content == "fn")
-        .expect("fn 关键字必须存在");
-    assert_eq!(
-        fn_span.style.fg,
-        Some(theme.info),
-        "storage 关键字用 info（onedarkpro cyan）: {:?}",
-        fn_span
-    );
+fn syntect_theme_colors_tokens_distinctly_under_any_tui_theme() {
+    for theme in [
+        theme::Theme::omp(),
+        theme::Theme::dark(),
+        theme::Theme::light(),
+        theme::Theme::opencode(),
+        theme::Theme::onedarkpro(),
+    ] {
+        let lines =
+            highlight::highlight_code_block("fn main() { let x: u32 = 42; }", Some("rust"), theme)
+                .expect("rust 可解析");
+        let line = &lines[0];
+        let fg = |token: &str| -> Option<ratatui::style::Color> {
+            line.spans
+                .iter()
+                .find(|s| s.content == token)
+                .and_then(|s| s.style.fg)
+        };
+        let num = fg("42").expect("数字 token 必须存在");
+        let keyword = fg("fn").expect("fn token 必须存在");
+        let ty = fg("u32").expect("类型 token 必须存在");
+        let distinct = [num, keyword, ty]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        // 不同类别 token 至少有 2 种不同颜色且都非空（主题间存在 scope
+        // 合并，故不要求全部互异）。
+        assert!(
+            distinct >= 2,
+            "token 类别应有区分颜色（{num:?} {keyword:?} {ty:?}）"
+        );
+    }
 }
 
-/// BUG 回归：assistant 裸文本行含行内 code 时，行尾 padding 不得继承
-/// code 的 surface_subtle 背景（此前 find_map 抓到行内第一个 bg span）。
+/// §用户诉求：行内代码与代码块一致——只做颜色变化（primary 前景色）、
+/// 不加背景；行尾 padding 也不得继承任何背景。
 #[test]
-fn inline_code_bg_does_not_leak_into_trailing_padding() {
+fn inline_code_has_no_background_and_no_padding_leak() {
     let mut view = ViewModel::default();
-    // assistant 消息行首 rail 无背景；行内含 inline code（surface_subtle 底）。
+    // assistant 消息行首 rail 无背景；行内含 inline code。
     view.push_line(
         LineKind::Assistant,
         r"请查看 `snake\src\main.rs` 是否已存在",
@@ -1930,21 +2126,27 @@ fn inline_code_bg_does_not_leak_into_trailing_padding() {
         .position(|r| r.as_ref().is_some_and(|s| s.text.contains("main.rs")))
         .expect("消息必须渲染");
     let line = &plan.window[row_idx];
-    // inline code span 本身保留 surface_subtle 背景（wrap 逐字符拆分 span）。
-    let has_code_bg = line.spans.iter().any(|s| {
-        !s.content.is_empty()
-            && !s.content.chars().all(|c| c == ' ')
-            && s.style.bg == Some(theme.surface_subtle)
-    });
-    assert!(has_code_bg, "行内 code 背景必须保留: {:?}", line.spans);
-    // 行尾 padding（内容全空格的 span）不得带任何背景（不再泄漏）。
+    // inline code span 本身无背景、保留 primary 前景色（wrap 逐字符拆分 span）。
+    let code_span = line
+        .spans
+        .iter()
+        .find(|s| s.content == "m")
+        .expect("inline code 内容必须渲染");
+    assert_eq!(
+        code_span.style.bg, None,
+        "行内 code 不得带背景: {:?}",
+        line.spans
+    );
+    assert_eq!(
+        code_span.style.fg,
+        Some(theme.primary),
+        "行内 code 保留 primary 前景色: {:?}",
+        code_span
+    );
+    // 行尾 padding（内容全空格的 span）不得带任何背景。
     for span in &line.spans {
         if span.content.chars().all(|c| c == ' ') && !span.content.is_empty() {
-            assert_eq!(
-                span.style.bg, None,
-                "行尾 padding 不得继承行内 code 背景: {:?}",
-                span
-            );
+            assert_eq!(span.style.bg, None, "行尾 padding 不得带背景: {:?}", span);
         }
     }
 }
@@ -2003,7 +2205,7 @@ fn diff_line_padding_keeps_panel_background() {
 }
 
 /// §修复回归：卡片正文文字区背景与卡片面板一致（不落到终端底色）。
-/// 主行 name/内容行正文都烙 panel；inline code（surface_subtle）保留。
+/// 主行 name/内容行正文都烙 panel。
 #[test]
 fn tool_card_body_bg_matches_panel() {
     let mut view = ViewModel {
@@ -2058,7 +2260,8 @@ fn tool_card_body_bg_matches_panel() {
     );
 }
 
-/// §修复回归：User 消息正文背景与面板一致（inline code 保留自身背景）。
+/// §修复回归：User 消息正文背景与面板一致；inline code 只做颜色变化
+/// （primary 前景、无背景，不被 panel 覆盖也不带自身背景）。
 #[test]
 fn user_message_body_bg_matches_panel() {
     let mut view = ViewModel::default();
@@ -2079,13 +2282,24 @@ fn user_message_body_bg_matches_panel() {
         "用户消息正文必须烙 panel 底: {:?}",
         row.spans
     );
-    // inline code 保留 surface_subtle（不被 panel 覆盖）。
-    assert!(
+    // inline code：无自身背景——在 User 面板里随正文烙 panel 底，仅保留
+    // primary 前景色（不再有独立的 surface_subtle 块）。
+    let code_span = row
+        .spans
+        .iter()
+        .find(|s| s.content == "s")
+        .expect("inline code 内容必须渲染");
+    assert_eq!(
+        code_span.style.bg,
+        Some(theme.panel),
+        "inline code 应随面板烙 panel 底（无独立背景）: {:?}",
         row.spans
-            .iter()
-            .any(|s| s.content == "s" && s.style.bg == Some(theme.surface_subtle)),
-        "inline code 背景保留: {:?}",
-        row.spans
+    );
+    assert_eq!(
+        code_span.style.fg,
+        Some(theme.primary),
+        "inline code 保留 primary 前景色: {:?}",
+        code_span
     );
 }
 
@@ -2481,7 +2695,8 @@ fn zero_collapsed_tool_cards_have_no_gap_between() {
     );
 }
 
-/// §用户诉求：thinking 用 markdown 渲染——展开后代码块带语法高亮背景。
+/// §用户诉求：thinking 用 markdown 渲染——展开后代码块有语法高亮
+/// （前景色；§用户诉求：代码块不加背景）。
 #[test]
 fn thinking_expanded_renders_markdown_code_highlight() {
     let mut view = ViewModel {
@@ -2503,14 +2718,14 @@ fn thinking_expanded_renders_markdown_code_highlight() {
         text.contains("先想一下") && text.contains("let x = 1"),
         "thinking 展开显示 md 内容: {text:?}"
     );
-    // 代码行有语法高亮背景（surface_subtle）。
+    // §用户诉求：代码块只做颜色变化——不得带 surface_subtle 背景。
     assert!(
-        plan.window.iter().any(|l| {
+        plan.window.iter().all(|l| {
             l.spans
                 .iter()
-                .any(|s| s.style.bg == Some(theme.surface_subtle))
+                .all(|s| s.style.bg != Some(theme.surface_subtle))
         }),
-        "代码块必须带高亮背景: {:?}",
+        "代码块不得带高亮背景: {:?}",
         plan.window
             .iter()
             .flat_map(|l| l.spans.iter())

@@ -104,6 +104,80 @@ pub fn usable_content_width(total_width: usize, reserved_cols: usize) -> Option<
         .filter(|remaining| *remaining > 0)
 }
 
+/// 按显示宽度（terminal cells）截断：保留头部，超预算部分以 `marker` 结尾；
+/// 总显示宽度不超过 `max_cells`（marker 计入预算；CJK 等双宽字符按 2 cells）。
+///
+/// 与字节版 [`truncate_middle_utf8`] 不同：预算单位是终端列宽而非字节，
+/// 供已知渲染列宽的场景使用（如侧边栏 todo 项——文本以开头信息为主，
+/// 中段截断会头尾割裂）。
+pub fn truncate_head_to_cell_width(s: &str, max_cells: usize, marker: &str) -> String {
+    if display_width(s) <= max_cells {
+        return s.to_string();
+    }
+    let budget = max_cells.saturating_sub(display_width(marker));
+    let mut end = 0usize;
+    let mut acc = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let w = char_cell_width(ch);
+        if acc + w > budget {
+            break;
+        }
+        acc += w;
+        end = idx + ch.len_utf8();
+    }
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..end]);
+    out.push_str(marker);
+    out
+}
+
+/// 按显示宽度（terminal cells）中段截断：头部与尾部各留约一半，中间以
+/// `marker` 连接；总显示宽度不超过 `max_cells`（marker 计入预算）。
+/// 用于开头与结尾都重要的长文本（如侧边栏用户消息大纲）。
+pub fn truncate_to_cell_width(s: &str, max_cells: usize, marker: &str) -> String {
+    if display_width(s) <= max_cells {
+        return s.to_string();
+    }
+    let marker_cells = display_width(marker);
+    if max_cells <= marker_cells {
+        // 预算连 marker 都放不下：退化为纯头部（仍不超预算）。
+        return truncate_head_to_cell_width(s, max_cells, "");
+    }
+    let budget = max_cells - marker_cells;
+    let head_limit = budget / 2;
+    let mut head_end = 0usize;
+    let mut head_cells = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let w = char_cell_width(ch);
+        if head_cells + w > head_limit {
+            break;
+        }
+        head_cells += w;
+        head_end = idx + ch.len_utf8();
+    }
+    // 尾部：从尾部反向累计到 <= 剩余预算（起点落在字符边界）。
+    let tail_budget = budget.saturating_sub(head_cells);
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..head_end]);
+    out.push_str(marker);
+    if tail_budget > 0 {
+        let mut start = s.len();
+        let mut acc = 0usize;
+        for (idx, ch) in s.char_indices().rev() {
+            let w = char_cell_width(ch);
+            if acc + w > tail_budget {
+                break;
+            }
+            acc += w;
+            start = idx;
+        }
+        if start < s.len() {
+            out.push_str(&s[start..]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +268,51 @@ mod tests {
     #[test]
     fn middle_truncation_short_input_is_unchanged() {
         assert_eq!(truncate_middle_utf8("你好", 100, "…"), "你好");
+    }
+
+    #[test]
+    fn head_truncation_keeps_head_within_cells() {
+        // “第一项：重构侧边栏布局与渲染管线” = 15 个双宽字符 = 32 cells。
+        let s = "第一项：重构侧边栏布局与渲染管线";
+        assert_eq!(display_width(s), 32);
+        let out = truncate_head_to_cell_width(s, 20, "…");
+        assert!(
+            display_width(&out) <= 20,
+            "out={out:?} cells={}",
+            display_width(&out)
+        );
+        assert!(out.starts_with("第一项："));
+        assert!(out.ends_with("…"));
+        // 短文本原样返回。
+        assert_eq!(truncate_head_to_cell_width(s, 100, "…"), s);
+    }
+
+    #[test]
+    fn head_truncation_budget_only_marker_yields_empty_head() {
+        let out = truncate_head_to_cell_width("abc", 1, "…");
+        assert_eq!(out, "…");
+        assert!(display_width(&out) <= 1);
+    }
+
+    #[test]
+    fn middle_truncation_keeps_both_ends_within_cells() {
+        // 长文本：头部与尾部各留约一半，中间以 marker 连接，总宽不超预算。
+        let s = "头部内容头部内容".repeat(4) + "中段" + &"尾部内容".repeat(4);
+        for budget in [2usize, 3, 4, 7, 8, 12, 16, 20, 32] {
+            let out = truncate_to_cell_width(&s, budget, "…");
+            assert!(
+                display_width(&out) <= budget,
+                "budget={budget} out={out:?} cells={}",
+                display_width(&out)
+            );
+            assert!(out.is_char_boundary(out.len()));
+            // 尾部必须是原文后缀（从某字符边界起的连续子串）。
+            if let Some(pos) = out.find("…")
+                && budget > 6
+            {
+                let tail = &out[pos + "…".len()..];
+                assert!(s.ends_with(tail), "tail={tail:?}");
+            }
+        }
     }
 }

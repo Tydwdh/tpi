@@ -31,6 +31,9 @@ pub struct Theme {
     pub border: Color,
     pub surface: Color,
     pub surface_subtle: Color,
+    /// 代码块语法高亮用的 syntect 内置主题名（§用户诉求：任何 token 都有
+    /// 独立颜色——由成熟主题库提供完整 scope 覆盖，而非手工映射少量语义色）。
+    pub syntax_theme: &'static str,
 }
 
 impl Theme {
@@ -51,6 +54,8 @@ impl Theme {
             border: Color::Rgb(0x45, 0x47, 0x5a),
             surface: Color::Rgb(0x21, 0x15, 0x22),
             surface_subtle: Color::Rgb(0x1b, 0x17, 0x24),
+            // base16-mocha.dark：棕褐暖系 + 高对比，与 omp 紫粉面板同属 mocha 系。
+            syntax_theme: "base16-mocha.dark",
         }
     }
 
@@ -87,6 +92,8 @@ impl Theme {
             border: Color::Rgb(0x3e, 0x44, 0x51),         // selection 边框灰
             surface: Color::Rgb(0x21, 0x25, 0x2b),        // widget/sidebar
             surface_subtle: Color::Rgb(0x1e, 0x22, 0x27), // input 深底（代码块）
+            // Solarized (dark)：青蓝 + 暖棕的经典克制配色，接近 One Dark 观感。
+            syntax_theme: "Solarized (dark)",
         }
     }
 
@@ -106,6 +113,8 @@ impl Theme {
             border: Color::Rgb(0x3d, 0x41, 0x49),
             surface: Color::Rgb(0x1e, 0x21, 0x28),
             surface_subtle: Color::Rgb(0x28, 0x2c, 0x34),
+            // base16-ocean.dark：蓝冷系，与 dark（Nord 系蓝灰）同气质。
+            syntax_theme: "base16-ocean.dark",
         }
     }
 
@@ -125,6 +134,8 @@ impl Theme {
             border: Color::Rgb(0xd0, 0xd3, 0xd9),
             surface: Color::Rgb(0xf5, 0xf5, 0xf5),
             surface_subtle: Color::Rgb(0xe9, 0xea, 0xec),
+            // base16-ocean.light：浅底下的高对比蓝系。
+            syntax_theme: "base16-ocean.light",
         }
     }
 
@@ -145,6 +156,8 @@ impl Theme {
             border: Color::Rgb(0x48, 0x48, 0x48),
             surface: Color::Rgb(0x14, 0x14, 0x14),
             surface_subtle: Color::Rgb(0x1f, 0x1f, 0x1f),
+            // base16-eighties.dark：复古暖色，与 opencode 的暖橙主色呼应。
+            syntax_theme: "base16-eighties.dark",
         }
     }
 }

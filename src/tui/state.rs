@@ -19,6 +19,8 @@ pub struct UiState {
     pub pending_messages: VecDeque<String>,
     /// /sessions 菜单 Enter 选中的 session id（app 执行恢复）。
     pub pending_session: Option<String>,
+    /// /theme 菜单 Enter 选中的主题名（app 应用主题 + 写配置）。
+    pub pending_theme: Option<String>,
     /// 待重试的上一次失败 turn（`/retry`；app 消费时以空 user_message 发起 run，
     /// 不重复记录 UserSubmitted，也不追加 User 消息）。
     pub pending_retry: Option<String>,
@@ -49,6 +51,7 @@ impl UiState {
             keymap,
             pending_messages: VecDeque::new(),
             pending_session: None,
+            pending_theme: None,
             pending_retry: None,
             running: false,
             force_compaction: false,
@@ -80,6 +83,7 @@ impl UiState {
     pub fn has_pending_work(&self) -> bool {
         !self.pending_messages.is_empty()
             || self.pending_session.is_some()
+            || self.pending_theme.is_some()
             || self.pending_retry.is_some()
     }
 

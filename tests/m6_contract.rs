@@ -78,6 +78,7 @@ async fn web_fetch_failure_is_explicit() {
     let outcome = web_fetch(
         WebFetchArgs {
             url: "http://127.0.0.1:1/".into(),
+            prompt: None,
         },
         &ctx,
     )
@@ -130,6 +131,7 @@ async fn web_fetch_converts_html_and_bounds_body() {
     let outcome = web_fetch_allowing_private_for_test(
         WebFetchArgs {
             url: format!("http://{addr}/page"),
+            prompt: None,
         },
         &ctx,
     )

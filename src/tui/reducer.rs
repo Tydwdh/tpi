@@ -41,9 +41,11 @@ fn sync_session_preview(state: &mut UiState) {
 }
 
 fn refresh_menus(state: &mut UiState) {
+    // Session / Theme 菜单是“Modal + 菜单”组合、由 app 层显式挂载，与输入
+    // 无关——↑/↓/Tab 等导航不得经命令菜单刷新把它们清掉。
     if matches!(
         state.view.menu.as_ref().map(|m| m.kind),
-        Some(MenuKind::Session)
+        Some(MenuKind::Session) | Some(MenuKind::Theme)
     ) {
         return;
     }
@@ -192,6 +194,14 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                         state.view.modal = None;
                         return effects;
                     }
+                    MenuKind::Theme => {
+                        // 主题应用由 app 执行（应用 renderer 主题 + 写配置）。
+                        // /theme = Modal + 菜单一个整体：选中后一并关闭。
+                        state.pending_theme = Some(label);
+                        state.view.menu = None;
+                        state.view.modal = None;
+                        return effects;
+                    }
                     _ => state.view.complete_menu_command(),
                 }
             }
@@ -246,10 +256,10 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.view.close_overlay();
             } else if state.view.modal.is_some() {
                 state.view.close_modal();
-                // /sessions 浏览器 = Modal + Session 菜单一个整体：Esc 一次关闭两者。
+                // /sessions、/theme 浏览器 = Modal + 菜单一个整体：Esc 一次关闭两者。
                 if matches!(
                     state.view.menu.as_ref().map(|m| m.kind),
-                    Some(MenuKind::Session)
+                    Some(MenuKind::Session) | Some(MenuKind::Theme)
                 ) {
                     state.view.menu = None;
                 }
@@ -526,6 +536,10 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
                 LineKind::System,
                 format!("⟳ 工具调用中断，正在重新生成该轮回答…（第 {attempt} 次）"),
             );
+        }
+        RuntimeEvent::CompactionNotice { message } => {
+            // §用户诉求：手动 /compact 结果反馈（成功/未生效）写入系统行。
+            view.push_line(LineKind::System, message);
         }
     }
 }

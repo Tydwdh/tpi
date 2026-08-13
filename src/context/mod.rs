@@ -228,23 +228,37 @@ fn push_line_within_budget(out: &mut String, line: &str, max_tokens: u64) -> boo
     }
 }
 
-/// Compaction summary schema（§15.4 固定字段）。
+/// Compaction summary schema（§15.4 固定字段；§用户诉求：给出输出示例，
+/// 引导模型严格照格式输出——只列字段名时模型常自由发挥导致解析失败）。
 pub const SUMMARY_SCHEMA: &str = "\
-请把下面的会话事实压缩为结构化摘要，严格按以下字段：
+请把下面的会话事实压缩为结构化摘要。
 
-Goal
-Constraints
-Decisions
-Completed
-In progress
-Next exact action
-Relevant files and revisions
-Verification status
-Failed attempts and why
+必须严格按以下格式逐行输出（字段名用英文，值用中文或原文语言）：
+
+Goal: <本次任务目标>
+Constraints: <约束条件>
+Decisions: <已做的关键决策>
+Completed: <已完成的事项>
+In progress: <正在进行的事项>
+Next exact action: <下一步要做的第一件事>
+Relevant files and revisions: <涉及文件及关键 revision>
+Verification status: <验证/测试状态>
+Failed attempts and why: <失败的尝试及原因>
+
+示例：
+Goal: 修复侧边栏布局
+Constraints: 不引入新依赖
+Decisions: 改用 cell 宽度截断
+Completed: 加宽侧边栏
+In progress: 调整浮层布局
+Next exact action: 运行 cargo test 验证
+Relevant files and revisions: src/tui/mod.rs
+Verification status: 测试通过
+Failed attempts and why: 无
 
 要求：只保留用户内容、已提交的 assistant 内容、工具证据和结构化状态；
-不要从 reasoning 提炼事实；不要编造不存在的细节。输出纯文本，字段用
-'Field: value' 格式。";
+不要从 reasoning 提炼事实；不要编造不存在的细节。输出纯文本，不要加
+任何前后缀说明。如果某个字段确实没有内容，写“无”，不要省略字段。";
 
 /// 构造 compaction 请求的消息（§15.4：无工具 schema、独立较小 output budget）。
 pub fn compaction_request_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -254,40 +268,132 @@ pub fn compaction_request_messages(messages: &[ChatMessage]) -> Vec<ChatMessage>
     out
 }
 
-/// 解析 compaction summary（§15.4：解析失败属于 compaction failure，不修正重试）。
+/// 解析 compaction summary（§用户诉求：尽量容错，失败有兜底）。
+///
+/// 字段名支持别名（大小写不敏感 + 中文 + 相近措辞），行首允许列表符/粗体
+/// 标记；核心字段齐全则输出结构化字段行。
+///
+/// 若模型完全没有按格式输出（核心字段缺失），**退化为使用全文**——模型
+/// 的压缩输出即使非结构化也保留了大量上下文，总比压缩失败、上下文继续
+/// 膨胀好；最终由 `is_significant_shrink` 把关（退化全文不够短会被拦下）。
+///
+/// 返回空串仅当：输入为空，或输入太短且不含任何字段线索（模型“好的我
+/// 来压缩”这类没干活的话）。
+fn normalize_field_name(name: &str) -> Option<&'static str> {
+    let name = name.trim().to_ascii_lowercase();
+    // (别名, 规范名)；别名按长度降序匹配（“next exact action”先于“next action”）。
+    const ALIASES: &[(&str, &str)] = &[
+        ("next exact action", "Next exact action"),
+        ("next exact step", "Next exact action"),
+        ("next action", "Next exact action"),
+        ("next step", "Next exact action"),
+        ("next exact", "Next exact action"),
+        ("next", "Next exact action"),
+        (
+            "relevant files and revisions",
+            "Relevant files and revisions",
+        ),
+        ("relevant files", "Relevant files and revisions"),
+        ("files and revisions", "Relevant files and revisions"),
+        ("failed attempts and why", "Failed attempts and why"),
+        ("failed attempts", "Failed attempts and why"),
+        ("verification status", "Verification status"),
+        ("verification", "Verification status"),
+        ("in progress", "In progress"),
+        ("in-progress", "In progress"),
+        ("inprogress", "In progress"),
+        ("progress", "In progress"),
+        ("constraints", "Constraints"),
+        ("constraint", "Constraints"),
+        ("decisions", "Decisions"),
+        ("decision", "Decisions"),
+        ("completed", "Completed"),
+        ("done", "Completed"),
+        ("goal", "Goal"),
+        ("target", "Goal"),
+        // 中文模型常用的中文字段名。
+        ("下一步", "Next exact action"),
+        ("进行中", "In progress"),
+        ("已完成", "Completed"),
+        ("约束", "Constraints"),
+        ("决策", "Decisions"),
+        ("目标", "Goal"),
+    ];
+    ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == name)
+        .map(|(_, canonical)| *canonical)
+}
+
+/// 剥掉行首的列表/粗体标记（`- `、`* `、`1. `、`**` 等），返回内容与是否剥过。
+fn strip_line_prefix(line: &str) -> (&str, bool) {
+    let line = line.trim_start();
+    let stripped = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("• "))
+        .or_else(|| {
+            // 数字列表：`1. ` / `1) `
+            let bytes = line.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            (i < bytes.len() && bytes[i] == b'.').then(|| &line[i + 1..])
+        })
+        .or_else(|| line.strip_prefix("**"))
+        .unwrap_or(line);
+    (stripped, stripped != line)
+}
+
 pub fn parse_summary(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    const FIELDS: [&str; 9] = [
-        "Goal",
-        "Constraints",
-        "Decisions",
-        "Completed",
-        "In progress",
-        "Next exact action",
-        "Relevant files and revisions",
-        "Verification status",
-        "Failed attempts and why",
-    ];
-    let mut seen = [false; FIELDS.len()];
-    for line in trimmed.lines().filter(|line| !line.trim().is_empty()) {
-        let Some((name, value)) = line.split_once(':') else {
-            return String::new();
-        };
-        let Some(index) = FIELDS.iter().position(|field| *field == name.trim()) else {
-            return String::new();
-        };
-        if seen[index] || value.trim().is_empty() {
-            return String::new();
+    const CORE_FIELDS: [&str; 3] = ["Goal", "In progress", "Next exact action"];
+
+    let mut out_lines: Vec<String> = Vec::new();
+    for raw_line in trimmed.lines() {
+        let raw = raw_line.trim();
+        if raw.is_empty() {
+            continue;
         }
-        seen[index] = true;
+        let (line, _) = strip_line_prefix(raw);
+        let Some((name, value)) = line.split_once(':') else {
+            continue; // 非字段行（引导语等）：忽略
+        };
+        let Some(canonical) = normalize_field_name(name) else {
+            continue; // 未知字段行：忽略
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if out_lines
+            .iter()
+            .any(|l| l.starts_with(&format!("{canonical}:")))
+        {
+            continue; // 重复字段：取第一个
+        }
+        out_lines.push(format!("{canonical}: {value}"));
     }
-    if seen.iter().any(|present| !present) {
-        return String::new();
+    let present: Vec<&str> = out_lines
+        .iter()
+        .filter_map(|l| l.split_once(':').map(|(n, _)| n.trim()))
+        .collect();
+    if CORE_FIELDS.iter().all(|core| present.contains(core)) {
+        return out_lines.join("\n");
     }
-    trimmed.to_string()
+
+    // 核心字段缺失：退化为全文。模型压缩输出即使非结构化也保留了大量
+    // 上下文；极短的“好的，我来压缩…”（<60 字节）判无效，最终由
+    // is_significant_shrink 把关（退化全文不够短会被拦下）。
+    if trimmed.len() >= 60 {
+        trimmed.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// Compaction summary 是否"足够缩小"值得提交（§15.4 第 5 条）。
@@ -394,13 +500,108 @@ mod tests {
         assert!(is_significant_shrink(u64::MAX, u64::MAX / 3));
     }
 
+    /// 全字段 + 值合法：原样保留。
     #[test]
-    fn summary_parser_requires_each_schema_field_once_with_a_value() {
+    fn summary_parser_full_valid_roundtrip() {
         let valid = "Goal: g\nConstraints: c\nDecisions: d\nCompleted: c\nIn progress: i\nNext exact action: n\nRelevant files and revisions: r\nVerification status: v\nFailed attempts and why: f";
         assert_eq!(parse_summary(valid), valid);
+    }
+
+    /// 缺核心字段且内容极短（<60 字节，像“好的，我来压缩”）：判无效。
+    #[test]
+    fn summary_parser_rejects_empty_and_tiny_output() {
+        assert!(parse_summary("").is_empty());
         assert!(parse_summary("Goal: only one field").is_empty());
-        assert!(parse_summary(&format!("{valid}\nGoal: duplicate")).is_empty());
-        assert!(parse_summary(&valid.replace("Constraints: c", "Constraints:")).is_empty());
-        assert!(parse_summary(&format!("{valid}\nUnknown: x")).is_empty());
+        assert!(parse_summary("好的，我来压缩这段历史").is_empty());
+    }
+
+    /// §用户诉求：核心字段缺失但有实质内容（≥60 字节）→ 退化返回全文，
+    /// 不再卡死（压缩失败比继续膨胀好；is_significant_shrink 仍会把关）。
+    #[test]
+    fn summary_parser_falls_back_to_full_text_when_core_missing() {
+        let no_next = "Goal: g\nIn progress: i\nConstraints: c\nDecisions: d\nCompleted: c";
+        let parsed = parse_summary(no_next);
+        assert!(!parsed.is_empty(), "有实质内容必须兜底返回");
+        assert_eq!(parsed, no_next, "兜底返回原文");
+    }
+
+    /// §用户诉求：字段名支持别名（大小写不敏感、相近措辞、中文）。
+    #[test]
+    fn summary_parser_accepts_field_aliases() {
+        let input = "Goal: 修 bug\nnext action: 跑测试\nIn-progress: 调代码";
+        let parsed = parse_summary(input);
+        assert!(
+            parsed.contains("Next exact action: 跑测试"),
+            "别名 Next action 应归一化: {parsed:?}"
+        );
+        assert!(
+            parsed.contains("In progress: 调代码"),
+            "In-progress 应归一化: {parsed:?}"
+        );
+        assert!(parsed.contains("Goal: 修 bug"));
+    }
+
+    /// §用户诉求：行首列表符/粗体标记不判死。
+    #[test]
+    fn summary_parser_strips_list_prefixes() {
+        let input = "- Goal: 目标\n* In progress: 进行中\n1. Next exact action: 下一步";
+        let parsed = parse_summary(input);
+        assert!(
+            parsed.contains("Goal: 目标") && parsed.contains("Next exact action: 下一步"),
+            "列表前缀应剥除后解析: {parsed:?}"
+        );
+    }
+
+    /// 中文模型输出中文字段名：也解析为规范字段。
+    #[test]
+    fn summary_parser_accepts_chinese_field_names() {
+        let input = "目标: 修复菜单\n进行中: 调整渲染\n下一步: 验证";
+        let parsed = parse_summary(input);
+        assert!(
+            parsed.contains("Goal: 修复菜单") && parsed.contains("In progress: 调整渲染"),
+            "中文字段名应归一化: {parsed:?}"
+        );
+    }
+
+    /// §用户诉求：容错——非字段行、未知字段、重复字段、空值辅助字段都不判死；
+    /// 核心字段齐全即有效。
+    #[test]
+    fn summary_parser_tolerates_noise_and_missing_aux_fields() {
+        let base = "Goal: 修复侧边栏\nIn progress: 加宽边栏\nNext exact action: 改宽度常量";
+        // 非字段引导语 + 未知字段 + 重复核心字段 + 空值辅助字段：全部忽略，仍有效。
+        let noisy =
+            format!("以下是摘要：\n{base}\nGoal: 重复（忽略）\nConstraints:\nUnknown: x\n尾部说明");
+        let parsed = parse_summary(&noisy);
+        assert!(!parsed.is_empty(), "核心字段齐全必须有效: {parsed:?}");
+        assert!(parsed.contains("修复侧边栏"), "保留核心字段值: {parsed:?}");
+        assert!(!parsed.contains("重复"), "重复字段取第一个: {parsed:?}");
+        assert!(!parsed.contains("Unknown"), "未知字段被忽略: {parsed:?}");
+        assert!(!parsed.contains("以下是摘要"), "引导语被忽略: {parsed:?}");
+    }
+
+    /// §用户诉求：字段值允许含冒号（split 只切第一个冒号）。
+    #[test]
+    fn summary_parser_keeps_colons_inside_values() {
+        let with_colon = "Goal: 修复 src/main.rs: 让缓存生效\nIn progress: i\nNext exact action: n";
+        let parsed = parse_summary(with_colon);
+        assert!(
+            parsed.contains("src/main.rs: 让缓存生效"),
+            "冒号后的值必须保留: {parsed:?}"
+        );
+    }
+
+    /// §用户诉求：辅助字段缺失（只剩核心三个）仍有效。
+    #[test]
+    fn summary_parser_accepts_core_fields_only() {
+        let core_only = "Goal: g\nIn progress: i\nNext exact action: n";
+        let parsed = parse_summary(core_only);
+        assert!(!parsed.is_empty(), "只有核心字段也必须有效");
+        assert_eq!(parsed, core_only);
+    }
+
+    #[test]
+    fn summary_parser_empty_input_is_invalid() {
+        assert!(parse_summary("").is_empty());
+        assert!(parse_summary("   \n  ").is_empty());
     }
 }

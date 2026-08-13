@@ -36,10 +36,15 @@ struct CardContentRow {
 /// HTML/XML 等结构明确的内容。bash 只有在命令本身是“查看文件”时才从路径
 /// 推断，避免把编译器日志错涂成源代码。
 pub(super) fn tool_output_language(card: &ToolCard, body: &str) -> Option<String> {
-    if card.name == "read" || card.line_number_start.is_some() {
+    // §用户诉求（edit 高亮）：read/write/edit 的 target 都是 `name path` 形式，
+    // 从路径扩展名解析语言——read 与 edit/write 同样适用（此前只有 read 命中，
+    // edit 输出是 diff 且不进路径 1，永远回退纯文本）。
+    if matches!(card.name.as_str(), "read" | "write" | "edit") || card.line_number_start.is_some() {
         let target = card.target.as_deref()?.trim();
         let path = target
             .strip_prefix("read ")
+            .or_else(|| target.strip_prefix("edit "))
+            .or_else(|| target.strip_prefix("write "))
             .unwrap_or(target)
             .split(" (lines ")
             .next()

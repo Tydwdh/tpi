@@ -41,6 +41,8 @@ pub fn spawn_watchdog(
     on_deadline: impl Fn() + Send + 'static,
     on_warn: impl Fn() + Send + 'static,
 ) -> (tokio::task::JoinHandle<BudgetEnd>, Duration) {
+    // §用户诉求：max_wall_time_minutes=0 = 不限制（默认）——调用方不启动
+    // watchdog；这里保持原语义（.max(1) 只是防御 0 的旧默认，不再触发）。
     let wall = Duration::from_secs(limits.max_wall_time_minutes.max(1) * 60);
     spawn_watchdog_with_wall(wall, cancel, on_deadline, on_warn)
 }

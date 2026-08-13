@@ -9,6 +9,44 @@ use serde::Deserialize;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_INSTRUCTION_BYTES: usize = 1024 * 1024;
 
+/// 持久化 `[ui] theme` 到用户配置（~/.tpi/config.toml；不存在则创建），
+/// 保留其它配置项。返回写入路径。
+///
+/// 注意：主题是用户级偏好，总是写 home 配置。若 workspace `.tpi/config.toml`
+/// 也配置了 `[ui] theme`（优先级更高），下次启动仍以 workspace 为准——
+/// 菜单内已提示此限制。
+pub fn set_ui_theme(theme: &str) -> Result<std::path::PathBuf, String> {
+    set_ui_theme_at(&tpi_home(), theme)
+}
+
+/// 以指定配置根目录写入（测试隔离用；公开入口 [`set_ui_theme`]）。
+pub(crate) fn set_ui_theme_at(
+    home: &std::path::Path,
+    theme: &str,
+) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(home).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    let path = home.join("config.toml");
+    let mut value: toml::Value = match std::fs::read_to_string(&path) {
+        Ok(raw) => {
+            toml::from_str(&raw).map_err(|e| format!("解析配置失败（{}）: {e}", path.display()))?
+        }
+        Err(_) => toml::Value::Table(toml::Table::new()),
+    };
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| "配置根必须是 table".to_string())?;
+    let ui = table
+        .entry("ui".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let ui = ui
+        .as_table_mut()
+        .ok_or_else(|| "配置 [ui] 必须是 table".to_string())?;
+    ui.insert("theme".to_string(), toml::Value::String(theme.to_string()));
+    let out = toml::to_string(&value).map_err(|e| format!("序列化配置失败: {e}"))?;
+    std::fs::write(&path, out).map_err(|e| format!("写入配置失败（{}）: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// 配置根目录（~/.tpi，§14.1）。
 pub fn tpi_home() -> std::path::PathBuf {
     std::env::var_os("TPI_HOME")
@@ -103,13 +141,19 @@ pub struct AgentFile {
     pub allow_outside_workspace: Option<bool>,
 }
 
+/// [agent.limits]：运行护栏（§用户诉求：默认全部 0 = 不限制，按需配置）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentLimitsFile {
+    /// 模型回合数上限；0 = 不限制（默认）。
     pub max_model_turns: Option<u32>,
+    /// 工具调用总数上限；0 = 不限制（默认）。
     pub max_tool_calls: Option<u32>,
+    /// 墙钟时间上限（分钟）；0 = 不限制（默认，不启动 watchdog）。
     pub max_wall_time_minutes: Option<u64>,
+    /// 同 wave 并行工具数；必须 > 0（默认 4）。
     pub max_parallel_tools: Option<u32>,
+    /// 无进展重复检测阈值；0 = 关闭检测（默认）。
     pub max_identical_no_progress: Option<u32>,
 }
 
@@ -165,26 +209,28 @@ pub struct ModelConfig {
 
 #[derive(Debug, Clone, Copy)]
 pub struct LimitsConfig {
-    /// 默认 80（§18.1 示例）。
+    /// 模型回合数上限；0 = 不限制（§用户诉求：默认不限制，仅护栏用）。
     pub max_model_turns: u32,
-    /// 默认 160。
+    /// 工具调用总数上限；0 = 不限制。
     pub max_tool_calls: u32,
-    /// 默认 45 分钟。
+    /// 墙钟时间上限（分钟）；0 = 不限制（不启动 watchdog）。
     pub max_wall_time_minutes: u64,
-    /// 默认 4（M4 scheduler 使用）。
+    /// 默认 4（M4 scheduler 使用；并行度是性能参数不是护栏，保留默认）。
     pub max_parallel_tools: u32,
-    /// 默认 2（M4 no-progress 检测使用）。
+    /// 无进展重复检测阈值；0 = 关闭检测（§用户诉求：默认不限制）。
     pub max_identical_no_progress: u32,
 }
 
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
-            max_model_turns: 80,
-            max_tool_calls: 160,
-            max_wall_time_minutes: 45,
+            // §用户诉求：默认不限制——护栏交给用户按需配置（对齐 OpenCode/
+            // Claude Code：交互模式默认无硬上限，限制是防失控逃生舱）。
+            max_model_turns: 0,
+            max_tool_calls: 0,
+            max_wall_time_minutes: 0,
             max_parallel_tools: 4,
-            max_identical_no_progress: 2,
+            max_identical_no_progress: 0,
         }
     }
 }
@@ -250,24 +296,26 @@ pub(crate) fn load_from_home(
     };
 
     let limits = LimitsConfig {
+        // §用户诉求：默认不限制（0）——护栏按需配置；与 LimitsConfig::default()
+        // 一致，避免两处默认值漂移。
         max_model_turns: merged
             .agent
             .limits
             .as_ref()
             .and_then(|l| l.max_model_turns)
-            .unwrap_or(80),
+            .unwrap_or(0),
         max_tool_calls: merged
             .agent
             .limits
             .as_ref()
             .and_then(|l| l.max_tool_calls)
-            .unwrap_or(160),
+            .unwrap_or(0),
         max_wall_time_minutes: merged
             .agent
             .limits
             .as_ref()
             .and_then(|l| l.max_wall_time_minutes)
-            .unwrap_or(45),
+            .unwrap_or(0),
         max_parallel_tools: merged
             .agent
             .limits
@@ -279,7 +327,7 @@ pub(crate) fn load_from_home(
             .limits
             .as_ref()
             .and_then(|l| l.max_identical_no_progress)
-            .unwrap_or(2),
+            .unwrap_or(0),
     };
     validate_limits(&limits)?;
     let shell_path = merged.shell.path.as_deref().map(Utf8PathBuf::from);
@@ -457,20 +505,14 @@ fn validate_model(primary: &PrimaryModelFile, effective_name: &str) -> Result<()
 }
 
 fn validate_limits(limits: &LimitsConfig) -> Result<(), String> {
-    if limits.max_model_turns == 0 {
-        return Err("agent.limits.max_model_turns 必须大于 0".into());
-    }
-    if limits.max_wall_time_minutes == 0 {
-        return Err("agent.limits.max_wall_time_minutes 必须大于 0".into());
-    }
+    // §用户诉求：0 = 不限制（默认）——max_model_turns/max_wall_time_minutes/
+    // max_identical_no_progress/max_tool_calls 都为 0 合法；仅并行度必须 > 0
+    // （性能参数，0 会导致 wave 构建异常）。
     if limits.max_wall_time_minutes > u64::MAX / 60 {
         return Err("agent.limits.max_wall_time_minutes 过大".into());
     }
     if limits.max_parallel_tools == 0 {
         return Err("agent.limits.max_parallel_tools 必须大于 0".into());
-    }
-    if limits.max_identical_no_progress == 0 {
-        return Err("agent.limits.max_identical_no_progress 必须大于 0".into());
     }
     Ok(())
 }
@@ -506,6 +548,23 @@ pub fn read_api_key(config: &Config) -> Result<String, String> {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+
+    /// §用户诉求：默认不限制——护栏字段默认全 0，且 validate_limits 接受
+    /// （仅 max_parallel_tools 必须 > 0）。
+    #[test]
+    fn limits_default_to_unlimited_and_validate_accepts_zero() {
+        let limits = LimitsConfig::default();
+        assert_eq!(limits.max_model_turns, 0, "回合数默认不限制");
+        assert_eq!(limits.max_tool_calls, 0, "工具数默认不限制");
+        assert_eq!(limits.max_wall_time_minutes, 0, "墙钟默认不限制");
+        assert_eq!(limits.max_identical_no_progress, 0, "无进展检测默认关闭");
+        assert_eq!(limits.max_parallel_tools, 4, "并行度保留默认（性能参数）");
+        assert!(validate_limits(&limits).is_ok(), "全 0 配置必须合法");
+        // 并行度 0 仍非法（性能参数不能为 0）。
+        let mut bad = limits;
+        bad.max_parallel_tools = 0;
+        assert!(validate_limits(&bad).is_err());
+    }
 
     /// P1-12：workspace 的 AGENTS.md 项目规则必须注入 system_prompt_extra
     ///（此前只读取 ~/.tpi/SYSTEM.md，项目级约束进不了 system prompt）。
@@ -679,5 +738,40 @@ mod tests {
         .unwrap();
 
         assert!(load_from_home(&workspace, Some(""), &home).is_err());
+    }
+
+    /// /theme 菜单持久化：写 [ui] theme 到 home 配置，保留其它字段。
+    #[test]
+    fn set_ui_theme_creates_and_updates_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // 1. 配置不存在：创建并写入 [ui] theme。
+        let path = set_ui_theme_at(&home, "onedarkpro").unwrap();
+        assert_eq!(path, home.join("config.toml"));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("theme = \"onedarkpro\""), "raw: {raw}");
+
+        // 2. 已存在其它配置：更新 theme，保留 model 等其它字段。
+        std::fs::write(
+            &path,
+            "[model.primary]\nprovider = \"p\"\nname = \"m\"\nbase_url = \"https://x\"\n[ui]\ncollapsed_lines = 5\n",
+        )
+        .unwrap();
+        set_ui_theme_at(&home, "light").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("theme = \"light\""), "raw: {raw}");
+        assert!(raw.contains("provider = \"p\""), "其它字段必须保留: {raw}");
+        assert!(
+            raw.contains("collapsed_lines = 5"),
+            "ui 其它字段必须保留: {raw}"
+        );
+
+        // 3. 写入结果可被 load 解析。
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().join("workspace")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let cfg = load_from_home(&workspace, None, &home).unwrap();
+        assert_eq!(cfg.ui_theme, "light");
     }
 }

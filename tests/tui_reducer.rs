@@ -81,6 +81,30 @@ fn event_sequence_is_replayable() {
     assert_eq!(s1.pending_messages, s2.pending_messages);
 }
 
+/// §用户诉求：手动 /compact 结果（CompactionNotice）写入系统行，用户可见。
+#[test]
+fn compaction_notice_pushes_system_line() {
+    let mut s = state();
+    let before = s.view.transcript.len();
+    reducer::update(
+        &mut s,
+        UiEvent::Agent(RuntimeEvent::CompactionNotice {
+            message: "手动压缩未生效：没有可压缩的历史".into(),
+        }),
+    );
+    assert_eq!(s.view.transcript.len(), before + 1, "必须写入一行系统消息");
+    let last = s.view.transcript.last().unwrap();
+    let tpi::tui::model::Entry::Message { line, .. } = last else {
+        panic!("CompactionNotice 必须产生 Message 条目");
+    };
+    assert_eq!(line.kind, LineKind::System);
+    assert!(
+        line.text.contains("没有可压缩的历史"),
+        "系统行必须包含通知文本: {:?}",
+        line.text
+    );
+}
+
 #[test]
 fn esc_priority_overlay_over_menu_over_cancel() {
     // overlay 打开：Esc 只关 overlay，不产生取消效果。
@@ -997,6 +1021,75 @@ fn esc_closes_sessions_browser_in_one_press() {
     assert!(
         s.view.modal.is_none() && s.view.menu.is_none(),
         "one Esc must dismiss the whole /sessions browser"
+    );
+}
+
+/// /theme 是“菜单 + Modal 指令”组合：Enter 仍应应用选中主题（例外路径），
+/// 与 /sessions 一致；选中后一并关闭菜单与 Modal。
+#[test]
+fn theme_menu_enter_sets_pending_theme() {
+    let mut s = state();
+    s.view.open_modal("/theme", "当前主题: omp");
+    s.view.menu = Some(tpi::tui::model::MenuView {
+        items: vec![
+            ("omp".into(), "默认 · base16-mocha".into()),
+            ("onedarkpro".into(), "One Dark Pro · Solarized".into()),
+        ],
+        selected: 1,
+        kind: tpi::tui::model::MenuKind::Theme,
+        session_previews: Vec::new(),
+    });
+    reducer::update(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.pending_theme.as_deref(), Some("onedarkpro"));
+    assert!(
+        s.view.menu.is_none() && s.view.modal.is_none(),
+        "selecting a theme must close both the menu and the /theme modal"
+    );
+}
+
+/// /theme 浏览器（Modal + Theme 菜单）一次 Esc 全部关闭。
+#[test]
+fn esc_closes_theme_browser_in_one_press() {
+    let mut s = state();
+    s.view.open_modal("/theme", "选择主题");
+    s.view.menu = Some(tpi::tui::model::MenuView {
+        items: vec![("omp".into(), "默认".into())],
+        selected: 0,
+        kind: tpi::tui::model::MenuKind::Theme,
+        session_previews: Vec::new(),
+    });
+    reducer::update(&mut s, key(KeyCode::Esc));
+    assert!(
+        s.view.modal.is_none() && s.view.menu.is_none(),
+        "one Esc must dismiss the whole /theme browser"
+    );
+}
+
+/// /theme 菜单在 ↑/↓ 导航后必须保持（同 /sessions 回归：refresh_menus
+/// 不得把 Modal+菜单组合清掉）。
+#[test]
+fn theme_menu_survives_up_down_navigation() {
+    let mut s = state();
+    s.view.open_modal("/theme", "选择主题");
+    s.view.menu = Some(tpi::tui::model::MenuView {
+        items: vec![
+            ("omp".into(), "默认".into()),
+            ("dark".into(), "深色".into()),
+            ("light".into(), "浅色".into()),
+        ],
+        selected: 0,
+        kind: tpi::tui::model::MenuKind::Theme,
+        session_previews: Vec::new(),
+    });
+    reducer::update(&mut s, key(KeyCode::Down));
+    assert_eq!(s.view.menu.as_ref().map(|m| m.selected), Some(1));
+    reducer::update(&mut s, key(KeyCode::Down));
+    assert_eq!(s.view.menu.as_ref().map(|m| m.selected), Some(2));
+    reducer::update(&mut s, key(KeyCode::Up));
+    assert_eq!(s.view.menu.as_ref().map(|m| m.selected), Some(1));
+    assert!(
+        s.view.menu.is_some(),
+        "theme menu must survive navigation (regression)"
     );
 }
 

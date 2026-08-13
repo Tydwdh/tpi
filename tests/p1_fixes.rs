@@ -779,10 +779,10 @@ impl Provider for AlwaysInterruptProvider {
     }
 }
 
-/// §4.3 第二阶段：续写再次断联时不得无限循环——以 ProviderInterrupted 结束，
-/// 且 session 记录两次 AssistantAttemptInterrupted。
+/// §4.3 第二阶段：续写一直断联时不得无限循环——以 ProviderInterrupted 结束。
+/// §用户诉求：上限提到 10 次续写（共 11 次调用）；session 记录每次中断。
 #[tokio::test]
-async fn recovery_capped_after_one_attempt() {
+async fn recovery_capped_after_max_attempts() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let config = test_config(&workspace);
@@ -820,7 +820,8 @@ async fn recovery_capped_after_one_attempt() {
         .iter()
         .filter(|e| matches!(e, SessionEvent::AssistantAttemptInterrupted { .. }))
         .count();
-    assert_eq!(interrupted, 2, "首次 + 续写各记录一次中断: {events:?}");
+    // 首次 + 10 次续写各记录一次中断（上限 10，共 11 次调用）。
+    assert_eq!(interrupted, 11, "每次中断都必须记录: {events:?}");
 }
 
 /// §4.3 第三阶段：已收到 tool delta 后断联 → **整个 model turn 重新生成**。
@@ -955,8 +956,8 @@ impl Provider for ToolDeltaAlwaysInterruptProvider {
         _cancel: CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
         self.calls += 1;
-        // 首次 + restart = 2 次；第 3 次说明 restart 未封顶（防无限循环）。
-        if self.calls > 2 {
+        // 首次 + 10 次 restart = 11 次；第 12 次说明 restart 未封顶（防无限循环）。
+        if self.calls > 11 {
             panic!("restart 必须封顶（防无限循环）");
         }
         events
@@ -1004,15 +1005,18 @@ async fn tool_delta_restart_is_capped() {
 
     drain.abort();
     assert_eq!(outcome.reason, CompletionReason::ProviderInterrupted);
-    assert_eq!(provider.calls, 2, "restart 必须封顶为 1 次（共 2 次调用）");
+    assert_eq!(
+        provider.calls, 11,
+        "restart 必须封顶为 10 次（共 11 次调用）"
+    );
 
-    // 两次中断都记录（首次 + restart）。
+    // 每次中断都记录（首次 + 10 次 restart）。
     let events = tpi::session::read_events(session.path()).unwrap();
     let interrupted = events
         .iter()
         .filter(|e| matches!(e, SessionEvent::AssistantAttemptInterrupted { .. }))
         .count();
-    assert_eq!(interrupted, 2, "首次 + restart 各记录一次中断: {events:?}");
+    assert_eq!(interrupted, 11, "每次中断都必须记录: {events:?}");
 }
 
 /// §4.3 `/retry`：空 user_message = retry 语义。
@@ -1151,4 +1155,186 @@ fn retry_pending_round_trips_through_state() {
         "retry 目标必须可取出"
     );
     assert!(ui.take_pending_retry().is_none(), "取出后清空");
+}
+
+/// §用户诉求：手动 /compact 成功时，UI 收到 CompactionNotice 完成提示
+/// （此前只写日志、界面无感知）。历史足够且摘要显著缩小才走到成功分支。
+#[tokio::test]
+async fn force_compaction_success_notifies_ui() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+
+    // summary 必须是 parse_summary 接受的 9 字段格式（否则校验失败走未生效分支）。
+    let summary = "Goal: g\nConstraints: c\nDecisions: d\nCompleted: c\nIn progress: i\nNext exact action: n\nRelevant files and revisions: r\nVerification status: v\nFailed attempts and why: f";
+    let mut provider = FakeProvider::scripted_loop(Box::new(move |request| {
+        if request.tools.is_empty() {
+            // compaction 请求（无工具 schema）：返回有效 summary。
+            FakeResponse::text(summary)
+        } else {
+            FakeResponse::text("done")
+        }
+    }));
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .unwrap();
+    let (ui_tx, mut ui_rx) = mpsc::channel(128);
+    let notices = tokio::spawn(async move {
+        let mut out = Vec::new();
+        while let Some(event) = ui_rx.recv().await {
+            if let agent::RuntimeEvent::CompactionNotice { message } = event {
+                out.push(message);
+            }
+        }
+        out
+    });
+
+    // 注入大历史使 messages.len() > 1 且原文显著大于 summary（4 倍缩小门槛）。
+    let big = "word ".repeat(2000); // 8000 chars ≈ 2000 tokens
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[
+                ChatMessage::User(big.clone()),
+                ChatMessage::Assistant {
+                    content: "中间回复".into(),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            user_message: "hello".into(),
+            ui: ui_tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.reason, CompletionReason::Stop);
+    drop(session);
+    let notices = notices.await.unwrap();
+    assert!(
+        notices.iter().any(|m| m.contains("手动压缩完成")),
+        "压缩成功必须通知 UI: {notices:?}"
+    );
+}
+
+/// §用户诉求：手动 /compact 但历史不足（无可压缩内容）时，UI 收到
+/// 明确提示而非静默。
+#[tokio::test]
+async fn force_compaction_too_short_notifies_ui() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = FakeProvider::scripted_loop(Box::new(|_| FakeResponse::text("ok")));
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .unwrap();
+    let (ui_tx, mut ui_rx) = mpsc::channel(128);
+    let notices = tokio::spawn(async move {
+        let mut out = Vec::new();
+        while let Some(event) = ui_rx.recv().await {
+            if let agent::RuntimeEvent::CompactionNotice { message } = event {
+                out.push(message);
+            }
+        }
+        out
+    });
+
+    // 空历史 + 单条 user 消息 → messages.len() == 1，不调压缩，直接提示无内容。
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "hello".into(),
+            ui: ui_tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.reason, CompletionReason::Stop);
+    drop(session);
+    let notices = notices.await.unwrap();
+    assert!(
+        notices.iter().any(|m| m.contains("没有可压缩的历史")),
+        "历史不足必须通知 UI: {notices:?}"
+    );
+}
+
+/// §用户诉求：手动 /compact 时模型未返回有效摘要（空输出/极短无内容）→
+/// UI 收到细分提示（SummaryInvalid）且带模型原文，可诊断。
+#[tokio::test]
+async fn force_compaction_invalid_summary_notifies_ui() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    // compaction 请求（tools 为空）返回极短无内容文本（<60 字节）→ SummaryInvalid。
+    let mut provider = FakeProvider::scripted_loop(Box::new(move |request| {
+        if request.tools.is_empty() {
+            FakeResponse::text("好的，我来压缩")
+        } else {
+            FakeResponse::text("done")
+        }
+    }));
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .unwrap();
+    let (ui_tx, mut ui_rx) = mpsc::channel(128);
+    let notices = tokio::spawn(async move {
+        let mut out = Vec::new();
+        while let Some(event) = ui_rx.recv().await {
+            if let agent::RuntimeEvent::CompactionNotice { message } = event {
+                out.push(message);
+            }
+        }
+        out
+    });
+
+    let big = "word ".repeat(2000); // 足够大的历史，使 messages.len() > 1。
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[
+                ChatMessage::User(big),
+                ChatMessage::Assistant {
+                    content: "中间回复".into(),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            user_message: "hello".into(),
+            ui: ui_tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.reason, CompletionReason::Stop);
+    drop(session);
+    let notices = notices.await.unwrap();
+    assert!(
+        notices
+            .iter()
+            .any(|m| m.contains("未返回有效摘要") && m.contains("好的，我来压缩")),
+        "模型未返回有效摘要时必须细分提示且带原文: {notices:?}"
+    );
 }
