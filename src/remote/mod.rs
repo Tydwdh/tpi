@@ -7,6 +7,7 @@
 pub mod executor;
 pub mod files;
 pub mod ssh;
+pub mod traverse;
 
 use std::sync::{Arc, Mutex};
 

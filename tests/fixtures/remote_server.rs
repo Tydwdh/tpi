@@ -117,6 +117,7 @@ impl russh::server::Handler for TestHandler {
                 root: self.root.clone(),
                 posix_root: self.posix_root.clone(),
                 handles: std::collections::HashMap::new(),
+                dirs: std::collections::HashMap::new(),
             };
             russh_sftp::server::run(channel.into_stream(), handler).await;
         } else {
@@ -135,6 +136,9 @@ struct SftpBackend {
     root: Arc<PathBuf>,
     posix_root: String,
     handles: std::collections::HashMap<String, (PathBuf, OpenFlags, u64)>,
+    /// opendir 句柄 → (目录路径, 是否已返回过)。readdir 第一次返回全部条目，
+    /// 之后返回 EOF（russh-sftp 客户端迭代器以 EOF 结束）。
+    dirs: std::collections::HashMap<String, (PathBuf, bool)>,
 }
 
 impl SftpBackend {
@@ -324,15 +328,22 @@ impl russh_sftp::server::Handler for SftpBackend {
         if !p.is_dir() {
             return Err(StatusCode::NoSuchFile);
         }
-        Ok(Handle {
-            id,
-            handle: format!("dir{id}"),
-        })
+        let handle = format!("dir{id}");
+        self.dirs.insert(handle.clone(), (p, false));
+        Ok(Handle { id, handle })
     }
 
-    async fn readdir(&mut self, id: u32, _handle: String) -> Result<Name, Self::Error> {
+    async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+        let Some((dir, done)) = self.dirs.get_mut(&handle) else {
+            return Err(StatusCode::Failure);
+        };
+        if *done {
+            // 已返回过：EOF 结束迭代（russh-sftp 客户端 read_dir 约定）。
+            return Err(StatusCode::Eof);
+        }
+        *done = true;
         let mut files = Vec::new();
-        let rd = std::fs::read_dir(self.root.as_path()).map_err(|_| StatusCode::Failure)?;
+        let rd = std::fs::read_dir(dir).map_err(|_| StatusCode::Failure)?;
         for entry in rd.flatten() {
             let meta = entry.metadata().map_err(|_| StatusCode::Failure)?;
             let mut attrs = FileAttributes {
