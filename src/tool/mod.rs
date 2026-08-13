@@ -489,7 +489,11 @@ pub struct ToolContext {
     /// 当前原子短计划（§13；agent loop 持有，update_plan 原子替换）。
     pub current_plan: std::sync::Arc<std::sync::Mutex<Option<crate::tool::plan::Plan>>>,
     /// Logical Shell Session（任务书 §S1：属于 Workspace；bash 工具读写）。
+    /// 与 `workspace` 内的 shell 是同一状态源（构造时共享 Arc）。
     pub shell: std::sync::Arc<std::sync::Mutex<crate::shell::ShellSessionState>>,
+    /// ActiveWorkspace（§26-§30：Tool Protocol 的分发目标）。
+    /// `workspace_root`/`allow_outside_workspace`/`shell` 是当前 workspace 的投影。
+    pub workspace: std::sync::Arc<std::sync::Mutex<crate::workspace::ActiveWorkspace>>,
     /// 交互模式（`-p` 为 false；§11 移除 ask_user 后仅保留供未来交互原语使用）。
     pub interactive: bool,
 }
@@ -881,10 +885,12 @@ mod tests {
         let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.txt")).unwrap();
         std::fs::write(path.as_std_path(), "hello 世界\n").unwrap();
+        let local = crate::workspace::LocalWorkspace::new(workspace.clone(), true);
         let ctx = ToolContext {
             workspace_root: workspace.clone(),
-            shell: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::shell::ShellSessionState::new(workspace.clone()),
+            shell: local.shell.clone(),
+            workspace: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::workspace::ActiveWorkspace::local(local),
             )),
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),

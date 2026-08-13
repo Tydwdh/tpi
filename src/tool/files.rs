@@ -596,10 +596,12 @@ mod tests {
         content.push_str("fn main() {}\n");
         std::fs::write(path.as_std_path(), &content).unwrap();
 
+        let local = crate::workspace::LocalWorkspace::new(workspace.clone(), true);
         let ctx = ToolContext {
             workspace_root: workspace.clone(),
-            shell: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::shell::ShellSessionState::new(workspace.clone()),
+            shell: local.shell.clone(),
+            workspace: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::workspace::ActiveWorkspace::local(local),
             )),
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),
@@ -653,10 +655,12 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.txt")).unwrap();
         std::fs::write(path.as_std_path(), b"old").unwrap();
         let revision = crate::tool::edit::revision_of(b"old");
+        let local = crate::workspace::LocalWorkspace::new(workspace.clone(), true);
         let ctx = ToolContext {
             workspace_root: workspace.clone(),
-            shell: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::shell::ShellSessionState::new(workspace.clone()),
+            shell: local.shell.clone(),
+            workspace: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::workspace::ActiveWorkspace::local(local),
             )),
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),
@@ -705,10 +709,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("new.txt")).unwrap();
+        let local = crate::workspace::LocalWorkspace::new(workspace.clone(), true);
         let ctx = ToolContext {
             workspace_root: workspace.clone(),
-            shell: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::shell::ShellSessionState::new(workspace.clone()),
+            shell: local.shell.clone(),
+            workspace: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::workspace::ActiveWorkspace::local(local),
             )),
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),

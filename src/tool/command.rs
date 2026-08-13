@@ -73,6 +73,28 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
             format!("timeout_ms 必须在 1..={MAX_TIMEOUT_MS} 范围内。"),
         );
     }
+    // §35：bash 按 ActiveWorkspace 分发。当前只有 Local（R1 加 Remote 分支
+    // → SshShellExecutor）。
+    let kind = {
+        let ws = crate::util::lock_mutex(&ctx.workspace, "workspace");
+        ws.kind()
+    };
+    match kind {
+        crate::workspace::WorkspaceKind::Local => local_bash(args, ctx).await,
+        crate::workspace::WorkspaceKind::Remote => {
+            // R1 实现 SshShellExecutor 前，Remote 明确不可用（不伪造执行）。
+            rejected_bash(
+                "remote_not_supported",
+                "当前 workspace 是 Remote（SSH）；Remote bash 尚未实现（Phase R1）。",
+            )
+        }
+    }
+}
+
+/// 本地执行器（LocalShellExecutor，§35）：fresh Git Bash + process-host +
+/// Job Object 进程树；ShellSessionState 由 ctx.shell 读写（= ActiveWorkspace
+/// 内 LocalWorkspace.shell 的同一状态）。
+async fn local_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
     if ctx.cancel.is_cancelled() {
         return ToolOutcome::failed(
             "bash",

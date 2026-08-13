@@ -31,6 +31,7 @@ pub(super) struct ToolRuntime {
     snapshot_store: Arc<Mutex<SnapshotStore>>,
     current_plan: Arc<Mutex<Option<Plan>>>,
     shell: Arc<Mutex<crate::shell::ShellSessionState>>,
+    workspace: Arc<Mutex<crate::workspace::ActiveWorkspace>>,
 }
 
 #[derive(Clone)]
@@ -49,6 +50,12 @@ impl ToolRuntime {
         interactive: bool,
         initial_plan: Option<Plan>,
     ) -> Self {
+        // §W0：LocalWorkspace 拥有 shell 状态；ctx.shell 与 workspace 共享同一 Arc。
+        let local = crate::workspace::LocalWorkspace::new(
+            config.workspace_root.clone(),
+            config.allow_outside_workspace,
+        );
+        let workspace = Arc::new(Mutex::new(crate::workspace::ActiveWorkspace::local(local.clone())));
         Self {
             config: RuntimeConfig {
                 workspace_root: config.workspace_root.clone(),
@@ -62,9 +69,8 @@ impl ToolRuntime {
             scan_snapshots: Default::default(),
             snapshot_store: Default::default(),
             current_plan: Arc::new(Mutex::new(initial_plan)),
-            shell: Arc::new(Mutex::new(crate::shell::ShellSessionState::new(
-                config.workspace_root.clone(),
-            ))),
+            shell: local.shell.clone(),
+            workspace,
         }
     }
 
@@ -90,6 +96,7 @@ impl ToolRuntime {
             snapshot_store: self.snapshot_store.clone(),
             current_plan: self.current_plan.clone(),
             shell: self.shell.clone(),
+            workspace: self.workspace.clone(),
             interactive: self.interactive,
         }
     }

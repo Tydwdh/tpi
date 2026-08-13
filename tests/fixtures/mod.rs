@@ -56,6 +56,10 @@ pub fn point_host_at_real_tpi() {
 /// 构造最小工具执行上下文（M2 起字段齐备）。
 pub fn test_tool_context(workspace_root: &Utf8PathBuf) -> tpi::tool::ToolContext {
     use tpi::tool::search::ScanSnapshot;
+    use std::sync::{Arc, Mutex};
+    // §W0：LocalWorkspace 拥有 shell；ctx.shell 与 ctx.workspace 共享同一 Arc。
+    let local = tpi::workspace::LocalWorkspace::new(workspace_root.clone(), true);
+    let workspace = Arc::new(Mutex::new(tpi::workspace::ActiveWorkspace::local(local.clone())));
     tpi::tool::ToolContext {
         workspace_root: workspace_root.clone(),
         cancel: tokio_util::sync::CancellationToken::new(),
@@ -72,9 +76,8 @@ pub fn test_tool_context(workspace_root: &Utf8PathBuf) -> tpi::tool::ToolContext
             tpi::tool::edit::SnapshotStore::default(),
         )),
         current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        shell: std::sync::Arc::new(std::sync::Mutex::new(tpi::shell::ShellSessionState::new(
-            workspace_root.clone(),
-        ))),
+        shell: local.shell.clone(),
+        workspace,
         interactive: true,
         allow_outside_workspace: true,
     }

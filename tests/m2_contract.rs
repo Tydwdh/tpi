@@ -92,6 +92,7 @@ async fn cancellation_kills_entire_process_tree() {
         snapshot_store: ctx.snapshot_store.clone(),
         current_plan: ctx.current_plan.clone(),
         shell: ctx.shell.clone(),
+        workspace: ctx.workspace.clone(),
         interactive: true,
         allow_outside_workspace: ctx.allow_outside_workspace,
     };

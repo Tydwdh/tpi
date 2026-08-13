@@ -96,6 +96,7 @@ fn doctor_report_with_home(
         .as_ref()
         .ok()
         .and_then(|config| config.shell_path.clone());
+    let local = crate::workspace::LocalWorkspace::new(workspace_root.clone(), true);
     let ctx = crate::tool::ToolContext {
         workspace_root: workspace_root.clone(),
         allow_outside_workspace: true,
@@ -112,8 +113,9 @@ fn doctor_report_with_home(
             crate::tool::edit::SnapshotStore::new(64, 8),
         )),
         current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        shell: std::sync::Arc::new(std::sync::Mutex::new(
-            crate::shell::ShellSessionState::new(workspace_root.clone()),
+        shell: local.shell.clone(),
+        workspace: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::workspace::ActiveWorkspace::local(local),
         )),
         interactive: false,
     };

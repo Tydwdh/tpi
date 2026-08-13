@@ -912,6 +912,7 @@ mod tests {
 
     /// 构造最小 ToolContext（list 行为测试用）。
     fn test_ctx(root: &Utf8PathBuf) -> ToolContext {
+        let local = crate::workspace::LocalWorkspace::new(root.clone(), true);
         ToolContext {
             workspace_root: root.clone(),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -927,8 +928,9 @@ mod tests {
                 crate::tool::edit::SnapshotStore::new(16, 4),
             )),
             current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            shell: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::shell::ShellSessionState::new(root.clone()),
+            shell: local.shell.clone(),
+            workspace: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::workspace::ActiveWorkspace::local(local),
             )),
             interactive: false,
             allow_outside_workspace: true,

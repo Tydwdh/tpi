@@ -19,3 +19,4 @@ pub mod shell;
 pub mod tool;
 pub mod tui;
 pub mod util;
+pub mod workspace;
