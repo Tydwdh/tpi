@@ -1,0 +1,42 @@
+# TPI MCP Server 配置示例（README2 §8）
+#
+# 复制本文件内容到 ~/.tpi/config.toml 的 [mcp.servers.*] 段启用。
+# 说明：
+# - command 是 server 可执行文件（PATH 中或绝对路径）
+# - args 是启动参数
+# - env 是传给 server 的环境变量（可选）
+# - enabled=false 时跳过启动（工具不注册）
+# - timeout_ms 是单次 tools/call 的等待上限（默认 30000）
+#
+# 启用后 TPI 会自动 spawn server、initialize、tools/list，并把工具以
+# mcp::<server>::<tool> 注册进工具目录（/mcp 查看状态）。
+
+# --- 简单测试 server（用 tests/fixtures/mcp_test_server.py） ---
+# [mcp.servers.test]
+# command = "python"
+# args = ["C:/Users/<you>/tpi/tests/fixtures/mcp_test_server.py"]
+# enabled = true
+# timeout_ms = 5000
+
+# --- 示例：文件系统 MCP（filesystem server 常见实现） ---
+# [mcp.servers.fs]
+# command = "node"
+# args = ["/path/to/filesystem-server/build/index.js", "C:/workspace"]
+# enabled = true
+# timeout_ms = 30000
+
+# --- 示例：带 env 的 server ---
+# [mcp.servers.llm]
+# command = "my_mcp_server"
+# args = ["--port", "8080"]
+# enabled = true
+# timeout_ms = 30000
+#
+# [mcp.servers.llm.env]
+# API_KEY = "sk-..."
+# MODEL = "default"
+
+# --- 关闭示例 ---
+# [mcp.servers.legacy]
+# command = "old_server"
+# enabled = false

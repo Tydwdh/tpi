@@ -2222,3 +2222,80 @@ export prefix
 # 73. 最终任务定义
 
 > **第一步，把现有本地 `bash` 升级成具有持久 cwd/env 的 Logical Shell Session，同时保留每命令独立进程树和 Job Object。第二步，把 Local/Remote 统一为 Active Workspace，让 SSH Remote Workspace 复用完全相同的 ShellSessionState 和现有 Tool DSL。Remote v1 不实现真正持久 Bash、PTY 或 job control；核心目标是让本地与远程工程任务在 Agent 看来拥有同一种操作语义。**
+
+---
+
+# 74. MCP Client 与 Agent Skills（README2 实施完成）
+
+> 本段记录 MCP 与 Skills 扩展的**使用方式**（架构设计见 `docs/mcp-skills-design.md`）。
+
+## MCP 配置
+
+在 `~/.tpi/config.toml` 添加：
+
+```toml
+[mcp.servers.<name>]
+command = "server 可执行文件"
+args = []
+enabled = true
+timeout_ms = 30000
+
+[mcp.servers.<name>.env]
+FOO = "bar"
+```
+
+启动 TPI 后自动 spawn server → initialize → tools/list，工具以
+`mcp::<server>::<tool>` 注册；`/mcp` 查看状态（Server/Status/Tools）。
+
+完整示例见 `examples/mcp-servers.toml`。
+
+## Skill 安装与目录
+
+Skill 目录优先级：**project > user > builtin**（同名覆盖，记录来源）：
+
+```text
+<workspace>/.agent/skills/<skill>/SKILL.md     # 项目级
+~/.tpi/skills/<skill>/SKILL.md                 # 用户级
+```
+
+标准 `SKILL.md` 格式（YAML frontmatter）：
+
+```markdown
+---
+name: skill-name
+description: 一句话说明
+---
+<body：使用说明/工作流/知识>
+```
+
+示例 skill 见 `examples/skills/`（hello-skill / rust-review / bevy-debug）。
+安装：把 skill 目录复制到 `<workspace>/.agent/skills/` 或 `~/.tpi/skills/`。
+
+## 工作方式（Progressive Disclosure）
+
+1. 启动只加载 skill 的 name/description（metadata-only），注入 system prompt
+   `[Available skills]` 列表；
+2. 模型匹配任务后调用内置工具 `activate_skill(name)` → 返回完整 SKILL.md
+   + references/scripts 清单；
+3. references 按需读取（`<skill>/references/*`）。
+
+## 调试命令
+
+```text
+/mcp           # MCP server 状态页
+/mcp list      # 等价 /mcp（状态表）
+/mcp tools     # 展示各 server 工具（并入状态页）
+/mcp restart   # 重启 server（卸载工具 → 杀进程 → 重新启动）
+```
+
+MCP 调用日志（debug）：`RUST_LOG=tpi=debug` 查看 server/tool/duration/status。
+
+## 已知限制（README2 §6-§7 明确不实现）
+
+- MCP：Resources / Prompts / Streamable HTTP / OAuth / Tasks / Notifications /
+  Sampling 未实现（YAGNI，README2 §7/§27 Phase 6）；
+- Skills：`allowed-tools` 权限不强制（README2 §24，V1 只 parse 保存 metadata）；
+- MCP 工具在 scheduler 中统一按 WorkspaceUnknown（保守串行）执行；
+- 工具经 ToolSelector 按上下文选择（builtin 始终保留，MCP 按关键词匹配，
+  总量上限 32）——未选中 MCP 工具本轮不可调用。
+
