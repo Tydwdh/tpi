@@ -11,6 +11,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste};
 use ratatui::crossterm::execute;
 
+const MOUSE_CAPTURE_SEQUENCE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+
 /// 视口模式（§1：默认 fullscreen；inline 仅为兼容模式）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
@@ -66,16 +68,12 @@ impl TerminalDriver {
             }
             execute!(std::io::stdout(), EnableBracketedPaste)?;
             // §PointerHit：App-managed mouse 模式（单一选择）——启用点击/拖动
-            // 捕获（?1000h ?1002h ?1006h）+ hover 上报（?1003h，未按键移动
-            // 也上报，卡片 hover 微高亮；成熟 TUI 标准行为）。
+            // 捕获（?1000h ?1002h ?1006h）。不启用 ?1003h any-event：当前 UI
+            // 没有 hover 状态，持续上报鼠标移动只会挤占输入队列并触发重绘。
             // 注意：启用 1002 后**拖动由应用接收**，终端不会同时做原生文本
             // 选择——这是有意为之的单一选择归属，不依赖"终端同时拖选"的
-            // 假设。应用内拖选 + Ctrl+C 复制负责文本选择。1003 只在现代终端
-            // 生效，不支持时静默无 hover（不影响点击/拖动）。
-            let _ = std::io::Write::write_all(
-                &mut std::io::stdout(),
-                b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h",
-            );
+            // 假设。应用内拖选 + Ctrl+C 复制负责文本选择。
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), MOUSE_CAPTURE_SEQUENCE);
             let (_, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
             let height = inline_activity_height(rows);
             let viewport = match mode {
@@ -245,5 +243,19 @@ mod tests {
         assert_eq!(inline_activity_height(24), 12); // (24*2)/5=9 → clamp 12
         assert_eq!(inline_activity_height(60), 24);
         assert_eq!(inline_activity_height(200), 80); // (200*2)/5=80
+    }
+
+    #[test]
+    fn mouse_capture_does_not_enable_any_event_hover() {
+        assert!(
+            !MOUSE_CAPTURE_SEQUENCE
+                .windows(6)
+                .any(|part| part == b"?1003h")
+        );
+        assert!(
+            MOUSE_CAPTURE_SEQUENCE
+                .windows(6)
+                .any(|part| part == b"?1002h")
+        );
     }
 }

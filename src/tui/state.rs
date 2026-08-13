@@ -26,22 +26,12 @@ pub struct UiState {
     pub running: bool,
     /// P1-10：手动 /compact 请求（下一次 run 开始时在完整边界压缩一次）。
     pub force_compaction: bool,
-    /// P0-4：空闲 Ctrl+C 连按两次退出的第一次按压时刻（2 秒窗口内第二次才退出）。
-    /// 记录在 reducer（纯状态转换），退出动作以 effect 返回——不依赖 signal
-    /// handler（raw mode 下 Windows 把 Ctrl+C 作为按键交给 reducer）。
-    pub ctrl_c_exit_armed: Option<std::time::Instant>,
     /// 大粘贴占位符存储（§用户诉求）：id → 真实内容。输入框只渲染
-    /// `[Pasted Text: N chars #id]` 占位符；提交时经
+    /// `[Pasted Content N chars]` 占位符；提交时经
     /// [`crate::tui::paste::expand_paste_placeholders`] 展开成全文一起发送。
     /// 真实内容不进 `Editor`，因此不受 `MAX_INPUT_BYTES` 截断，也不分块上屏。
-    pub pasted: HashMap<u64, String>,
-    /// 占位符 id 自增序列（reducer 纯函数，无 RNG；从 1 开始）。
-    pub paste_seq: u64,
+    pub pasted: HashMap<String, String>,
 }
-
-/// 占位符条目上限：防大粘贴次数无限增长内存。超限清空整个表——旧占位符
-/// 在提交时查不到 id，按原样显示（极少触发，64 次大粘贴才会）。
-const PASTED_CAP: usize = 64;
 
 /// 排队消息上限（防运行中无限 Enter 导致内存/状态无限增长；超限丢最旧并提示）。
 const PENDING_CAP: usize = 16;
@@ -62,21 +52,17 @@ impl UiState {
             pending_retry: None,
             running: false,
             force_compaction: false,
-            ctrl_c_exit_armed: None,
             pasted: HashMap::new(),
-            paste_seq: 0,
         }
     }
 
-    /// 存储一段大粘贴内容，返回占位符 id（§用户诉求）。
-    /// 超上限时清空旧条目（见 [`PASTED_CAP`]）。
-    pub fn store_paste(&mut self, text: String) -> u64 {
-        if self.pasted.len() >= PASTED_CAP {
-            self.pasted.clear();
-        }
-        self.paste_seq += 1;
-        self.pasted.insert(self.paste_seq, text);
-        self.paste_seq
+    /// 存储一段大粘贴内容，返回插入编辑器的用户可见占位符。
+    /// 内容在提交、清空或取消 composer 时统一释放；不能中途淘汰旧条目，
+    /// 否则屏幕上仍存在的占位符将无法还原。
+    pub fn store_paste(&mut self, text: String) -> String {
+        let placeholder = crate::tui::paste::next_paste_placeholder(&self.pasted, &text);
+        self.pasted.insert(placeholder.clone(), text);
+        placeholder
     }
 
     /// 请求重试上一次失败 turn（`/retry`）。

@@ -6,7 +6,7 @@
 //! - Esc：取消当前 run，保留 session（Ctrl-C 只用于复制，见 reducer）。
 //!
 //! M5：Ratatui inline renderer——只有 renderer 写 stdout（§3.2 不变量 11、
-//! §16.1），16 ms 帧合并，synchronized update。
+//! §16.1），FRAME_INTERVAL 帧合并，synchronized update。
 //! M6+：键盘由独立线程持续读取（运行中也响应输入/翻页/折叠），
 //! 命令补全菜单（Tab）、输入历史（↑/↓）、多行输入（Alt+Enter）、
 //! 思考折叠（Alt+T）、动画时钟（spinner）。
@@ -62,6 +62,17 @@ enum SlashAction {
 struct RetryTarget {
     message: String,
     reason: crate::session::CompletionReason,
+}
+
+/// 键盘线程到 UI 主循环的输入。crossterm 事件保持原样；仅旧终端逐键粘贴
+/// 达到长文本阈值时增加两个语义事件，用于折叠及补齐旁路全文。
+enum TerminalInput {
+    Event(Event),
+    CollapseKeyStreamPaste {
+        rendered_suffix: String,
+        text: String,
+    },
+    FinishKeyStreamPaste(crate::tui::paste::FinishedKeyStreamPaste),
 }
 
 /// 应用入口。
@@ -322,75 +333,103 @@ async fn interactive_loop<P: Provider>(
     // §用户诉求（粘贴整段上屏）：支持 bracketed paste 的终端（WT/conhost 新
     // 版）把 Ctrl+V 注入为 `\x1b[200~ … \x1b[201~` 按键流；crossterm Windows
     // 后端不解析该序列。键盘线程按 Esc+`[` 检测粘贴开始、消费前缀 `[200~`、
-    // 缓冲内容按键直到 `[201~`，整段作为一次 Event::Paste 上屏——不依赖
-    // 间隔猜测、不读剪贴板，行尾 Enter 转 \n 不触发 submit，也不出现 `[200~`
-    // 垃圾前缀。
-    // §降级路径（不支持 bracketed paste 的旧 conhost/mintty/SSH）：粘贴内容
-    // 拆成连续按键流（含 Enter），逐键路由会让换行命中 submit 直接发送。
-    // 间隔感知（§用户诉求：打字 0 延迟）：降级检测的代价只发生在「连续两键
-    // 间隔 < paste::DENSE_GAP（16ms）」之后——该间隔人类打字不可能达到，只
-    // 有终端批量转发可达。普通按键（间隔 ≥16ms）**立即转发、0 等待**，打字
-    // 路径不承担任何探测/收集开销；确认是洪流后跨过旧终端批间节流，整次
-    // 合并为 Event::Paste（字面换行，不触发提交）。
-    let (key_tx, mut key_rx) = mpsc::channel::<Event>(128);
+    // 缓冲内容按键直到 `[201~`，整段作为一次 Event::Paste 上屏；行尾 Enter
+    // 转 \n 不触发 submit，也不出现 `[200~` 垃圾前缀。
+    // 普通 Ctrl+V/Shift+Insert 直接读取剪贴板，支持 bracketed paste 的终端
+    // 解析完整控制序列。旧终端若退化成逐键流，字符仍一律立即转发，只把紧跟
+    // 可插入字符的普通 Enter 改写为 Shift+Enter；不再缓冲/回溯整串输入。
+    let (key_tx, mut key_rx) = mpsc::channel::<TerminalInput>(128);
     std::thread::spawn(move || {
         use crate::tui::paste;
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};
-        // 待处理事件队列：Enter 探测 read 出的后续事件放回这里再处理，
-        // 保证探测过程中读出的任何事件都不丢失。
+        // 待处理事件队列：bracketed-paste 前后缀探测读出的非控制事件放回
+        // 这里再处理，保证探测过程中读出的任何事件都不丢失。
         let mut backlog: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
-        // 最近一次按键（Press）到达时刻：洪流判定只依据相邻按键间隔，
-        // 不依赖任何时间窗等待。None = 尚无按键或刚被非按键事件打断。
-        let mut last_press: Option<std::time::Instant> = None;
-        // 只由旧终端的按键洪流兜底路径武装；防止 burst flush 后迟到的 Enter
-        // 被当成提交。现代 Event::Paste / Ctrl+V 快路径不受影响。
-        let mut fallback_guard = paste::FallbackPasteGuard::default();
+        let mut fast_enter_guard = paste::FastPasteEnterGuard::default();
+        macro_rules! send_event {
+            ($event:expr) => {
+                key_tx.blocking_send(TerminalInput::Event($event))
+            };
+        }
+        macro_rules! finish_key_stream_paste {
+            () => {{
+                match fast_enter_guard.finish() {
+                    Some(finished) => key_tx
+                        .blocking_send(TerminalInput::FinishKeyStreamPaste(finished))
+                        .is_ok(),
+                    None => true,
+                }
+            }};
+        }
         // 取下一个事件：backlog 优先，否则阻塞 read（不增加输入延迟）。
+        // Windows Console 同时产生 key-down/key-up；Release 不是编辑动作，且
+        // 若夹在 bracketed-paste 控制序列中会打断前后缀解析，因此在最外层
+        // 统一丢弃。
         macro_rules! next_event {
-            () => {
-                if let Some(e) = backlog.pop_front() {
-                    e
-                } else {
-                    match event::read() {
-                        Ok(e) => e,
-                        Err(_) => break,
+            () => {{
+                loop {
+                    let candidate = if let Some(e) = backlog.pop_front() {
+                        e
+                    } else {
+                        match event::read() {
+                            Ok(e) => e,
+                            Err(_) => return,
+                        }
+                    };
+                    if !matches!(
+                        &candidate,
+                        Event::Key(k) if k.kind == KeyEventKind::Release
+                    ) {
+                        break candidate;
                     }
                 }
-            };
+            }};
         }
         loop {
             let event = next_event!();
-            let now = std::time::Instant::now();
+            let event_at = std::time::Instant::now();
+            if let Some(finished) = fast_enter_guard.finish_if_stale(event_at)
+                && key_tx
+                    .blocking_send(TerminalInput::FinishKeyStreamPaste(finished))
+                    .is_err()
+            {
+                return;
+            }
             let (is_key, is_press) = match &event {
                 Event::Key(k) => (true, k.kind == KeyEventKind::Press),
                 _ => (false, false),
             };
             if !is_key {
-                // Paste/Mouse/Resize：无需洪流合并，立即转发；并重置间隔基线
-                //（新输入上下文，后续按键不与旧按键比间隔）。
-                if key_tx.blocking_send(event).is_err() {
+                // Paste/Mouse/Resize：无需解析，立即转发。
+                if !finish_key_stream_paste!() {
+                    return;
+                }
+                fast_enter_guard.clear();
+                if send_event!(event).is_err() {
                     break;
                 }
-                last_press = None;
                 continue;
             }
             // §优化（粘贴瞬间出现）：Ctrl+V / Shift+Insert 直读系统剪贴板，
             // 整段一次 Event::Paste（一次 draw 完成），任何终端都生效。
             if is_press && is_paste_shortcut(&event) {
+                if !finish_key_stream_paste!() {
+                    return;
+                }
+                fast_enter_guard.clear();
                 if let Some(text) = crate::clipboard::read_text().ok().flatten()
                     && !text.is_empty()
-                    && key_tx.blocking_send(Event::Paste(text)).is_err()
+                    && send_event!(Event::Paste(text)).is_err()
                 {
                     return;
                 }
-                last_press = None;
                 continue;
             }
             // §bracketed paste 序列解析（WT/conhost 等支持 bracketed paste 的
             // 终端）：Ctrl+V 粘贴被注入为 `\x1b[200~ … \x1b[201~` 按键流——
             // crossterm Windows 后端不解析该序列（逐键产生 KeyEvent），逐键转发
-            // 会把 `[200~` 垃圾送进输入框，行尾 Enter 在批次边界还可能被下方
-            // Enter 探测窗误判为提交。检测无修饰 Esc 后紧跟 `[` 键 → 判定粘贴
+            // 会把 `[200~` 垃圾送进输入框，内容里的 Enter 也会被当作提交。
+            // 检测无修饰 Esc 后紧跟 `[` 键 → 判定粘贴
             // 开始：消费前缀 `[200~`，内容按键全部缓冲，直到 `[201~`（Esc 后
             // 紧接 `2,0,1,~`）结束，整段作为一次 Event::Paste 上屏。不依赖间隔
             // 猜测、不读剪贴板；行尾 Enter 经 paste_char 转 \n，不会误提交。
@@ -401,9 +440,12 @@ async fn interactive_loop<P: Provider>(
                     _ => unreachable!(),
                 })
             {
-                if event::poll(paste::BRACKETED_PROBE_GAP).unwrap_or(false)
-                    && let Ok(next) = event::read()
-                {
+                if !finish_key_stream_paste!() {
+                    return;
+                }
+                fast_enter_guard.clear();
+                if event::poll(paste::BRACKETED_PROBE_GAP).unwrap_or(false) {
+                    let next = next_event!();
                     // 只匹配字符码：终端注入 `[` 时可能带 SHIFT 修饰（美式键盘
                     // `[` 是 Shift+[），不检查修饰，避免探测失败。Esc+Char('[')
                     // 组合正常输入只可能来自 bracketed paste 前缀。
@@ -426,10 +468,7 @@ async fn interactive_loop<P: Provider>(
                                 prefix_ok = false;
                                 break;
                             }
-                            let Ok(e) = event::read() else {
-                                prefix_ok = false;
-                                break;
-                            };
+                            let e = next_event!();
                             let matches = matches!(
                                 &e,
                                 Event::Key(k) if paste::is_sequence_char(k, expected)
@@ -442,17 +481,14 @@ async fn interactive_loop<P: Provider>(
                         }
                         if !prefix_ok {
                             // 不是 bracketed paste：原样转发探测期间消费的事件。
-                            if key_tx.blocking_send(event).is_err()
-                                || key_tx.blocking_send(next).is_err()
-                            {
+                            if send_event!(event).is_err() || send_event!(next).is_err() {
                                 return;
                             }
                             for e in prefix_events {
-                                if key_tx.blocking_send(e).is_err() {
+                                if send_event!(e).is_err() {
                                     return;
                                 }
                             }
-                            last_press = None;
                             continue;
                         }
                         // 内容收集：直到 `[201~` 或空闲超时。内容完整缓冲，
@@ -461,9 +497,7 @@ async fn interactive_loop<P: Provider>(
                             if !event::poll(paste::PASTE_IDLE_TIMEOUT).unwrap_or(false) {
                                 // 空闲超时：粘贴流结束但未收到 201~（异常/误判）。
                                 if !buf.is_empty()
-                                    && key_tx
-                                        .blocking_send(Event::Paste(std::mem::take(&mut buf)))
-                                        .is_err()
+                                    && send_event!(Event::Paste(std::mem::take(&mut buf))).is_err()
                                 {
                                     return;
                                 }
@@ -479,21 +513,20 @@ async fn interactive_loop<P: Provider>(
                                         let mut is_end = true;
                                         let mut consumed = Vec::new();
                                         for expected in paste::BRACKETED_END_TAIL {
-                                            if event::poll(paste::BRACKETED_PROBE_GAP)
+                                            if !event::poll(paste::BRACKETED_PROBE_GAP)
                                                 .unwrap_or(false)
-                                                && let Ok(nxt) = event::read()
                                             {
-                                                let ok = matches!(
-                                                    &nxt,
-                                                    Event::Key(k2)
-                                                        if paste::is_sequence_char(k2, expected)
-                                                );
-                                                consumed.push(nxt);
-                                                if !ok {
-                                                    is_end = false;
-                                                    break;
-                                                }
-                                            } else {
+                                                is_end = false;
+                                                break;
+                                            }
+                                            let nxt = next_event!();
+                                            let ok = matches!(
+                                                &nxt,
+                                                Event::Key(k2)
+                                                    if paste::is_sequence_char(k2, expected)
+                                            );
+                                            consumed.push(nxt);
+                                            if !ok {
                                                 is_end = false;
                                                 break;
                                             }
@@ -501,11 +534,10 @@ async fn interactive_loop<P: Provider>(
                                         if is_end {
                                             // `[201~`：粘贴结束，整段一次上屏。
                                             if !buf.is_empty()
-                                                && key_tx
-                                                    .blocking_send(Event::Paste(std::mem::take(
-                                                        &mut buf,
-                                                    )))
-                                                    .is_err()
+                                                && send_event!(Event::Paste(std::mem::take(
+                                                    &mut buf
+                                                )))
+                                                .is_err()
                                             {
                                                 return;
                                             }
@@ -530,15 +562,14 @@ async fn interactive_loop<P: Provider>(
                                             // 异常键（修饰组合/特殊键）：flush 已收，
                                             // 原样转发该键，退出收集。
                                             if !buf.is_empty()
-                                                && key_tx
-                                                    .blocking_send(Event::Paste(std::mem::take(
-                                                        &mut buf,
-                                                    )))
-                                                    .is_err()
+                                                && send_event!(Event::Paste(std::mem::take(
+                                                    &mut buf
+                                                )))
+                                                .is_err()
                                             {
                                                 return;
                                             }
-                                            if key_tx.blocking_send(Event::Key(*k)).is_err() {
+                                            if send_event!(Event::Key(*k)).is_err() {
                                                 return;
                                             }
                                             break;
@@ -548,224 +579,66 @@ async fn interactive_loop<P: Provider>(
                                 other => {
                                     // 非按键事件：flush 已收，转发，退出收集。
                                     if !buf.is_empty()
-                                        && key_tx
-                                            .blocking_send(Event::Paste(std::mem::take(&mut buf)))
+                                        && send_event!(Event::Paste(std::mem::take(&mut buf)))
                                             .is_err()
                                     {
                                         return;
                                     }
-                                    if key_tx.blocking_send(other.clone()).is_err() {
+                                    if send_event!(other.clone()).is_err() {
                                         return;
                                     }
                                     break;
                                 }
                             }
                         }
-                        last_press = None;
                         continue;
                     }
                 }
                 // 无后续 `[`：普通 Esc，立即转发。
-                if key_tx.blocking_send(event).is_err() {
+                if send_event!(event).is_err() {
                     return;
                 }
-                last_press = Some(now);
                 continue;
             }
-            // 降级粘贴 burst 刚结束时，某些终端会把尾部换行单独延迟投递。
-            // 此时必须把 Enter 作为字面换行，而不是提交已有输入。
-            if is_press
-                && paste::is_plain_enter(match &event {
-                    Event::Key(k) => k,
-                    _ => unreachable!(),
-                })
-                && fallback_guard.absorb_enter(now)
-            {
-                if key_tx.blocking_send(Event::Paste("\n".into())).is_err() {
-                    return;
-                }
-                last_press = Some(now);
-                continue;
-            }
-            // §bug 修复（先输入再粘贴会误发送）：降级路径下粘贴按键流中的
-            // Enter——若位于粘贴开头/批次边界，与上一键间隔 ≥DENSE_GAP 会被
-            // 当普通按键逐键转发 → 命中 submit，把输入框已有文本发送出去。
-            // 无修饰 Enter（提交键）不在洪流中时：探测短窗（FLUSH_GAP），
-            // 后续 40ms 内若紧跟 Press 按键（粘贴流特征）→ 判定为粘贴流中的
-            // Enter，转 \n 进收集；否则是用户提交，立即转发（Enter 后无事件
-            // 时 0 额外延迟；Enter 是低频提交动作，40ms 探测无感）。
-            if is_press
-                && paste::is_plain_enter(match &event {
-                    Event::Key(k) => k,
-                    _ => unreachable!(),
-                })
-                && !paste::is_dense(last_press, now)
-            {
-                if event::poll(paste::FLUSH_GAP).unwrap_or(false)
-                    && let Ok(next) = event::read()
-                {
-                    let dense_next =
-                        matches!(&next, Event::Key(k) if k.kind == KeyEventKind::Press);
-                    backlog.push_front(next);
-                    if dense_next {
-                        // 粘贴流中的 Enter：转 \n，与后续键一起进入洪流收集。
-                        let mut buf = String::from("\n");
-                        loop {
-                            if buf.len() >= paste::MAX_BUF
-                                && key_tx
-                                    .blocking_send(Event::Paste(std::mem::take(&mut buf)))
-                                    .is_err()
-                            {
-                                return;
-                            }
-                            match next_event!() {
-                                Event::Key(k) if k.kind == KeyEventKind::Press => {
-                                    last_press = Some(std::time::Instant::now());
-                                    match paste::paste_char(&k) {
-                                        Some(c) => buf.push(c),
-                                        None => {
-                                            if !buf.is_empty()
-                                                && key_tx
-                                                    .blocking_send(Event::Paste(std::mem::take(
-                                                        &mut buf,
-                                                    )))
-                                                    .is_err()
-                                            {
-                                                return;
-                                            }
-                                            if key_tx.blocking_send(Event::Key(k)).is_err() {
-                                                return;
-                                            }
-                                            break;
-                                        }
-                                    }
-                                    if !event::poll(paste::FALLBACK_IDLE_GAP).unwrap_or(false) {
-                                        if !buf.is_empty()
-                                            && key_tx
-                                                .blocking_send(Event::Paste(std::mem::take(
-                                                    &mut buf,
-                                                )))
-                                                .is_err()
-                                        {
-                                            return;
-                                        }
-                                        break;
-                                    }
-                                }
-                                other => {
-                                    if !buf.is_empty()
-                                        && key_tx
-                                            .blocking_send(Event::Paste(std::mem::take(&mut buf)))
-                                            .is_err()
-                                    {
-                                        return;
-                                    }
-                                    if key_tx.blocking_send(other).is_err() {
-                                        return;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        fallback_guard.arm(std::time::Instant::now());
-                        continue;
-                    }
-                }
-                // 无后续密集键：用户正常提交，立即转发 Enter。
-                if key_tx.blocking_send(event).is_err() {
-                    return;
-                }
-                last_press = Some(now);
-                continue;
-            }
-            // 普通按键（含非 Press 的 Repeat/Release）：立即转发，0 延迟。
-            if !is_press || !paste::is_dense(last_press, now) {
-                if key_tx.blocking_send(event).is_err() {
-                    break;
-                }
-                if is_press {
-                    last_press = Some(now);
-                }
-                continue;
-            }
-            // 与上一键间隔 < DENSE_GAP：粘贴洪流信号（人类打字不可能）。
-            // 整次 burst 合并：把后续可插入按键收进缓冲区，跨过旧终端常见
-            // 30~50ms 的批间节流，空闲 FALLBACK_IDLE_GAP 后统一上屏；这样大
-            // 粘贴不会被切成多个小事件。洪流中的 Enter 经 paste_char
-            // 转字面换行（不触发提交）。期间到达的 Paste/Mouse/Resize 立即
-            // 转发（先 flush 已收内容），特殊键/Repeat 终止收集并原样转发。
-            let mut buf: String = String::new();
-            match paste::paste_char(&match event {
-                Event::Key(k) => k,
-                _ => unreachable!(),
-            }) {
-                Some(c) => buf.push(c),
-                None => {
-                    // 触发洪流的键本身不可插入（理论边角）：原样转发，不收集。
-                    if key_tx.blocking_send(event).is_err() {
-                        return;
-                    }
-                    continue;
-                }
-            }
-            loop {
-                // 单块上限：防异常长流无限累积（超限先 flush 再继续，语义不变）。
-                if buf.len() >= paste::MAX_BUF
-                    && key_tx
-                        .blocking_send(Event::Paste(std::mem::take(&mut buf)))
-                        .is_err()
+            // Gemini CLI 同类旧终端兜底：达到长文本阈值前字符完全不缓冲，
+            // 只把紧跟可插入字符的普通 Enter 改成 Shift+Enter（换行）。达到
+            // 300 字符/第 6 行后立即折叠，余下尾部改走旁路，避免继续撑大 Editor。
+            // `record_forwarded` 放在 blocking_send 之后，channel 背压不会把长粘贴
+            // 内本来相邻的字符/Enter 人为拉出保护窗口。
+            let Event::Key(key) = event else {
+                unreachable!("non-key events were forwarded above");
+            };
+            let (key, protected_enter) = fast_enter_guard.rewrite_key(key, event_at);
+            if fast_enter_guard.capture_if_collapsed(&key, protected_enter, event_at) {
+                // 尾部静默后主动完成，不必等用户再按一个键才刷新实际字符数。
+                if !event::poll(paste::FAST_PASTE_ENTER_GAP).unwrap_or(false)
+                    && !finish_key_stream_paste!()
                 {
                     return;
                 }
-                match next_event!() {
-                    Event::Key(k) if k.kind == KeyEventKind::Press => {
-                        last_press = Some(std::time::Instant::now());
-                        match paste::paste_char(&k) {
-                            Some(c) => buf.push(c),
-                            None => {
-                                // 特殊键/修饰组合：flush 已收内容，再原样转发该键。
-                                if !buf.is_empty()
-                                    && key_tx
-                                        .blocking_send(Event::Paste(std::mem::take(&mut buf)))
-                                        .is_err()
-                                {
-                                    return;
-                                }
-                                if key_tx.blocking_send(Event::Key(k)).is_err() {
-                                    return;
-                                }
-                                break;
-                            }
-                        }
-                        // 超过 burst 空闲边界才 flush；短暂节流仍属于同次粘贴。
-                        if !event::poll(paste::FALLBACK_IDLE_GAP).unwrap_or(false) {
-                            if !buf.is_empty()
-                                && key_tx
-                                    .blocking_send(Event::Paste(std::mem::take(&mut buf)))
-                                    .is_err()
-                            {
-                                return;
-                            }
-                            break;
-                        }
-                    }
-                    other => {
-                        // 非按键事件：先 flush 已收内容，再立即转发。
-                        if !buf.is_empty()
-                            && key_tx
-                                .blocking_send(Event::Paste(std::mem::take(&mut buf)))
-                                .is_err()
-                        {
-                            return;
-                        }
-                        if key_tx.blocking_send(other).is_err() {
-                            return;
-                        }
-                        break;
-                    }
-                }
+                continue;
             }
-            fallback_guard.arm(std::time::Instant::now());
+            if fast_enter_guard.is_collapsed() && !finish_key_stream_paste!() {
+                return;
+            }
+            if send_event!(Event::Key(key)).is_err() {
+                break;
+            }
+            let forwarded_at = std::time::Instant::now();
+            if let Some(rendered_suffix) =
+                fast_enter_guard.record_forwarded(&key, protected_enter, forwarded_at)
+            {
+                if key_tx
+                    .blocking_send(TerminalInput::CollapseKeyStreamPaste {
+                        text: rendered_suffix.clone(),
+                        rendered_suffix,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                fast_enter_guard.mark_delivery_complete(std::time::Instant::now());
+            }
         }
     });
 
@@ -786,7 +659,7 @@ async fn interactive_loop<P: Provider>(
             tokio::select! {
                 event = key_rx.recv() => {
                     match event {
-                        Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                        Some(TerminalInput::Event(Event::Key(key))) if is_actionable_key_kind(key.kind) => {
                             need_draw = true;
                             let effects = crate::tui::reducer::update(&mut ui_state, UiEvent::Key(key));
                             let mut quit = false;
@@ -800,13 +673,30 @@ async fn interactive_loop<P: Provider>(
                                 break;
                             }
                         }
-                        Some(Event::Paste(text)) => {
+                        Some(TerminalInput::Event(Event::Paste(text))) => {
                             need_draw = true;
                             crate::tui::reducer::update(&mut ui_state, UiEvent::Paste(text));
                         }
+                        Some(TerminalInput::CollapseKeyStreamPaste { rendered_suffix, text }) => {
+                            need_draw = true;
+                            crate::tui::reducer::update(
+                                &mut ui_state,
+                                UiEvent::CollapseKeyStreamPaste { rendered_suffix, text },
+                            );
+                        }
+                        Some(TerminalInput::FinishKeyStreamPaste(finished)) => {
+                            need_draw = true;
+                            crate::tui::reducer::update(
+                                &mut ui_state,
+                                UiEvent::FinishKeyStreamPaste {
+                                    initial_text: finished.initial_text,
+                                    full_text: finished.full_text,
+                                },
+                            );
+                        }
                         // 鼠标：统一走 Pointer State Machine（§InteractionRefactor），
                         // §PointerHit ⑥：统一鼠标 dispatch（idle 与 run 同一实现）。
-                        Some(Event::Mouse(mouse)) => {
+                        Some(TerminalInput::Event(Event::Mouse(mouse))) => {
                             let overlay_open = ui_state.view.overlay.is_some()
                                 || ui_state.view.modal.is_some();
                             let events = handle_mouse(
@@ -816,13 +706,16 @@ async fn interactive_loop<P: Provider>(
                                 overlay_open,
                             );
                             if !events.is_empty() {
-                                need_draw = true;
                                 for event in events {
                                     crate::tui::reducer::update(&mut ui_state, event);
                                 }
+                                // Moved 不产生 reducer 事件；点击/拖选/滚动一旦
+                                // 产生状态变化就必须画尾帧，不能因帧限速一直停在
+                                // 旧状态直到下一次按键。
+                                need_draw = true;
                             }
                         }
-                        Some(Event::Resize(_, _)) => {
+                        Some(TerminalInput::Event(Event::Resize(_, _))) => {
                             renderer.autoresize().map_err(|e| e.to_string())?;
                             need_draw = true;
                         }
@@ -909,7 +802,10 @@ async fn interactive_loop<P: Provider>(
                     ui_state.view.turn = 0;
                     ui_state.view.push_line(
                         LineKind::System,
-                        format!("run 失败，session 已保留：{error}"),
+                        format!(
+                            "run 失败，session 已保留：{}",
+                            friendly_provider_failure(&error)
+                        ),
                     );
                     renderer
                         .draw(&mut ui_state.view)
@@ -987,7 +883,10 @@ async fn interactive_loop<P: Provider>(
                     ui_state.view.turn = 0;
                     ui_state.view.push_line(
                         LineKind::System,
-                        format!("run 失败，session 已保留：{error}"),
+                        format!(
+                            "run 失败，session 已保留：{}",
+                            friendly_provider_failure(&error)
+                        ),
                     );
                     renderer
                         .draw(&mut ui_state.view)
@@ -1542,15 +1441,28 @@ fn execute_ui_effect(
                 if crate::clipboard::set_text(&text) {
                     ui_state.view.transient_hint =
                         Some(format!("已复制 {} 行到剪贴板", text.lines().count()));
+                    // 复制成功后清除选区（高亮消失）。
+                    ui_state.view.selection_clear();
                 } else {
+                    // §修复：失败保留选区——否则第一次失败后选区消失，再按
+                    // Ctrl+C 变成无选区（无动作），只能重新拖选。
                     ui_state.view.transient_hint =
-                        Some("复制失败：剪贴板不可用（可能被占用或平台不支持）".into());
+                        Some("复制失败：剪贴板不可用，可再按一次 Ctrl+C 重试".into());
                 }
             }
-            // 复制后清除选区（高亮消失）。
-            ui_state.view.selection_clear();
             false
         }
+    }
+}
+
+/// §修复：run 失败的错误文案——连接类失败（Connection/StreamInterrupted）对
+/// 用户显示可操作提示而非裸露内部错误（"stream ended before [DONE]..." 等），
+/// 完整错误仍在 tracing 日志与 session 记录中可诊断；非连接类保留原文。
+fn friendly_provider_failure(error: &str) -> String {
+    if error.contains("connection failed") || error.contains("stream interrupted") {
+        "模型连接中断（重试后仍失败）；session 已保留，可稍后重试或检查网络/代理".to_string()
+    } else {
+        error.to_string()
     }
 }
 
@@ -1567,7 +1479,7 @@ fn open_url_external(url: &str) {
 struct InteractiveIo<'a> {
     ui_state: &'a mut UiState,
     renderer: &'a mut Renderer,
-    key_rx: &'a mut mpsc::Receiver<Event>,
+    key_rx: &'a mut mpsc::Receiver<TerminalInput>,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
@@ -1582,7 +1494,6 @@ async fn run_interactive<P: Provider>(
     use crate::tui::effect::UiEffect;
     use crate::tui::event::UiEvent;
     use crate::tui::model::LineKind;
-    use ratatui::crossterm::event::KeyEventKind;
     let InteractiveIo {
         ui_state,
         renderer,
@@ -1618,8 +1529,10 @@ async fn run_interactive<P: Provider>(
     );
     tokio::pin!(run_future);
 
-    // 动画时钟（§16.1）：独立推进，活动时目标 60 FPS。
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+    // 动画时钟（§16.1）：独立推进，驱动 spinner/工具卡动画。150 ms/帧
+    // （≈6.7 FPS）视觉已流畅——动画只有 footer spinner 与工具卡 spinner，
+    // 过密的 tick 只会让整屏全量重绘更频繁（性能：终端卡顿）。
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(150));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let outcome = loop {
@@ -1641,7 +1554,7 @@ async fn run_interactive<P: Provider>(
             }
             key = key_rx.recv() => {
                 match key {
-                    Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                    Some(TerminalInput::Event(Event::Key(key))) if is_actionable_key_kind(key.kind) => {
                         // 键盘事件 → reducer；Esc 取消语义在 reducer 内
                         // 依据 running 状态决策（§6.2 保留 session）。
                         let effects = crate::tui::reducer::update(ui_state, UiEvent::Key(key));
@@ -1662,12 +1575,15 @@ async fn run_interactive<P: Provider>(
                                                 "已复制 {} 行到剪贴板",
                                                 text.lines().count()
                                             ));
+                                            // 复制成功后清除选区。
+                                            ui_state.view.selection_clear();
                                         } else {
-                                            ui_state.view.transient_hint =
-                                                Some("复制失败：剪贴板不可用".into());
+                                            // §修复：失败保留选区，可重试（同主循环 handler）。
+                                            ui_state.view.transient_hint = Some(
+                                                "复制失败：剪贴板不可用，可再按一次 Ctrl+C 重试".into(),
+                                            );
                                         }
                                     }
-                                    ui_state.view.selection_clear();
                                 }
                                 UiEffect::Quit
                                 | UiEffect::ResumeSession(_)
@@ -1679,21 +1595,42 @@ async fn run_interactive<P: Provider>(
                         }
                         renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }
-                    Some(Event::Paste(text)) => {
+                    Some(TerminalInput::Event(Event::Paste(text))) => {
                         crate::tui::reducer::update(ui_state, UiEvent::Paste(text));
                         renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }
-                    Some(Event::Mouse(mouse)) => {
+                    Some(TerminalInput::CollapseKeyStreamPaste { rendered_suffix, text }) => {
+                        crate::tui::reducer::update(
+                            ui_state,
+                            UiEvent::CollapseKeyStreamPaste { rendered_suffix, text },
+                        );
+                        renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
+                    }
+                    Some(TerminalInput::FinishKeyStreamPaste(finished)) => {
+                        crate::tui::reducer::update(
+                            ui_state,
+                            UiEvent::FinishKeyStreamPaste {
+                                initial_text: finished.initial_text,
+                                full_text: finished.full_text,
+                            },
+                        );
+                        renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
+                    }
+                    Some(TerminalInput::Event(Event::Mouse(mouse))) => {
                         // §PointerHit ⑥：统一鼠标 dispatch（idle 与 run 同一实现）。
                         let overlay_open = ui_state.view.overlay.is_some()
                             || ui_state.view.modal.is_some();
                         let events = handle_mouse(mouse, renderer, &mut pointer_gesture, overlay_open);
+                        let changed = !events.is_empty();
                         for event in events {
                             crate::tui::reducer::update(ui_state, event);
                         }
-                        renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
+                        // 未启用 any-event hover；只有真实状态变化才重绘。
+                        if changed {
+                            renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
+                        }
                     }
-                    Some(Event::Resize(_, _)) => {
+                    Some(TerminalInput::Event(Event::Resize(_, _))) => {
                         renderer.autoresize().map_err(|e| e.to_string())?;
                         renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }
@@ -1853,6 +1790,16 @@ fn is_paste_shortcut(event: &Event) -> bool {
         }
         _ => false,
     }
+}
+
+/// Press 与按住产生的 Repeat 都是编辑动作；Release 只用于增强键盘协议，
+/// 不应重复插入。此前主循环只收 Press，导致长按退格/方向键完全不重复。
+fn is_actionable_key_kind(kind: ratatui::crossterm::event::KeyEventKind) -> bool {
+    matches!(
+        kind,
+        ratatui::crossterm::event::KeyEventKind::Press
+            | ratatui::crossterm::event::KeyEventKind::Repeat
+    )
 }
 
 fn spawn_ctrl_c_handler(current_cancel: Arc<Mutex<Option<CancellationToken>>>) {
@@ -2240,7 +2187,14 @@ fn fmt_time_short(t: std::time::SystemTime) -> String {
 mod tests {
     use super::*;
     use crate::tui::model::ViewModel;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    #[test]
+    fn key_repeat_is_an_edit_event_but_release_is_not() {
+        assert!(is_actionable_key_kind(KeyEventKind::Press));
+        assert!(is_actionable_key_kind(KeyEventKind::Repeat));
+        assert!(!is_actionable_key_kind(KeyEventKind::Release));
+    }
 
     /// §用户诉求：--resume 前缀匹配——完整 UUID 直解、唯一前缀补全（大小写
     /// 不敏感）、多匹配/无匹配给出可操作错误，不歧义恢复。

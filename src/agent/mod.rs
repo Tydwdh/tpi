@@ -539,8 +539,9 @@ pub async fn run<P: Provider>(
                                 )
                                 .await;
                             // §4.3 第二阶段：text-only attempt 断联 → 自动续写一次。
-                            // 条件：已产生文本（非连接不可用）、未出现 tool delta（partial
-                            // JSON 恢复风险大）、还有续写额度。
+                            // 条件：已产生文本后流截断（StreamInterrupted，非未收内容
+                            // 的 Connection）、未出现 tool delta（partial JSON 恢复风险大）、
+                            // 还有续写额度。
                             if saw_any_semantic
                                 && !saw_tool_calls
                                 && recoverable_stream_interrupt(&e)
@@ -567,7 +568,8 @@ pub async fn run<P: Provider>(
                                 continue 'attempt;
                             }
                             // §4.3 第三阶段：partial tool-call 后断联 → 整个 turn 重新生成。
-                            // 条件：已出现 tool delta（saw_tool_calls=true）、还有 restart 额度。
+                            // 条件：已出现 tool delta（saw_tool_calls=true）、流截断
+                            // （StreamInterrupted）、还有 restart 额度。
                             // 不尝试续接 partial JSON（风险大）；重新发起原始请求。
                             if saw_tool_calls
                                 && recoverable_stream_interrupt(&e)
@@ -934,7 +936,9 @@ fn interrupt_cause(error: &crate::provider::ProviderError) -> crate::session::In
     use crate::provider::ProviderError;
     use crate::session::InterruptCause;
     match error {
-        ProviderError::Connection(_) => InterruptCause::Connection,
+        ProviderError::Connection(_) | ProviderError::StreamInterrupted(_) => {
+            InterruptCause::Connection
+        }
         ProviderError::Http(_) => InterruptCause::Connection,
         ProviderError::Protocol(_) => InterruptCause::Protocol,
         ProviderError::RateLimited(_) => InterruptCause::RateLimited,
@@ -943,8 +947,17 @@ fn interrupt_cause(error: &crate::provider::ProviderError) -> crate::session::In
     }
 }
 
+/// §4.3：流中断是否值得自动恢复（续写/重生成）。
+///
+/// 只有连接层面已建立、已收到部分内容后才断流（`StreamInterrupted`）才恢复：
+/// - 已产生文本但未出 tool delta → 续写（新请求带 recovery instruction）；
+/// - 已出 tool delta → 整个 turn 重新生成。
+///
+/// `Connection`（未收到任何内容的传输失败）不恢复——provider 内部已按退避
+/// 重试 `MAX_ATTEMPTS` 次仍失败，agent 再续写大概率同样失败，只增加网络请求
+/// 与 UI 噪音（§用户诉求：修复"大量 run 失败"刷屏）。
 fn recoverable_stream_interrupt(error: &crate::provider::ProviderError) -> bool {
-    matches!(error, crate::provider::ProviderError::Connection(_))
+    matches!(error, crate::provider::ProviderError::StreamInterrupted(_))
 }
 
 /// compaction 一轮（§15.4）。
@@ -1210,7 +1223,10 @@ pub fn session_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{AbortTaskOnDrop, ensure_plan_state_messages, recovery_overlap_bytes};
+    use super::{
+        AbortTaskOnDrop, ensure_plan_state_messages, recoverable_stream_interrupt,
+        recovery_overlap_bytes,
+    };
     use crate::provider::ChatMessage;
     use crate::tool::plan::{Plan, PlanItem, PlanStatus};
 
@@ -1285,6 +1301,30 @@ mod tests {
         ensure_plan_state_messages(&mut messages, Some(&plan));
         ensure_plan_state_messages(&mut messages, Some(&plan));
         assert_eq!(messages.len(), 2, "恢复态不能在每次请求尾部重复注入");
+    }
+
+    /// §修复：只有"已收到部分内容后截断"（StreamInterrupted）才值得自动续写/
+    /// 重生成；未收内容的传输失败（Connection）不再触发——provider 内部已重试
+    /// 耗尽，agent 续写只增加网络请求与 UI 噪音（"大量 run 失败"刷屏）。
+    #[test]
+    fn recoverable_stream_interrupt_distinguishes_truncation_from_connect_failure() {
+        use crate::provider::ProviderError;
+        assert!(
+            recoverable_stream_interrupt(&ProviderError::StreamInterrupted(
+                "stream ended before [DONE]".into()
+            )),
+            "已收内容后截断必须可恢复（续写/重生成）"
+        );
+        assert!(
+            !recoverable_stream_interrupt(&ProviderError::Connection(
+                "attempt 3: connect timeout".into()
+            )),
+            "未收内容的连接失败不得自动续写（provider 已重试耗尽）"
+        );
+        assert!(
+            !recoverable_stream_interrupt(&ProviderError::Protocol("x".into())),
+            "协议错误不可恢复"
+        );
     }
 
     #[test]

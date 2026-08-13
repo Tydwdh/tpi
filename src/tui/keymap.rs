@@ -58,8 +58,10 @@ pub enum KeyAction {
     JumpPrevUserTurn,
     /// 跳到下一条用户消息（Alt+Down）。
     JumpNextUserTurn,
-    /// 有选区复制到剪贴板；无选区且运行中取消当前 run（Ctrl+C 复合语义）。
-    CopyOrInterrupt,
+    /// 复制选中文本到剪贴板（Ctrl+C 只做复制；无选区静默忽略）。
+    Copy,
+    /// 退出 TPI（Ctrl+D；§用户诉求：退出与复制分离）。
+    QuitApp,
     /// 清空输入（Ctrl+U）。
     ClearInput,
     /// 删除光标前一个词（Ctrl+W）。
@@ -112,7 +114,8 @@ impl KeyAction {
             Self::FollowTail => "follow_tail",
             Self::JumpPrevUserTurn => "jump_prev_user_turn",
             Self::JumpNextUserTurn => "jump_next_user_turn",
-            Self::CopyOrInterrupt => "copy_or_interrupt",
+            Self::Copy => "copy",
+            Self::QuitApp => "quit",
             Self::ClearInput => "clear_input",
             Self::DeleteWordBack => "delete_word_back",
             Self::DeleteToLineEnd => "delete_to_line_end",
@@ -152,7 +155,9 @@ impl KeyAction {
             "follow_tail" => Self::FollowTail,
             "jump_prev_user_turn" => Self::JumpPrevUserTurn,
             "jump_next_user_turn" => Self::JumpNextUserTurn,
-            "copy_or_interrupt" => Self::CopyOrInterrupt,
+            // 兼容旧配置名（此前 Ctrl+C 的复合语义名）。
+            "copy" | "copy_or_interrupt" => Self::Copy,
+            "quit" | "quit_app" => Self::QuitApp,
             "clear_input" => Self::ClearInput,
             "delete_word_back" => Self::DeleteWordBack,
             "delete_to_line_end" => Self::DeleteToLineEnd,
@@ -323,7 +328,9 @@ impl Keymap {
         bind("down", KeyAction::MoveDown);
         bind("pageup", KeyAction::PageUp);
         bind("pagedown", KeyAction::PageDown);
-        bind("ctrl+c", KeyAction::CopyOrInterrupt);
+        bind("ctrl+c", KeyAction::Copy);
+        // §用户诉求：退出用 Ctrl+D（Ctrl+C 只负责复制）。
+        bind("ctrl+d", KeyAction::QuitApp);
         bind("ctrl+u", KeyAction::ClearInput);
         bind("ctrl+a", KeyAction::LineStart);
         bind("ctrl+e", KeyAction::LineEnd);
@@ -351,7 +358,10 @@ impl Keymap {
             return Some(*action);
         }
         if let KeyCode::Char(c) = key.code {
-            let printable = mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT;
+            // Windows/国际键盘的 AltGr 通常上报为 Ctrl+Alt。精确自定义绑定
+            // 仍优先；未绑定但终端已给出字符时应插入，不能静默吞掉 @/€ 等。
+            let alt_gr = mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::ALT);
+            let printable = mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT || alt_gr;
             if printable {
                 return Some(KeyAction::insert_char(c));
             }
@@ -551,6 +561,11 @@ mod tests {
         );
         assert_eq!(km.action(key("ctrl+f")), Some(KeyAction::OpenSearch));
         assert_eq!(km.action(key("esc")), Some(KeyAction::Escape));
+        // §用户诉求：复制 Ctrl+C、退出 Ctrl+D，语义分离。
+        assert_eq!(km.action(key("ctrl+c")), Some(KeyAction::Copy));
+        assert_eq!(km.action(key("ctrl+d")), Some(KeyAction::QuitApp));
+        assert_eq!(KeyAction::Copy.name(), "copy", "配置名必须稳定");
+        assert_eq!(KeyAction::QuitApp.name(), "quit", "配置名必须稳定");
         assert_eq!(km.action(key("ctrl+z")), Some(KeyAction::Undo));
         assert_eq!(km.action(key("ctrl+y")), Some(KeyAction::Redo));
         // §用户诉求：右侧边栏默认 Ctrl+B 绑定。
@@ -563,6 +578,16 @@ mod tests {
         // 普通字符回退为插入。
         assert_eq!(km.action(key("h")), Some(KeyAction::TypedChar('h')));
         assert_eq!(km.action(key("ctrl+h")), None, "Ctrl+h 未绑定则应忽略");
+    }
+
+    #[test]
+    fn unbound_altgr_character_is_inserted() {
+        let km = Keymap::builtin();
+        let altgr_at = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(km.action(altgr_at), Some(KeyAction::TypedChar('@')));
     }
 
     #[test]

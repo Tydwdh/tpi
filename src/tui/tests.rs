@@ -1032,6 +1032,17 @@ fn multiline_input_area_grows() {
     assert_eq!(input_area_rows(&view, 80), 8, "超 8 行 clamp 到 8");
 }
 
+#[test]
+fn input_area_uses_full_width_after_prompt_line() {
+    let view = ViewModel {
+        input: "abcdefghijklmn".into(),
+        ..Default::default()
+    };
+    // width=8：首行 6 格，续行 8 格，恰好两行。旧实现错误地让续行也
+    // 只用 6 格，因此计算成三行并造成输入区跳动。
+    assert_eq!(input_area_rows(&view, 8), 2);
+}
+
 /// 修复：Overlay 必须先 Clear 覆盖区，否则底层 transcript 文字透出（背景干扰）。
 #[test]
 fn overlay_clears_background_before_rendering() {
@@ -1301,7 +1312,7 @@ fn wrap_cache_reuses_and_invalidates() {
     view.push_line(LineKind::Assistant, "第一行 hello");
     let rev0 = view.transcript_revision;
     let mut cache = HashMap::new();
-    let mut wrap_cache: HashMap<(EntryId, u16), Vec<WrappedRow>> = HashMap::new();
+    let mut wrap_cache: HashMap<(EntryId, u16), Arc<Vec<WrappedRow>>> = HashMap::new();
     let plan1 = plan_window(
         &mut view,
         theme::Theme::omp(),
@@ -1314,7 +1325,11 @@ fn wrap_cache_reuses_and_invalidates() {
     );
     assert_eq!(wrap_cache.len(), 1, "历史 entry 必须写入缓存");
     assert_eq!(plan1.window.len(), 2, "消息行 + 留白空行");
-    // 再次调用（revision 未变）→ 命中缓存，不新增条目。
+    let key = (view.transcript[0].id(), 80);
+    let cached_rows = Arc::clone(&wrap_cache[&key]);
+    // 丢掉 markdown 缓存后再次调用：完整的历史 wrap-cache 应走稳态快
+    // 路径，不得为了输入/光标重绘而重建全部 Markdown 逻辑行。
+    cache.clear();
     let _plan2 = plan_window(
         &mut view,
         theme::Theme::omp(),
@@ -1326,6 +1341,11 @@ fn wrap_cache_reuses_and_invalidates() {
         &mut wrap_cache,
     );
     assert_eq!(wrap_cache.len(), 1, "未变化时命中缓存不增长");
+    assert!(cache.is_empty(), "稳态重绘不得重新构建历史 Markdown");
+    assert!(
+        Arc::ptr_eq(&cached_rows, &wrap_cache[&key]),
+        "稳态重绘必须共享 wrapped rows，而不是深拷贝整段历史"
+    );
     // 新增 entry → revision bump；draw 层会清空缓存（此处模拟）。
     view.push_line(LineKind::Assistant, "第二行 world");
     assert_ne!(
@@ -2747,7 +2767,7 @@ fn live_thinking_keeps_gap_across_wrap_cache() {
         None,
     );
     let mut cache = HashMap::new();
-    let mut wrap_cache: HashMap<(EntryId, u16), Vec<WrappedRow>> = HashMap::new();
+    let mut wrap_cache: HashMap<(EntryId, u16), Arc<Vec<WrappedRow>>> = HashMap::new();
     // 帧 1：无 live 内容 → 历史末尾工具卡被缓存（无 gap）。
     plan_window(
         &mut view,

@@ -19,7 +19,7 @@ const CF_UNICODETEXT: u32 = 13;
 /// §优化：粘贴快捷键直读剪贴板——不依赖终端 bracketed paste 支持，
 /// 任何终端下 Ctrl+V 都能整段一次上屏。
 pub fn read_text() -> std::io::Result<Option<String>> {
-    if !open_clipboard() {
+    if !open_clipboard_with_retry() {
         return Ok(None);
     }
     let result = (|| {
@@ -31,13 +31,18 @@ pub fn read_text() -> std::io::Result<Option<String>> {
         if lock.is_null() {
             return Ok(None);
         }
+        let max_units = global_size(h) / std::mem::size_of::<u16>();
+        if max_units == 0 {
+            global_unlock(h);
+            return Ok(None);
+        }
         let mut len = 0usize;
         let ptr = lock.cast::<u16>();
         // SAFETY: GetClipboardData(CF_UNICODETEXT) 返回系统所有权的
         // NUL 结尾 UTF-16 内存；GlobalLock 保证持有锁期间该内存有效。
         // 扫描在字符串边界内停止，不会越界读取。
         unsafe {
-            while *ptr.add(len) != 0 {
+            while len < max_units && *ptr.add(len) != 0 {
                 len += 1;
             }
         }
@@ -79,7 +84,7 @@ pub fn set_text(text: &str) -> bool {
     }
     global_unlock(h);
 
-    if !open_clipboard() {
+    if !open_clipboard_with_retry() {
         global_free(h);
         return false;
     }
@@ -98,6 +103,24 @@ pub fn set_text(text: &str) -> bool {
     })();
     close_clipboard();
     ok
+}
+
+/// 剪贴板会被其他进程短暂独占（浏览器、远程桌面和输入法都常见）。
+/// 粘贴/复制动作允许一个很短的有界重试，避免偶发 Ctrl+V 静默无响应。
+/// §修复：总窗口从 ~10ms 拉长到 ~100ms——很多短暂占用（尤其输入法/远程
+/// 桌面）超过 10ms，此前重试几乎等于没重试。
+fn open_clipboard_with_retry() -> bool {
+    const ATTEMPTS: usize = 20;
+    const INTERVAL_MS: u64 = 5;
+    for attempt in 0..ATTEMPTS {
+        if open_clipboard() {
+            return true;
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(INTERVAL_MS));
+        }
+    }
+    false
 }
 
 #[cfg(windows)]
@@ -142,6 +165,13 @@ fn global_unlock(h: *mut std::ffi::c_void) {
     use windows_sys::Win32::System::Memory::GlobalUnlock;
     // SAFETY: h was successfully locked by global_lock above.
     let _ = unsafe { GlobalUnlock(h as _) };
+}
+
+#[cfg(windows)]
+fn global_size(h: *mut std::ffi::c_void) -> usize {
+    use windows_sys::Win32::System::Memory::GlobalSize;
+    // SAFETY: h is the system-owned handle returned by GetClipboardData.
+    unsafe { GlobalSize(h as _) }
 }
 
 #[cfg(windows)]
@@ -190,6 +220,10 @@ fn global_lock(_h: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
 }
 #[cfg(not(windows))]
 fn global_unlock(_h: *mut std::ffi::c_void) {}
+#[cfg(not(windows))]
+fn global_size(_h: *mut std::ffi::c_void) -> usize {
+    0
+}
 #[cfg(not(windows))]
 fn global_free(_h: *mut std::ffi::c_void) {}
 #[cfg(not(windows))]

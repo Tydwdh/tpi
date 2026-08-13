@@ -131,7 +131,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
 
     // Ctrl+C 语义（§用户诉求）：只用于复制——Windows Terminal 选中文本后
     // Ctrl+C 由终端优先复制（不传给应用）；未选中时到达应用的 Ctrl+C 静默忽略，
-    // 不取消/退出（取消统一用 Esc）。
+    // 不取消/退出（取消用 Esc、退出用 Ctrl+D）。
     // 注意：raw mode 下 crossterm 把 Ctrl+C 读成 KeyEvent；若不做任何处理，
     // 它会落到 Char('c') 分支变成输入 'c'，因此必须显式忽略（默认 keymap 绑定）。
 
@@ -208,6 +208,9 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             } else {
                 crate::tui::paste::expand_paste_placeholders(&text, &state.pasted)
             };
+            // editor 已提交并清空，旁路内容已展开进消息；及时释放真实粘贴
+            // 文本，避免大剪贴板在整个会话中常驻内存。
+            state.pasted.clear();
             if !text.is_empty() {
                 // §PointerHit：运行中提交立即在 footer 提示（不写 transcript，
                 // 避免消费时重复显示；实际 User 消息在消费时入 transcript）。
@@ -258,6 +261,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             } else if !state.editor.text().is_empty() {
                 // 空闲时 Esc 清空当前输入（人体工学：“退出当前输入”的通用假设）。
                 state.editor.clear();
+                state.pasted.clear();
                 state.sync_input();
                 refresh_menus(state);
             }
@@ -376,33 +380,20 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 state.view.scroll_down(8);
             }
         }
-        KeyAction::CopyOrInterrupt => {
-            // Ctrl+C 语义（§PointerHit 统一 + P0-4 双击退出）：
-            // - 有选区：复制到剪贴板（清掉双击计数）；
-            // - 运行中无选区：取消 run（与 Esc 一致；不清双击计数）；
-            // - 空闲无选区：第一次提示"再按一次退出"，2 秒内第二次退出。
-            //   （终端习惯：空闲 Ctrl+C 连按两次退出，避免一次误触直接退出。）
+        KeyAction::Copy => {
+            // Ctrl+C 只做复制（§用户诉求）：有选区复制到剪贴板；无选区静默忽略
+            // ——不取消 run（Esc 负责）、不退出（Ctrl+D 负责）。
             if state.view.selection.is_some() {
-                state.ctrl_c_exit_armed = None;
                 effects.push(UiEffect::CopySelection);
-            } else if state.running {
-                state.ctrl_c_exit_armed = None;
-                effects.push(UiEffect::CancelRun);
-            } else {
-                let now = std::time::Instant::now();
-                if let Some(first) = state.ctrl_c_exit_armed
-                    && now.duration_since(first) < std::time::Duration::from_secs(2)
-                {
-                    state.ctrl_c_exit_armed = None;
-                    effects.push(UiEffect::Quit);
-                } else {
-                    state.ctrl_c_exit_armed = Some(now);
-                    state.view.transient_hint = Some("再按一次 Ctrl+C 退出 TPI（空闲状态）".into());
-                }
             }
+        }
+        KeyAction::QuitApp => {
+            // §用户诉求：退出用 Ctrl+D（与复制分离，避免 Ctrl+C 误触退出）。
+            effects.push(UiEffect::Quit);
         }
         KeyAction::ClearInput => {
             state.editor.clear();
+            state.pasted.clear();
             state.sync_input();
             refresh_menus(state);
         }
@@ -554,6 +545,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if state.view.overlay.is_some() || state.view.modal.is_some() {
                 return Vec::new();
             }
+            let text = crate::tui::paste::normalize_newlines(text);
             if state.view.search.is_some() {
                 // BUG-014：搜索打开时粘贴应进入搜索框，而不是 composer。
                 let mut query = state
@@ -570,8 +562,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
                 // §用户诉求：大粘贴不真实渲染——全文存入旁路，输入框只放
                 // 占位符；提交时一次性展开（避免分块上屏/MAX_INPUT_BYTES 截断/
                 // 行尾 Enter 批次边界误判提交）。
-                let id = state.store_paste(text);
-                let placeholder = crate::tui::paste::paste_placeholder(id, &state.pasted[&id]);
+                let placeholder = state.store_paste(text);
                 state.editor.insert_str(&placeholder);
                 state.sync_input();
                 refresh_menus(state);
@@ -586,6 +577,75 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
                         "输入已截断到 {} KiB",
                         crate::tui::editor::MAX_INPUT_BYTES / 1024
                     ));
+                }
+            }
+            Vec::new()
+        }
+        UiEvent::CollapseKeyStreamPaste {
+            rendered_suffix,
+            text,
+        } => {
+            if state.view.overlay.is_some()
+                || state.view.modal.is_some()
+                || state.view.search.is_some()
+            {
+                return Vec::new();
+            }
+            let placeholder = crate::tui::paste::next_paste_placeholder(&state.pasted, &text);
+            if state
+                .editor
+                .replace_suffix_before_cursor(&rendered_suffix, &placeholder)
+            {
+                state.pasted.insert(placeholder, text);
+                state.sync_input();
+                refresh_menus(state);
+            }
+            Vec::new()
+        }
+        UiEvent::FinishKeyStreamPaste {
+            initial_text,
+            full_text,
+        } => {
+            if initial_text == full_text {
+                return Vec::new();
+            }
+            if state.view.search.is_some() {
+                // 搜索框不展示占位符；把阈值后旁路收集的尾部补回并沿用 4 KiB 上限。
+                if let Some(search) = state.view.search.as_ref()
+                    && let Some(prefix) = search.query.strip_suffix(&initial_text)
+                {
+                    let mut query = prefix.to_owned();
+                    let room = (4 * 1024usize).saturating_sub(query.len());
+                    let keep = crate::tui::text::floor_char_boundary(
+                        &full_text,
+                        room.min(full_text.len()),
+                    );
+                    query.push_str(&full_text[..keep]);
+                    state.view.update_search_query(&query);
+                }
+                return Vec::new();
+            }
+            if state.view.overlay.is_some() || state.view.modal.is_some() {
+                return Vec::new();
+            }
+            let before_cursor = &state.editor.text[..state.editor.cursor];
+            let matching = state.pasted.iter().find_map(|(placeholder, content)| {
+                (content == &initial_text && before_cursor.ends_with(placeholder))
+                    .then(|| placeholder.clone())
+            });
+            if let Some(old_placeholder) = matching {
+                state.pasted.remove(&old_placeholder);
+                let new_placeholder =
+                    crate::tui::paste::next_paste_placeholder(&state.pasted, &full_text);
+                if state
+                    .editor
+                    .replace_suffix_before_cursor(&old_placeholder, &new_placeholder)
+                {
+                    state.pasted.insert(new_placeholder, full_text);
+                    state.sync_input();
+                    refresh_menus(state);
+                } else {
+                    state.pasted.insert(old_placeholder, initial_text);
                 }
             }
             Vec::new()

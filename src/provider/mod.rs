@@ -106,8 +106,15 @@ pub struct ProviderResponse {
 /// Provider 请求失败（§7.3 重试后仍失败，或流中途协议错误）。
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
+    /// 传输层失败（连接被拒/超时/未收到任何语义内容前断流）。provider 内部
+    /// 已重试 `MAX_ATTEMPTS` 次仍失败；agent 不再自动续写（续写请求大概率
+    /// 同样失败，只增加噪音）。
     #[error("connection failed: {0}")]
     Connection(String),
+    /// 连接已建立、流中途截断且已收到部分语义内容（§4.3）。不可重发原请求
+    /// （会重复已到达的文本/工具调用）；agent 据此决定自动续写/重生成。
+    #[error("stream interrupted: {0}")]
+    StreamInterrupted(String),
     #[error("http error: {0}")]
     Http(String),
     #[error("protocol error: {0}")]

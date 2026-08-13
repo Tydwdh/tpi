@@ -47,6 +47,18 @@ pub enum UiEvent {
     ToggleSidebar,
     /// bracketed paste 文本。
     Paste(String),
+    /// 旧终端将粘贴拆成逐键流：达到长文本阈值后，把已经插入的精确后缀
+    /// `rendered_suffix` 折叠为占位符，全文转入旁路存储。
+    CollapseKeyStreamPaste {
+        rendered_suffix: String,
+        text: String,
+    },
+    /// 长逐键粘贴折叠后，键盘线程继续旁路收集其余内容；流结束时用完整文本
+    /// 更新占位符及存储。`initial_text` 用来精确定位本次折叠，避免串段。
+    FinishKeyStreamPaste {
+        initial_text: String,
+        full_text: String,
+    },
     /// Agent 运行时事件（模型增量/工具生命周期/上下文用量）。
     Agent(RuntimeEvent),
     /// 动画时钟（spinner）。

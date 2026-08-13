@@ -341,7 +341,9 @@ impl Provider for InterruptAfterDeltaProvider {
             .send(ProviderEvent::TextDelta("因为 target_exists 分支".into()))
             .await
             .map_err(|_| ProviderError::Protocol("closed".into()))?;
-        Err(ProviderError::Connection("connection reset by peer".into()))
+        Err(ProviderError::StreamInterrupted(
+            "connection reset by peer".into(),
+        ))
     }
 }
 
@@ -560,7 +562,7 @@ impl Provider for RecoverThenSucceedProvider {
             ))
             .await
             .map_err(|_| ProviderError::Protocol("closed".into()))?;
-        Err(ProviderError::Connection("connection reset".into()))
+        Err(ProviderError::StreamInterrupted("connection reset".into()))
     }
 }
 
@@ -773,7 +775,7 @@ impl Provider for AlwaysInterruptProvider {
             .send(ProviderEvent::TextDelta("又断一次".into()))
             .await
             .map_err(|_| ProviderError::Protocol("closed".into()))?;
-        Err(ProviderError::Connection("flaky network".into()))
+        Err(ProviderError::StreamInterrupted("flaky network".into()))
     }
 }
 
@@ -867,7 +869,7 @@ impl Provider for ToolDeltaThenRestartProvider {
             })
             .await
             .map_err(|_| ProviderError::Protocol("closed".into()))?;
-        Err(ProviderError::Connection("flaky".into()))
+        Err(ProviderError::StreamInterrupted("flaky".into()))
     }
 }
 
@@ -965,7 +967,7 @@ impl Provider for ToolDeltaAlwaysInterruptProvider {
             })
             .await
             .map_err(|_| ProviderError::Protocol("closed".into()))?;
-        Err(ProviderError::Connection("flaky".into()))
+        Err(ProviderError::StreamInterrupted("flaky".into()))
     }
 }
 

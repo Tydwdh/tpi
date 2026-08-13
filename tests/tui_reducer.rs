@@ -390,9 +390,9 @@ fn alt_up_down_jumps_between_user_turns() {
     assert_eq!(anchor.entry_id.0, 3);
 }
 
-/// §PointerHit：Ctrl-C 语义统一——运行中无选区取消 run；有选区复制。
+/// §用户诉求：Ctrl+C 只做复制——运行中无选区静默忽略（取消统一用 Esc）。
 #[test]
-fn ctrl_c_running_cancels_run_when_no_selection() {
+fn ctrl_c_running_without_selection_is_ignored() {
     let mut s = state();
     s.running = true;
     let effects = reducer::update(
@@ -400,44 +400,35 @@ fn ctrl_c_running_cancels_run_when_no_selection() {
         UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
     );
     assert!(
-        effects.contains(&UiEffect::CancelRun),
-        "运行中 Ctrl-C 应取消 run（与 Esc 一致）: {effects:?}"
+        effects.is_empty(),
+        "运行中无选区 Ctrl-C 应静默忽略（不取消、不复制）: {effects:?}"
     );
-    // 也不得输入 'c' 到 composer。
+    assert!(!effects.contains(&UiEffect::CancelRun), "Ctrl-C 不取消 run");
     assert!(s.view.input.is_empty(), "Ctrl-C 不得写入输入框");
 }
 
-/// P0-4：空闲 Ctrl+C 连按两次退出（终端习惯）。
-/// 第一次：不退出，记录按压时刻并提示；2 秒内第二次：退出。
+/// §用户诉求：退出用 Ctrl+D（与复制分离，避免 Ctrl+C 误触退出）。
 #[test]
-fn ctrl_c_idle_double_press_quits() {
+fn ctrl_d_quits() {
     let mut s = state();
-    let ctrl_c = || UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-    // 第一次：不退出，提示「再按一次退出」。
-    let effects1 = reducer::update(&mut s, ctrl_c());
-    assert!(
-        !effects1.contains(&UiEffect::Quit),
-        "第一次空闲 Ctrl-C 不得直接退出: {effects1:?}"
+    let effects = reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
     );
     assert!(
-        s.ctrl_c_exit_armed.is_some(),
-        "第一次必须记录双击窗口起始时刻"
+        effects.contains(&UiEffect::Quit),
+        "Ctrl-D 必须退出: {effects:?}"
+    );
+    // Ctrl+C 空闲不再退出。
+    let effects2 = reducer::update(
+        &mut s,
+        UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
     );
     assert!(
-        s.view
-            .transient_hint
-            .as_deref()
-            .is_some_and(|h| h.contains("Ctrl+C")),
-        "必须给出可发现的提示: {:?}",
-        s.view.transient_hint
+        !effects2.contains(&UiEffect::Quit),
+        "Ctrl-C 不得退出（退出用 Ctrl-D）: {effects2:?}"
     );
-    // 第二次（测试内瞬时连续，必然在 2 秒窗口内）：退出。
-    let effects2 = reducer::update(&mut s, ctrl_c());
-    assert!(
-        effects2.contains(&UiEffect::Quit),
-        "2 秒内第二次 Ctrl-C 必须退出: {effects2:?}"
-    );
-    assert!(s.ctrl_c_exit_armed.is_none(), "退出后双击窗口清零");
+    assert!(s.view.input.is_empty(), "Ctrl-D 不得写入输入框");
 }
 
 /// §用户诉求：Ctrl-C 静默忽略——不关闭 Overlay（Esc 负责关闭弹层）。
@@ -1281,7 +1272,7 @@ fn large_paste_becomes_placeholder_and_expands_on_submit() {
     // 输入框渲染的是占位符，不是全文。
     let text = s.editor.text().to_string();
     assert!(
-        text.starts_with("[Pasted Text: ") && text.contains(" chars #1]"),
+        text.starts_with("[Pasted Content ") && text.ends_with(" chars]"),
         "大粘贴必须是占位符，实际: {text:?}"
     );
     assert_eq!(s.pasted.len(), 1, "真实内容存入旁路");
@@ -1293,6 +1284,17 @@ fn large_paste_becomes_placeholder_and_expands_on_submit() {
         "提交时占位符必须展开为完整原文"
     );
     assert!(s.editor.text().is_empty(), "提交后编辑区清空");
+    assert!(s.pasted.is_empty(), "提交后必须释放旁路粘贴内容");
+}
+
+#[test]
+fn clearing_composer_releases_large_paste_storage() {
+    let mut s = state();
+    reducer::update(&mut s, UiEvent::Paste("x".repeat(400)));
+    assert_eq!(s.pasted.len(), 1);
+    reducer::update(&mut s, key(KeyCode::Esc));
+    assert!(s.editor.text().is_empty());
+    assert!(s.pasted.is_empty());
 }
 
 /// §用户诉求：小粘贴（低于阈值）保持直接插入输入框，不产生占位符。
@@ -1302,6 +1304,15 @@ fn small_paste_inserts_verbatim() {
     reducer::update(&mut s, UiEvent::Paste("short text".into()));
     assert_eq!(s.editor.text(), "short text");
     assert!(s.pasted.is_empty(), "小粘贴不进入占位符存储");
+}
+
+#[test]
+fn windows_paste_newlines_are_normalized() {
+    let mut s = state();
+    reducer::update(&mut s, UiEvent::Paste("第一行\r\n第二行\r第三行".into()));
+    assert_eq!(s.editor.text(), "第一行\n第二行\n第三行");
+    reducer::update(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.pop_pending().as_deref(), Some("第一行\n第二行\n第三行"));
 }
 
 /// §用户诉求：大粘贴占位符与普通输入混排时，提交展开不吞普通文本。
@@ -1321,6 +1332,51 @@ fn placeholder_expands_among_typed_text() {
         pending.starts_with("a\nb\nc\nd\ne\nf"),
         "占位符展开为原文开头"
     );
+}
+
+#[test]
+fn same_length_large_pastes_get_readable_unique_placeholders() {
+    let mut s = state();
+    let first = "a".repeat(300);
+    let second = "b".repeat(300);
+    reducer::update(&mut s, UiEvent::Paste(first.clone()));
+    reducer::update(&mut s, UiEvent::Paste(second.clone()));
+
+    assert_eq!(
+        s.editor.text(),
+        "[Pasted Content 300 chars][Pasted Content 300 chars] #2"
+    );
+    reducer::update(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.pop_pending(), Some(format!("{first}{second}")));
+}
+
+#[test]
+fn unbracketed_multiline_key_stream_is_collapsed_and_completed() {
+    let mut s = state();
+    let initial = "a\nb\nc\nd\ne\n";
+    let full = "a\nb\nc\nd\ne\nf-tail";
+    s.editor.insert_str(initial);
+    s.sync_input();
+
+    reducer::update(
+        &mut s,
+        UiEvent::CollapseKeyStreamPaste {
+            rendered_suffix: initial.into(),
+            text: initial.into(),
+        },
+    );
+    assert_eq!(s.editor.text(), "[Pasted Content 10 chars]");
+
+    reducer::update(
+        &mut s,
+        UiEvent::FinishKeyStreamPaste {
+            initial_text: initial.into(),
+            full_text: full.into(),
+        },
+    );
+    assert_eq!(s.editor.text(), "[Pasted Content 16 chars]");
+    reducer::update(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.pop_pending().as_deref(), Some(full));
 }
 
 /// §用户诉求：右侧边栏——Ctrl+B 切换开关（default 关闭，启动时 app 打开）；

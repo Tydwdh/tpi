@@ -675,11 +675,18 @@ async fn consume_stream(
                         ("utf8".to_string(), err.to_string())
                     }
                 };
+                let detail = format!(
+                    "stream transport ({kind}): {detail}; events_received={received_any}; bytes_read={}",
+                    streamed_bytes.load(std::sync::atomic::Ordering::Relaxed)
+                );
                 return ConsumeResult::Failed {
-                    error: ProviderError::Connection(format!(
-                        "stream transport ({kind}): {detail}; events_received={received_any}; bytes_read={}",
-                        streamed_bytes.load(std::sync::atomic::Ordering::Relaxed)
-                    )),
+                    // §修复：已收到部分语义内容后断流 = StreamInterrupted（agent 可
+                    // 自动续写）；未收到任何内容 = Connection（agent 不再续写）。
+                    error: if received_any {
+                        ProviderError::StreamInterrupted(detail)
+                    } else {
+                        ProviderError::Connection(detail)
+                    },
                     // §7.3/§15：只有未收到任何事件时才能重试——否则重发请求会重复
                     // 已到达的文本/工具调用（此前恒为 true，SSE 中途断开会重复内容）。
                     retryable: sse_transport_error_retryable(received_any),
@@ -964,14 +971,16 @@ async fn consume_stream(
         if finish_reason.is_some() {
             // 正常结束（宽松 provider 路径）。
         } else if received_any {
-            // 已发出事件：不可重试（避免事件重复/乱序）。
+            // 已发出语义事件：不可重试（避免事件重复/乱序）；分类为
+            // StreamInterrupted——agent 据此自动续写/重生成（§4.3）。
             return ConsumeResult::Failed {
-                error: ProviderError::Connection(
+                error: ProviderError::StreamInterrupted(
                     "stream ended before [DONE] and no finish_reason".into(),
                 ),
                 retryable: false,
             };
         } else {
+            // 未收到任何语义内容：可安全重试（provider 内部退避重试）。
             return ConsumeResult::Failed {
                 error: ProviderError::Connection("empty stream".into()),
                 retryable: true,

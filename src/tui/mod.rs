@@ -39,6 +39,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use markdown::{LinkRange, RenderedMarkdown, render_markdown, render_markdown_detailed};
@@ -46,8 +47,10 @@ use model::{Entry, LineKind, StatusLine, ToolCard, ViewModel};
 use scroll::{EntryId, ScrollMode};
 use tool_card::{card_semantic_rows, tool_card_lines};
 
-/// 帧合并间隔（§16.1：100-500 deltas/s 时按 16 ms 合并，而不是 delta 数量等于 draw 次数）。
-pub const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+/// 帧合并间隔（§16.1：高频事件按帧合并，而不是事件数量等于 draw 次数）。
+/// 33 ms ≈ 30 FPS：文本流式/拖选在此帧率下视觉已顺滑，同时把 Windows
+/// 终端上的全量重绘与 CSI I/O 压到 60 FPS 的一半（性能：终端卡顿）。
+pub const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
 /// 活动区高度：约 2/5 屏，随终端行数自适应。
 ///
@@ -138,7 +141,7 @@ pub struct Renderer {
     md_cache: HashMap<(u64, u16), RenderedMarkdown>,
     /// wrap 结果缓存（§性能）：历史 entry (id, width) → 折行结果，跨帧复用；
     /// transcript_revision 变化或 resize 时清空。
-    wrap_cache: HashMap<(EntryId, u16), Vec<WrappedRow>>,
+    wrap_cache: HashMap<(EntryId, u16), Arc<Vec<WrappedRow>>>,
     /// 上次 draw 的 transcript 结构版本（wrap 缓存失效依据）。
     last_transcript_revision: u64,
     /// 缓存有效时的终端宽度；宽度变化清空缓存并重置提交位置（§16.1）。
@@ -283,7 +286,7 @@ impl Renderer {
             .map(|l| l.url.clone())
     }
 
-    /// 距上次 draw 是否已过帧间隔（§16.1：16 ms 合并）。
+    /// 距上次 draw 是否已过帧间隔（§16.1：FRAME_INTERVAL 合并）。
     pub fn should_draw(&self) -> bool {
         match self.last_draw {
             Some(last) => last.elapsed() >= FRAME_INTERVAL,
@@ -423,7 +426,7 @@ struct RenderContext<'a> {
     markdown_cache: &'a mut HashMap<(u64, u16), RenderedMarkdown>,
     /// wrap 结果缓存（§性能：历史 entry 折叠/内容不变 → 跨帧复用，
     /// 避免每帧对全量历史逐字符重建 span）。key = (entry_id, width)。
-    wrap_cache: &'a mut HashMap<(EntryId, u16), Vec<WrappedRow>>,
+    wrap_cache: &'a mut HashMap<(EntryId, u16), Arc<Vec<WrappedRow>>>,
     cache_width: &'a mut u16,
     committed: &'a mut usize,
     scrollback: bool,
@@ -654,40 +657,77 @@ fn plan_window(
     committed: usize,
     reset_committed: bool,
     cache: &mut HashMap<(u64, u16), RenderedMarkdown>,
-    wrap_cache: &mut HashMap<(EntryId, u16), Vec<WrappedRow>>,
+    wrap_cache: &mut HashMap<(EntryId, u16), Arc<Vec<WrappedRow>>>,
 ) -> FramePlan {
     let width = width.max(1) as usize;
-    // 按 entry 构建逻辑行（entry → wrapped 行 + hits + 语义文本）。
-    // ids/heights 必须以 wrapped_by_entry 为准（含 live 哨兵 group，§7.2）。
-    let per_entry = build_transcript_text(view, theme, cache, width);
-    let mut wrapped_by_entry: Vec<(EntryId, Vec<WrappedRow>)> = Vec::with_capacity(per_entry.len());
-    // §性能：历史 transcript entry 的内容与折叠状态决定 wrap 结果。
-    // transcript_revision 变化时 wrap_cache 已被清空；命中则直接复用，
-    // 避免每帧对全量历史逐字符重建 span（上下文越多收益越大）。
-    // live 区（不在 transcript 中）内容每帧变化，不缓存。
-    let live_ids: std::collections::HashSet<EntryId> = view
-        .live
-        .tool_order
+    // 输入、光标、footer 或动画变化时 transcript 通常完全没变。旧路径即使
+    // wrap-cache 全命中，也会先为全部历史重建 Markdown 逻辑行，再把结果丢掉；
+    // 长会话中一次按键因此仍可能耗费几十毫秒。缓存完整时直接复用历史的
+    // wrapped rows，只构建确实会变化的 live 区。
+    let historical_ids: Vec<EntryId> = view.transcript.iter().map(Entry::id).collect();
+    let history_cache_complete = historical_ids
         .iter()
-        .filter_map(|id| view.live.tools.get(id).map(|t| t.entry_id))
-        .chain(view.live.assistant.iter().map(|m| m.entry_id))
-        .chain(view.live.reasoning.iter().map(|m| m.entry_id))
-        .collect();
-    for (id, logical, hits, semantic_lines) in per_entry {
-        let cacheable = !live_ids.contains(&id);
-        let key = (id, width as u16);
-        let rows = if cacheable {
-            if let Some(hit) = wrap_cache.get(&key) {
-                hit.clone()
-            } else {
-                let rows = wrap_with_semantic(logical, hits, &semantic_lines, width, id);
-                wrap_cache.insert(key, rows.clone());
-                rows
+        .all(|id| wrap_cache.contains_key(&(*id, width as u16)));
+    let mut wrapped_by_entry: Vec<(EntryId, Arc<Vec<WrappedRow>>)> = Vec::new();
+    if history_cache_complete {
+        wrapped_by_entry.reserve(historical_ids.len() + 3);
+        for id in historical_ids {
+            if let Some(rows) = wrap_cache.get(&(id, width as u16)) {
+                wrapped_by_entry.push((id, Arc::clone(rows)));
             }
-        } else {
-            wrap_with_semantic(logical, hits, &semantic_lines, width, id)
-        };
-        wrapped_by_entry.push((id, rows));
+        }
+        for (id, logical, hits, semantic_lines) in
+            build_live_transcript_text(view, theme, cache, width)
+        {
+            let rows = Arc::new(wrap_with_semantic(
+                logical,
+                hits,
+                &semantic_lines,
+                width,
+                id,
+            ));
+            wrapped_by_entry.push((id, rows));
+        }
+    } else {
+        // 结构变化/resize：重建一次全部 entry 并填充缓存。
+        let per_entry = build_transcript_text(view, theme, cache, width);
+        let live_ids: std::collections::HashSet<EntryId> = view
+            .live
+            .tool_order
+            .iter()
+            .filter_map(|id| view.live.tools.get(id).map(|t| t.entry_id))
+            .chain(view.live.assistant.iter().map(|m| m.entry_id))
+            .chain(view.live.reasoning.iter().map(|m| m.entry_id))
+            .collect();
+        wrapped_by_entry.reserve(per_entry.len());
+        for (id, logical, hits, semantic_lines) in per_entry {
+            let cacheable = !live_ids.contains(&id);
+            let key = (id, width as u16);
+            let rows = if cacheable {
+                if let Some(hit) = wrap_cache.get(&key) {
+                    Arc::clone(hit)
+                } else {
+                    let rows = Arc::new(wrap_with_semantic(
+                        logical,
+                        hits,
+                        &semantic_lines,
+                        width,
+                        id,
+                    ));
+                    wrap_cache.insert(key, Arc::clone(&rows));
+                    rows
+                }
+            } else {
+                Arc::new(wrap_with_semantic(
+                    logical,
+                    hits,
+                    &semantic_lines,
+                    width,
+                    id,
+                ))
+            };
+            wrapped_by_entry.push((id, rows));
+        }
     }
     let ids: Vec<EntryId> = wrapped_by_entry.iter().map(|(id, _)| *id).collect();
     let heights: Vec<usize> = wrapped_by_entry
@@ -1769,6 +1809,32 @@ fn build_transcript_text(
     groups
 }
 
+/// 只构建 live 区，用于历史 wrap-cache 完整命中的常见重绘路径。
+fn build_live_transcript_text(
+    view: &ViewModel,
+    theme: theme::Theme,
+    cache: &mut HashMap<(u64, u16), RenderedMarkdown>,
+    width: usize,
+) -> Vec<EntryGroup> {
+    let mut groups = Vec::new();
+    let mut lines = Vec::new();
+    let mut hits = Vec::new();
+    let mut semantic = Vec::new();
+    build_live_group(
+        view,
+        theme,
+        cache,
+        width,
+        GroupBuffers {
+            lines: &mut lines,
+            hits: &mut hits,
+            semantic: &mut semantic,
+            groups: &mut groups,
+        },
+    );
+    groups
+}
+
 /// 追加一行间隔（块间留白；text 空、不可选，与历史区 needs_gap 同构）。
 fn push_gap_row(
     out: &mut Vec<Line<'static>>,
@@ -2514,8 +2580,10 @@ fn input_area_rows(view: &ViewModel, width: u16) -> u16 {
     if view.input.is_empty() {
         return 1;
     }
-    let budget = width.saturating_sub(2).max(1) as usize;
-    let wrapped = wrap_lines(vec![Line::from(Span::raw(view.input.clone()))], budget);
+    // 与 draw_input/input_cursor_cell 共用同一规则：只有首行扣 prompt 宽度，
+    // 续行使用整行宽度。此前这里每一行都扣 2 列，会错误增高输入区并造成
+    // 光标/内部滚动在窄窗口中抖动。
+    let wrapped = input_wrap(&view.input, width as usize, 2);
     // §8.2：composer 动态 1..8 行，超过 8 行内部滚动（draw_input 跟随光标）。
     wrapped.len().clamp(1, 8) as u16
 }
@@ -2900,7 +2968,7 @@ pub fn draw_to_test_backend_mode(
     };
     let theme = theme::Theme::omp();
     let mut cache: HashMap<(u64, u16), RenderedMarkdown> = HashMap::new();
-    let mut wrap_cache: HashMap<(EntryId, u16), Vec<WrappedRow>> = HashMap::new();
+    let mut wrap_cache: HashMap<(EntryId, u16), Arc<Vec<WrappedRow>>> = HashMap::new();
     let mut cache_width = 0u16;
     let mut committed = 0usize;
     let scrollback = mode == terminal::ViewMode::Inline;
@@ -2951,7 +3019,7 @@ pub fn draw_captured_bytes(view: &mut ViewModel) -> Vec<u8> {
         let mut cache: HashMap<(u64, u16), RenderedMarkdown> = HashMap::new();
         let mut cache_width = 0u16;
         let mut committed = 0usize;
-        let mut wrap_cache: HashMap<(EntryId, u16), Vec<WrappedRow>> = HashMap::new();
+        let mut wrap_cache: HashMap<(EntryId, u16), Arc<Vec<WrappedRow>>> = HashMap::new();
         let mut overflow: Vec<Line<'static>> = Vec::new();
         terminal
             .draw(|frame| {

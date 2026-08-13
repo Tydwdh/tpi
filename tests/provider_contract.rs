@@ -921,7 +921,16 @@ async fn sse_midstream_error_after_events_does_not_retry() {
         .await;
     drop(tx);
     drain.abort();
-    assert!(result.is_err(), "SSE 中途断开（已收到事件）必须是错误");
+    let err = match result {
+        Ok(_) => panic!("SSE 中途断开（已收到事件）必须是错误"),
+        Err(err) => err,
+    };
+    // §修复：已收到部分内容后截断 → StreamInterrupted（agent 据此自动续写），
+    // 而不是 Connection（未收内容的传输失败，agent 不再续写）。
+    assert!(
+        matches!(&err, tpi::provider::ProviderError::StreamInterrupted(_)),
+        "已收内容后截断必须分类为 StreamInterrupted: {err}"
+    );
     assert_eq!(
         conns.await.unwrap(),
         1,

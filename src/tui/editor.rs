@@ -106,6 +106,34 @@ impl Editor {
         });
     }
 
+    /// 仅当光标前的文本精确等于 `suffix` 时，将其原子替换为 `replacement`。
+    ///
+    /// 用于把旧终端逐键注入、已经即时显示的长粘贴折叠成占位符。精确后缀校验
+    /// 可确保光标移动、截断或其他编辑发生时绝不误删用户原有内容。
+    pub fn replace_suffix_before_cursor(&mut self, suffix: &str, replacement: &str) -> bool {
+        let Some(start) = self.cursor.checked_sub(suffix.len()) else {
+            return false;
+        };
+        if !self.text.is_char_boundary(start)
+            || self.text.get(start..self.cursor) != Some(suffix)
+            || self
+                .text
+                .len()
+                .saturating_sub(suffix.len())
+                .saturating_add(replacement.len())
+                > MAX_INPUT_BYTES
+        {
+            return false;
+        }
+        let end = self.cursor;
+        self.edit(EditOp::Discrete, |editor| {
+            editor.text.replace_range(start..end, replacement);
+            editor.cursor = start + replacement.len();
+            editor.preferred_column = None;
+        });
+        true
+    }
+
     /// 撤销上一次编辑（Ctrl+Z）。无可撤销历史时静默无操作。
     pub fn undo(&mut self) {
         if let Some(snap) = self.undo_stack.pop() {
