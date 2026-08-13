@@ -11,6 +11,7 @@ pub mod edit;
 pub mod files;
 pub mod outcome;
 pub mod plan;
+pub mod registry;
 pub mod search;
 pub mod web;
 
