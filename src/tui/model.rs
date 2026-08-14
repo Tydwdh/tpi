@@ -457,7 +457,7 @@ fn search_tool_haystack(card: &ToolCard) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusLine {
     Idle,
-    Running { turn: u32, tool: String },
+    Running { step: u32, tool: String },
     Compacting,
 }
 
@@ -566,7 +566,7 @@ pub struct ViewModel {
     /// workspace 目录名（footer 展示）。
     pub workspace: String,
     /// 当前正在运行的 turn 数。
-    pub turn: u32,
+    pub step: u32,
     /// 正在变化的 turn（流式文本 + 运行中工具；§7.2 与 transcript 分离）。
     pub live: LiveTurnState,
     /// 滚动模式（TUI v2 §3）：Follow = 尾部；Locked = 锚定 EntryId + row。
@@ -649,7 +649,7 @@ impl Default for ViewModel {
             status: StatusLine::Idle,
             model_name: "?".into(),
             workspace: String::new(),
-            turn: 0,
+            step: 0,
             live: LiveTurnState::default(),
             scroll_mode: ScrollMode::Follow,
             pending_below: 0,
@@ -721,7 +721,7 @@ impl ViewModel {
         self.live = LiveTurnState::default();
         self.plan = None;
         self.status = StatusLine::Idle;
-        self.turn = 0;
+        self.step = 0;
         self.reasoning_expanded.clear();
         self.scroll_mode = ScrollMode::Follow;
         self.pending_below = 0;

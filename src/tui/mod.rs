@@ -2361,11 +2361,11 @@ fn draw_footer(
             spans.push(Span::styled(" · ", muted));
             spans.push(Span::styled("就绪", Style::default().fg(theme.success)));
         }
-        StatusLine::Running { turn, tool } => {
+        StatusLine::Running { step, tool } => {
             spans.push(Span::styled(" · ", muted));
             let spin = SPINNER_FRAMES[view.anim_tick as usize % SPINNER_FRAMES.len()];
             spans.push(Span::styled(
-                format!("{spin} turn {turn} · {tool}"),
+                format!("{spin} step {step} · {tool}"),
                 Style::default().fg(theme.info),
             ));
         }

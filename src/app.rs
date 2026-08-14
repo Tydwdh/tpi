@@ -222,6 +222,148 @@ pub async fn run(
 /// 非交互单次 run（输出经 stdout，仅最终答案）。
 ///
 /// `pub`：`-p` 模式的执行路径，集成测试直接覆盖（P0-1 死锁回归）。
+/// P1-03：把 UI-agnostic [`LiveEvent`] 投影为 TUI view event（[`RuntimeEvent`]）。
+///
+/// agent 只发语义事实；展示投影（工具 target/command 摘要、tail 数据源）
+/// 在此生成。headless / RPC / 测试可直接消费 `LiveEvent`，无需本投影。
+pub fn project_live_event(event: crate::agent::LiveEvent) -> Option<crate::agent::RuntimeEvent> {
+    use crate::agent::{LiveEvent, RuntimeEvent};
+    match event {
+        LiveEvent::StepStarted { step } => Some(RuntimeEvent::StepStarted { step }),
+        LiveEvent::AssistantDelta {
+            request_id,
+            kind,
+            text,
+        } => Some(RuntimeEvent::AssistantDelta {
+            request_id,
+            kind,
+            text,
+        }),
+        LiveEvent::ToolStarted {
+            call_id,
+            name,
+            arguments,
+        } => {
+            let (target, command) = tool_target(&name, &arguments);
+            Some(RuntimeEvent::ToolStarted {
+                call_id,
+                name,
+                target,
+                command,
+            })
+        }
+        LiveEvent::ToolCompleted {
+            call_id,
+            name,
+            status,
+            duration_ms,
+            exit_code,
+            output,
+            diff,
+        } => Some(RuntimeEvent::ToolCompleted {
+            call_id,
+            name,
+            status,
+            duration_ms,
+            exit_code,
+            // 有界输出即 TUI tail 的数据源（tail 是展示裁剪，见 reducer.finish_tool）。
+            tail: output,
+            diff,
+        }),
+        LiveEvent::ToolOutputDelta {
+            call_id,
+            stream,
+            text,
+        } => Some(RuntimeEvent::ToolOutputDelta {
+            call_id,
+            stream,
+            text,
+        }),
+        LiveEvent::ContextUsage { projected, usable } => {
+            Some(RuntimeEvent::ContextUsage { projected, usable })
+        }
+        LiveEvent::UsageUpdated {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+        } => Some(RuntimeEvent::UsageUpdated {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+        }),
+        LiveEvent::BudgetWarning => Some(RuntimeEvent::BudgetWarning),
+        LiveEvent::PlanUpdated { plan } => Some(RuntimeEvent::PlanUpdated { plan }),
+        LiveEvent::StreamRecovering { attempt } => Some(RuntimeEvent::StreamRecovering { attempt }),
+        LiveEvent::TurnRestarting { attempt } => Some(RuntimeEvent::TurnRestarting { attempt }),
+        LiveEvent::CompactionNotice { message } => Some(RuntimeEvent::CompactionNotice { message }),
+    }
+}
+
+/// 工具调用的主行 target 与完整命令（P1-03：从 agent/tool_runtime 移入
+/// presentation projector）。
+///
+/// - bash：target = 压缩后的命令（换行折空格、连续空白压缩、200 字符截断）；
+///   command = 原文（≤8KiB，overlay 展示）。
+/// - 其他文件工具：target = `name path`；其余只显示工具名。
+/// - request_input：主行携带问题摘要（首行）。
+fn tool_target(name: &str, arguments: &str) -> (String, Option<String>) {
+    fn truncate(text: &str, max_chars: usize) -> String {
+        if text.chars().count() <= max_chars {
+            text.to_string()
+        } else {
+            let mut t: String = text.chars().take(max_chars).collect();
+            t.push('…');
+            t
+        }
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(arguments).ok();
+    match name {
+        "bash" => {
+            if let Some(cmd) = parsed
+                .as_ref()
+                .and_then(|v| v.get("command"))
+                .and_then(|c| c.as_str())
+            {
+                let compressed = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+                (truncate(&compressed, 200), Some(truncate(cmd, 8 * 1024)))
+            } else {
+                ("bash".into(), None)
+            }
+        }
+        name if matches!(name, "read" | "write" | "edit" | "list" | "search") => {
+            let target = parsed
+                .as_ref()
+                .and_then(|v| v.get("path"))
+                .and_then(|p| p.as_str())
+                .map(|path| format!("{name} {path}"))
+                .unwrap_or_else(|| name.to_string());
+            (truncate(&target, 120), None)
+        }
+        // §去重/信息：request_input（askuser）卡片主行携带问题摘要（首行）。
+        "request_input" => {
+            let summary = parsed
+                .as_ref()
+                .and_then(|v| v.get("question"))
+                .and_then(|q| q.as_str())
+                .or_else(|| {
+                    parsed
+                        .as_ref()
+                        .and_then(|v| v.get("questions"))
+                        .and_then(|qs| qs.as_array())
+                        .and_then(|qs| qs.first())
+                        .and_then(|q| q.get("question"))
+                        .and_then(|q| q.as_str())
+                })
+                .map(|q| q.lines().next().unwrap_or("").trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("request_input {s}"))
+                .unwrap_or_else(|| "request_input".to_string());
+            (truncate(&summary, 120), None)
+        }
+        name => (name.to_string(), None),
+    }
+}
+
 pub async fn run_prompt_once<P: Provider>(
     provider: &mut P,
     session: &mut SessionLog,
@@ -235,6 +377,8 @@ pub async fn run_prompt_once<P: Provider>(
     let (ui_tx, mut ui_rx) = mpsc::channel(128);
     // P0-1：`-p` 模式没有 TUI 消费 UI 事件；直接丢弃 rx 会在 channel 满后
     // 让 agent 的 `ui.send().await` 永久等待（挂死）。drain task 持续消费。
+    // P1-03：headless 消费的是 UI-agnostic `LiveEvent`（不投影 TUI view event）；
+    // 真正的“无 drain task”headless 订阅在 P3-05（直接订阅 semantic runtime）。
     tokio::spawn(async move { while ui_rx.recv().await.is_some() {} });
     let outcome = agent::run(
         provider,
@@ -289,11 +433,8 @@ async fn interactive_loop<P: Provider>(
     // P1-05：TUI 是窄视图 UiConfig 的 owner——不直接读 Config 的 ui_* 字段。
     let ui_cfg = config.ui_config();
 
-    let mut renderer = Renderer::new(
-        crate::tui::theme::Theme::named(&ui_cfg.theme),
-        ui_cfg.mode,
-    )
-    .map_err(|e| format!("初始化终端失败: {e}"))?;
+    let mut renderer = Renderer::new(crate::tui::theme::Theme::named(&ui_cfg.theme), ui_cfg.mode)
+        .map_err(|e| format!("初始化终端失败: {e}"))?;
     // §31：panic 时尽力恢复终端（不把 Windows Terminal/PowerShell 留在 raw mode）。
     install_terminal_panic_hook();
     let mut view = ViewModel {
@@ -873,7 +1014,7 @@ async fn interactive_loop<P: Provider>(
                 Err(error) => {
                     conversation.refresh_from_log()?;
                     ui_state.view.status = crate::tui::model::StatusLine::Idle;
-                    ui_state.view.turn = 0;
+                    ui_state.view.step = 0;
                     ui_state.view.push_line_dedup(
                         LineKind::System,
                         format!(
@@ -1002,7 +1143,7 @@ async fn interactive_loop<P: Provider>(
                     // 交互模式：run 失败（provider/工具基础设施）不得杀死整个 TUI。
                     // 显示实际错误并保留 session，用户可以继续对话。
                     ui_state.view.status = crate::tui::model::StatusLine::Idle;
-                    ui_state.view.turn = 0;
+                    ui_state.view.step = 0;
                     ui_state.view.push_line(
                         LineKind::System,
                         format!(
@@ -1722,7 +1863,7 @@ async fn run_interactive<P: Provider>(
     let cancel = CancellationToken::new();
     *crate::util::lock_mutex(&current_cancel, "current_cancel") = Some(cancel.clone());
     ui_state.view.status = StatusLine::Running {
-        turn: 0,
+        step: 0,
         tool: "正在连接模型".into(),
     };
     ui_state.running = true;
@@ -1760,7 +1901,9 @@ async fn run_interactive<P: Provider>(
             event = ui_rx.recv() => {
                 if let Some(event) = event {
                     // Agent 事件 → reducer（纯状态转换；T3）。
-                    crate::tui::reducer::update(ui_state, UiEvent::Agent(event));
+                    if let Some(view_event) = project_live_event(event) {
+                        crate::tui::reducer::update(ui_state, UiEvent::Agent(view_event));
+                    }
                 }
                 if renderer.should_draw() {
                     renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
@@ -1864,7 +2007,9 @@ async fn run_interactive<P: Provider>(
                 // finalize_live 提交的 live.assistant 缺最后一段，屏幕上
                 // 最后一句被截断（如“要我做”只剩“要我做”）。
                 while let Ok(event) = ui_rx.try_recv() {
-                    crate::tui::reducer::update(ui_state, UiEvent::Agent(event));
+                    if let Some(view_event) = project_live_event(event) {
+                        crate::tui::reducer::update(ui_state, UiEvent::Agent(view_event));
+                    }
                 }
                 break result;
             }
@@ -1972,7 +2117,7 @@ async fn run_interactive<P: Provider>(
         }
     }
     ui_state.view.status = StatusLine::Idle;
-    ui_state.view.turn = 0;
+    ui_state.view.step = 0;
     renderer
         .draw(&mut ui_state.view)
         .map_err(|e| e.to_string())?;
@@ -2452,6 +2597,97 @@ mod tests {
     use super::*;
     use crate::tui::model::ViewModel;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    /// P1-03：LiveEvent → RuntimeEvent 投影覆盖全部变体（headless 消费 LiveEvent
+    /// 不依赖此投影；TUI 依赖它生成 view event）。
+    #[test]
+    fn project_live_event_covers_all_variants() {
+        use crate::agent::{DeltaKind, LiveEvent};
+        use crate::ids::{RequestId, ToolCallId};
+        use crate::tool::outcome::ToolStatus;
+        let call_id = ToolCallId::new_v7();
+        let plan = crate::tool::plan::Plan {
+            explanation: Some("p".into()),
+            items: vec![],
+        };
+        let cases: Vec<(LiveEvent, &str)> = vec![
+            (LiveEvent::StepStarted { step: 3 }, "step"),
+            (
+                LiveEvent::AssistantDelta {
+                    request_id: RequestId::new_v7(),
+                    kind: DeltaKind::Text,
+                    text: "hi".into(),
+                },
+                "assistant_delta",
+            ),
+            (
+                LiveEvent::ToolStarted {
+                    call_id,
+                    name: "bash".into(),
+                    arguments: r#"{"command":"echo hi"}"#.into(),
+                },
+                "tool_started",
+            ),
+            (
+                LiveEvent::ToolCompleted {
+                    call_id,
+                    name: "bash".into(),
+                    status: ToolStatus::Succeeded,
+                    duration_ms: 5,
+                    exit_code: Some(0),
+                    output: "ok".into(),
+                    diff: None,
+                },
+                "tool_completed",
+            ),
+            (
+                LiveEvent::ToolOutputDelta {
+                    call_id,
+                    stream: 0,
+                    text: "out".into(),
+                },
+                "tool_output",
+            ),
+            (
+                LiveEvent::ContextUsage {
+                    projected: 10,
+                    usable: 100,
+                },
+                "context_usage",
+            ),
+            (
+                LiveEvent::UsageUpdated {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    cache_read_tokens: 3,
+                },
+                "usage",
+            ),
+            (LiveEvent::BudgetWarning, "budget"),
+            (LiveEvent::PlanUpdated { plan }, "plan"),
+            (
+                LiveEvent::StreamRecovering { attempt: 1 },
+                "stream_recovering",
+            ),
+            (LiveEvent::TurnRestarting { attempt: 1 }, "turn_restarting"),
+            (
+                LiveEvent::CompactionNotice {
+                    message: "c".into(),
+                },
+                "compaction",
+            ),
+        ];
+        for (live, kind) in cases {
+            let view = project_live_event(live).unwrap_or_else(|| panic!("{kind} 投影缺失"));
+            let _ = view; // 类型已保证是 RuntimeEvent；全变体覆盖即验收
+        }
+        // 工具 target 投影：bash 命令摘要 + read 路径摘要。
+        let (target, command) = tool_target("bash", r#"{"command":"echo a && echo b"}"#);
+        assert!(target.starts_with("echo a"), "bash target 压缩: {target}");
+        assert_eq!(command.as_deref(), Some("echo a && echo b"));
+        let (target, _) = tool_target("read", r#"{"path":"src/main.rs"}"#);
+        assert_eq!(target, "read src/main.rs");
+    }
 
     #[test]
     fn key_repeat_is_an_edit_event_but_release_is_not() {

@@ -1553,7 +1553,7 @@ fn cursor_hidden_during_run_when_input_empty() {
     ));
     assert!(!should_show_input_cursor(
         &StatusLine::Running {
-            turn: 1,
+            step: 1,
             tool: "x".into()
         },
         true,
@@ -1562,7 +1562,7 @@ fn cursor_hidden_during_run_when_input_empty() {
     ));
     assert!(should_show_input_cursor(
         &StatusLine::Running {
-            turn: 1,
+            step: 1,
             tool: "x".into()
         },
         false,
@@ -1575,7 +1575,7 @@ fn cursor_hidden_during_run_when_input_empty() {
     );
     assert!(!should_show_input_cursor(
         &StatusLine::Running {
-            turn: 1,
+            step: 1,
             tool: "x".into()
         },
         false,
@@ -1588,7 +1588,7 @@ fn cursor_hidden_during_run_when_input_empty() {
     );
     assert!(!should_show_input_cursor(
         &StatusLine::Running {
-            turn: 1,
+            step: 1,
             tool: "x".into()
         },
         false,
@@ -1599,7 +1599,7 @@ fn cursor_hidden_during_run_when_input_empty() {
     // Byte level: running + empty input must emit the hide sequence.
     let mut view = ViewModel {
         status: StatusLine::Running {
-            turn: 1,
+            step: 1,
             tool: "generating".into(),
         },
         ..ViewModel::default()

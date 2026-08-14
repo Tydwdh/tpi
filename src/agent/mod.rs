@@ -109,7 +109,7 @@ pub struct AwaitingInput {
 pub struct RunInput<'a> {
     pub history: &'a [ChatMessage],
     pub user_message: String,
-    pub ui: mpsc::Sender<RuntimeEvent>,
+    pub ui: mpsc::Sender<LiveEvent>,
     pub cancel: CancellationToken,
     pub interactive: bool,
     /// P1-10：手动 `/compact`——无条件在第一个完整边界执行一次压缩。
@@ -160,11 +160,73 @@ impl std::fmt::Display for BudgetKind {
     }
 }
 
-/// ephemeral 运行时事件（§4.3：不逐 token 写盘）。
+/// UI-agnostic 运行时事件（P1-03：agent 只发语义事实，**不含任何展示字段**）。
+///
+/// - headless / RPC / 测试可直接消费，无需理解 TUI 表示（target/diff/tail）；
+/// - TUI 的展示投影（`RuntimeEvent`）由 app projector 生成（`app::project_live_event`）。
+///
+/// 工具事件携带**原始参数**（`arguments`）而非渲染后的 target/command——
+/// target/command 是 view 概念，由 projector 按需生成。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveEvent {
+    /// 每次实际 provider 请求前发送（= 目标词汇的 Step 边界，P1-01）。
+    StepStarted { step: u32 },
+    AssistantDelta {
+        request_id: RequestId,
+        kind: DeltaKind,
+        text: String,
+    },
+    /// 工具真正启动前发送（语义事实：call + name + 原始参数）。
+    ToolStarted {
+        call_id: ToolCallId,
+        name: String,
+        /// 模型发出的原始参数 JSON（projector 用它生成 target/command 摘要）。
+        arguments: String,
+    },
+    /// 工具终态（语义事实 + 有界输出/diff；`tail` 展示裁剪由 projector 生成）。
+    ToolCompleted {
+        call_id: ToolCallId,
+        name: String,
+        status: ToolStatus,
+        duration_ms: u64,
+        exit_code: Option<i32>,
+        /// 有界输出摘要（模型/用户可见内容）。
+        output: String,
+        /// edit/write 的结构化 diff（无独立数据源可重建，随语义终态携带）。
+        diff: Option<String>,
+    },
+    /// 工具执行中的实时输出增量（bash stdout/stderr）。
+    ToolOutputDelta {
+        call_id: ToolCallId,
+        stream: u8,
+        text: String,
+    },
+    /// 上下文占用投影（每次请求前）。
+    ContextUsage { projected: u64, usable: u64 },
+    /// 每次 provider 请求返回 usage 后（缓存命中实时展示）。
+    UsageUpdated {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+    },
+    /// 接近 wall-time 预算。
+    BudgetWarning,
+    /// `update_plan` 提交后的独立状态。
+    PlanUpdated { plan: crate::tool::plan::Plan },
+    /// 流中断后正在自动续写（text-only attempt 恢复）。
+    StreamRecovering { attempt: u32 },
+    /// partial tool-call 后整个 model step 重新生成。
+    TurnRestarting { attempt: u32 },
+    /// 手动 /compact 的结果反馈。
+    CompactionNotice { message: String },
+}
+
+/// TUI view event（P1-03：由 app projector 从 [`LiveEvent`] 生成，agent 不再直接发）。
+/// 含展示字段（target/diff/tail），只被 TUI 消费。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
     /// 每次实际 provider 请求前发送，供 TUI 更新运行状态。
-    TurnStarted { turn: u32 },
+    StepStarted { step: u32 },
     AssistantDelta {
         request_id: RequestId,
         kind: DeltaKind,
@@ -335,7 +397,7 @@ async fn run_inner<P: Provider>(
             },
             move || {
                 tracing::info!("run approaching wall-time budget");
-                let _ = warn_ui.try_send(RuntimeEvent::BudgetWarning);
+                let _ = warn_ui.try_send(LiveEvent::BudgetWarning);
             },
         );
         AbortTaskOnDrop(watchdog)
@@ -377,7 +439,7 @@ async fn run_inner<P: Provider>(
             Ok(()) => {
                 ensure_plan_state_messages(&mut messages, initial_plan.as_ref());
                 let _ = ui
-                    .send(RuntimeEvent::CompactionNotice {
+                    .send(LiveEvent::CompactionNotice {
                         message: "手动压缩完成：旧历史已压缩为摘要，上下文已精简".into(),
                     })
                     .await;
@@ -395,7 +457,7 @@ async fn run_inner<P: Provider>(
                     preview
                 };
                 let _ = ui
-                    .send(RuntimeEvent::CompactionNotice {
+                    .send(LiveEvent::CompactionNotice {
                         message: format!(
                             "手动压缩未生效：模型未返回有效摘要。模型输出：{preview:?}"
                         ),
@@ -405,7 +467,7 @@ async fn run_inner<P: Provider>(
             Err(CompactionFailure::NotSignificant) => {
                 tracing::warn!("manual compaction: not significant");
                 let _ = ui
-                    .send(RuntimeEvent::CompactionNotice {
+                    .send(LiveEvent::CompactionNotice {
                         message: "手动压缩未生效：摘要无显著收益（历史本身已较精简或摘要过长）"
                             .into(),
                     })
@@ -414,7 +476,7 @@ async fn run_inner<P: Provider>(
             Err(CompactionFailure::Provider(error)) => {
                 tracing::warn!(error = %error, "manual compaction: provider failed");
                 let _ = ui
-                    .send(RuntimeEvent::CompactionNotice {
+                    .send(LiveEvent::CompactionNotice {
                         message: format!("手动压缩未生效：压缩请求失败（{error}）"),
                     })
                     .await;
@@ -425,7 +487,7 @@ async fn run_inner<P: Provider>(
         }
     } else if force_compaction {
         let _ = ui
-            .send(RuntimeEvent::CompactionNotice {
+            .send(LiveEvent::CompactionNotice {
                 message: "手动压缩未生效：没有可压缩的历史（当前对话过短）".into(),
             })
             .await;
@@ -477,7 +539,7 @@ async fn run_inner<P: Provider>(
         // 一个 request_id 标识一个逻辑 model turn；自动续写/restart 沿用它，
         // 下一轮（通常在工具结果之后）必须分配新 id。
         let request_id = RequestId::new_v7();
-        let _ = ui.send(RuntimeEvent::TurnStarted { turn }).await;
+        let _ = ui.send(LiveEvent::StepStarted { step: turn }).await;
 
         // §15.4：compaction 检查（只在下一次请求前；完整 boundary 之后）。
         // P0-9：投影用请求级估算（system prompt + 计划工具轮 + 工具 schema），
@@ -614,9 +676,7 @@ async fn run_inner<P: Provider>(
                 let system_prompt = system_prompt_text(config, ephemeral_system.as_deref());
                 let projected =
                     crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
-                let _ = ui
-                    .send(RuntimeEvent::ContextUsage { projected, usable })
-                    .await;
+                let _ = ui.send(LiveEvent::ContextUsage { projected, usable }).await;
             }
             let (event_tx, mut event_rx) = mpsc::channel(crate::provider::EVENT_CHANNEL_CAPACITY);
 
@@ -746,7 +806,7 @@ async fn run_inner<P: Provider>(
                                     .and_then(|_| session.sync_data())
                                     .map_err(|e2| RunFailure::Session(e2.to_string()))?;
                                 let _ = ui
-                                    .send(RuntimeEvent::StreamRecovering {
+                                    .send(LiveEvent::StreamRecovering {
                                         attempt: stream_recoveries + 1,
                                     })
                                     .await;
@@ -774,7 +834,7 @@ async fn run_inner<P: Provider>(
                                     .and_then(|_| session.sync_data())
                                     .map_err(|e2| RunFailure::Session(e2.to_string()))?;
                                 let _ = ui
-                                    .send(RuntimeEvent::TurnRestarting {
+                                    .send(LiveEvent::TurnRestarting {
                                         attempt: turn_restarts + 1,
                                     })
                                     .await;
@@ -799,7 +859,7 @@ async fn run_inner<P: Provider>(
                                 && turn_restarts < MAX_TURN_RESTARTS
                             {
                                 let _ = ui
-                                    .send(RuntimeEvent::TurnRestarting {
+                                    .send(LiveEvent::TurnRestarting {
                                         attempt: turn_restarts + 1,
                                     })
                                     .await;
@@ -876,7 +936,7 @@ async fn run_inner<P: Provider>(
         // 本次 input/cache token 发给 TUI，不等 run 结束（此前只有 run 完成
         // 后的累计 ⇄ 显示，无法看到“本次请求缓存命中率”）。
         let _ = ui
-            .send(RuntimeEvent::UsageUpdated {
+            .send(LiveEvent::UsageUpdated {
                 input_tokens: response.usage.input_tokens,
                 output_tokens: response.usage.output_tokens,
                 cache_read_tokens: response.usage.cache_read_tokens,
@@ -1023,7 +1083,7 @@ async fn consume_stream_event(
     content: &mut String,
     saw_any_semantic: &mut bool,
     saw_tool_calls: &mut bool,
-    ui: &mpsc::Sender<RuntimeEvent>,
+    ui: &mpsc::Sender<LiveEvent>,
     emit_text: bool,
 ) {
     match &event {
@@ -1048,7 +1108,7 @@ async fn consume_attempt_stream_event(
     recovering_text: bool,
     saw_any_semantic: &mut bool,
     saw_tool_calls: &mut bool,
-    ui: &mpsc::Sender<RuntimeEvent>,
+    ui: &mpsc::Sender<LiveEvent>,
 ) {
     let target = if recovering_text {
         recovery_content
@@ -1072,7 +1132,7 @@ async fn flush_recovery_text(
     request_id: RequestId,
     content: &mut String,
     recovery_content: &mut String,
-    ui: &mpsc::Sender<RuntimeEvent>,
+    ui: &mpsc::Sender<LiveEvent>,
 ) {
     if !recovering_text || recovery_content.is_empty() {
         return;
@@ -1083,7 +1143,7 @@ async fn flush_recovery_text(
     recovery_content.clear();
     if !append.is_empty() {
         let _ = ui
-            .send(RuntimeEvent::AssistantDelta {
+            .send(LiveEvent::AssistantDelta {
                 request_id,
                 kind: DeltaKind::Text,
                 text: append,
@@ -1150,7 +1210,7 @@ async fn forward_provider_event(
     event: ProviderEvent,
     request_id: RequestId,
     content: &mut String,
-    ui: &mpsc::Sender<RuntimeEvent>,
+    ui: &mpsc::Sender<LiveEvent>,
     emit_text: bool,
 ) {
     match event {
@@ -1158,7 +1218,7 @@ async fn forward_provider_event(
             content.push_str(&text);
             if emit_text {
                 let _ = ui
-                    .send(RuntimeEvent::AssistantDelta {
+                    .send(LiveEvent::AssistantDelta {
                         request_id,
                         kind: DeltaKind::Text,
                         text,
@@ -1169,7 +1229,7 @@ async fn forward_provider_event(
         ProviderEvent::ReasoningDelta(text) => {
             // §15.5：reasoning 只在 UI 展示，不进入 durable facts。
             let _ = ui
-                .send(RuntimeEvent::AssistantDelta {
+                .send(LiveEvent::AssistantDelta {
                     request_id,
                     kind: DeltaKind::Reasoning,
                     text,

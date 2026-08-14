@@ -534,10 +534,10 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
                 "⚠ 接近 wall-time 预算：run 即将被取消，请尽快收敛或保存进度".to_string(),
             );
         }
-        RuntimeEvent::TurnStarted { turn } => {
-            view.turn = turn;
+        RuntimeEvent::StepStarted { step } => {
+            view.step = step;
             view.status = StatusLine::Running {
-                turn,
+                step,
                 tool: "模型生成中".into(),
             };
         }

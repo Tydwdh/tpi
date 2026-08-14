@@ -54,14 +54,11 @@ async fn finish_stop_without_tool_calls_completes_run_without_second_request() {
 
     // 每个真实请求先通知 UI 更新运行状态，随后流文本送达。
     let started = rx.recv().await.expect("turn started");
-    assert!(matches!(
-        started,
-        agent::RuntimeEvent::TurnStarted { turn: 1 }
-    ));
+    assert!(matches!(started, agent::LiveEvent::StepStarted { step: 1 }));
     let event = rx.recv().await.expect("one text delta");
     assert!(matches!(
         event,
-        agent::RuntimeEvent::AssistantDelta { text, .. } if text == "done"
+        agent::LiveEvent::AssistantDelta { text, .. } if text == "done"
     ));
 
     // session 事实：UserSubmitted → RunStarted → AssistantMessageCommitted → RunCompleted。
@@ -335,7 +332,7 @@ async fn context_usage_event_sent_before_requests() {
 
     let mut saw_usage = false;
     while let Ok(event) = rx.try_recv() {
-        if let agent::RuntimeEvent::ContextUsage { projected, usable } = event {
+        if let agent::LiveEvent::ContextUsage { projected, usable } = event {
             saw_usage = true;
             // usable = window - output(未配置) - reserve = 100000 - 8192。
             assert_eq!(usable, 100_000 - 8192);

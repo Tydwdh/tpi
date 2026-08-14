@@ -182,11 +182,29 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - session projection 先输出 domain message，provider converter 再生成旧 ChatMessage。
 - 验收：所有 golden model requests byte/semantic 等价；provider-specific field 不进入 domain。
 
-#### P1-03 拆 live runtime 与 view event
+#### P1-03 拆 live runtime 与 view event — **DONE（2026-08-14）**
 
 - 建 UI-agnostic event；先迁一个事件（如 phase/usage），app projector 生成旧 TUI event。
 - 每 PR 迁一组：assistant、tool lifecycle、process、plan/input。
 - 验收：headless sink 可直接消费所有 runtime events；无 UI drain task需求的 contract test。
+- 实施：
+  - 新增 `agent::LiveEvent`（UI-agnostic）：StepStarted/AssistantDelta/ToolStarted
+    （带原始 arguments，非渲染 target）/ToolCompleted（带 output+diff，非 tail）/ToolOutputDelta/
+    ContextUsage/UsageUpdated/BudgetWarning/PlanUpdated/StreamRecovering/TurnRestarting/
+    CompactionNotice。
+  - `RunInput.ui` 从 `Sender<RuntimeEvent>` 改为 `Sender<LiveEvent>`；agent/tool_runtime
+    只发 LiveEvent（不再产生 view 字段）。
+  - 新增 `app::project_live_event`：LiveEvent → RuntimeEvent（TUI view event），含
+    `tool_target` 展示投影（从 agent/tool_runtime 移入 app，P1-03 前由 agent 产生
+    target/command 摘要）。
+  - P1-01 遗留改名：`RuntimeEvent::TurnStarted`→`StepStarted`、`view.turn`→`view.step`、
+    `StatusLine::Running { turn }`→`{ step }`（live event 非 durable，改名安全）。
+  - headless（run_prompt_once）消费 LiveEvent；注释注明真正无 drain 的 headless 订阅
+    在 P3-05。
+  - 测试：app.rs `project_live_event_covers_all_variants`（全变体投影 + tool_target 摘要）；
+    agent_flow/p1_fixes 断言改为 LiveEvent；tui_reducer 改 StepStarted。
+  - 验收达成：headless sink（agent_flow 直接消费 LiveEvent）不依赖 TUI 投影；
+    `agent -> tui` 引用在 P1-03 后仅剩……（见 P1 Exit gate 检查）。
 
 #### P1-04 消除 `tui::reducer -> app` — **DONE（2026-08-14）**
 

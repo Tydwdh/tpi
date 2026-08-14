@@ -886,7 +886,10 @@ mod tests {
         let agent = cfg.agent_config();
         assert_eq!(agent.model.name, cfg.model.name);
         assert_eq!(agent.limits.max_model_turns, cfg.limits.max_model_turns);
-        assert_eq!(agent.limits.max_parallel_tools, cfg.limits.max_parallel_tools);
+        assert_eq!(
+            agent.limits.max_parallel_tools,
+            cfg.limits.max_parallel_tools
+        );
         assert_eq!(agent.safety_reserve_tokens, cfg.safety_reserve_tokens);
         assert_eq!(agent.system_prompt_extra, cfg.system_prompt_extra);
         assert_eq!(agent.workspace_root, cfg.workspace_root);

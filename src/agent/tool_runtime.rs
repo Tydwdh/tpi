@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{RunFailure, RuntimeEvent};
+use super::{LiveEvent, RunFailure};
 use crate::config::Config;
 use crate::ids::ToolCallId;
 use crate::provider::{ChatMessage, FinishReason, ModelRequest, Provider, ProviderEvent, ToolCall};
@@ -193,7 +193,7 @@ pub(super) struct ToolBatchExecutor<'a> {
     messages: &'a mut Vec<ChatMessage>,
     progress: &'a mut crate::tool::scheduler::ProgressTracker,
     runtime: &'a ToolRuntime,
-    ui: &'a mpsc::Sender<RuntimeEvent>,
+    ui: &'a mpsc::Sender<LiveEvent>,
 }
 
 impl<'a> ToolBatchExecutor<'a> {
@@ -203,7 +203,7 @@ impl<'a> ToolBatchExecutor<'a> {
         messages: &'a mut Vec<ChatMessage>,
         progress: &'a mut crate::tool::scheduler::ProgressTracker,
         runtime: &'a ToolRuntime,
-        ui: &'a mpsc::Sender<RuntimeEvent>,
+        ui: &'a mpsc::Sender<LiveEvent>,
     ) -> Self {
         Self {
             config,
@@ -443,7 +443,7 @@ error: invalid_arguments
         let stream_forwarder = tokio::spawn(async move {
             while let Some(event) = output_rx.recv().await {
                 let _ = ui_for_stream
-                    .send(RuntimeEvent::ToolOutputDelta {
+                    .send(LiveEvent::ToolOutputDelta {
                         call_id: event.call_id,
                         stream: event.stream,
                         text: event.text,
@@ -471,16 +471,15 @@ error: invalid_arguments
             let blocked = config.limits.max_identical_no_progress > 0
                 && progress.should_block(&action_key, &state_stamp);
 
-            // 工具真正启动前通知 TUI；长命令不再等执行结束才出现反馈。
+            // 工具真正启动前通知（语义事实 + 原始参数；P1-03：target/command 展示
+            // 摘要由 app projector 生成，agent 不再产生 view 字段）。
             let kind_name = kind.name().to_string();
             if kind_name != "update_plan" {
-                let (target, command) = tool_target(&calls[source_index]);
                 let _ = ui
-                    .send(RuntimeEvent::ToolStarted {
+                    .send(LiveEvent::ToolStarted {
                         call_id: calls[source_index].call_id,
                         name: calls[source_index].name.clone(),
-                        target,
-                        command,
+                        arguments: calls[source_index].arguments.clone(),
                     })
                     .await;
             }
@@ -566,7 +565,7 @@ error: invalid_arguments
                         .append_event(&SessionEvent::PlanReplaced { plan: plan.clone() })
                         .and_then(|_| session.sync_data())
                         .map_err(|e| RunFailure::Session(e.to_string()))?;
-                    let _ = ui.send(RuntimeEvent::PlanUpdated { plan }).await;
+                    let _ = ui.send(LiveEvent::PlanUpdated { plan }).await;
                 }
             }
             // §12.3：edit/write 成功 → workspace epoch 增加（允许基于新状态重试）。
@@ -598,14 +597,16 @@ error: invalid_arguments
                 let _ = std::fs::remove_file(backup);
             }
             if calls[index].name != "update_plan" {
+                // P1-03：tail（展示裁剪）由 projector 从 output 生成；
+                // agent 只发语义终态 + 有界输出 + diff。
                 let _ = ui
-                    .send(RuntimeEvent::ToolCompleted {
+                    .send(LiveEvent::ToolCompleted {
                         call_id: calls[index].call_id,
                         name: calls[index].name.clone(),
                         status: outcome.status,
                         duration_ms: outcome.model_payload.duration_ms,
                         exit_code: outcome.model_payload.exit_code,
-                        tail: outcome.model_payload.output.clone(),
+                        output: outcome.model_payload.output.clone(),
                         diff: outcome.session_metadata.diff.clone(),
                     })
                     .await;
@@ -788,74 +789,6 @@ fn extract_external_content(output: &str) -> Option<&str> {
         .unwrap_or(body_start);
     let end = output[body_start..].find("</external_content>")? + body_start;
     Some(output[body_start..end].trim())
-}
-
-/// 工具调用的可读展示摘要（TUI 工具卡片，§16.2）。
-///
-/// bash → `bash: <command>`；其余显示工具名。有界到 200 字符，避免整段脚本刷屏。
-/// 工具调用的主行 target 与完整命令（整改 A2/A3：主行单行、命令进 overlay）。
-///
-/// - bash：target = 压缩后的命令（换行折空格、连续空白压缩、200 字符截断）；
-///   command = 原文（≤8KiB，overlay 展示）。
-/// - 其他文件工具：target = `name path`；其余只显示工具名。
-fn tool_target(call: &ToolCall) -> (String, Option<String>) {
-    fn truncate(text: &str, max_chars: usize) -> String {
-        if text.chars().count() <= max_chars {
-            text.to_string()
-        } else {
-            let mut t: String = text.chars().take(max_chars).collect();
-            t.push('…');
-            t
-        }
-    }
-    let parsed = serde_json::from_str::<serde_json::Value>(&call.arguments).ok();
-    match call.name.as_str() {
-        "bash" => {
-            if let Some(cmd) = parsed
-                .as_ref()
-                .and_then(|v| v.get("command"))
-                .and_then(|c| c.as_str())
-            {
-                let compressed = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
-                (truncate(&compressed, 200), Some(truncate(cmd, 8 * 1024)))
-            } else {
-                ("bash".into(), None)
-            }
-        }
-        name if matches!(name, "read" | "write" | "edit" | "list" | "search") => {
-            let target = parsed
-                .as_ref()
-                .and_then(|v| v.get("path"))
-                .and_then(|p| p.as_str())
-                .map(|path| format!("{name} {path}"))
-                .unwrap_or_else(|| name.to_string());
-            (truncate(&target, 120), None)
-        }
-        // §去重/信息：request_input（askuser）卡片主行携带问题摘要（首行）——
-        // 否则主行只有工具名，用户扫不到“模型在问什么”；完整问题由挂起提示
-        // 块展示（卡片输出不再重复，见 user_visible_output）。
-        "request_input" => {
-            let summary = parsed
-                .as_ref()
-                .and_then(|v| v.get("question"))
-                .and_then(|q| q.as_str())
-                .or_else(|| {
-                    parsed
-                        .as_ref()
-                        .and_then(|v| v.get("questions"))
-                        .and_then(|qs| qs.as_array())
-                        .and_then(|qs| qs.first())
-                        .and_then(|q| q.get("question"))
-                        .and_then(|q| q.as_str())
-                })
-                .map(|q| q.lines().next().unwrap_or("").trim().to_string())
-                .filter(|s| !s.is_empty())
-                .map(|s| format!("request_input {s}"))
-                .unwrap_or_else(|| "request_input".to_string());
-            (truncate(&summary, 120), None)
-        }
-        name => (name.to_string(), None),
-    }
 }
 
 /// §12.3：无进展重复的拒绝结果。

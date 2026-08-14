@@ -175,15 +175,15 @@ fn menu_enter_submits_completed_command() {
 fn agent_events_drive_view_state() {
     let mut s = state();
     s.view.status = StatusLine::Running {
-        turn: 0,
+        step: 0,
         tool: "连接中".into(),
     };
     reducer::update(
         &mut s,
-        UiEvent::Agent(RuntimeEvent::TurnStarted { turn: 2 }),
+        UiEvent::Agent(RuntimeEvent::StepStarted { step: 2 }),
     );
-    assert_eq!(s.view.turn, 2);
-    assert!(matches!(s.view.status, StatusLine::Running { turn: 2, .. }));
+    assert_eq!(s.view.step, 2);
+    assert!(matches!(s.view.status, StatusLine::Running { step: 2, .. }));
     reducer::update(
         &mut s,
         UiEvent::Agent(RuntimeEvent::AssistantDelta {

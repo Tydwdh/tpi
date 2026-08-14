@@ -590,7 +590,7 @@ async fn text_only_interrupt_auto_continues_and_merges() {
     let captured_ids = request_ids.clone();
     let drain = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            if let agent::RuntimeEvent::AssistantDelta { request_id, .. } = event {
+            if let agent::LiveEvent::AssistantDelta { request_id, .. } = event {
                 captured_ids.lock().unwrap().push(request_id);
             }
         }
@@ -754,7 +754,7 @@ async fn distinct_model_turns_use_distinct_request_ids() {
 
     let mut request_ids = Vec::new();
     while let Ok(event) = rx.try_recv() {
-        if let agent::RuntimeEvent::AssistantDelta { request_id, .. } = event {
+        if let agent::LiveEvent::AssistantDelta { request_id, .. } = event {
             request_ids.push(request_id);
         }
     }
@@ -1199,7 +1199,7 @@ async fn force_compaction_success_notifies_ui() {
     let notices = tokio::spawn(async move {
         let mut out = Vec::new();
         while let Some(event) = ui_rx.recv().await {
-            if let agent::RuntimeEvent::CompactionNotice { message } = event {
+            if let agent::LiveEvent::CompactionNotice { message } = event {
                 out.push(message);
             }
         }
@@ -1257,7 +1257,7 @@ async fn force_compaction_too_short_notifies_ui() {
     let notices = tokio::spawn(async move {
         let mut out = Vec::new();
         while let Some(event) = ui_rx.recv().await {
-            if let agent::RuntimeEvent::CompactionNotice { message } = event {
+            if let agent::LiveEvent::CompactionNotice { message } = event {
                 out.push(message);
             }
         }
@@ -1315,7 +1315,7 @@ async fn force_compaction_invalid_summary_notifies_ui() {
     let notices = tokio::spawn(async move {
         let mut out = Vec::new();
         while let Some(event) = ui_rx.recv().await {
-            if let agent::RuntimeEvent::CompactionNotice { message } = event {
+            if let agent::LiveEvent::CompactionNotice { message } = event {
                 out.push(message);
             }
         }
