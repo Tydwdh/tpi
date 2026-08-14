@@ -11,6 +11,7 @@ pub mod edit;
 pub mod files;
 pub mod outcome;
 pub mod plan;
+pub mod process;
 pub mod registry;
 pub mod search;
 pub mod selector;
@@ -161,6 +162,7 @@ pub enum BuiltinTool {
     Edit,
     Write,
     Bash,
+    Process,
     UpdatePlan,
     WebSearch,
     WebFetch,
@@ -218,6 +220,7 @@ impl BuiltinTool {
             BuiltinTool::Edit => "edit",
             BuiltinTool::Write => "write",
             BuiltinTool::Bash => "bash",
+            BuiltinTool::Process => "process",
             BuiltinTool::UpdatePlan => "update_plan",
             BuiltinTool::WebSearch => "web_search",
             BuiltinTool::WebFetch => "web_fetch",
@@ -235,6 +238,7 @@ impl BuiltinTool {
             "edit" => Some(Self::Edit),
             "write" => Some(Self::Write),
             "bash" => Some(Self::Bash),
+            "process" => Some(Self::Process),
             "update_plan" => Some(Self::UpdatePlan),
             "web_search" => Some(Self::WebSearch),
             "web_fetch" => Some(Self::WebFetch),
@@ -250,6 +254,8 @@ impl BuiltinTool {
             Self::List | Self::Search | Self::Glob => ToolExecutionClass::FileReadRecursive,
             Self::Edit | Self::Write => ToolExecutionClass::FileWriteExact,
             Self::Bash => ToolExecutionClass::WorkspaceUnknown,
+            // §5：process 工具读 registry / 控制 managed process，无文件副作用。
+            Self::Process => ToolExecutionClass::Pure,
             Self::UpdatePlan | Self::WebSearch | Self::WebFetch | Self::ActivateSkill => {
                 ToolExecutionClass::Pure
             }
@@ -325,8 +331,24 @@ Logical shell state persists across calls: `cd` changes the session cwd; `export
 change the session environment (both auto-inherited by later calls). The optional `cwd` field, \
 if given, overrides the working directory for this call only (it does not change the session \
 cwd unless the command itself runs `cd`). \
-Cost: real execution time, capped by timeout_ms (default 120s, max 24h). \
-Example: bash command=\"cargo test\" timeout_ms=180000"
+`background=true` starts a TPI-owned managed process: returns immediately with a logical \
+process id (p17) and the command keeps running while you continue other work; manage it later \
+with `process` (status/output/wait/cancel). Do not use shell '&'/nohup when TPI should manage \
+the process. Do not repeatedly poll an unchanged background process — continue independent \
+work and use `process wait`/`status` only when the result is needed. \
+Cost: real execution time (foreground, capped by timeout_ms; default 120s, max 24h) or \
+immediate return (background). \
+Example: bash command=\"cargo test\" timeout_ms=180000; bash command=\"python app.py\" background=true"
+            }
+            BuiltinTool::Process => {
+                "Manage TPI-owned background processes started with `bash(background=true)`. \
+Actions: `list` (all processes), `status` (state/command/runtime/workspace + tail), `output` \
+(recent output; full output in the @artifact reference), `wait` (block up to timeout_ms; \
+completes with the terminal state, still-running returns `running` — not an error), \
+`cancel` (terminate the whole process tree). \
+Use wait/status only when the result is needed; do not poll an unchanged process. \
+Cost: list/status/output/cancel ~local I/O; wait blocks up to timeout_ms. \
+Example: process action=status id=\"p17\"; process action=wait id=\"p17\" timeout_ms=10000"
             }
             BuiltinTool::UpdatePlan => {
                 "Update the plan with a complete explicit snapshot (max 7 total items). Every item \
@@ -383,6 +405,7 @@ Example: activate_skill name=\"rust-review\""
             BuiltinTool::Edit => schema_value::<edit::EditArgs>("edit"),
             BuiltinTool::Write => schema_value::<files::WriteArgs>("write"),
             BuiltinTool::Bash => schema_value::<command::BashArgs>("bash"),
+            BuiltinTool::Process => schema_value::<process::ProcessArgs>("process"),
             BuiltinTool::UpdatePlan => schema_value::<plan::UpdatePlanArgs>("update_plan"),
             BuiltinTool::WebSearch => schema_value::<web::WebSearchArgs>("web_search"),
             BuiltinTool::WebFetch => schema_value::<web::WebFetchArgs>("web_fetch"),
@@ -407,6 +430,7 @@ Example: activate_skill name=\"rust-review\""
             BuiltinTool::Edit => parse_args_typed("edit", arguments, ValidatedArgs::Edit),
             BuiltinTool::Write => parse_args_typed("write", arguments, ValidatedArgs::Write),
             BuiltinTool::Bash => parse_args_typed("bash", arguments, ValidatedArgs::Bash),
+            BuiltinTool::Process => parse_args_typed("process", arguments, ValidatedArgs::Process),
             BuiltinTool::UpdatePlan => {
                 parse_args_typed("update_plan", arguments, ValidatedArgs::UpdatePlan)
             }
@@ -435,6 +459,7 @@ pub enum ValidatedArgs {
     Edit(edit::EditArgs),
     Write(files::WriteArgs),
     Bash(command::BashArgs),
+    Process(process::ProcessArgs),
     UpdatePlan(plan::UpdatePlanArgs),
     WebSearch(web::WebSearchArgs),
     WebFetch(web::WebFetchArgs),
@@ -453,6 +478,7 @@ impl ValidatedArgs {
             Self::Edit(_) => BuiltinTool::Edit,
             Self::Write(_) => BuiltinTool::Write,
             Self::Bash(_) => BuiltinTool::Bash,
+            Self::Process(_) => BuiltinTool::Process,
             Self::UpdatePlan(_) => BuiltinTool::UpdatePlan,
             Self::WebSearch(_) => BuiltinTool::WebSearch,
             Self::WebFetch(_) => BuiltinTool::WebFetch,
@@ -471,6 +497,7 @@ impl ValidatedArgs {
             Self::Edit(args) => Some(&args.path),
             Self::Write(args) => Some(&args.path),
             Self::Bash(_)
+            | Self::Process(_)
             | Self::UpdatePlan(_)
             | Self::WebSearch(_)
             | Self::WebFetch(_)
@@ -524,6 +551,11 @@ pub struct ToolContext {
     /// ActiveWorkspace（§26-§30：Tool Protocol 的分发目标）。
     /// `workspace_root`/`allow_outside_workspace`/`shell` 是当前 workspace 的投影。
     pub workspace: std::sync::Arc<std::sync::Mutex<crate::workspace::ActiveWorkspace>>,
+    /// ManagedProcess registry（任务书 §8：session 级共享；background bash 注册，
+    /// `process` 工具读取/取消）。
+    pub processes: std::sync::Arc<
+        std::sync::Mutex<crate::process::managed::ProcessRegistry>,
+    >,
     /// 交互模式（`-p` 为 false；§11 移除 ask_user 后仅保留供未来交互原语使用）。
     pub interactive: bool,
 }
@@ -741,6 +773,7 @@ pub async fn execute(
             web::web_search(args, ctx).await
         }
         (BuiltinTool::WebFetch, ValidatedArgs::WebFetch(args)) => web::web_fetch(args, ctx).await,
+        (BuiltinTool::Process, ValidatedArgs::Process(args)) => process::process(args, ctx).await,
         // §Skills：activate_skill 是同步控制操作（读 SKILL.md）。
         (BuiltinTool::ActivateSkill, ValidatedArgs::ActivateSkill(args)) => {
             crate::skills::activate::activate_skill(args, ctx)
@@ -813,6 +846,7 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
         BuiltinTool::Edit,
         BuiltinTool::Write,
         BuiltinTool::Bash,
+        BuiltinTool::Process,
         BuiltinTool::UpdatePlan,
         BuiltinTool::WebSearch,
         BuiltinTool::WebFetch,
@@ -936,6 +970,9 @@ mod tests {
             shell_path: None,
             snapshot_store: Default::default(),
             current_plan: Default::default(),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::process::managed::ProcessRegistry::new(),
+            )),
             interactive: false,
             allow_outside_workspace: true,
         };

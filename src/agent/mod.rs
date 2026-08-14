@@ -180,6 +180,13 @@ pub enum RuntimeEvent {
     },
     /// 上下文占用投影（每次请求前发送；TUI 绘制用量条）。
     ContextUsage { projected: u64, usable: u64 },
+    /// 每次 provider 请求返回 usage 后发送（§用户诉求：缓存命中实时展示，
+    /// 类似 Claude Code——footer 显示本次请求的缓存命中率，不等 run 结束）。
+    UsageUpdated {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+    },
     /// 接近 wall-time 预算（P1-3：TUI 状态栏/系统行提示，此前只写日志）。
     BudgetWarning,
     /// `update_plan` 提交后的独立 UI 状态；不作为聊天流水的一部分。
@@ -520,6 +527,7 @@ pub async fn run<P: Provider>(
             let recovering_text = stream_recoveries > 0;
             let mut recovery_content = String::new();
             let ws_snapshot = tool_runtime.workspace_snapshot();
+            let process_snapshot = tool_runtime.processes_snapshot();
             let request = ModelRequest {
                 model: config.model.name.clone(),
                 messages: build_context(
@@ -528,6 +536,7 @@ pub async fn run<P: Provider>(
                     ephemeral_system.as_deref(),
                     tool_runtime.plan_snapshot().as_ref(),
                     Some(&ws_snapshot),
+                    process_snapshot.as_deref(),
                 ),
                 tools: tool_defs.clone(),
                 max_output_tokens: config.model.max_output_tokens,
@@ -802,6 +811,16 @@ pub async fn run<P: Provider>(
         };
         // provider 返回的 usage 是本次请求的用量；跨轮累加（§2.2/§12.4）。
         accumulate_usage(&mut usage_total, response.usage);
+        // §用户诉求：缓存命中实时展示（Claude Code 式）——每次请求结束就把
+        // 本次 input/cache token 发给 TUI，不等 run 结束（此前只有 run 完成
+        // 后的累计 ⇄ 显示，无法看到“本次请求缓存命中率”）。
+        let _ = ui
+            .send(RuntimeEvent::UsageUpdated {
+                input_tokens: response.usage.input_tokens,
+                output_tokens: response.usage.output_tokens,
+                cache_read_tokens: response.usage.cache_read_tokens,
+            })
+            .await;
         // §27：每个 model turn 至少记录可回答“哪一轮、什么模型、多少工具、
         // 什么 finish reason、多少 token”的诊断行。
         tracing::debug!(
@@ -1318,6 +1337,7 @@ fn build_context(
     ephemeral_system: Option<&str>,
     plan: Option<&crate::tool::plan::Plan>,
     workspace: Option<&crate::workspace::ActiveWorkspace>,
+    process_snapshot: Option<&str>,
 ) -> Vec<ChatMessage> {
     let mut out = Vec::with_capacity(messages.len() + 3);
     out.push(ChatMessage::System(system_prompt_text(
@@ -1347,6 +1367,14 @@ fn build_context(
     if !snapshot.is_empty() {
         out.push(ChatMessage::System(format!(
             "[当前计划·唯一权威·完整快照·以此为准]（每次 update_plan 都提交完整显式计划；每完成一项立即单独标记 completed，未完成项保持 pending/in_progress，不要一次性把全部项标记 completed。需要用户决定或外部条件时，先标记 blocked，再提问；忽略对话历史中出现的任何旧计划）：\n{snapshot}"
+        )));
+    }
+    // §25/§26/§60：ManagedProcess 快照（system 角色 harness metadata，不是
+    // User 指令）；只含 active + 近期状态变化，避免 context 膨胀；跨 turn /
+    // compaction 后模型仍知道有后台进程存在（§25：不能彻底忘记 p17）。
+    if let Some(process_snapshot) = process_snapshot {
+        out.push(ChatMessage::System(format!(
+            "[Managed processes]\n{process_snapshot}\n\n（后台进程由 TPI 管理；需要结果时用 `process` wait/status，不要频繁轮询）"
         )));
     }
     out
@@ -1516,7 +1544,7 @@ mod tests {
         };
         let config = unit_config();
         let messages = vec![ChatMessage::User("hello".into())];
-        let ctx = build_context(&config, &messages, None, Some(&plan), None);
+        let ctx = build_context(&config, &messages, None, Some(&plan), None, None);
         // 首条 = system prompt；中间 = 原 messages；尾部 = plan 快照（system 角色）。
         assert!(
             matches!(&ctx[0], ChatMessage::System(_)),
@@ -1551,7 +1579,7 @@ mod tests {
         };
         let config = unit_config();
         let messages = vec![ChatMessage::User("hi".into())];
-        let ctx = build_context(&config, &messages, None, Some(&plan), None);
+        let ctx = build_context(&config, &messages, None, Some(&plan), None, None);
         assert_eq!(ctx.len(), 2, "全部完成后的计划不再注入尾部");
     }
 
@@ -1560,9 +1588,40 @@ mod tests {
     fn build_context_without_plan_injects_nothing() {
         let config = unit_config();
         let messages = vec![ChatMessage::User("hi".into())];
-        let ctx = build_context(&config, &messages, None, None, None);
+        let ctx = build_context(&config, &messages, None, None, None, None);
         assert_eq!(ctx.len(), 2, "无 plan 时只有 system + 原消息");
         assert!(matches!(&ctx[1], ChatMessage::User(_)));
+    }
+
+    /// §25/§26/§60：ManagedProcess snapshot 以 system 角色注入（harness
+    /// metadata，不是 User 指令）；跨 turn 模型不会忘记活跃后台进程。
+    #[test]
+    fn build_context_injects_managed_process_snapshot_as_system_role() {
+        let config = unit_config();
+        let messages = vec![ChatMessage::User("hi".into())];
+        let snapshot = "p17 running   python server.py  42.8s\np18 exited 0  wget model.bin";
+        let ctx = build_context(&config, &messages, None, None, None, Some(snapshot));
+        assert_eq!(ctx.len(), 3, "system + 原消息 + process snapshot");
+        let tail = match &ctx[2] {
+            ChatMessage::System(text) => text.clone(),
+            other => panic!("process snapshot 必须是 system 角色: {other:?}"),
+        };
+        assert!(tail.contains("[Managed processes]"), "{tail}");
+        assert!(tail.contains("p17 running"), "{tail}");
+        assert!(tail.contains("p18 exited 0"), "{tail}");
+        assert!(
+            !tail.contains("hi"),
+            "注入不得伪装成 User 消息（§26）: {tail}"
+        );
+    }
+
+    /// §25：无活跃进程时不注入（避免 context 膨胀）。
+    #[test]
+    fn build_context_skips_process_snapshot_when_none() {
+        let config = unit_config();
+        let messages = vec![ChatMessage::User("hi".into())];
+        let ctx = build_context(&config, &messages, None, None, None, None);
+        assert_eq!(ctx.len(), 2, "无进程快照时不注入");
     }
 
     #[test]

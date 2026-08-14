@@ -612,6 +612,9 @@ mod tests {
             shell_path: None,
             snapshot_store: Default::default(),
             current_plan: Default::default(),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::process::managed::ProcessRegistry::new(),
+            )),
             interactive: false,
             allow_outside_workspace: true,
         };
@@ -671,6 +674,9 @@ mod tests {
             shell_path: None,
             snapshot_store: Default::default(),
             current_plan: Default::default(),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::process::managed::ProcessRegistry::new(),
+            )),
             interactive: false,
             allow_outside_workspace: true,
         };
@@ -725,6 +731,9 @@ mod tests {
             shell_path: None,
             snapshot_store: Default::default(),
             current_plan: Default::default(),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::process::managed::ProcessRegistry::new(),
+            )),
             interactive: false,
             allow_outside_workspace: true,
         };

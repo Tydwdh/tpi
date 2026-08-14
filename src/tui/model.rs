@@ -586,6 +586,14 @@ pub struct ViewModel {
     pub output_tokens: u64,
     /// 缓存命中的输入 token（§16.2：`⇄` 展示）。
     pub cache_read_tokens: u64,
+    /// 最近一次请求的输入/缓存命中 token（§用户诉求：Claude Code 式缓存命中
+    /// 实时展示——footer 显示本次请求命中率，不等 run 结束）。
+    pub last_input_tokens: u64,
+    pub last_output_tokens: u64,
+    pub last_cache_read_tokens: u64,
+    /// 本次 run 内断线自动重连/重启的累计次数（§用户诉求：Claude Code 式
+    /// 重连提示——系统行带时间戳与次数，footer 显示累计）。
+    pub reconnect_count: u32,
     /// 本会话累计花费（美元；§16.2：config 配置单价后显示）。
     pub cost_usd: f64,
     /// 输入/输出单价（每百万 token，美元；None = 不显示花费）。
@@ -642,6 +650,10 @@ impl Default for ViewModel {
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
+            last_input_tokens: 0,
+            last_output_tokens: 0,
+            last_cache_read_tokens: 0,
+            reconnect_count: 0,
             cost_usd: 0.0,
             price_input: None,
             price_output: None,

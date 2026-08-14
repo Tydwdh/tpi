@@ -2206,8 +2206,16 @@ fn draw_sidebar(
     // —— Todo ——
     lines.push(Line::from(vec![Span::styled(" ☑ Todo", title_style)]));
     hits.push(None);
+    // §用户诉求：全部项完成/取消后计划视为结束——与 plan_snapshot 的语义一致
+    // （plan.rs：全部终态 → 空快照，不再注入模型上下文），侧边栏同样不显示
+    // 已结束计划的完成态列表（此前只检查 items 非空，全标完成后 Todo 仍挂在 UI）。
+    // 有开放项时保留历史（终态项沉底，sidebar_plan_items 排序）。
+    let has_open = view
+        .plan
+        .as_ref()
+        .is_some_and(|plan| plan.items.iter().any(|item| item.status.is_open()));
     match &view.plan {
-        Some(plan) if !plan.items.is_empty() => {
+        Some(plan) if !plan.items.is_empty() && has_open => {
             for item in sidebar_plan_items(plan) {
                 let (marker, style) = match item.status {
                     crate::tool::plan::PlanStatus::Completed => (
@@ -2234,18 +2242,24 @@ fn draw_sidebar(
                             .add_modifier(Modifier::DIM),
                     ),
                 };
-                // §用户诉求：todo 项按显示列宽截断而非字节——CJK 双宽字符
-                // 不会被严重提前截断；保留头部信息（marker 前缀占 4 列）。
-                let text = crate::tui::text::truncate_head_to_cell_width(
+                // §用户诉求：todo 长文本折行显示完整（不截断）；marker 占 4 列
+                // （3 字符 + 空格），续行缩进 4 列对齐。CJK 双宽按 2 cells 折行。
+                let wrapped = crate::tui::text::wrap_to_cell_width(
                     &item.text,
                     content_w.saturating_sub(4),
-                    "…",
                 );
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{marker} {text}"),
-                    style,
-                )]));
-                hits.push(None);
+                for (index, segment) in wrapped.iter().enumerate() {
+                    let prefix = if index == 0 {
+                        format!("{marker} ")
+                    } else {
+                        "     ".to_string()
+                    };
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("{prefix}{segment}"),
+                        style,
+                    )]));
+                    hits.push(None);
+                }
             }
         }
         _ => {
@@ -2431,10 +2445,25 @@ fn draw_footer(
         ));
     }
     // §16.2：缓存命中的输入 token（⇄ 标记；减少真实计费输入的直观反馈）。
+    // §用户诉求：Claude Code 式缓存命中显示——累计旁附“最近一次请求命中率”。
     if view.cache_read_tokens > 0 {
+        let mut text = format!(" · ⇄{}", fmt_tokens(view.cache_read_tokens));
+        if view.last_input_tokens > 0 && view.last_cache_read_tokens > 0 {
+            let pct = (view.last_cache_read_tokens as f64
+                / view.last_input_tokens as f64
+                * 100.0) as u64;
+            text.push_str(&format!("({pct}%)"));
+        }
         spans.push(Span::styled(
-            format!(" · ⇄{}", fmt_tokens(view.cache_read_tokens)),
+            text,
             Style::default().fg(theme.success),
+        ));
+    }
+    // §用户诉求：Claude Code 式重连提示——本次 run 断线重连/重启累计次数。
+    if view.reconnect_count > 0 {
+        spans.push(Span::styled(
+            format!(" · ⟳{}", view.reconnect_count),
+            Style::default().fg(theme.warning),
         ));
     }
     // §16.2：配置单价后显示本会话花费。

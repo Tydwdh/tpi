@@ -23,6 +23,7 @@ async fn cancellation_terminates_running_command_with_cancelled_status() {
         command: "powershell.exe -NoProfile -Command 'Start-Sleep -Seconds 30'".into(),
         cwd: None,
         timeout_ms: 60_000,
+        background: false,
     };
 
     let handle = tokio::spawn(async move { bash(args, &ctx).await });
@@ -50,6 +51,7 @@ async fn timeout_terminates_command_with_timed_out_status() {
         command: "powershell.exe -NoProfile -Command 'Start-Sleep -Seconds 30'".into(),
         cwd: None,
         timeout_ms: 500,
+        background: false,
     };
 
     let outcome = bash(args, &ctx).await;

@@ -249,6 +249,9 @@ mod tests {
                     true,
                 )),
             )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::process::managed::ProcessRegistry::new(),
+            )),
             interactive: false,
         };
         // 非法参数 → rejected（不 panic）。

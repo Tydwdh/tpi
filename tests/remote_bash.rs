@@ -56,6 +56,7 @@ async fn setup_remote_ctx() -> (tempfile::TempDir, tpi::tool::ToolContext) {
         current_plan: Arc::new(Mutex::new(None)),
         shell: remote.shell.clone(),
         workspace: Arc::new(Mutex::new(active)),
+        processes: Arc::new(Mutex::new(tpi::process::managed::ProcessRegistry::new())),
         interactive: false,
     };
     (root, ctx)
@@ -73,6 +74,7 @@ async fn run_bash(
             command: command.into(),
             cwd: None,
             timeout_ms: 60_000,
+            background: false,
         },
         &ctx,
     )
@@ -173,6 +175,7 @@ async fn remote_explicit_cwd_is_one_shot() {
             command: "pwd".into(),
             cwd: Some(root_posix),
             timeout_ms: 60_000,
+            background: false,
         },
         &ctx2,
     )

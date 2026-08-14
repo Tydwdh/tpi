@@ -30,6 +30,7 @@ async fn run_bash(
             command: command.into(),
             cwd: None,
             timeout_ms,
+            background: false,
         },
         &ctx,
     )
@@ -200,6 +201,7 @@ async fn explicit_cwd_is_one_shot_override() {
             command: "pwd".into(),
             cwd: Some(".".into()),
             timeout_ms: 60_000,
+            background: false,
         },
         &ctx2,
     )

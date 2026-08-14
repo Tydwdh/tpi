@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Deserialize;
 
-use super::{MSG_EXIT, MSG_OUTPUT, MSG_START, STREAM_STDERR, STREAM_STDOUT};
+use super::{MSG_EXIT, MSG_OUTPUT, MSG_START, MSG_STARTED, STREAM_STDERR, STREAM_STDOUT};
 
 #[derive(Deserialize)]
 struct StartSpec {
@@ -69,6 +69,9 @@ pub fn run_host() -> i32 {
             return 1;
         }
     };
+    // P2：target 已成功 spawn——立即发 MSG_STARTED（payload = target pid LE bytes），
+    // 供后台启动方确认“进程已真正启动”。此时单线程，无帧撕裂风险。
+    write_message(MSG_STARTED, &child.id().to_le_bytes());
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 

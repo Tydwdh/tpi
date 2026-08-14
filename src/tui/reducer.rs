@@ -15,6 +15,14 @@ use crate::tui::keymap::KeyAction;
 use crate::tui::model::{LineKind, MenuKind, StatusLine};
 use crate::tui::state::UiState;
 
+/// 当前本地时间 `HH:MM:SS`（重连/续写提示的时间戳，Claude Code 式）。
+/// 本地时区不可用时退回 UTC；失败（几乎不可能）退回空串。
+fn now_hhmmss() -> String {
+    let now = time::OffsetDateTime::now_local()
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    format!("{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second())
+}
+
 /// 输入变化后重建菜单：`@` 文件菜单优先（维护中不触碰），否则斜杠命令菜单。
 ///
 /// §用户诉求（/sessions 菜单）：Session 菜单是 Modal+Menu 组合、由 app 层
@@ -504,6 +512,17 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
         RuntimeEvent::ContextUsage { projected, usable } => {
             view.context_usage = Some((projected, usable));
         }
+        RuntimeEvent::UsageUpdated {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+        } => {
+            // §用户诉求：缓存命中实时展示（Claude Code 式）——记录最近一次
+            // 请求的输入/命中 token，footer 据此显示本次命中率。
+            view.last_input_tokens = input_tokens;
+            view.last_output_tokens = output_tokens;
+            view.last_cache_read_tokens = cache_read_tokens;
+        }
         RuntimeEvent::BudgetWarning => {
             // P1-3：接近 wall-time 预算（此前只写日志，用户看不到）。
             view.push_line(
@@ -523,18 +542,29 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
         }
         RuntimeEvent::StreamRecovering { attempt } => {
             // §4.3 第二阶段：text-only 断联后自动续写，不打断用户。
+            // §用户诉求：Claude Code 式重连提示——显示时间与次数（第 N/MAX 次）。
+            view.reconnect_count = view.reconnect_count.saturating_add(1);
             view.push_line(
                 LineKind::System,
-                format!("⟳ 模型连接中断，正在自动续写…（第 {attempt} 次）"),
+                format!(
+                    "[{}] ⟳ 模型连接中断，正在自动续写…（第 {attempt}/{} 次）",
+                    now_hhmmss(),
+                    crate::agent::MAX_STREAM_RECOVERIES
+                ),
             );
         }
         RuntimeEvent::TurnRestarting { attempt } => {
             // §4.3 第三阶段：partial tool-call 后整个 turn 重新生成——
             // 丢弃已显示的 partial（不进 transcript），提示用户。
             view.discard_live_turn();
+            view.reconnect_count = view.reconnect_count.saturating_add(1);
             view.push_line(
                 LineKind::System,
-                format!("⟳ 工具调用中断，正在重新生成该轮回答…（第 {attempt} 次）"),
+                format!(
+                    "[{}] ⟳ 工具调用中断，正在重新生成该轮回答…（第 {attempt}/{} 次）",
+                    now_hhmmss(),
+                    crate::agent::MAX_TURN_RESTARTS
+                ),
             );
         }
         RuntimeEvent::CompactionNotice { message } => {

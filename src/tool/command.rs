@@ -34,8 +34,16 @@ pub struct BashArgs {
     #[serde(default)]
     pub cwd: Option<String>,
     /// 超时毫秒（默认 120000，上限 24h）。长任务（构建/测试）显式调大。
+    /// 仅 foreground 生效；`background=true` 时忽略（后台无默认短 timeout，
+    /// 任务书 §45/§46）。
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    /// 后台模式（任务书 §3/§4）：默认 false = foreground（等待退出）；
+    /// true = 启动由 TPI 拥有的 ManagedProcess，立即返回逻辑 ProcessId，
+    /// 之后用 `process` 工具管理（status/output/wait/cancel）。
+    /// 不要用 shell `&`/`nohup` 代替本字段。
+    #[serde(default)]
+    pub background: bool,
 }
 
 /// bash 工具内部使用的启动规格（由 `command::bash` 构造，不暴露为工具 schema）。
@@ -80,8 +88,31 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
         ws.kind()
     };
     match kind {
-        crate::workspace::WorkspaceKind::Local => local_bash(args, ctx).await,
-        crate::workspace::WorkspaceKind::Remote => crate::remote::executor::remote_bash(args, ctx).await,
+        crate::workspace::WorkspaceKind::Local => {
+            if args.background {
+                local_bash_background(args, ctx).await
+            } else {
+                local_bash(args, ctx).await
+            }
+        }
+        crate::workspace::WorkspaceKind::Remote => {
+            if args.background {
+                ToolOutcome::failed(
+                    "bash",
+                    ModelPayload {
+                        status: ToolStatus::Rejected,
+                        program: Some("ssh".into()),
+                        exit_code: None,
+                        duration_ms: 0,
+                        output: "status: rejected\ntool: bash\nerror: remote_background_unsupported\n\nRemote ManagedProcess 尚未实现（任务书 §62 Phase P8：先由当前 SSH backend 实际能力定义 guarantee）。".into(),
+                        effect: None,
+                        artifact: None,
+                    },
+                )
+            } else {
+                crate::remote::executor::remote_bash(args, ctx).await
+            }
+        }
     }
 }
 
@@ -358,6 +389,108 @@ fn rejected_bash(code: &str, detail: impl std::fmt::Display) -> ToolOutcome {
             artifact: None,
         },
     )
+}
+
+/// 本地后台执行器（P2，任务书 §56）：`bash(background=true)`。
+///
+/// 只读取 ShellSessionState 快照（cwd + env overlay）构造启动规格，
+/// **绝不 commit 回 ShellSessionState**（§10/§44 硬不变量：background 不修改
+/// session 状态，多个后台进程之间不可能竞争写 cwd/env）。
+///
+/// 返回：`status: running` + 逻辑 ProcessId（任务书 §49/§51 文本格式）；
+/// 工具调用本身很快完成（start succeeded），进程仍在后台运行（§50 分离）。
+async fn local_bash_background(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
+    if ctx.cancel.is_cancelled() {
+        return ToolOutcome::failed(
+            "bash",
+            ModelPayload {
+                status: ToolStatus::Cancelled,
+                program: Some("bash".into()),
+                exit_code: None,
+                duration_ms: 0,
+                output: "status: cancelled\ntool: bash\nerror: cancelled".into(),
+                effect: None,
+                artifact: None,
+            },
+        );
+    }
+    let Some(bash_exe) = locate_git_bash(ctx) else {
+        return ToolOutcome::failed(
+            "bash",
+            ModelPayload {
+                status: ToolStatus::Failed,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: "status: failed\ntool: bash\nerror: git_bash_not_found\n\n未找到 Git Bash（§11.2 解析顺序：shell.path → Program Files\\Git\\bin\\bash.exe → usr\\bin → PATH）。".to_string(),
+                effect: None,
+                artifact: None,
+            },
+        );
+    };
+    // 启动时快照（§9：process creation 时继承；之后 session 变化不影响已运行进程）。
+    let session_cwd = {
+        let state = crate::util::lock_mutex(&ctx.shell, "shell");
+        state.cwd.clone()
+    };
+    let exec_cwd = match &args.cwd {
+        Some(path) => match crate::tool::resolve_tool_path(ctx, path) {
+            Ok(path) => path.to_string(),
+            Err(error) => return crate::tool::path_rejected_outcome("bash", error),
+        },
+        None => session_cwd.to_string(),
+    };
+    let (overlay_set, overlay_unset) = {
+        let state = crate::util::lock_mutex(&ctx.shell, "shell");
+        (
+            state.env_overlay.set.clone(),
+            state.env_overlay.unset.clone(),
+        )
+    };
+    let workspace_id = {
+        let ws = crate::util::lock_mutex(&ctx.workspace, "workspace");
+        ws.id().to_string()
+    };
+    // background 命令原样执行（无 capture wrapper：不捕获、不 commit §10）。
+    let run_args = RunArgs {
+        program: bash_exe,
+        args: vec!["--noprofile".into(), "--norc".into(), "-c".into(), args.command.clone()],
+        cwd: exec_cwd,
+        // §45/§46：background 无默认短 timeout（进程寿命由 lifecycle 管理）。
+        timeout_ms: 0,
+        env: overlay_set,
+        env_remove: overlay_unset.into_iter().collect(),
+    };
+    let request = crate::process::managed::BackgroundStartRequest {
+        args: run_args,
+        launcher: Some("git-bash"),
+        workspace: workspace_id.clone(),
+        command: args.command.clone(),
+        artifacts_root: ctx.artifacts_root.clone(),
+        session_id: ctx.session_id.clone(),
+        registry: ctx.processes.clone(),
+    };
+    match crate::process::managed::start_background(request).await {
+        Ok(id) => ToolOutcome::succeeded(
+            "bash",
+            format!(
+                "status: running\nprocess_id: {id}\ncommand: {}\nworkspace: {}\n\nThe process was started successfully and continues in the background. Use `process` to inspect, wait for, or cancel it.",
+                args.command, workspace_id
+            ),
+        ),
+        Err(message) => ToolOutcome::failed(
+            "bash",
+            ModelPayload {
+                status: ToolStatus::Failed,
+                program: Some("bash".into()),
+                exit_code: None,
+                duration_ms: 0,
+                output: message,
+                effect: None,
+                artifact: None,
+            },
+        ),
+    }
 }
 
 /// 解析状态捕获段（任务书 §22）：第一行 = cwd（cygpath -w 输出的 Windows

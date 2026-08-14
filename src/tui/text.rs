@@ -178,6 +178,34 @@ pub fn truncate_to_cell_width(s: &str, max_cells: usize, marker: &str) -> String
     out
 }
 
+/// 按显示宽度（terminal cells）折行：每行显示宽度不超过 `max_cells`
+/// （CJK 双宽按 2 cells；零宽字符并入当前行不触发折行）。
+/// 返回多行文本，语义是「完整显示原文」，不做截断。
+///
+/// 边界：`max_cells == 0`（极窄终端）时原样返回单行（宁可超宽也不丢失
+/// 内容/死循环）；单个字符本身就超宽时强制放入当前行。
+pub fn wrap_to_cell_width(s: &str, max_cells: usize) -> Vec<String> {
+    if s.is_empty() || max_cells == 0 {
+        return vec![s.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut cells = 0usize;
+    for ch in s.chars() {
+        let w = char_cell_width(ch);
+        if cells + w > max_cells && cells > 0 {
+            lines.push(std::mem::take(&mut current));
+            cells = 0;
+        }
+        current.push(ch);
+        cells += w;
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +342,34 @@ mod tests {
                 assert!(s.ends_with(tail), "tail={tail:?}");
             }
         }
+    }
+
+    #[test]
+    fn wrap_to_cell_width_splits_long_text_on_cjk_cells() {
+        // “第一项：重构侧边栏” = 8 汉字 + 1 全角冒号 = 18 cells；预算 10 cells
+        // → 折成多行，每行 <= 10 cells，且不切字符、不丢内容。
+        let lines = wrap_to_cell_width("第一项：重构侧边栏", 10);
+        let joined: String = lines.join("");
+        assert_eq!(joined, "第一项：重构侧边栏", "折行不得丢字符");
+        for line in &lines {
+            assert!(display_width(line) <= 10, "每行宽度受限: {line:?}");
+        }
+        assert!(lines.len() >= 2, "长文本必须折行: {lines:?}");
+    }
+
+    #[test]
+    fn wrap_to_cell_width_keeps_zero_width_chars_with_current_line() {
+        // emoji 序列（含 ZWJ，0 宽）不得被折行拆开。
+        let emoji = "👨\u{200d}💻 程序员";
+        let lines = wrap_to_cell_width(emoji, 8);
+        assert!(lines[0].contains("👨\u{200d}💻"), "ZWJ 序列不得拆行: {lines:?}");
+    }
+
+    #[test]
+    fn wrap_to_cell_width_short_text_is_single_line() {
+        assert_eq!(wrap_to_cell_width("短", 10), vec!["短".to_string()]);
+        assert_eq!(wrap_to_cell_width("", 10), vec![String::new()]);
+        // 预算 0：原样单行（不丢内容、不死循环）。
+        assert_eq!(wrap_to_cell_width("abc", 0), vec!["abc".to_string()]);
     }
 }

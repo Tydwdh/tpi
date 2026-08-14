@@ -34,6 +34,7 @@ async fn bash_pipefail_makes_pipeline_failure_visible() {
             command: "false | echo hello".into(),
             cwd: None,
             timeout_ms: 30_000,
+            background: false,
         },
         &ctx,
     )
@@ -51,6 +52,7 @@ async fn bash_pipefail_makes_pipeline_failure_visible() {
             command: "echo hello".into(),
             cwd: None,
             timeout_ms: 30_000,
+            background: false,
         },
         &ctx,
     )
@@ -79,6 +81,7 @@ async fn cancellation_kills_entire_process_tree() {
         command: script,
         cwd: None,
         timeout_ms: 60_000,
+        background: false,
     };
     let run_ctx = ToolContext {
         workspace_root: ctx.workspace_root.clone(),
@@ -93,6 +96,7 @@ async fn cancellation_kills_entire_process_tree() {
         current_plan: ctx.current_plan.clone(),
         shell: ctx.shell.clone(),
         workspace: ctx.workspace.clone(),
+        processes: ctx.processes.clone(),
         interactive: true,
         allow_outside_workspace: ctx.allow_outside_workspace,
     };
@@ -132,6 +136,7 @@ async fn is_process_alive(pid: u32, _ctx: &ToolContext) -> bool {
             ),
             cwd: None,
             timeout_ms: 10_000,
+            background: false,
         };
         let outcome = bash(args, &check_ctx).await;
         match outcome.model_payload.exit_code {
@@ -248,6 +253,7 @@ async fn bash_output_lands_in_artifact_and_readable_via_opaque_ref() {
             .into(),
         cwd: None,
         timeout_ms: 30_000,
+        background: false,
     };
     let outcome = bash(args, &ctx).await;
     assert_eq!(outcome.status, ToolStatus::Succeeded);
@@ -299,6 +305,7 @@ async fn bash_streams_live_output_through_output_tx() {
         command: r#"powershell.exe -NoProfile -Command "1..20 | ForEach-Object { Write-Output ('s-' + \$_); Start-Sleep -Milliseconds 50 }""#.into(),
         cwd: None,
         timeout_ms: 30_000,
+        background: false,
     };
     let call_id = ctx.call_id;
     let mut handle = tokio::spawn(async move { bash(args, &ctx).await });
@@ -351,6 +358,7 @@ async fn bash_does_not_block_when_stream_channel_full() {
         command: "for i in $(seq 1 200); do echo line-$i; done".into(),
         cwd: None,
         timeout_ms: 30_000,
+        background: false,
     };
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), bash(args, &ctx))
         .await

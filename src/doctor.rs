@@ -117,6 +117,9 @@ fn doctor_report_with_home(
         workspace: std::sync::Arc::new(std::sync::Mutex::new(
             crate::workspace::ActiveWorkspace::local(local),
         )),
+        processes: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::process::managed::ProcessRegistry::new(),
+        )),
         interactive: false,
     };
     let bash = crate::tool::command::locate_git_bash(&ctx);

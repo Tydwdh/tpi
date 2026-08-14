@@ -5,6 +5,7 @@
 
 pub mod capture;
 pub mod host;
+pub mod managed;
 
 use std::path::PathBuf;
 
@@ -21,6 +22,9 @@ pub type StreamSink = dyn Fn(u8, &[u8]) + Sync;
 const MSG_START: u8 = 0;
 const MSG_OUTPUT: u8 = 1;
 const MSG_EXIT: u8 = 2;
+/// P2：host 成功 spawn target 后发送（payload = target pid LE bytes）。
+/// 前台调用忽略；后台启动用它确认“进程已真正启动”（区分 spawn 失败 Exit(-2)）。
+const MSG_STARTED: u8 = 3;
 
 /// host 输出中的流标识。
 pub const STREAM_STDOUT: u8 = 0;
@@ -248,6 +252,10 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
             }
             read = read_frame(&mut stdout) => {
                 match read {
+                    Ok(Some((MSG_STARTED, _))) => {
+                        // P2：host 已成功 spawn target（后台确认信号）；前台调用忽略。
+                        continue;
+                    }
                     // payload = [stream][bytes]?子进程输出 1-3 字节的小块时
                     // 框长度为 2-4（正常有效）。此前要求 >= 5
                     // 会把这些小输出丢帧并刷“unknown process-host message kind=1”告警。

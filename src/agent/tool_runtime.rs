@@ -32,6 +32,8 @@ pub(super) struct ToolRuntime {
     current_plan: Arc<Mutex<Option<Plan>>>,
     shell: Arc<Mutex<crate::shell::ShellSessionState>>,
     workspace: Arc<Mutex<crate::workspace::ActiveWorkspace>>,
+    /// ManagedProcess registry（session 级；background bash + process 工具共享）。
+    processes: Arc<Mutex<crate::process::managed::ProcessRegistry>>,
     /// ToolRegistry（builtin + MCP；agent 工具目录，README2 Phase 5）。
     /// Mutex：Phase 3 的 McpManager 运行时注册 MCP 工具。
     registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
@@ -79,6 +81,9 @@ impl ToolRuntime {
             current_plan: Arc::new(Mutex::new(initial_plan)),
             shell,
             workspace,
+            processes: Arc::new(Mutex::new(
+                crate::process::managed::ProcessRegistry::new(),
+            )),
             registry,
         }
     }
@@ -115,6 +120,21 @@ impl ToolRuntime {
         crate::util::lock_mutex(&self.workspace, "workspace").clone()
     }
 
+    /// ManagedProcess 上下文快照（§25/§26/§60）：active + 近期状态变化的进程。
+    /// 空 = 无活跃进程（不注入，避免 context 膨胀）。返回文本由 build_context
+    /// 以 system 角色注入（harness metadata，非 User 消息，§26）。
+    pub(super) fn processes_snapshot(&self) -> Option<String> {
+        let reg = crate::util::lock_mutex(&self.processes, "process_registry");
+        let lines = reg.snapshot_lines(&[]);
+        if lines.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Managed processes:\n{}\n（仅 active + 近期状态变化；用 `process` 查看/等待/取消，不要高频轮询）",
+            lines.join("\n")
+        ))
+    }
+
     pub(super) fn context(
         &self,
         call_id: ToolCallId,
@@ -134,6 +154,7 @@ impl ToolRuntime {
             current_plan: self.current_plan.clone(),
             shell: self.shell.clone(),
             workspace: self.workspace.clone(),
+            processes: self.processes.clone(),
             interactive: self.interactive,
         }
     }

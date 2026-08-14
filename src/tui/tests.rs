@@ -1,9 +1,72 @@
 //! tui/mod.rs 的渲染测试（从 `mod tests` 内联块迁出；子模块可经 `super::*`
 //! 访问父模块私有项，行为与内联等价）。
 use super::*;
+use crate::tui::event::UiEvent;
 use crate::tui::model::LineKind;
 use crate::tui::model::ToolCardState;
+use crate::tui::reducer;
+use crate::tui::state::UiState;
 use crate::tui::tool_card::{render_diff_lines, tool_name_style};
+
+/// §用户诉求：缓存命中实时展示（Claude Code 式）——UsageUpdated 事件记录
+/// 最近一次请求的输入/命中 token，footer 据此显示本次命中率（不等 run 结束）。
+#[test]
+fn usage_updated_records_last_request_cache_hit() {
+    let mut state = UiState::new(ViewModel::default());
+    reducer::update(
+        &mut state,
+        UiEvent::Agent(crate::agent::RuntimeEvent::UsageUpdated {
+            input_tokens: 1000,
+            output_tokens: 200,
+            cache_read_tokens: 600,
+        }),
+    );
+    assert_eq!(state.view.last_input_tokens, 1000);
+    assert_eq!(state.view.last_output_tokens, 200);
+    assert_eq!(state.view.last_cache_read_tokens, 600);
+    // 累计字段不受影响（run 结束才由 add_usage 累加）。
+    assert_eq!(state.view.cache_read_tokens, 0);
+}
+
+/// §用户诉求：断开重连提示带时间与次数（Claude Code 式）——系统行含
+/// `[HH:MM:SS]` 时间戳、`第 N/MAX 次`；footer 的 reconnect_count 累计。
+#[test]
+fn reconnect_prompt_shows_time_and_attempt_count() {
+    let mut state = UiState::new(ViewModel::default());
+    reducer::update(
+        &mut state,
+        UiEvent::Agent(crate::agent::RuntimeEvent::StreamRecovering { attempt: 2 }),
+    );
+    assert_eq!(state.view.reconnect_count, 1);
+    let text = entry_text(&state.view.transcript[0]);
+    // 时间戳 [HH:MM:SS]（Claude Code 式）。
+    assert!(
+        text.starts_with('[') && text.contains(':') && text.contains("] ⟳"),
+        "系统行必须带 [HH:MM:SS] 时间戳: {text}"
+    );
+    assert!(
+        text.contains("第 2/10 次"),
+        "必须显示第 N/MAX 次（MAX=MAX_STREAM_RECOVERIES）: {text}"
+    );
+
+    // 再一次 TurnRestarting：次数累计，且显示对应 MAX（10）。
+    reducer::update(
+        &mut state,
+        UiEvent::Agent(crate::agent::RuntimeEvent::TurnRestarting { attempt: 1 }),
+    );
+    assert_eq!(state.view.reconnect_count, 2);
+    let text2 = entry_text(&state.view.transcript[1]);
+    assert!(text2.contains("第 1/10 次"), "{text2}");
+    assert!(text2.contains("重新生成"), "{text2}");
+}
+
+/// 取 Entry 的文本（Message 行）；测试辅助。
+fn entry_text(entry: &crate::tui::model::Entry) -> String {
+    match entry {
+        crate::tui::model::Entry::Message { line, .. } => line.text.clone(),
+        crate::tui::model::Entry::Tool { .. } => String::new(),
+    }
+}
 
 #[test]
 fn plan_window_follows_tail_and_commits_overflow() {
@@ -1224,16 +1287,16 @@ fn session_modal_and_menu_stay_within_main_area_when_sidebar_open() {
     );
 }
 
-/// §用户诉求：todo 项按显示列宽截断而非字节——CJK 双宽字符不被严重提前
-/// 截断：长项保留头部完整信息（旧字节实现按 width-3=27 字节 ≈ 9 汉字
-/// ≈ 18 cells 预算，而实际可用约 25 cells，内容显示不足且中段割裂）。
+/// §用户诉求：todo 长文本折行显示完整（不截断）——CJK 双宽按 2 cells
+/// 折行；第一行带 marker，续行缩进对齐。此前单行截断丢内容，用户反馈
+/// “todo 显示不完全”。
 #[test]
-fn sidebar_todo_truncates_by_cell_width() {
+fn sidebar_todo_wraps_long_text_by_cell_width() {
     let mut view = ViewModel {
         plan: Some(crate::tool::plan::Plan {
             explanation: None,
             items: vec![crate::tool::plan::PlanItem {
-                text: "第一项：重构侧边栏布局与渲染管线".into(),
+                text: "第一项：重构侧边栏布局与渲染管线使其支持长文本折行显示".into(),
                 status: crate::tool::plan::PlanStatus::InProgress,
             }],
         }),
@@ -1245,22 +1308,127 @@ fn sidebar_todo_truncates_by_cell_width() {
     };
     let buf = draw_to_test_backend(&mut view, 80, 24);
     let sidebar_start_x = 80u16 - crate::tui::model::SIDEBAR_WIDTH;
-    // 找到含 todo 标记的行（逐 cell 拼接；CJK 中间插空格，过滤后断言）。
-    let mut row_text = String::new();
+    // 收集侧边栏全部行（逐 cell 拼接；CJK 中间插空格，过滤后断言）。
+    let mut rows: Vec<String> = Vec::new();
     for y in 0..24u16 {
-        row_text.clear();
+        let mut row_text = String::new();
         for x in sidebar_start_x..80u16 {
             row_text.push_str(buf[(x, y)].symbol());
         }
-        if row_text.contains("[>]") {
-            break;
+        if !row_text.trim().is_empty() {
+            rows.push(row_text);
         }
     }
-    let compact: String = row_text.chars().filter(|c| *c != ' ').collect();
-    // 行首是竖线分隔符“│”，todo 内容在其后。
+    // 找到 todo 首行（含 [>]），其后的行（用户消息标题之前）都是续行。
+    let first = rows.iter().position(|r| r.contains("[>]")).expect("todo 首行");
+    let todo_rows = rows[first..]
+        .iter()
+        .take_while(|r| !r.contains("用户消息"))
+        .collect::<Vec<_>>();
+    let compact: Vec<String> = todo_rows
+        .iter()
+        .map(|r| r.chars().filter(|c| *c != ' ').collect::<String>())
+        .collect();
+    // 第一行保留 marker + 头部（折行而非截断）。
     assert!(
-        compact.contains("[>]第一项：重构侧边栏布局与"),
-        "todo 项应保留头部完整信息: {row_text:?}"
+        compact[0].contains("[>]第一项：重构侧边栏"),
+        "首行应保留头部: {todo_rows:?}"
+    );
+    // 折行：至少 2 行，且续行包含尾部文本（完整显示，无 “…” 截断）。
+    assert!(todo_rows.len() >= 2, "长 todo 必须折行而不是单行截断: {todo_rows:?}");
+    let tail_text: String = compact[1..].join("");
+    assert!(
+        tail_text.contains("长文本折行显示"),
+        "续行必须包含文本尾部（完整显示）: {todo_rows:?}"
+    );
+    assert!(
+        !compact.iter().any(|r| r.contains('…')),
+        "折行不应出现省略号截断: {todo_rows:?}"
+    );
+}
+
+/// §用户诉求：全部项完成/取消后 Todo 自动清空，不再显示完成态列表
+/// （此前只检查 items 非空，全标完成后完成项仍挂在侧边栏）。
+#[test]
+fn sidebar_clears_todo_when_plan_fully_terminal() {
+    let mut view = ViewModel {
+        plan: Some(crate::tool::plan::Plan {
+            explanation: None,
+            items: vec![
+                crate::tool::plan::PlanItem {
+                    text: "完成的任务甲".into(),
+                    status: crate::tool::plan::PlanStatus::Completed,
+                },
+                crate::tool::plan::PlanItem {
+                    text: "取消的任务乙".into(),
+                    status: crate::tool::plan::PlanStatus::Cancelled,
+                },
+            ],
+        }),
+        sidebar: crate::tui::model::SidebarState {
+            open: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let buf = draw_to_test_backend(&mut view, 80, 24);
+    let sidebar_start_x = 80u16 - crate::tui::model::SIDEBAR_WIDTH;
+    let mut sidebar_text = String::new();
+    for y in 0..24u16 {
+        for x in sidebar_start_x..80u16 {
+            sidebar_text.push_str(buf[(x, y)].symbol());
+        }
+        sidebar_text.push('\n');
+    }
+    let compact: String = sidebar_text.chars().filter(|c| *c != ' ').collect();
+    assert!(
+        compact.contains("(无活动计划)"),
+        "全部终态后 Todo 应显示无活动计划: {sidebar_text}"
+    );
+    assert!(
+        !compact.contains("完成任务甲") && !compact.contains("取消的任务乙"),
+        "全部终态后不再显示完成项列表: {sidebar_text}"
+    );
+}
+
+/// §用户诉求：部分完成时保留历史（终态项沉底），但开放项仍显示。
+#[test]
+fn sidebar_keeps_terminal_history_when_open_items_exist() {
+    let mut view = ViewModel {
+        plan: Some(crate::tool::plan::Plan {
+            explanation: None,
+            items: vec![
+                crate::tool::plan::PlanItem {
+                    text: "已完成的任务".into(),
+                    status: crate::tool::plan::PlanStatus::Completed,
+                },
+                crate::tool::plan::PlanItem {
+                    text: "进行中的任务".into(),
+                    status: crate::tool::plan::PlanStatus::InProgress,
+                },
+            ],
+        }),
+        sidebar: crate::tui::model::SidebarState {
+            open: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let buf = draw_to_test_backend(&mut view, 80, 24);
+    let sidebar_start_x = 80u16 - crate::tui::model::SIDEBAR_WIDTH;
+    let mut sidebar_text = String::new();
+    for y in 0..24u16 {
+        for x in sidebar_start_x..80u16 {
+            sidebar_text.push_str(buf[(x, y)].symbol());
+        }
+        sidebar_text.push('\n');
+    }
+    let compact: String = sidebar_text.chars().filter(|c| *c != ' ').collect();
+    assert!(compact.contains("进行中的任务"), "开放项必须显示: {sidebar_text}");
+    assert!(compact.contains("已完成的任务"), "有开放项时历史保留（沉底）: {sidebar_text}");
+    assert!(
+        !compact.contains("(无活动计划)"),
+        "有开放项时不得显示无活动计划: {sidebar_text}"
     );
 }
 

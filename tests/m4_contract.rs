@@ -86,6 +86,7 @@ fn bash_serializes_all_following_tools() {
                 command: "echo hi".into(),
                 cwd: None,
                 timeout_ms: 1000,
+                background: false,
             }),
         },
         access: ToolAccess::WorkspaceUnknown,

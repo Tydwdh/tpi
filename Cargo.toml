@@ -63,6 +63,7 @@ tempfile = "3"
 proptest = "1"
 socket2 = "0.6"
 rand = "0.10.2"
+serial_test = "3"
 
 [profile.release]
 lto = "thin"

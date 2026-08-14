@@ -932,6 +932,9 @@ mod tests {
             workspace: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::workspace::ActiveWorkspace::local(local),
             )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::process::managed::ProcessRegistry::new(),
+            )),
             interactive: false,
             allow_outside_workspace: true,
         }
