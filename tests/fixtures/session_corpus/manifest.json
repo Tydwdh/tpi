@@ -1,0 +1,83 @@
+{
+  "schema": 1,
+  "generated": "2026-08-14",
+  "source": "~/.tpi/sessions 真实 session（39 文件，0 损坏）",
+  "scrub_script": "scripts/scrub_session.py",
+  "note": "fixture 已脱敏：payload 文本替换为 REDACTED_*；多行字符串一律替换；路径归一 /workspace/...；envelope 结构保留",
+  "fixtures": [
+    {
+      "id": "001_tool_loop",
+      "file": "001_tool_loop.jsonl",
+      "src_session": "019ff96f",
+      "src_lines": 321,
+      "fixture_lines": 321,
+      "lifecycle": [
+        "tool_calls",
+        "plan_replaced"
+      ],
+      "note": "多 run：普通 tool 循环 + plan_replaced",
+      "blake3": "5d150f83aca5711f"
+    },
+    {
+      "id": "002_stream_interrupted",
+      "file": "002_stream_interrupted.jsonl",
+      "src_session": "019fe22e",
+      "src_lines": 36,
+      "fixture_lines": 36,
+      "lifecycle": [
+        "assistant_attempt_interrupted"
+      ],
+      "note": "流中断（attempt interrupted）",
+      "blake3": "97c33c99b9186d35"
+    },
+    {
+      "id": "003_awaiting_input",
+      "file": "003_awaiting_input.jsonl",
+      "src_session": "01a00078",
+      "src_lines": 526,
+      "fixture_lines": 526,
+      "lifecycle": [
+        "user_input_requested",
+        "assistant_attempt_interrupted"
+      ],
+      "note": "挂起等待用户输入 + interrupted（已冻结会话）",
+      "blake3": "fb25a5b5354371d1"
+    },
+    {
+      "id": "004_compaction_segment",
+      "file": "004_compaction_segment.jsonl",
+      "src_session": "019ffaba",
+      "src_lines": 4083,
+      "fixture_lines": 56,
+      "lifecycle": [
+        "compaction_committed"
+      ],
+      "note": "大文件 019ffaba 中 compaction 所在完整 run 段",
+      "blake3": "3e9504785bae64f3"
+    },
+    {
+      "id": "005_corrupt_tail",
+      "file": "005_corrupt_tail.jsonl",
+      "src_session": "019fe22e(合成)",
+      "src_lines": 36,
+      "fixture_lines": 37,
+      "lifecycle": [
+        "corrupt_tail"
+      ],
+      "note": "尾部未完成行：reader 应截断并成功",
+      "blake3": "58adf7d0a5cb7afc"
+    },
+    {
+      "id": "006_corrupt_middle",
+      "file": "006_corrupt_middle.jsonl",
+      "src_session": "019fe22e(合成)",
+      "src_lines": 36,
+      "fixture_lines": 37,
+      "lifecycle": [
+        "corrupt_middle"
+      ],
+      "note": "中间坏行：reader 应返回 InvalidData",
+      "blake3": "70b2355bc82f67b6"
+    }
+  ]
+}
