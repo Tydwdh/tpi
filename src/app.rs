@@ -1873,18 +1873,23 @@ async fn run_interactive<P: Provider>(
         // 逐行 push（每行独立 bound），避免单行超长被截断。
         // §13 升级：所有问题都带 options 时同时打开键盘选项选择器
         // （模态覆盖；↑/↓+Enter 选择，Esc 关闭后自由输入）。
+        // 块级去重：连续相同挂起提示（中间无用户回答插入）只保留一个块，
+        // 避免反复挂起时 transcript 被相同提示刷屏。
         crate::session::CompletionReason::AwaitingUserInput => {
             let awaiting = outcome.awaiting_input.as_ref();
             let question = awaiting
                 .map(|a| a.text.as_str())
                 .unwrap_or("请提供你的输入");
-            ui_state
-                .view
-                .push_line(LineKind::System, "⏸ run 挂起，等待你的输入：".to_string());
-            for line in question.lines() {
-                ui_state.view.push_line(LineKind::System, line.to_string());
-            }
+            let mut block: Vec<String> = Vec::with_capacity(question.lines().count() + 2);
+            block.push("⏸ run 挂起，等待你的输入：".to_string());
+            block.extend(question.lines().map(String::from));
+            block.push(
+                "（输入回答后继续；↑/↓ + Enter 可从选项中选择，Esc 关闭后自由输入）".to_string(),
+            );
+            ui_state.view.push_system_block_dedup(&block);
             // 全部问题都有选项 → 打开键盘选择器（逐题导航，确认后作为回答）。
+            // 与提示块去重独立：即使提示被去重（连续挂起），选择器仍要重新打开
+            //（用户上次可能 Esc 关闭了）。
             if let Some(questions) = awaiting.map(|a| &a.questions)
                 && !questions.is_empty()
                 && questions.iter().all(|q| !q.options.is_empty())
@@ -1900,10 +1905,6 @@ async fn run_interactive<P: Provider>(
                 ui_state.view.input_choice =
                     Some(crate::tui::model::InputChoiceState::new(items));
             }
-            ui_state.view.push_line(
-                LineKind::System,
-                "（输入回答后继续；↑/↓ + Enter 可从选项中选择，Esc 关闭后自由输入）".to_string(),
-            );
         }
     }
     ui_state.view.status = StatusLine::Idle;

@@ -932,12 +932,45 @@ impl ViewModel {
     ///
     /// 用于反复触发型反馈（如 `/retry`）：相同 target 的重试提示只保留一行，
     /// 避免用户多次操作时 transcript 被相同文本刷屏。返回是否真正写入。
+    /// 注意：与 `push_line` 一样先 `bound_message` 再比较（超长输入在比较与
+    /// 存储两侧一致，去重不因截断失效）。
     pub fn push_line_dedup(&mut self, kind: LineKind, text: impl Into<String>) -> bool {
-        let text = text.into();
+        let text = bound_message(&text.into());
         if self.last_message_text() == Some(text.as_str()) {
             return false;
         }
         self.push_line(kind, text);
+        true
+    }
+
+    /// push 一个多行系统提示块，但若 transcript 末尾最后几条消息恰好等于
+    /// `lines`（文本与顺序一致）则整个块跳过（块级连续去重）。
+    ///
+    /// 用于由多行组成的反馈（如 `request_input` 挂起提示 = 头 + 问题 + 尾）：
+    /// 反复触发相同提示时只保留一个块，不刷屏。返回是否真正写入。
+    /// 逐行先 `bound_message`（与 `push_line` 一致），比较基于存储文本。
+    pub fn push_system_block_dedup(&mut self, lines: &[String]) -> bool {
+        if lines.is_empty() {
+            return false;
+        }
+        let bounded: Vec<String> = lines.iter().map(|l| bound_message(l)).collect();
+        // transcript 末尾最后 bounded.len() 条 Message 文本（跳过工具卡）。
+        let tail: Vec<&str> = self
+            .transcript
+            .iter()
+            .rev()
+            .filter_map(|entry| match entry {
+                Entry::Message { line, .. } => Some(line.text.as_str()),
+                Entry::Tool { .. } => None,
+            })
+            .take(bounded.len())
+            .collect();
+        if tail.len() == bounded.len() && tail.iter().rev().zip(&bounded).all(|(a, b)| a == b) {
+            return false;
+        }
+        for line in bounded {
+            self.push_line(LineKind::System, line);
+        }
         true
     }
 

@@ -983,4 +983,63 @@ mod p2_card_nav_tests {
         view.push_line(LineKind::System, "⟳ 重试");
         assert_eq!(view.last_message_text(), Some("⟳ 重试"));
     }
+
+    /// §去重：`push_system_block_dedup` 相同块（文本+顺序）只保留一个，
+    /// 不同块正常写入；中间插入其他消息后相同块允许再次出现。
+    #[test]
+    fn push_system_block_dedup_skips_consecutive_identical_block() {
+        let mut view = ViewModel::default();
+        let block: Vec<String> = vec![
+            "⏸ run 挂起，等待你的输入：".into(),
+            "1. 要运行测试吗？".into(),
+            "（输入回答后继续）".into(),
+        ];
+        // 第一次写入：返回 true，产生 3 行。
+        assert!(view.push_system_block_dedup(&block));
+        let count = view.transcript.len();
+        assert_eq!(count, 3);
+        // 连续相同块：跳过（返回 false），不产生新行。
+        assert!(!view.push_system_block_dedup(&block));
+        assert_eq!(view.transcript.len(), count, "相同块不得重复写入");
+        // 不同块（问题不同）：写入。
+        let other: Vec<String> = vec![
+            "⏸ run 挂起，等待你的输入：".into(),
+            "1. 发布到哪个环境？".into(),
+            "（输入回答后继续）".into(),
+        ];
+        assert!(view.push_system_block_dedup(&other));
+        assert_eq!(view.transcript.len(), count + 3);
+        // 中间插入用户消息后，相同块再次出现 → 允许写入（去重只针对连续）。
+        view.push_line(LineKind::User, "回答");
+        assert!(view.push_system_block_dedup(&block));
+    }
+
+    /// §去重：块匹配跳过工具卡（工具卡不打断“连续相同块”判定）。
+    #[test]
+    fn push_system_block_dedup_ignores_tool_cards_between() {
+        let mut view = ViewModel::default();
+        let block: Vec<String> = vec!["⏸ run 挂起，等待你的输入：".into(), "问题？".into()];
+        view.push_system_block_dedup(&block);
+        // 工具卡插入在提示块之后（不应阻断末尾匹配）。
+        view.begin_tool("c1", "bash", Some("cmd".into()), None);
+        view.finish_tool(("c1", "bash"), ToolStatus::Succeeded, 1, None, "", None);
+        assert!(
+            !view.push_system_block_dedup(&block),
+            "工具卡不打断连续相同块判定（末尾仍是提示块）"
+        );
+    }
+
+    /// §去重：超长文本按 bound 后比较——`push_line_dedup` 不因截断失效。
+    #[test]
+    fn push_line_dedup_compares_bounded_text() {
+        let mut view = ViewModel::default();
+        let long = "x".repeat(MAX_MESSAGE_CHARS + 100);
+        assert!(view.push_line_dedup(LineKind::System, long.clone()));
+        let count = view.transcript.len();
+        assert!(
+            !view.push_line_dedup(LineKind::System, long.clone()),
+            "超长文本 bound 后相同也应去重"
+        );
+        assert_eq!(view.transcript.len(), count);
+    }
 }
