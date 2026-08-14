@@ -508,10 +508,13 @@ async fn replay_after_compaction_matches_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let mut h = ReplayHarness::new(&workspace);
-    // 窗口需容纳 system(≈1181) + 工具 schema(≈5668) + 首轮 read 输出后仍有余量：
-    // 9000 会在第 2 轮就超 93 tokens（压缩时消息太少必然失败）；
-    // 12000 让触发点落在第 5-6 轮，此时 history 有足够消息可显著压缩。
-    h.config.model.context_window = Some(8500);
+    // 窗口标定依赖 system prompt（含全部工具 schema/description）大小：
+    // 工具描述/参数的演进会增大初始占用、提前 compaction 触发点——触发时
+    // history 消息太少则压缩不显著（NotSignificant）而不提交。当前 schema 下
+    // 9000 让触发点落在 history 已有足够消息可显著压缩的位置；8500（旧值）
+    // 在原始 schema 下等效，但 request_input 多问题升级（description/schema
+    // 变大）后提前触发导致本场景不再提交 compaction，故窗口需重新标定。
+    h.config.model.context_window = Some(9000);
     h.config.safety_reserve_tokens = 100;
 
     // 状态机：工具请求按序 read×10（中等输出累积 context，第 5-6 轮触发

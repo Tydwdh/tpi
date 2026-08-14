@@ -167,7 +167,9 @@ pub(super) enum BatchEnd {
     BudgetExceeded,
     /// §13（AGENTS.md）：本批中的 `request_input` 成功调用——run 应在该点
     /// 挂起（记录 UserInputRequested），而不是继续下一轮模型请求。
-    SuspendRequested { question: String },
+    /// 携带完整参数：渲染文本（`args.render()`）供 session/TUI 展示，
+    /// 结构化 questions 供 TUI 选项选择器（键盘交互）使用。
+    SuspendRequested { args: crate::tool::request_input::RequestInputArgs },
 }
 
 /// Owns the mutable boundary of one tool-call batch.
@@ -612,7 +614,9 @@ error: invalid_arguments
         // §13（AGENTS.md）：本 wave 含 `request_input` 且成功 → run 挂起。
         // 该 wave 的工具结果已全部持久化（ToolRequested/ToolCompleted），
         // 后续 wave 不再执行；由 agent run 记录 UserInputRequested 并结束。
-        let suspend_question = wave.iter().find_map(|call| {
+        // 携带完整参数（而非渲染文本）：agent 层同时得到渲染文本与结构化
+        // questions（TUI 选项选择器用）。
+        let suspend_args = wave.iter().find_map(|call| {
             let source = &calls[call.source_index];
             if source.name != "request_input" {
                 return None;
@@ -623,16 +627,15 @@ error: invalid_arguments
             if !succeeded {
                 return None;
             }
-            let question = serde_json::from_str::<crate::tool::request_input::RequestInputArgs>(
+            // 工具成功执行意味着参数已通过预检；解析失败（理论不可能）
+            // 时回退为空参数，由 agent 层以默认文本挂起。
+            serde_json::from_str::<crate::tool::request_input::RequestInputArgs>(
                 &source.arguments,
             )
             .ok()
-            .map(|args| args.question)
-            .unwrap_or_else(|| "请提供你的输入".to_string());
-            Some(question)
         });
-        if let Some(question) = suspend_question {
-            return Ok(BatchEnd::SuspendRequested { question });
+        if let Some(args) = suspend_args {
+            return Ok(BatchEnd::SuspendRequested { args });
         }
     }
 

@@ -283,6 +283,118 @@ pub enum OverlayKind {
     Link,
 }
 
+/// 输入选择器中的一个问题（`request_input` 选项键盘选择；与 tool 层
+/// `RequestInputQuestion` 解耦的轻量投影，转换在 app 层完成）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputChoiceItem {
+    pub header: Option<String>,
+    pub question: String,
+    pub options: Vec<String>,
+}
+
+/// `request_input` 挂起后的选项选择器状态（§13 升级：键盘交互选择选项，
+/// 替代手敲选项文本）。模态覆盖显示：
+///
+/// - ↑/↓ / Tab / Shift+Tab：在当前问题的选项间移动（循环）；
+/// - Enter / 数字 1-9：确认当前选项，前进到下一问题；
+/// - 全部问题确认后：选项文本按问题顺序逐行拼接，push 进待提交消息
+///   （作为用户回答继续 run）；
+/// - Esc：关闭选择器（放弃已暂存答案，回到自由输入）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputChoiceState {
+    /// 全部问题（只含带选项的问题；打开条件由 app 层保证）。
+    pub items: Vec<InputChoiceItem>,
+    /// 当前问题索引。
+    pub current: usize,
+    /// 当前问题中选中选项索引。
+    pub selected: usize,
+    /// 已确认的答案（按问题顺序；逐题推进时累积）。
+    pub answers: Vec<String>,
+    /// 面板内滚动偏移（选项行）。
+    pub scroll: usize,
+}
+
+impl InputChoiceState {
+    pub fn new(items: Vec<InputChoiceItem>) -> Self {
+        Self {
+            items,
+            current: 0,
+            selected: 0,
+            answers: Vec::new(),
+            scroll: 0,
+        }
+    }
+
+    pub fn current_options(&self) -> &[String] {
+        self.items
+            .get(self.current)
+            .map(|item| item.options.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// 移动选中项到上一项（循环）；窗口跟随。
+    pub fn move_prev(&mut self) {
+        let n = self.current_options().len();
+        if n == 0 {
+            return;
+        }
+        self.selected = (self.selected + n - 1) % n;
+        self.sync_scroll();
+    }
+
+    /// 移动选中项到下一项（循环）；窗口跟随。
+    pub fn move_next(&mut self) {
+        let n = self.current_options().len();
+        if n == 0 {
+            return;
+        }
+        self.selected = (self.selected + 1) % n;
+        self.sync_scroll();
+    }
+
+    /// 确认当前选中项。全部问题确认完返回答案列表（此后选择器应关闭）；
+    /// 否则返回 None（前进到下一问题继续）。
+    pub fn confirm_selected(&mut self) -> Option<Vec<String>> {
+        if let Some(option) = self.current_options().get(self.selected) {
+            self.answers.push(option.clone());
+        }
+        self.advance()
+    }
+
+    /// 按 1-based 编号确认选项（数字键 1-9）；编号越界时忽略。
+    pub fn confirm_index(&mut self, index: usize) -> Option<Vec<String>> {
+        let n = self.current_options().len();
+        if index >= n {
+            return None;
+        }
+        self.selected = index;
+        self.confirm_selected()
+    }
+
+    /// 推进到下一问题；完成时返回全部答案。
+    fn advance(&mut self) -> Option<Vec<String>> {
+        self.sync_scroll();
+        if self.current + 1 < self.items.len() {
+            self.current += 1;
+            self.selected = 0;
+            self.scroll = 0;
+            None
+        } else {
+            Some(std::mem::take(&mut self.answers))
+        }
+    }
+
+    /// 选项窗口跟随选中项（可视 8 行；渲染侧同一策略）。
+    fn sync_scroll(&mut self) {
+        const VISIBLE: usize = 8;
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + VISIBLE {
+            self.scroll = self.selected - VISIBLE + 1;
+        }
+    }
+}
+
 /// 详情 Overlay 状态（整改 B：历史/工具详情不重写 scrollback，覆盖显示）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayState {
@@ -607,6 +719,9 @@ pub struct ViewModel {
     pub overlay: Option<OverlayState>,
     /// 操作型 Modal（None = 关闭；§42：/help /settings /doctor 等不污染 transcript）。
     pub modal: Option<ModalState>,
+    /// §13 升级：`request_input` 选项选择器（None = 关闭；模态覆盖显示，
+    /// 键盘 ↑/↓/Enter/数字选择选项作为回答提交）。
+    pub input_choice: Option<InputChoiceState>,
     /// 转录搜索（None = 关闭；§14 Ctrl+F）。
     pub search: Option<SearchState>,
     /// 右侧边栏（§用户诉求）：todo + 用户消息大纲；关闭时主区占满全宽。
@@ -656,6 +771,7 @@ impl Default for ViewModel {
             file_index: Vec::new(),
             overlay: None,
             modal: None,
+            input_choice: None,
             search: None,
             sidebar: SidebarState::default(),
             next_version: 1,
@@ -717,6 +833,7 @@ impl ViewModel {
         self.menu = None;
         self.overlay = None;
         self.modal = None;
+        self.input_choice = None;
         self.search = None;
         self.active_hit = None;
         self.selection = None;

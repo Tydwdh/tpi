@@ -498,9 +498,12 @@ async fn request_input_suspends_run_with_durable_event() {
     .await
     .expect("run succeeds");
 
-    // 挂起：reason + 问题文本。
+    // 挂起：reason + 问题文本（渲染格式：编号前缀）。
     assert_eq!(outcome.reason, CompletionReason::AwaitingUserInput);
-    assert_eq!(outcome.awaiting_input.as_deref(), Some("要运行完整测试套件吗？"));
+    assert_eq!(
+        outcome.awaiting_input.as_ref().map(|a| a.text.as_str()),
+        Some("1. 要运行完整测试套件吗？")
+    );
 
     // session 事实：request_input 是工具调用（ToolRequested/ToolCompleted），
     // 之后 user_input_requested + run_completed(AwaitingUserInput)。
@@ -591,7 +594,7 @@ async fn resume_after_suspend_records_input_and_continues() {
     .await
     .expect("resume run succeeds");
     assert_eq!(outcome2.reason, CompletionReason::Stop);
-    assert_eq!(outcome2.awaiting_input, None);
+    assert!(outcome2.awaiting_input.is_none());
 
     // session 完整保留请求/回答事件对；resume 的模型请求能看到
     // request_input 的工具结果与用户的回答（上下文连续）。
@@ -614,4 +617,137 @@ async fn resume_after_suspend_records_input_and_continues() {
     let joined = joined.join("\n");
     assert!(joined.contains("要跑测试吗"), "resume 上下文应含问题: {joined}");
     assert!(joined.contains("跑吧"), "resume 上下文应含用户回答: {joined}");
+}
+
+/// AGENTS.md §13（对标 AskUserQuestion）：`request_input` 一次请求多个问题
+/// （各带 header/options）——渲染后的挂起问题文本包含全部问题、标题与选项，
+/// session 记录 `user_input_requested`；旧单问题格式仍兼容。
+#[tokio::test]
+async fn request_input_multi_question_suspends_with_rendered_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = FakeProvider::new(vec![FakeResponse::with_tool_calls(vec![
+        fixtures::fake_provider::tool_call(
+            "request_input",
+            serde_json::json!({
+                "questions": [
+                    {
+                        "question": "要运行完整测试套件吗？",
+                        "options": ["是，运行全部", "只跑单元测试", "跳过"]
+                    },
+                    {
+                        "question": "发布到哪个环境？",
+                        "header": "部署",
+                        "options": ["生产", "staging"]
+                    }
+                ]
+            }),
+        ),
+    ])]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, _rx) = mpsc::channel(32);
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "需要你确认几件事".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+            workspace: None,
+        },
+    )
+    .await
+    .expect("run succeeds");
+
+    assert_eq!(outcome.reason, CompletionReason::AwaitingUserInput);
+    let awaiting = outcome.awaiting_input.expect("挂起信息");
+    let prompt = &awaiting.text;
+    // 全部问题 + header + 选项进入渲染文本（编号、分组、选项行）。
+    assert!(prompt.contains("要运行完整测试套件吗"), "prompt: {prompt}");
+    assert!(prompt.contains("只跑单元测试"), "prompt: {prompt}");
+    assert!(prompt.contains("部署"), "header 应渲染: {prompt}");
+    assert!(prompt.contains("发布到哪个环境"), "prompt: {prompt}");
+    assert!(prompt.contains("staging"), "prompt: {prompt}");
+    // 两个问题都编号。
+    assert!(prompt.contains("1. ") && prompt.contains("2. "), "prompt: {prompt}");
+    // 结构化 questions 供 TUI 选择器使用：全部问题 + 选项保留。
+    assert_eq!(awaiting.questions.len(), 2, "结构化问题数");
+    assert_eq!(awaiting.questions[0].options, vec!["是，运行全部", "只跑单元测试", "跳过"]);
+    assert_eq!(awaiting.questions[1].header.as_deref(), Some("部署"));
+    assert_eq!(awaiting.questions[1].options, vec!["生产", "staging"]);
+
+    // session 事实：user_input_requested 记录渲染后的完整问题文本。
+    let events = read_events(session.path()).expect("read session");
+    let requested = events.iter().find_map(|event| match event {
+        SessionEvent::UserInputRequested { prompt } => Some(prompt.as_str()),
+        _ => None,
+    });
+    assert!(requested.is_some(), "缺少 user_input_requested");
+    assert!(
+        requested.unwrap().contains("发布到哪个环境"),
+        "durable prompt 应含全部问题: {:?}",
+        requested
+    );
+}
+
+/// AGENTS.md §13：旧单问题格式（question + options）仍可用，
+/// 渲染文本包含问题与建议选项（兼容回归）。
+#[tokio::test]
+async fn request_input_legacy_single_question_still_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = FakeProvider::new(vec![FakeResponse::with_tool_calls(vec![
+        fixtures::fake_provider::tool_call(
+            "request_input",
+            serde_json::json!({
+                "question": "要运行完整测试套件吗？",
+                "options": ["是", "否"]
+            }),
+        ),
+    ])]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, _rx) = mpsc::channel(32);
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "确认一下".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+            workspace: None,
+        },
+    )
+    .await
+    .expect("run succeeds");
+
+    assert_eq!(outcome.reason, CompletionReason::AwaitingUserInput);
+    let awaiting = outcome.awaiting_input.expect("挂起信息");
+    let prompt = &awaiting.text;
+    assert!(prompt.contains("要运行完整测试套件吗"), "prompt: {prompt}");
+    assert!(prompt.contains("是") && prompt.contains("否"), "prompt: {prompt}");
+    // 兼容格式同样产出结构化问题（供选择器）。
+    assert_eq!(awaiting.questions.len(), 1);
+    assert_eq!(awaiting.questions[0].options, vec!["是", "否"]);
 }

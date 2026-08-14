@@ -88,9 +88,19 @@ pub struct AgentOutcome {
     pub messages: Vec<ChatMessage>,
     /// 最终 assistant 文本（UI 展示）。
     pub assistant_text: String,
-    /// §13（AGENTS.md）：run 因 `request_input` 挂起时，模型提出的问题文本
-    /// （TUI 显示并等待用户回答；非挂起为 None）。
-    pub awaiting_input: Option<String>,
+    /// §13（AGENTS.md）：run 因 `request_input` 挂起时的完整信息
+    /// （TUI 显示问题并等待用户回答；非挂起为 None）。
+    pub awaiting_input: Option<AwaitingInput>,
+}
+
+/// §13：`request_input` 挂起的结构化信息。
+///
+/// `text` 是参数渲染后的多行文本（编号 + header + 选项），session 的
+/// `UserInputRequested.prompt` 与 TUI 展示共用；`questions` 是结构化问题
+/// 列表（TUI 据此构建键盘选项选择器；无选项时为空列表）。
+pub struct AwaitingInput {
+    pub text: String,
+    pub questions: Vec<crate::tool::request_input::RequestInputQuestion>,
 }
 
 /// Inputs that describe one agent run independently of its provider, session,
@@ -404,7 +414,7 @@ pub async fn run<P: Provider>(
 
     let mut assistant_text = String::new();
     // §13：`request_input` 挂起时模型的问题（随 AgentOutcome 返回给 app 层显示）。
-    let mut awaiting_input: Option<String> = None;
+    let mut awaiting_input: Option<AwaitingInput> = None;
     // §12.3：确定性无进展检测（不调用额外模型）。
     let mut progress = crate::tool::scheduler::ProgressTracker::default();
     // §15.4：同一阈值区间内 compaction 失败后不反复调用模型。
@@ -880,13 +890,20 @@ pub async fn run<P: Provider>(
                 &mut usage_total,
             )
             .await?;
-            if let BatchEnd::SuspendRequested { question } = batch {
+            if let BatchEnd::SuspendRequested { args } = batch {
                 // §13（AGENTS.md）：request_input 成功 → run 在该点挂起。
                 // 记录 UserInputRequested（durable 事实）+ RunCompleted
                 // (AwaitingUserInput)——等待用户输入**不等于** run 完成。
+                let text = args.render();
+                let text = if text.is_empty() {
+                    "请提供你的输入".to_string()
+                } else {
+                    text
+                };
+                let questions = args.normalized_questions().unwrap_or_default();
                 session
                     .append_event(&SessionEvent::UserInputRequested {
-                        prompt: question.clone(),
+                        prompt: text.clone(),
                     })
                     .and_then(|_| session.sync_data())
                     .map_err(|e| RunFailure::Session(e.to_string()))?;
@@ -897,7 +914,7 @@ pub async fn run<P: Provider>(
                     })
                     .and_then(|_| session.sync_data())
                     .map_err(|e| RunFailure::Session(e.to_string()))?;
-                awaiting_input = Some(question);
+                awaiting_input = Some(AwaitingInput { text, questions });
                 break 'run_loop CompletionReason::AwaitingUserInput;
             }
             if batch == BatchEnd::BudgetExceeded {

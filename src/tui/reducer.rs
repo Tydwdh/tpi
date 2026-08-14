@@ -132,6 +132,66 @@ fn handle_search_key(
     std::mem::take(effects)
 }
 
+/// §13 升级：`request_input` 选项选择器的按键路由（模态覆盖，固定键位，
+/// 不经 keymap——与 Modal/Overlay 一致）。
+///
+/// - ↑ / Tab / Shift+Tab（BackTab）/ ↓：在选项间移动（循环）；
+/// - Enter / 数字 1-9：确认当前选项，前进到下一问题；全部问题确认后把
+///   答案逐行拼接 push 进待提交消息（作为用户回答继续 run）；
+/// - Esc：关闭选择器（放弃已暂存答案，回到自由输入）。
+///
+/// 返回 effects（当前无跨边界动作，保持签名与 handle_key 一致）。
+fn handle_input_choice_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
+    let effects = Vec::new();
+    let mods = key.modifiers;
+    let ctrl_alt = mods.contains(KeyModifiers::CONTROL) || mods.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Up if !ctrl_alt => {
+            if let Some(choice) = &mut state.view.input_choice {
+                choice.move_prev();
+            }
+        }
+        KeyCode::Down | KeyCode::Tab if !ctrl_alt => {
+            if let Some(choice) = &mut state.view.input_choice {
+                choice.move_next();
+            }
+        }
+        KeyCode::BackTab => {
+            if let Some(choice) = &mut state.view.input_choice {
+                choice.move_prev();
+            }
+        }
+        KeyCode::Enter => {
+            let done = state
+                .view
+                .input_choice
+                .as_mut()
+                .and_then(|choice| choice.confirm_selected());
+            if let Some(answers) = done {
+                state.view.input_choice = None;
+                state.push_pending(answers.join("\n"));
+            }
+        }
+        KeyCode::Char(c) if !ctrl_alt && c.is_ascii_digit() && c != '0' => {
+            let index = (c as u32 - '0' as u32) as usize - 1;
+            let done = state
+                .view
+                .input_choice
+                .as_mut()
+                .and_then(|choice| choice.confirm_index(index));
+            if let Some(answers) = done {
+                state.view.input_choice = None;
+                state.push_pending(answers.join("\n"));
+            }
+        }
+        KeyCode::Esc => {
+            state.view.input_choice = None;
+        }
+        _ => {}
+    }
+    effects
+}
+
 /// 处理单个按键事件（空闲与运行中共用；行为与迁移前的 handle_key 一致）。
 /// 键盘路由优先级（§11）：Overlay > Modal > Search > Menu > Composer。
 /// 键位语义由 `state.keymap.action(key)` 解析（`[ui.keymap]` 可覆盖）。
@@ -139,6 +199,12 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
     let mut effects = Vec::new();
     // 过渡提示下一次键盘操作清除（同一个键可重新设置）。
     state.view.transient_hint = None;
+
+    // §13 升级：输入选择器是最高优先级的模态——打开时所有按键先路由给它
+    // （↑/↓/Enter/数字/Esc），不得落入 composer/menu/run 取消等普通路径。
+    if state.view.input_choice.is_some() {
+        return handle_input_choice_key(state, key);
+    }
 
     // Ctrl+C 语义（§用户诉求）：只用于复制——Windows Terminal 选中文本后
     // Ctrl+C 由终端优先复制（不传给应用）；未选中时到达应用的 Ctrl+C 静默忽略，
@@ -589,9 +655,12 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
         }
         UiEvent::Paste(text) => {
             state.view.transient_hint = None;
-            // While a Modal/Overlay is open, Paste must not write into the composer
-            // behind it (keys are already blocked; Paste is a separate event).
-            if state.view.overlay.is_some() || state.view.modal.is_some() {
+            // While a Modal/Overlay/InputChoice is open, Paste must not write into
+            // the composer behind it (keys are already blocked; Paste is a separate event).
+            if state.view.overlay.is_some()
+                || state.view.modal.is_some()
+                || state.view.input_choice.is_some()
+            {
                 return Vec::new();
             }
             let text = crate::tui::paste::normalize_newlines(text);
@@ -636,6 +705,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
         } => {
             if state.view.overlay.is_some()
                 || state.view.modal.is_some()
+                || state.view.input_choice.is_some()
                 || state.view.search.is_some()
             {
                 return Vec::new();

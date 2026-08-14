@@ -368,10 +368,15 @@ Example: process action=status id=\"p17\"; process action=wait id=\"p17\" timeou
             BuiltinTool::RequestInput => {
                 "Request input from the user. Use when you need a decision, clarification, \
 permission, or additional information that only the user can provide. \
-The run SUSPENDS at this point (it does not end): the question is shown to the user, \
-their answer is recorded, and the run continues with full history. \
-Do not end the conversation with a question — call this tool instead. \
-Example: request_input question=\"should I run the full test suite?\""
+The run SUSPENDS at this point (it does not end): questions are shown to the user, \
+their answers are recorded, and the run continues with full history. \
+Supports multiple questions in one call: pass a `questions` array; each item may \
+carry a `header` grouping title and suggested `options` the user can pick (by number) \
+or override with custom text. Batch related questions into one call instead of \
+suspending repeatedly. The legacy single-question form (`question` + `options`) \
+still works. Do not end the conversation with a question — call this tool instead. \
+Example: request_input questions=[{\"question\": \"should I run the full test suite?\", \
+\"options\": [\"yes\", \"no\"]}, {\"question\": \"deploy target?\", \"header\": \"release\"}]"
             }
             BuiltinTool::RuntimeInspect => {
                 "Inspect the current runtime capabilities: available tools (with provider/\
@@ -1001,6 +1006,21 @@ mod tests {
             fetch_schema.parameters.to_string().contains("loopback"),
             "web_fetch.url 边界必须进 schema"
         );
+    }
+
+    /// §13 升级（对标 AskUserQuestion）：request_input schema 必须暴露
+    /// questions 数组与 header/options 字段（模型侧结构化参数），
+    /// 同时保留旧 question 字段兼容。
+    #[test]
+    fn request_input_schema_exposes_questions_header_options() {
+        let schema = BuiltinTool::RequestInput.schema();
+        let params = schema.parameters.to_string();
+        for marker in ["questions", "header", "options", "question"] {
+            assert!(
+                params.contains(marker),
+                "request_input schema 应含 {marker}: {params}"
+            );
+        }
     }
 
     /// BUG-009：同步工具（read）经 spawn_blocking 执行后仍返回正确结果。

@@ -8,7 +8,7 @@ use tpi::agent::{DeltaKind, RuntimeEvent};
 use tpi::tool::outcome::ToolStatus;
 use tpi::tui::effect::UiEffect;
 use tpi::tui::event::UiEvent;
-use tpi::tui::model::{LineKind, StatusLine, ViewModel};
+use tpi::tui::model::{InputChoiceItem, InputChoiceState, LineKind, StatusLine, ViewModel};
 use tpi::tui::reducer;
 use tpi::tui::scroll::ScrollMode;
 use tpi::tui::state::UiState;
@@ -1530,4 +1530,109 @@ fn sidebar_jump_locks_to_user_entry_and_keeps_open() {
         ScrollMode::Locked(anchor) if anchor.entry_id == user_id
     ));
     assert!(s.view.sidebar.open, "跳转后侧边栏应保持打开");
+}
+
+/// 构造选择器状态：每个元组 = (问题, 选项列表)。
+fn choice(items: Vec<(&str, Vec<&str>)>) -> InputChoiceState {
+    InputChoiceState::new(
+        items
+            .into_iter()
+            .map(|(question, options)| InputChoiceItem {
+                header: None,
+                question: question.to_string(),
+                options: options.into_iter().map(String::from).collect(),
+            })
+            .collect(),
+    )
+}
+
+/// §13 升级：选择器 ↑/↓ 移动、Enter 确认选中项 → push_pending 为回答。
+#[test]
+fn input_choice_down_enter_submits_selected_option() {
+    let mut s = state();
+    s.view.input_choice = Some(choice(vec![("跑测试吗？", vec!["是", "否", "跳过"])]));
+    // ↓ 到第 2 项。
+    reducer::update(&mut s, key(KeyCode::Down));
+    assert_eq!(s.view.input_choice.as_ref().unwrap().selected, 1);
+    // Enter 确认 → 关闭选择器，选项入待提交消息。
+    reducer::update(&mut s, key(KeyCode::Enter));
+    assert!(s.view.input_choice.is_none(), "完成后选择器关闭");
+    assert_eq!(s.pending_messages.front().map(String::as_str), Some("否"));
+}
+
+/// §13 升级：数字键 1-9 直接选中对应选项提交。
+#[test]
+fn input_choice_digit_selects_option_directly() {
+    let mut s = state();
+    s.view.input_choice = Some(choice(vec![("目标环境？", vec!["生产", "staging", "本地"])]));
+    reducer::update(&mut s, key(KeyCode::Char('3')));
+    assert!(s.view.input_choice.is_none());
+    assert_eq!(s.pending_messages.front().map(String::as_str), Some("本地"));
+}
+
+/// §13 升级：多问题逐题导航——Enter 确认后前进到下一问题，全部确认后
+/// 答案按问题顺序逐行拼接为一条消息。
+#[test]
+fn input_choice_multi_question_advances_and_completes() {
+    let mut s = state();
+    s.view.input_choice = Some(choice(vec![
+        ("跑测试吗？", vec!["是", "否"]),
+        ("部署环境？", vec!["生产", "staging"]),
+    ]));
+    // Q1 默认选第 1 项 → Enter 前进到 Q2。
+    reducer::update(&mut s, key(KeyCode::Enter));
+    let state_after = s.view.input_choice.as_ref().expect("还有下一题");
+    assert_eq!(state_after.current, 1);
+    assert_eq!(state_after.selected, 0);
+    assert_eq!(state_after.answers, vec!["是"]);
+    // Q2 选第 2 项 → 完成。
+    reducer::update(&mut s, key(KeyCode::Down));
+    reducer::update(&mut s, key(KeyCode::Enter));
+    assert!(s.view.input_choice.is_none());
+    assert_eq!(
+        s.pending_messages.front().map(String::as_str),
+        Some("是\nstaging"),
+        "答案按问题顺序逐行拼接"
+    );
+}
+
+/// §13 升级：Esc 关闭选择器（放弃已暂存答案，不提交任何消息）。
+#[test]
+fn input_choice_esc_closes_without_submit() {
+    let mut s = state();
+    s.view.input_choice = Some(choice(vec![("跑测试吗？", vec!["是", "否"])]));
+    reducer::update(&mut s, key(KeyCode::Esc));
+    assert!(s.view.input_choice.is_none());
+    assert!(s.pending_messages.is_empty(), "Esc 不得提交答案");
+}
+
+/// §13 升级：选择器打开时普通字符不得写入 composer（模态优先）。
+#[test]
+fn input_choice_blocks_composer_typing() {
+    let mut s = state();
+    s.view.input_choice = Some(choice(vec![("跑测试吗？", vec!["是", "否"])]));
+    reducer::update(&mut s, key(KeyCode::Char('a')));
+    assert!(s.editor.text().is_empty(), "选择器打开时字符不得进输入框");
+    assert!(s.view.input_choice.is_some(), "选择器保持打开");
+}
+
+/// §13 升级：↑ 循环到末尾、↓ 循环回开头。
+#[test]
+fn input_choice_movement_wraps_around() {
+    let mut s = state();
+    s.view.input_choice = Some(choice(vec![("跑测试吗？", vec!["是", "否", "跳过"])]));
+    reducer::update(&mut s, key(KeyCode::Up));
+    assert_eq!(s.view.input_choice.as_ref().unwrap().selected, 2, "↑ 从 0 到末项");
+    reducer::update(&mut s, key(KeyCode::Down));
+    assert_eq!(s.view.input_choice.as_ref().unwrap().selected, 0, "↓ 从末项回 0");
+}
+
+/// §13 升级：选择器模态优先于 run 取消——打开时 Esc 不得产生 CancelRun。
+#[test]
+fn input_choice_esc_does_not_cancel_run() {
+    let mut s = state();
+    s.running = false;
+    s.view.input_choice = Some(choice(vec![("跑测试吗？", vec!["是", "否"])]));
+    let effects = reducer::update(&mut s, key(KeyCode::Esc));
+    assert!(effects.is_empty(), "选择器关闭不得触发取消: {effects:?}");
 }

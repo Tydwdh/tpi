@@ -960,8 +960,12 @@ async fn interactive_loop<P: Provider>(
             conversation.refresh_from_log()?;
             // §13（AGENTS.md）：request_input 挂起 → 记录待回答问题，
             // 用户下一条普通消息即作为回答继续（UserInputReceived 已在此前分支记录）。
+            // 选择器确认的选项也走同一条 pending_messages 路径。
             if outcome.reason == crate::session::CompletionReason::AwaitingUserInput {
-                pending_question = outcome.awaiting_input.clone();
+                pending_question = outcome
+                    .awaiting_input
+                    .as_ref()
+                    .map(|awaiting| awaiting.text.clone());
             }
             // 成功（或正常中断）后清空 retry 目标；ProviderInterrupted 是失败类，
             // 保留以便用户 /retry。
@@ -1846,15 +1850,40 @@ async fn run_interactive<P: Provider>(
                 .push_line(LineKind::System, "run 已取消（Esc）".to_string());
         }
         // §13（AGENTS.md）：request_input 挂起——不是完成也不是失败；
-        // 明确显示模型的问题，提示用户输入回答后继续。
+        // 明确显示模型的问题，提示用户输入回答后继续。多问题渲染为多行：
+        // 逐行 push（每行独立 bound），避免单行超长被截断。
+        // §13 升级：所有问题都带 options 时同时打开键盘选项选择器
+        // （模态覆盖；↑/↓+Enter 选择，Esc 关闭后自由输入）。
         crate::session::CompletionReason::AwaitingUserInput => {
-            let question = outcome
-                .awaiting_input
-                .as_deref()
+            let awaiting = outcome.awaiting_input.as_ref();
+            let question = awaiting
+                .map(|a| a.text.as_str())
                 .unwrap_or("请提供你的输入");
+            ui_state
+                .view
+                .push_line(LineKind::System, "⏸ run 挂起，等待你的输入：".to_string());
+            for line in question.lines() {
+                ui_state.view.push_line(LineKind::System, line.to_string());
+            }
+            // 全部问题都有选项 → 打开键盘选择器（逐题导航，确认后作为回答）。
+            if let Some(questions) = awaiting.map(|a| &a.questions)
+                && !questions.is_empty()
+                && questions.iter().all(|q| !q.options.is_empty())
+            {
+                let items: Vec<crate::tui::model::InputChoiceItem> = questions
+                    .iter()
+                    .map(|q| crate::tui::model::InputChoiceItem {
+                        header: q.header.clone(),
+                        question: q.question.clone(),
+                        options: q.options.clone(),
+                    })
+                    .collect();
+                ui_state.view.input_choice =
+                    Some(crate::tui::model::InputChoiceState::new(items));
+            }
             ui_state.view.push_line(
                 LineKind::System,
-                format!("⏸ run 挂起，等待你的输入：{question}（输入回答后继续）"),
+                "（输入回答后继续；↑/↓ + Enter 可从选项中选择，Esc 关闭后自由输入）".to_string(),
             );
         }
     }
