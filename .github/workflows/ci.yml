@@ -25,6 +25,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
+      # P0-07：架构依赖 gate（tui->app / agent->tui / 新增 global_registry 均拒绝）
+      - name: Architecture gate
+        run: bash scripts/arch_gate.sh
       - run: cargo test --all-targets --all-features
 
   audit:

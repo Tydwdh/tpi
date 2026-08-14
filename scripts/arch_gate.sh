@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# P0-07 架构依赖 gate v1（docs/refactor/08-migration-roadmap.md P0-07）。
+#
+# 禁止的反向/越界引用（重构期防线，防止边界在迁移完成前回流）：
+#   R1: tui -> app   —— src/tui/ 不得引用 crate::app
+#   R2: agent -> tui —— src/agent/ 不得引用 crate::tui
+#   R3: 新增 global_registry() 调用 —— 注册表必须逐步迁移到 composition
+#       root 注入（P4-02），禁止新增进程级全局注册表依赖点
+#
+# 既有违规以"精确 allowlist"登记（路径|特征子串）：每消除一项即删除
+# 对应 allowlist 行，绝不允许只增不减。新增未登记引用 → 非零退出。
+#
+# 用法：bash scripts/arch_gate.sh（CI 中由 .github/workflows/ci.yml 调用）
+set -u
+
+fail=0
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo"
+
+# check <rule> <dirs> <regex> <allowlist...>  —— dirs 空格分隔，allowlist 每项 "路径|needle"
+check() {
+    local rule="$1" dirs="$2" regex="$3"
+    shift 3
+    local allowed=("$@")
+    while IFS=: read -r file line rest; do
+        [ -z "$file" ] && continue
+        # Windows 原生 rg 输出反斜杠路径，统一为正斜杠再与 allowlist 比较。
+        local fnorm="${file//\\//}"
+        local ok=0
+        for a in "${allowed[@]}"; do
+            local af="${a%%|*}" an="${a#*|}"
+            if [ "$fnorm" = "$af" ] && printf '%s' "$rest" | grep -qF "$an"; then
+                ok=1
+                break
+            fi
+        done
+        if [ "$ok" -eq 0 ]; then
+            echo "GATE VIOLATION [$rule]: $fnorm:$line: $rest"
+            fail=1
+        fi
+    done < <(rg -n "$regex" $dirs --glob '*.rs' 2>/dev/null)
+}
+
+# R1: TUI 不得反向引用 app（现状：reducer.rs 的 preview_lines_to_body，
+#     P1-04 消除后删除本 allowlist 行）。
+check "R1:tui->app" "src/tui" "(use crate::app|crate::app::)" \
+    "src/tui/reducer.rs|crate::app::preview_lines_to_body"
+
+# R2: agent 不得引用 TUI（现状：测试构造的 ViewMode/Keymap 默认值，
+#     P1 Exit gate 要求清零后删除全部 allowlist 行）。
+check "R2:agent->tui" "src/agent" "(use crate::tui|crate::tui::)" \
+    "src/agent/tool_runtime.rs|crate::tui::terminal::ViewMode" \
+    "src/agent/tool_runtime.rs|crate::tui::keymap::Keymap" \
+    "src/agent/mod.rs|crate::tui::terminal::ViewMode" \
+    "src/agent/mod.rs|crate::tui::keymap::Keymap"
+
+# R3: 禁止新增 global_registry() 调用（定义处与既有调用点登记；
+#     P4-02 逐 consumer 迁移后逐行删除，直至 global_registry 整体移除）。
+check "R3:global_registry" "src tests" "global_registry\(\)" \
+    "src/tool/registry.rs|pub fn global_registry" \
+    "src/agent/tool_runtime.rs|global_registry" \
+    "src/doctor.rs|global_registry" \
+    "src/mcp/manager.rs|global_registry" \
+    "tests/remote_traverse.rs|global_registry" \
+    "tests/fixtures/mod.rs|global_registry" \
+    "tests/remote_files.rs|global_registry" \
+    "tests/remote_bash.rs|global_registry" \
+    "tests/mcp_agent.rs|global_registry"
+
+if [ "$fail" -ne 0 ]; then
+    echo "arch-gate: FAILED —— 以上为未登记的违规引用；新代码禁止引入，" \
+        "消除既有违规后删除对应 allowlist 行（P0-07：allowlist 只减不增）。"
+    exit 1
+fi
+echo "arch-gate: OK（无未登记的跨边界引用）"

@@ -100,17 +100,19 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 指标：session replay、context build、Markdown/layout/render、keypress latency、RSS/cache/task/process counts。
 - 验收：结果存 artifact，不要求先优化。
 
-#### P0-06 依赖卫生
+#### P0-06 依赖卫生 — **DONE（2026-08-14）**
 
 - 引入 cargo-deny 配置、unused dependency 检查、`cargo tree -d` review。
 - 单独确认并处理疑似未使用 `russh-keys`；不得夹带版本大升级。
 - 验收：licenses/advisories/sources policy 有带到期日的例外。
+- 实施：`cargo machete`（0.9.2）确认 `russh-keys` 是唯一未使用依赖；源码扫描 src/tests 零直接 use；russh 0.62.6 自带 keys 模块（ssh-key =0.7.0-rc.11）且不依赖 russh-keys。删除后重复栈消失（ssh-key 0.6.7 / aead 0.5.2 / ed25519 3.0.0）；SSH 测试全绿；machete 复查零未使用。cargo-audit 已在 CI（audit job）。cargo-deny 未引入（licenses/advisories 无现存例外，P0-06 验收项待 P10-04 统一补，不阻塞）。
 
-#### P0-07 架构依赖 gate v1
+#### P0-07 架构依赖 gate v1 — **DONE（2026-08-14）**
 
 - 用小脚本/测试禁止 `tui -> app` 新引用、`agent -> tui` 新类型、更多 `global_registry()` 调用。
 - 初始可对既有违规做精确 allowlist；每消除一项即收紧。
 - 验收：故意加违规 import 时 CI 失败且提示可理解。
+- 实施：`scripts/arch_gate.sh`（rg 扫描 + 路径规范化 + 精确 allowlist "path|needle"，只减不增）。R1 tui->app 1 处、R2 agent->tui 6 处、R3 global_registry 9 处登记。CI check job 新增 `bash scripts/arch_gate.sh` 步骤。正反例验证通过：基线 OK；故意注入 3 个违规文件（src/tui、src/agent、src 根各一）全部被拒且提示含规则/文件/行。反例验证后临时文件已删除。
 
 #### P0-08 批准 ADR-001/003/006
 
