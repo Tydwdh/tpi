@@ -286,9 +286,12 @@ async fn interactive_loop<P: Provider>(
     use crate::tui::state::UiState;
     use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
+    // P1-05：TUI 是窄视图 UiConfig 的 owner——不直接读 Config 的 ui_* 字段。
+    let ui_cfg = config.ui_config();
+
     let mut renderer = Renderer::new(
-        crate::tui::theme::Theme::named(&config.ui_theme),
-        config.ui_mode,
+        crate::tui::theme::Theme::named(&ui_cfg.theme),
+        ui_cfg.mode,
     )
     .map_err(|e| format!("初始化终端失败: {e}"))?;
     // §31：panic 时尽力恢复终端（不把 Windows Terminal/PowerShell 留在 raw mode）。
@@ -306,7 +309,7 @@ async fn interactive_loop<P: Provider>(
         price_output: config.model.price_output,
         // §用户诉求：卡片折叠时显示的正文行数（[ui] collapsed_lines；
         // 0 = 折叠态只显示主行摘要）。
-        collapsed_lines: config.ui_collapsed_lines,
+        collapsed_lines: ui_cfg.collapsed_lines,
         ..Default::default()
     };
     view.push_line(
@@ -326,7 +329,7 @@ async fn interactive_loop<P: Provider>(
     // §26-27：UiState 是 UI 单一事实源；交互循环只做
     // event → reducer → effects → draw（T3）。
     // §成熟化：注入 `[ui.keymap]` 生效键位（未配置动作保持内建默认）。
-    let mut ui_state = UiState::with_keymap(view, config.ui_keymap.clone());
+    let mut ui_state = UiState::with_keymap(view, ui_cfg.keymap.clone());
     // §用户诉求：右侧边栏默认打开（todo + 用户消息大纲；Ctrl+B 切换）。
     ui_state.view.sidebar.open = true;
     // BUG-006：--continue/--resume 启动时把已加载的 history 重建到屏幕，
@@ -1078,6 +1081,8 @@ fn handle_slash_command(
     mcp_manager: &mut crate::mcp::manager::McpManager,
 ) -> Result<SlashAction, String> {
     use crate::tui::SLASH_COMMANDS;
+    // P1-05：slash 命令的 TUI 展示字段也走窄视图 UiConfig。
+    let ui_cfg = config.ui_config();
     match message {
         "/quit" | "/exit" => Ok(SlashAction::Quit),
         // README2 Phase 3：/mcp 状态页（Server/Status/Tools）+ restart。
@@ -1098,7 +1103,7 @@ fn handle_slash_command(
                 .unwrap_or_else(|| "未配置（自动查找 Git Bash）".to_string());
             // §成熟化：展示 [ui.keymap] 生效绑定（默认 + 自定义合并后）。
             let mut keymap_text = String::new();
-            for (action, keys) in config.ui_keymap.display_bindings() {
+            for (action, keys) in ui_cfg.keymap.display_bindings() {
                 keymap_text.push_str(&format!("  {action}: {keys}\n"));
             }
             ui_state.view.open_modal(
@@ -1122,7 +1127,7 @@ web_search: DuckDuckGo（免费，无需 API key）
                     config.workspace_root,
                     config.sessions_root.display(),
                     config.artifacts_root.display(),
-                    config.ui_theme,
+                    ui_cfg.theme,
                     if config.auto_open_browser {
                         "是"
                     } else {
@@ -1319,7 +1324,7 @@ workspace: {}
                 "/theme",
                 format!(
                     "当前主题: {}（代码高亮随主题联动）\n\n↑/↓ 选择 · Enter 应用并保存到 {} · Esc 取消\n\n注：若 workspace 配置了 [ui] theme，下次启动以 workspace 为准。",
-                    config.ui_theme,
+                    ui_cfg.theme,
                     crate::config::tpi_home().join("config.toml").display(),
                 ),
             );

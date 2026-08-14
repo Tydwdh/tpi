@@ -235,6 +235,96 @@ impl Default for LimitsConfig {
     }
 }
 
+// ---- P1-05：resolved config 的窄视图（每个 owner 只读自己的设置）----
+//
+// `Config` 保留为 composition resolver 的总输出（字段级 merge / unknown
+// rejection / default snapshot 不变）；以下窄视图是从 `Config` 投影的
+// domain-specific resolved views，供各 owner 接收，避免“单个大 config 在
+// 各层透传、每个组件读到不属于自己的设置”（audit Medium-5）。
+// 新代码优先接收窄视图；`Config` 只应在 composition root（main/app 组装）出现。
+
+/// Agent 运行所需配置（model + 护栏 + context 预算 + 指令）。
+#[derive(Debug, Clone)]
+pub struct AgentConfig {
+    pub model: ModelConfig,
+    pub limits: LimitsConfig,
+    pub safety_reserve_tokens: u64,
+    pub system_prompt_extra: Option<String>,
+    pub workspace_root: Utf8PathBuf,
+}
+
+/// 工具执行策略（权限/路径/网络/web 摘要）。
+#[derive(Debug, Clone)]
+pub struct ToolPolicy {
+    pub allow_outside_workspace: bool,
+    pub shell_path: Option<Utf8PathBuf>,
+    pub artifacts_root: std::path::PathBuf,
+    pub sessions_root: std::path::PathBuf,
+    pub auto_open_browser: bool,
+    pub web_summary_model: String,
+}
+
+/// TUI 展示配置（theme/mode/keymap/折叠行数）。
+#[derive(Debug, Clone)]
+pub struct UiConfig {
+    pub theme: String,
+    pub mode: crate::tui::terminal::ViewMode,
+    pub keymap: crate::tui::keymap::Keymap,
+    pub collapsed_lines: usize,
+}
+
+/// 存储路径（workspace/session/artifact）。
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    pub workspace_root: Utf8PathBuf,
+    pub sessions_root: std::path::PathBuf,
+    pub artifacts_root: std::path::PathBuf,
+}
+
+impl Config {
+    /// Agent 视图：agent/context 层只读这一份（不触 UI/tool 策略）。
+    pub fn agent_config(&self) -> AgentConfig {
+        AgentConfig {
+            model: self.model.clone(),
+            limits: self.limits,
+            safety_reserve_tokens: self.safety_reserve_tokens,
+            system_prompt_extra: self.system_prompt_extra.clone(),
+            workspace_root: self.workspace_root.clone(),
+        }
+    }
+
+    /// 工具策略视图：ToolContext/工具执行只读这一份。
+    pub fn tool_policy(&self) -> ToolPolicy {
+        ToolPolicy {
+            allow_outside_workspace: self.allow_outside_workspace,
+            shell_path: self.shell_path.clone(),
+            artifacts_root: self.artifacts_root.clone(),
+            sessions_root: self.sessions_root.clone(),
+            auto_open_browser: self.auto_open_browser,
+            web_summary_model: self.web_summary_model.clone(),
+        }
+    }
+
+    /// TUI 视图：渲染/键位/主题只读这一份。
+    pub fn ui_config(&self) -> UiConfig {
+        UiConfig {
+            theme: self.ui_theme.clone(),
+            mode: self.ui_mode,
+            keymap: self.ui_keymap.clone(),
+            collapsed_lines: self.ui_collapsed_lines,
+        }
+    }
+
+    /// 存储视图：session/artifact 路径。
+    pub fn storage_config(&self) -> StorageConfig {
+        StorageConfig {
+            workspace_root: self.workspace_root.clone(),
+            sessions_root: self.sessions_root.clone(),
+            artifacts_root: self.artifacts_root.clone(),
+        }
+    }
+}
+
 /// 加载配置：合并 ~/.tpi/config.toml 与 workspace .tpi/config.toml。
 ///
 /// 模型配置缺失时返回明确错误（§18.1：不允许看不见的默认模型）。
@@ -773,5 +863,54 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let cfg = load_from_home(&workspace, None, &home).unwrap();
         assert_eq!(cfg.ui_theme, "light");
+    }
+
+    /// P1-05：resolved 窄视图是 Config 的投影——default snapshot 不变
+    /// （各视图字段与 Config 字段逐一一致），字段级 merge / unknown rejection
+    /// 由既有测试（load_rejects_unknown_fields 等）保持。
+    #[test]
+    fn resolved_views_match_config_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().join("workspace")).unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[model.primary]\nprovider = \"p\"\nname = \"m\"\nbase_url = \"https://example.invalid\"\nprice_input = 0.5\n\n[agent.limits]\nmax_model_turns = 10\nmax_parallel_tools = 2\n\n[ui]\ntheme = \"dark\"\ncollapsed_lines = 5\n",
+        )
+        .unwrap();
+        let cfg = load_from_home(&workspace, None, &home).unwrap();
+
+        // Agent 视图：model/limits/context 预算/指令/workspace。
+        let agent = cfg.agent_config();
+        assert_eq!(agent.model.name, cfg.model.name);
+        assert_eq!(agent.limits.max_model_turns, cfg.limits.max_model_turns);
+        assert_eq!(agent.limits.max_parallel_tools, cfg.limits.max_parallel_tools);
+        assert_eq!(agent.safety_reserve_tokens, cfg.safety_reserve_tokens);
+        assert_eq!(agent.system_prompt_extra, cfg.system_prompt_extra);
+        assert_eq!(agent.workspace_root, cfg.workspace_root);
+
+        // 工具策略视图：权限/路径/网络。
+        let policy = cfg.tool_policy();
+        assert_eq!(policy.allow_outside_workspace, cfg.allow_outside_workspace);
+        assert_eq!(policy.shell_path, cfg.shell_path);
+        assert_eq!(policy.artifacts_root, cfg.artifacts_root);
+        assert_eq!(policy.sessions_root, cfg.sessions_root);
+        assert_eq!(policy.auto_open_browser, cfg.auto_open_browser);
+        assert_eq!(policy.web_summary_model, cfg.web_summary_model);
+
+        // TUI 视图。
+        let ui = cfg.ui_config();
+        assert_eq!(ui.theme, cfg.ui_theme);
+        assert_eq!(ui.mode, cfg.ui_mode);
+        assert_eq!(ui.keymap, cfg.ui_keymap);
+        assert_eq!(ui.collapsed_lines, cfg.ui_collapsed_lines);
+
+        // 存储视图。
+        let storage = cfg.storage_config();
+        assert_eq!(storage.workspace_root, cfg.workspace_root);
+        assert_eq!(storage.sessions_root, cfg.sessions_root);
+        assert_eq!(storage.artifacts_root, cfg.artifacts_root);
     }
 }

@@ -288,7 +288,8 @@ pub fn format_key(key: KeyEvent) -> String {
 }
 
 /// 键位映射表：`(code, mods) → action`。
-#[derive(Debug, Clone, Default)]
+/// PartialEq：P1-05 的 UiConfig 投影一致性测试需要比较 keymap。
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Keymap {
     bindings: HashMap<(KeyCode, KeyModifiers), KeyAction>,
 }

@@ -192,7 +192,7 @@ fn doctor_report_with_home(
     let keymap = loaded_config
         .as_ref()
         .ok()
-        .map(|config| config.ui_keymap.clone())
+        .map(|config| config.ui_config().keymap)
         .unwrap_or_else(crate::tui::keymap::Keymap::builtin);
     use crate::tui::keymap::KeyAction;
     let critical = [

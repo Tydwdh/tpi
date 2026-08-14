@@ -66,12 +66,15 @@ impl ToolRuntime {
         // §Phase 5：工具目录 = 进程级共享 registry（builtin + McpManager 注册的
         // MCP 工具）。
         let registry = crate::tool::registry::global_registry();
+        // P1-05：工具执行策略来自窄视图 ToolPolicy（不直接读 Config 的
+        // allow_outside_workspace/artifacts_root/shell_path）。
+        let policy = config.tool_policy();
         Self {
             config: RuntimeConfig {
                 workspace_root: config.workspace_root.clone(),
-                allow_outside_workspace: config.allow_outside_workspace,
-                artifacts_root: config.artifacts_root.clone(),
-                shell_path: config.shell_path.clone(),
+                allow_outside_workspace: policy.allow_outside_workspace,
+                artifacts_root: policy.artifacts_root,
+                shell_path: policy.shell_path,
             },
             cancel,
             session_id,
