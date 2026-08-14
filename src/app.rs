@@ -861,7 +861,6 @@ async fn interactive_loop<P: Provider>(
                     continue;
                 }
             };
-            ui_state.view.add_usage(&outcome.usage);
             // P0-3：统一从 durable log 重建 history（与 -p 路径一致）。
             conversation.refresh_from_log()?;
             last_failed = match outcome.reason {
@@ -956,7 +955,6 @@ async fn interactive_loop<P: Provider>(
                     continue;
                 }
             };
-            ui_state.view.add_usage(&outcome.usage);
             // P0-3：统一从 durable log 重建 history——Cancel/ProviderInterrupted/
             // 正常完成都由 session 事实源投影，杜绝 runtime 与 log 分叉。
             conversation.refresh_from_log()?;

@@ -9,6 +9,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::agent::{DeltaKind, RuntimeEvent};
+use crate::session::Usage;
 use crate::tui::effect::UiEffect;
 use crate::tui::event::UiEvent;
 use crate::tui::keymap::KeyAction;
@@ -517,11 +518,15 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
             output_tokens,
             cache_read_tokens,
         } => {
-            // §用户诉求：缓存命中实时展示（Claude Code 式）——记录最近一次
-            // 请求的输入/命中 token，footer 据此显示本次命中率。
-            view.last_input_tokens = input_tokens;
-            view.last_output_tokens = output_tokens;
-            view.last_cache_read_tokens = cache_read_tokens;
+            // §用户诉求：缓存命中实时展示（Claude Code 式）——每次请求结束就把
+            // usage **实时累加**到累计字段（不等 run 结束），footer 的 ↑↓⇄ 与
+            // 命中率因此始终同口径（修复：此前只存“最近一次”导致累计值旁边
+            // 挂的是本次命中率，口径不一致）。
+            view.add_usage(&Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+            });
         }
         RuntimeEvent::BudgetWarning => {
             // P1-3：接近 wall-time 预算（此前只写日志，用户看不到）。

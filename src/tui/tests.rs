@@ -8,10 +8,11 @@ use crate::tui::reducer;
 use crate::tui::state::UiState;
 use crate::tui::tool_card::{render_diff_lines, tool_name_style};
 
-/// §用户诉求：缓存命中实时展示（Claude Code 式）——UsageUpdated 事件记录
-/// 最近一次请求的输入/命中 token，footer 据此显示本次命中率（不等 run 结束）。
+/// §修复：UsageUpdated 事件实时累加到累计字段（不等 run 结束）——
+/// footer 的 ↑↓⇄ 与缓存命中率因此同口径（累计 cache_read / 累计 input），
+/// 不再出现“累计值旁挂本次命中率”的矛盾（⇄27.1M(33%)）。
 #[test]
-fn usage_updated_records_last_request_cache_hit() {
+fn usage_updated_accumulates_incrementally() {
     let mut state = UiState::new(ViewModel::default());
     reducer::update(
         &mut state,
@@ -21,11 +22,21 @@ fn usage_updated_records_last_request_cache_hit() {
             cache_read_tokens: 600,
         }),
     );
-    assert_eq!(state.view.last_input_tokens, 1000);
-    assert_eq!(state.view.last_output_tokens, 200);
-    assert_eq!(state.view.last_cache_read_tokens, 600);
-    // 累计字段不受影响（run 结束才由 add_usage 累加）。
-    assert_eq!(state.view.cache_read_tokens, 0);
+    assert_eq!(state.view.input_tokens, 1000);
+    assert_eq!(state.view.output_tokens, 200);
+    assert_eq!(state.view.cache_read_tokens, 600);
+    // 第二次（下一轮请求）继续累加，而不是覆盖。
+    reducer::update(
+        &mut state,
+        UiEvent::Agent(crate::agent::RuntimeEvent::UsageUpdated {
+            input_tokens: 500,
+            output_tokens: 100,
+            cache_read_tokens: 300,
+        }),
+    );
+    assert_eq!(state.view.input_tokens, 1500);
+    assert_eq!(state.view.output_tokens, 300);
+    assert_eq!(state.view.cache_read_tokens, 900);
 }
 
 /// §用户诉求：断开重连提示带时间与次数（Claude Code 式）——系统行含

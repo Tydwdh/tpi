@@ -2445,13 +2445,15 @@ fn draw_footer(
         ));
     }
     // §16.2：缓存命中的输入 token（⇄ 标记；减少真实计费输入的直观反馈）。
-    // §用户诉求：Claude Code 式缓存命中显示——累计旁附“最近一次请求命中率”。
+    // §修复：百分比必须与 ⇄ 值同口径——⇄ 显示的是**累计** cache read，
+    // 命中率就用累计 cache_read / 累计 input（provider 的 prompt_tokens 含命中
+    // 部分）；此前用“最近一次请求”的命中率，与累计值矛盾（如 ⇄27.1M(33%)）。
     if view.cache_read_tokens > 0 {
         let mut text = format!(" · ⇄{}", fmt_tokens(view.cache_read_tokens));
-        if view.last_input_tokens > 0 && view.last_cache_read_tokens > 0 {
-            let pct = (view.last_cache_read_tokens as f64
-                / view.last_input_tokens as f64
-                * 100.0) as u64;
+        if view.input_tokens > 0 {
+            let pct = ((view.cache_read_tokens as f64 / view.input_tokens as f64)
+                * 100.0)
+                .min(100.0) as u64;
             text.push_str(&format!("({pct}%)"));
         }
         spans.push(Span::styled(
