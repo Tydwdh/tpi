@@ -30,13 +30,9 @@ async fn setup_connected() -> (tempfile::TempDir, tpi::remote::ssh::SshClient, S
     let mut client = tpi::remote::ssh::SshClient::new(host);
     assert_eq!(client.connect().await.unwrap(), HostKeyDecision::Accepted);
 
-    // 远端 root：POSIX 形式（测试 server exec 在本地 Git Bash 执行）。
-    let posix = std::process::Command::new("cygpath")
-        .arg("-u")
-        .arg(root.path())
-        .output()
-        .expect("cygpath");
-    let root_posix = String::from_utf8(posix.stdout).unwrap().trim().to_string();
+    // 远端 root：POSIX 形式（测试 server exec 在本地 Git Bash 执行）；
+    // 纯 Rust 转换，与 fixture server 用同一实现，不依赖 cygpath。
+    let root_posix = fixtures::remote_server::win_to_posix(root.path());
     (root, client, root_posix)
 }
 

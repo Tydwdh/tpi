@@ -29,12 +29,7 @@ async fn setup_connected() -> (tempfile::TempDir, tpi::remote::ssh::SshClient, S
     let mut client = tpi::remote::ssh::SshClient::new(host);
     assert_eq!(client.connect().await.unwrap(), HostKeyDecision::Accepted);
 
-    let posix = std::process::Command::new("cygpath")
-        .arg("-u")
-        .arg(root.path())
-        .output()
-        .expect("cygpath");
-    let root_posix = String::from_utf8(posix.stdout).unwrap().trim().to_string();
+    let root_posix = fixtures::remote_server::win_to_posix(root.path());
     (root, client, root_posix)
 }
 

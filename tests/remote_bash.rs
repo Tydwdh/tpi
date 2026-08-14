@@ -35,15 +35,7 @@ async fn setup_remote_ctx() -> (tempfile::TempDir, tpi::tool::ToolContext) {
     host.password = Some(fixtures::remote_server::TEST_PASSWORD.into());
     // 远端 root 用 POSIX 形式（远端是 Linux，路径本就 POSIX；测试 server 的
     // exec 在本地 Git Bash 执行，cd 用 msys 路径才能与 $PWD 保持一致）。
-    let posix = std::process::Command::new("cygpath")
-        .arg("-u")
-        .arg(root.path())
-        .output()
-        .expect("cygpath 可用");
-    let root_posix = String::from_utf8(posix.stdout)
-        .expect("utf8")
-        .trim()
-        .to_string();
+    let root_posix = fixtures::remote_server::win_to_posix(root.path());
     let root_path = Utf8PathBuf::from(root_posix);
     let remote = RemoteWorkspace::new(host, root_path.clone());
     let active = ActiveWorkspace::remote(remote.clone());

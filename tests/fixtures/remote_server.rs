@@ -386,6 +386,38 @@ impl russh_sftp::server::Handler for SftpBackend {
     }
 }
 
+/// Windows 路径 → msys/Git Bash POSIX 形式（`cygpath -u` 的最小等价实现）。
+///
+/// - `C:\foo\bar` → `/c/foo/bar`（盘符小写）；
+/// - `\\server\share\foo` → `//server/share/foo`（UNC）；
+/// - 已是 POSIX 绝对路径（如 Linux 的 `/tmp/.tmpXXX`）→ 原样返回。
+///
+/// 只用于测试 fixture：server 与各 remote 测试用**同一**转换，保证绝对
+/// 路径前缀匹配一致；不依赖外部 `cygpath`（P0-02：消除隐式工具前提，
+/// Windows 无 Git Bash 时也能跑 remote 测试）。
+pub fn win_to_posix(path: &Path) -> String {
+    let s = path.to_string_lossy().replace('\\', "/");
+    if s.starts_with("//") {
+        return s; // UNC：已是 //server/share
+    }
+    if s.starts_with('/') {
+        return s; // 已是 POSIX 绝对路径
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        let drive = bytes[0].to_ascii_lowercase() as char;
+        // 对齐 cygpath：`C:` → `/c`，`C:/`（盘符根）→ `/c/`。
+        let tail = &s[2..];
+        if tail.is_empty() {
+            format!("/{drive}")
+        } else {
+            format!("/{drive}/{}", tail.trim_start_matches('/'))
+        }
+    } else {
+        s
+    }
+}
+
 /// 启动一个测试 SSH server，返回 (port, tempdir_root, known_hosts 文件路径)。
 pub async fn start_test_server() -> (u16, tempfile::TempDir, PathBuf) {
     let root = tempfile::tempdir().unwrap();
@@ -402,16 +434,8 @@ pub async fn start_test_server() -> (u16, tempfile::TempDir, PathBuf) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let root_path = Arc::new(root.path().to_path_buf());
-    // 远端 POSIX root（msys 形式，供绝对路径映射）。
-    let posix_out = std::process::Command::new("cygpath")
-        .arg("-u")
-        .arg(root.path())
-        .output()
-        .expect("cygpath");
-    let posix_root = String::from_utf8(posix_out.stdout)
-        .expect("utf8")
-        .trim()
-        .to_string();
+    // 远端 POSIX root（msys 形式，供绝对路径映射）；纯 Rust 转换，不依赖 cygpath。
+    let posix_root = win_to_posix(root.path());
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -437,4 +461,42 @@ pub async fn test_client(port: u16, known_hosts: &Path) -> SshClient {
     host.known_hosts_path = known_hosts.to_path_buf();
     host.password = Some(TEST_PASSWORD.into());
     SshClient::new(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::win_to_posix;
+    use std::path::Path;
+
+    #[test]
+    fn win_to_posix_drive_letter() {
+        assert_eq!(
+            win_to_posix(Path::new("C:\\Users\\foo\\Temp\\abc")),
+            "/c/Users/foo/Temp/abc"
+        );
+        // 正斜杠输入与大小写混用也应归一化盘符。
+        assert_eq!(win_to_posix(Path::new("D:/Work/x.rs")), "/d/Work/x.rs");
+    }
+
+    #[test]
+    fn win_to_posix_unc() {
+        assert_eq!(
+            win_to_posix(Path::new("\\\\server\\share\\dir")),
+            "//server/share/dir"
+        );
+    }
+
+    #[test]
+    fn win_to_posix_already_posix() {
+        // Linux 上 tempdir 即 POSIX 绝对路径，必须原样返回。
+        assert_eq!(win_to_posix(Path::new("/tmp/.tmpXYZ")), "/tmp/.tmpXYZ");
+        assert_eq!(win_to_posix(Path::new("relative")), "relative");
+    }
+
+    #[test]
+    fn win_to_posix_drive_root() {
+        // 对齐 cygpath：`C:` → `/c`，`C:/`（盘符根）→ `/c/`。
+        assert_eq!(win_to_posix(Path::new("C:\\")), "/c/");
+        assert_eq!(win_to_posix(Path::new("C:")), "/c");
+    }
 }

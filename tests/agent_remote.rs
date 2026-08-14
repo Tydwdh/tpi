@@ -37,13 +37,9 @@ async fn setup_remote_workspace() -> (tempfile::TempDir, tpi::workspace::ActiveW
     let mut host = RemoteHost::direct("127.0.0.1", port, "test");
     host.known_hosts_path = known_hosts;
     host.password = Some(fixtures::remote_server::TEST_PASSWORD.into());
-    // 远端 root：POSIX（远端 Linux；测试 server exec 在本地 Git Bash 执行）。
-    let posix = std::process::Command::new("cygpath")
-        .arg("-u")
-        .arg(root.path())
-        .output()
-        .expect("cygpath");
-    let root_posix = String::from_utf8(posix.stdout).unwrap().trim().to_string();
+    // 远端 root：POSIX（远端 Linux；测试 server exec 在本地 Git Bash 执行）；
+    // 纯 Rust 转换，与 fixture server 用同一实现，不依赖 cygpath。
+    let root_posix = fixtures::remote_server::win_to_posix(root.path());
     let remote = RemoteWorkspace::new(host, Utf8PathBuf::from(root_posix));
     (root, ActiveWorkspace::remote(remote))
 }
