@@ -615,6 +615,9 @@ mod tests {
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::tool::registry::ToolRegistry::new(),
+            )),
             interactive: false,
             allow_outside_workspace: true,
         };
@@ -677,6 +680,9 @@ mod tests {
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::tool::registry::ToolRegistry::new(),
+            )),
             interactive: false,
             allow_outside_workspace: true,
         };
@@ -733,6 +739,9 @@ mod tests {
             current_plan: Default::default(),
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
+            )),
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::tool::registry::ToolRegistry::new(),
             )),
             interactive: false,
             allow_outside_workspace: true,

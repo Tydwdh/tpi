@@ -389,6 +389,8 @@ fn stats_from_events(events: &[(i128, SessionEvent)]) -> EvalStats {
     for (ts, event) in events {
         match event {
             SessionEvent::UserSubmitted { .. } => start_ts = Some(*ts),
+            // §13：挂起请求/回答不是独立指标（run 挂起不计入 turns）。
+            SessionEvent::UserInputRequested { .. } | SessionEvent::UserInputReceived { .. } => {}
             SessionEvent::RunStarted { .. } => stats.run_calls += 1,
             SessionEvent::AssistantMessageCommitted { .. } => stats.turns += 1,
             // 中断的 attempt 不是完整 turn：不计入 turns（§4.3 语义区分）。

@@ -663,6 +663,9 @@ async fn interactive_loop<P: Provider>(
     // `/retry` 目标：上一次因 provider 失败而中断的 turn。
     // reason 决定是否先移除 TUI 中未提交的 partial；成功后必须清空。
     let mut last_failed: Option<RetryTarget> = None;
+    // §13（AGENTS.md）：run 因 request_input 挂起时，模型提出的问题；
+    // 用户下一条普通消息即是对该问题的回答（记录 UserInputReceived 后继续）。
+    let mut pending_question: Option<String> = None;
     // §InteractionRefactor：统一指针状态机（idle 与 run 共用），
     // 取代旧的 mouse_down/drag_selecting 两套路径。
     let mut pointer_gesture = crate::tui::interaction::PointerGesture::default();
@@ -896,8 +899,20 @@ async fn interactive_loop<P: Provider>(
                 .map_err(|e| e.to_string())?;
 
             conversation.ensure_started(&config.sessions_root, &config.workspace_root)?;
+            // §13：若上一个 run 因 request_input 挂起，本次提交就是对该问题的回答
+            // ——app 层先记录 UserInputReceived（durable 事实），再以普通 User
+            // 消息继续（投影 + 完整历史）。
+            let resume_answer = pending_question.take().map(|_| message.clone());
             let run_result = {
                 let (session_log, history) = conversation.parts_for_run()?;
+                if let Some(answer) = &resume_answer {
+                    session_log
+                        .append_event(&SessionEvent::UserInputReceived {
+                            content: answer.clone(),
+                        })
+                        .and_then(|_| session_log.sync_data())
+                        .map_err(|e| e.to_string())?;
+                }
                 run_interactive(
                     provider,
                     session_log,
@@ -945,6 +960,11 @@ async fn interactive_loop<P: Provider>(
             // P0-3：统一从 durable log 重建 history——Cancel/ProviderInterrupted/
             // 正常完成都由 session 事实源投影，杜绝 runtime 与 log 分叉。
             conversation.refresh_from_log()?;
+            // §13（AGENTS.md）：request_input 挂起 → 记录待回答问题，
+            // 用户下一条普通消息即作为回答继续（UserInputReceived 已在此前分支记录）。
+            if outcome.reason == crate::session::CompletionReason::AwaitingUserInput {
+                pending_question = outcome.awaiting_input.clone();
+            }
             // 成功（或正常中断）后清空 retry 目标；ProviderInterrupted 是失败类，
             // 保留以便用户 /retry。
             match outcome.reason {
@@ -1826,6 +1846,18 @@ async fn run_interactive<P: Provider>(
             ui_state
                 .view
                 .push_line(LineKind::System, "run 已取消（Esc）".to_string());
+        }
+        // §13（AGENTS.md）：request_input 挂起——不是完成也不是失败；
+        // 明确显示模型的问题，提示用户输入回答后继续。
+        crate::session::CompletionReason::AwaitingUserInput => {
+            let question = outcome
+                .awaiting_input
+                .as_deref()
+                .unwrap_or("请提供你的输入");
+            ui_state.view.push_line(
+                LineKind::System,
+                format!("⏸ run 挂起，等待你的输入：{question}（输入回答后继续）"),
+            );
         }
     }
     ui_state.view.status = StatusLine::Idle;

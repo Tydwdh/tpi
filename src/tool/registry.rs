@@ -75,6 +75,24 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
+    /// 注册并返回 RAII 句柄（Cordis revertible effect 的 Rust 版本：谁注册谁
+    /// 清理）。句柄 Drop（或 [`ToolRegistration::unregister`]）时自动从 registry
+    /// 移除该工具——MCP server 重启/关闭只需 drop 句柄，不再按名字前缀扫描。
+    ///
+    /// 需要 `Arc<Mutex<Self>>`：Drop 清理必须能访问 registry；`&mut self` 的
+    /// [`ToolRegistry::register`] 留给进程级/内置注册（生命周期与 registry 同长）。
+    pub fn register_owned(
+        registry: &Arc<std::sync::Mutex<ToolRegistry>>,
+        tool: Arc<dyn Tool>,
+    ) -> ToolRegistration {
+        let name = tool.name().to_string();
+        registry.lock().unwrap().register(tool);
+        ToolRegistration {
+            registry: Some(registry.clone()),
+            name,
+        }
+    }
+
     pub fn unregister(&mut self, name: &str) {
         self.tools.remove(name);
     }
@@ -194,6 +212,32 @@ pub fn builtin_registry() -> ToolRegistry {
     registry
 }
 
+/// RAII 注册句柄（AGENTS.md §11/§12：revertible effect / PluginScope 的最小机制）。
+///
+/// 持有注册目标 registry 的 `Arc` 与工具名；`Drop` 时执行注销（幂等）。
+/// 生命周期由所有权决定：scope/manager 持有句柄，句柄 drop = 工具消失，
+/// 不依赖任何 runtime 依赖图或反注册回调注册表。
+#[must_use]
+pub struct ToolRegistration {
+    registry: Option<Arc<std::sync::Mutex<ToolRegistry>>>,
+    name: String,
+}
+
+impl ToolRegistration {
+    /// 主动注销（幂等）；`Drop` 也会注销。
+    pub fn unregister(&mut self) {
+        if let Some(registry) = self.registry.take() {
+            registry.lock().unwrap().unregister(&self.name);
+        }
+    }
+}
+
+impl Drop for ToolRegistration {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
+
 /// 进程级共享 ToolRegistry（README2 Phase 5）：McpManager 启动时注册 MCP
 /// 工具，agent 的 ToolRuntime 读取同一目录——MCP 工具自动进入 agent loop。
 pub fn global_registry() -> Arc<std::sync::Mutex<ToolRegistry>> {
@@ -251,6 +295,9 @@ mod tests {
             )),
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
+            )),
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::tool::registry::ToolRegistry::new(),
             )),
             interactive: false,
         };

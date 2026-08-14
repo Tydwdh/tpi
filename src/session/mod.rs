@@ -69,6 +69,9 @@ pub enum CompletionReason {
     /// 工具调用预算超限（P1-2：与 Error 区分，UI 可明确提示）。
     MaxToolCalls,
     Cancelled,
+    /// §13（AGENTS.md）：模型请求用户输入后 run 挂起——等待输入**不等于**完成。
+    /// 用户回答以 `UserInputReceived` 记录，后续 run 继续；事件对完整保留。
+    AwaitingUserInput,
     /// 压缩与 prune 后上下文仍超出模型窗口（P1-4：不再发起必然失败的请求）。
     ContextOverflow,
     /// §16：wall-clock 预算到期被 watchdog 自动取消（不是用户取消）。
@@ -134,6 +137,16 @@ pub enum SessionEvent {
     UserSubmitted {
         content: String,
     },
+    /// §13（AGENTS.md）：模型通过 `request_input` 请求用户输入（run 挂起）。
+    /// 与 [`SessionEvent::UserInputReceived`] 成对；`prompt` 是模型提出的问题。
+    UserInputRequested {
+        prompt: String,
+    },
+    /// §13：用户对挂起问题的回答（durable 事实；对话投影仍由 UserSubmitted 承担，
+    /// 该事件是“这是对挂起请求的响应”这一语义的记录）。
+    UserInputReceived {
+        content: String,
+    },
     RunStarted {
         model: ModelRef,
         limits: RunLimits,
@@ -180,6 +193,8 @@ impl SessionEvent {
     pub fn type_name(&self) -> &'static str {
         match self {
             SessionEvent::UserSubmitted { .. } => "user_submitted",
+            SessionEvent::UserInputRequested { .. } => "user_input_requested",
+            SessionEvent::UserInputReceived { .. } => "user_input_received",
             SessionEvent::RunStarted { .. } => "run_started",
             SessionEvent::AssistantMessageCommitted { .. } => "assistant_message_committed",
             SessionEvent::AssistantAttemptInterrupted { .. } => "assistant_attempt_interrupted",
@@ -213,6 +228,12 @@ pub enum EventBody {
     UserSubmitted {
         payload: UserSubmittedPayload,
     },
+    UserInputRequested {
+        payload: UserInputRequestedPayload,
+    },
+    UserInputReceived {
+        payload: UserInputReceivedPayload,
+    },
     RunStarted {
         payload: RunStartedPayload,
     },
@@ -244,6 +265,16 @@ pub enum EventBody {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserSubmittedPayload {
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserInputRequestedPayload {
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserInputReceivedPayload {
     pub content: String,
 }
 
@@ -305,6 +336,16 @@ impl Envelope {
         let body = match event {
             SessionEvent::UserSubmitted { content } => EventBody::UserSubmitted {
                 payload: UserSubmittedPayload {
+                    content: content.clone(),
+                },
+            },
+            SessionEvent::UserInputRequested { prompt } => EventBody::UserInputRequested {
+                payload: UserInputRequestedPayload {
+                    prompt: prompt.clone(),
+                },
+            },
+            SessionEvent::UserInputReceived { content } => EventBody::UserInputReceived {
+                payload: UserInputReceivedPayload {
                     content: content.clone(),
                 },
             },
@@ -394,6 +435,12 @@ impl Envelope {
     pub fn to_session_event(&self) -> SessionEvent {
         match &self.body {
             EventBody::UserSubmitted { payload } => SessionEvent::UserSubmitted {
+                content: payload.content.clone(),
+            },
+            EventBody::UserInputRequested { payload } => SessionEvent::UserInputRequested {
+                prompt: payload.prompt.clone(),
+            },
+            EventBody::UserInputReceived { payload } => SessionEvent::UserInputReceived {
                 content: payload.content.clone(),
             },
             EventBody::RunStarted { payload } => SessionEvent::RunStarted {

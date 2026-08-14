@@ -82,6 +82,7 @@ pub fn test_tool_context(workspace_root: &Utf8PathBuf) -> tpi::tool::ToolContext
         processes: std::sync::Arc::new(std::sync::Mutex::new(
             tpi::process::managed::ProcessRegistry::new(),
         )),
+        registry: tpi::tool::registry::global_registry(),
         interactive: true,
         allow_outside_workspace: true,
     }

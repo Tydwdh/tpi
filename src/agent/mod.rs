@@ -13,7 +13,11 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 
 pub mod limits;
-pub mod scheduler;
+/// 调度原语（§12：资源声明 / waves / 无进展检测）物理上属于 tool 领域
+/// （src/tool/scheduler.rs）。此处 re-export 仅兼容既有 `agent::scheduler`
+/// 引用（测试契约）；新代码请直接用 `crate::tool::scheduler`，
+/// 测试引用迁移完成后删除本行（AGENTS.md §27 清理）。
+pub use crate::tool::scheduler as scheduler;
 mod tool_runtime;
 use self::tool_runtime::{BatchEnd, ToolBatchExecutor, ToolRuntime};
 use crate::ids::{EventId, RequestId, ToolCallId};
@@ -84,6 +88,9 @@ pub struct AgentOutcome {
     pub messages: Vec<ChatMessage>,
     /// 最终 assistant 文本（UI 展示）。
     pub assistant_text: String,
+    /// §13（AGENTS.md）：run 因 `request_input` 挂起时，模型提出的问题文本
+    /// （TUI 显示并等待用户回答；非挂起为 None）。
+    pub awaiting_input: Option<String>,
 }
 
 /// Inputs that describe one agent run independently of its provider, session,
@@ -396,8 +403,10 @@ pub async fn run<P: Provider>(
     let tool_defs: Vec<crate::provider::ToolDef> = tool_runtime.active_tool_defs(&user_message);
 
     let mut assistant_text = String::new();
+    // §13：`request_input` 挂起时模型的问题（随 AgentOutcome 返回给 app 层显示）。
+    let mut awaiting_input: Option<String> = None;
     // §12.3：确定性无进展检测（不调用额外模型）。
-    let mut progress = crate::agent::scheduler::ProgressTracker::default();
+    let mut progress = crate::tool::scheduler::ProgressTracker::default();
     // §15.4：同一阈值区间内 compaction 失败后不反复调用模型。
     let mut compaction_failed = false;
     let final_reason: CompletionReason = 'run_loop: loop {
@@ -871,6 +880,26 @@ pub async fn run<P: Provider>(
                 &mut usage_total,
             )
             .await?;
+            if let BatchEnd::SuspendRequested { question } = batch {
+                // §13（AGENTS.md）：request_input 成功 → run 在该点挂起。
+                // 记录 UserInputRequested（durable 事实）+ RunCompleted
+                // (AwaitingUserInput)——等待用户输入**不等于** run 完成。
+                session
+                    .append_event(&SessionEvent::UserInputRequested {
+                        prompt: question.clone(),
+                    })
+                    .and_then(|_| session.sync_data())
+                    .map_err(|e| RunFailure::Session(e.to_string()))?;
+                session
+                    .append_event(&SessionEvent::RunCompleted {
+                        reason: CompletionReason::AwaitingUserInput,
+                        usage: usage_total,
+                    })
+                    .and_then(|_| session.sync_data())
+                    .map_err(|e| RunFailure::Session(e.to_string()))?;
+                awaiting_input = Some(question);
+                break 'run_loop CompletionReason::AwaitingUserInput;
+            }
             if batch == BatchEnd::BudgetExceeded {
                 // P1-2：工具预算超限用独立 reason（此前归为 Error，
                 // 用户/模型会误以为是协议错误）。
@@ -921,6 +950,7 @@ pub async fn run<P: Provider>(
         usage: usage_total,
         messages,
         assistant_text,
+        awaiting_input,
     })
 }
 

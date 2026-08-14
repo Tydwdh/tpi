@@ -1,4 +1,4 @@
-//! 基于资源访问声明的工具调度。
+//! 基于资源访问声明的工具调度（ToolExecutor 的调度层，纯函数）。
 //!
 //! - §12.1 资源访问声明：read/list/search 生成 read lock；edit/write 生成 write lock；
 //!   run/bash 记为 `WorkspaceUnknown`（按源顺序串行）。
@@ -7,6 +7,10 @@
 //!   按源顺序执行；结果按原 call index 送回 provider。
 //! - §12.3 无进展检测：`ActionKey + ObservationKey + StateStamp` 相同才算重复；
 //!   默认连续 2 次后，第 3 次执行前返回 `repeated_without_progress`。
+//!
+//! 边界（AGENTS.md §十）：本模块只做**纯状态转换与声明推导**——无 IO、无 session、
+//! 无 provider 依赖。实际执行、持久化与 UI 通知由 ToolExecutor（agent/tool_runtime.rs
+//! 的 ToolBatchExecutor）在 waves 之上编排；AgentLoop 只提供 calls 与预算计数。
 
 use std::collections::HashMap;
 

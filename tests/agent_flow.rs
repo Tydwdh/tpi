@@ -458,3 +458,160 @@ async fn final_turn_injects_wrapup_instruction() {
     // 收尾轮后若再调工具，下一轮触发 MaxTurns；本测试第 2 轮直接 stop。
     assert_eq!(outcome.reason, CompletionReason::Stop);
 }
+
+/// AGENTS.md §13：`request_input` 使 run 真正挂起（不是完成）——
+/// session 记录 `user_input_requested` + `run_completed(AwaitingUserInput)`，
+/// outcome 携带模型的问题文本。
+#[tokio::test]
+async fn request_input_suspends_run_with_durable_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = FakeProvider::new(vec![FakeResponse::with_tool_calls(vec![
+        fixtures::fake_provider::tool_call(
+            "request_input",
+            serde_json::json!({"question": "要运行完整测试套件吗？"}),
+        ),
+    ])]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, _rx) = mpsc::channel(32);
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "需要你确认一下".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+            workspace: None,
+        },
+    )
+    .await
+    .expect("run succeeds");
+
+    // 挂起：reason + 问题文本。
+    assert_eq!(outcome.reason, CompletionReason::AwaitingUserInput);
+    assert_eq!(outcome.awaiting_input.as_deref(), Some("要运行完整测试套件吗？"));
+
+    // session 事实：request_input 是工具调用（ToolRequested/ToolCompleted），
+    // 之后 user_input_requested + run_completed(AwaitingUserInput)。
+    let events = read_events(session.path()).expect("read session");
+    let types: Vec<&str> = events.iter().map(SessionEvent::type_name).collect();
+    assert!(
+        types.contains(&"user_input_requested"),
+        "缺少 user_input_requested: {types:?}"
+    );
+    assert!(types.contains(&"tool_requested"), "{types:?}");
+    assert!(types.contains(&"tool_completed"), "{types:?}");
+    let last = events.last().expect("run_completed");
+    assert!(matches!(
+        last,
+        SessionEvent::RunCompleted {
+            reason: CompletionReason::AwaitingUserInput,
+            ..
+        }
+    ));
+}
+
+/// AGENTS.md §13：挂起后用户回答 → `user_input_received` 记录，
+/// 后续 run 带着完整历史继续（reason 正常完成）。
+#[tokio::test]
+async fn resume_after_suspend_records_input_and_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+
+    // 第一次 run：模型请求输入 → 挂起。
+    let mut provider = FakeProvider::new(vec![FakeResponse::with_tool_calls(vec![
+        fixtures::fake_provider::tool_call(
+            "request_input",
+            serde_json::json!({"question": "要跑测试吗？"}),
+        ),
+    ])]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, _rx) = mpsc::channel(32);
+    let outcome1 = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "确认一下".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+            workspace: None,
+        },
+    )
+    .await
+    .expect("run succeeds");
+    assert_eq!(outcome1.reason, CompletionReason::AwaitingUserInput);
+
+    // 模拟 app 层：用户回答 → 先记录 UserInputReceived（durable 事实）。
+    session
+        .append_event(&SessionEvent::UserInputReceived {
+            content: "跑吧".into(),
+        })
+        .and_then(|_| session.sync_data())
+        .expect("append user input received");
+
+    // 第二次 run：resume（history 从 session 重建；user_message = 回答）。
+    let history = tpi::session::replay_messages(session.path()).expect("replay");
+    let mut provider2 = FakeProvider::new(vec![FakeResponse::text("好的，开始跑测试")]);
+    let (tx2, _rx2) = mpsc::channel(32);
+    let outcome2 = agent::run(
+        &mut provider2,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &history,
+            user_message: "跑吧".into(),
+            ui: tx2,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+            workspace: None,
+        },
+    )
+    .await
+    .expect("resume run succeeds");
+    assert_eq!(outcome2.reason, CompletionReason::Stop);
+    assert_eq!(outcome2.awaiting_input, None);
+
+    // session 完整保留请求/回答事件对；resume 的模型请求能看到
+    // request_input 的工具结果与用户的回答（上下文连续）。
+    let events = read_events(session.path()).expect("read session");
+    let types: Vec<&str> = events.iter().map(SessionEvent::type_name).collect();
+    assert!(
+        types.contains(&"user_input_requested") && types.contains(&"user_input_received"),
+        "请求/回答事件对必须都保留: {types:?}"
+    );
+    let resume_request = provider2.requests.last().expect("resume request");
+    let joined: Vec<String> = resume_request
+        .messages
+        .iter()
+        .map(|m| match m {
+            ChatMessage::User(text) | ChatMessage::System(text) => text.clone(),
+            ChatMessage::Assistant { content, .. } => content.clone(),
+            ChatMessage::Tool { content, .. } => content.clone(),
+        })
+        .collect();
+    let joined = joined.join("\n");
+    assert!(joined.contains("要跑测试吗"), "resume 上下文应含问题: {joined}");
+    assert!(joined.contains("跑吧"), "resume 上下文应含用户回答: {joined}");
+}

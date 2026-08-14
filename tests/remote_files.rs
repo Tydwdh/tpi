@@ -60,6 +60,7 @@ fn remote_ctx(root_posix: &str) -> tpi::tool::ToolContext {
         shell: remote.shell.clone(),
         workspace: Arc::new(Mutex::new(active)),
         processes: Arc::new(Mutex::new(tpi::process::managed::ProcessRegistry::new())),
+        registry: tpi::tool::registry::global_registry(),
         interactive: false,
     }
 }

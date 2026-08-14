@@ -155,27 +155,38 @@ impl ToolRuntime {
             shell: self.shell.clone(),
             workspace: self.workspace.clone(),
             processes: self.processes.clone(),
+            registry: self.registry.clone(),
             interactive: self.interactive,
         }
     }
 }
 /// batch 执行结果（§12.4：预算超限时明确结束）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum BatchEnd {
     Continue,
     BudgetExceeded,
+    /// §13（AGENTS.md）：本批中的 `request_input` 成功调用——run 应在该点
+    /// 挂起（记录 UserInputRequested），而不是继续下一轮模型请求。
+    SuspendRequested { question: String },
 }
 
 /// Owns the mutable boundary of one tool-call batch.
 ///
-/// The model-turn state machine only supplies calls and a budget counter; tool
-/// persistence, scheduling, progress detection, UI events, and result injection
-/// remain cohesive inside this module.
+/// This is the **ToolExecutor** deep module (AGENTS.md §十): the model-turn
+/// state machine only supplies calls and a budget counter; tool persistence,
+/// scheduling (waves), progress detection, write-ahead recovery, cancellation,
+/// output normalization, UI events, and result injection remain cohesive here.
+///
+/// Pipeline (all hidden from the caller):
+/// pre-check all args → build waves (`tool::scheduler`) → write-ahead
+/// (ToolStarted/RecoveryMetadata) → execute wave (parallel Pure/Read, serial
+/// Write/WorkspaceUnknown) → observe (no-progress) → persist (ToolCompleted)
+/// → refill results by source index.
 pub(super) struct ToolBatchExecutor<'a> {
     config: &'a Config,
     session: &'a mut SessionLog,
     messages: &'a mut Vec<ChatMessage>,
-    progress: &'a mut crate::agent::scheduler::ProgressTracker,
+    progress: &'a mut crate::tool::scheduler::ProgressTracker,
     runtime: &'a ToolRuntime,
     ui: &'a mpsc::Sender<RuntimeEvent>,
 }
@@ -185,7 +196,7 @@ impl<'a> ToolBatchExecutor<'a> {
         config: &'a Config,
         session: &'a mut SessionLog,
         messages: &'a mut Vec<ChatMessage>,
-        progress: &'a mut crate::agent::scheduler::ProgressTracker,
+        progress: &'a mut crate::tool::scheduler::ProgressTracker,
         runtime: &'a ToolRuntime,
         ui: &'a mpsc::Sender<RuntimeEvent>,
     ) -> Self {
@@ -224,7 +235,7 @@ async fn execute_batch<P: Provider>(
     tool_calls_total: &mut u32,
     usage_total: &mut Usage,
 ) -> Result<BatchEnd, RunFailure> {
-    use crate::agent::scheduler::{
+    use crate::tool::scheduler::{
         PreparedCall, ToolAccess, action_key, action_key_from_name, build_waves,
         stable_observation, state_stamp_from_ctx,
     };
@@ -287,7 +298,7 @@ async fn execute_batch<P: Provider>(
             if let Some(adapter) = tool_runtime.registry.lock().unwrap().get(&call.name) {
                 prepared.push(PreparedCall {
                     source_index: index,
-                    kind: crate::agent::scheduler::PreparedKind::External {
+                    kind: crate::tool::scheduler::PreparedKind::External {
                         name: call.name.clone(),
                         args_json: call.arguments.clone(),
                         adapter,
@@ -311,7 +322,7 @@ async fn execute_batch<P: Provider>(
         };
         match tool.parse_args(&call.arguments) {
             Ok(args) => {
-                let access = crate::agent::scheduler::tool_access(
+                let access = crate::tool::scheduler::tool_access(
                     tool,
                     &args,
                     &config.workspace_root,
@@ -326,7 +337,7 @@ async fn execute_batch<P: Provider>(
                 );
                 prepared.push(PreparedCall {
                     source_index: index,
-                    kind: crate::agent::scheduler::PreparedKind::Builtin { tool, args },
+                    kind: crate::tool::scheduler::PreparedKind::Builtin { tool, args },
                     access,
                     action_key: action_key(tool, &call.arguments),
                     plan,
@@ -381,14 +392,14 @@ error: invalid_arguments
         for call in &wave {
             let source = &calls[call.source_index];
             let requires_wa = match &call.kind {
-                crate::agent::scheduler::PreparedKind::Builtin { tool, .. } => {
+                crate::tool::scheduler::PreparedKind::Builtin { tool, .. } => {
                     tool.requires_write_ahead()
                 }
-                crate::agent::scheduler::PreparedKind::External { .. } => false,
+                crate::tool::scheduler::PreparedKind::External { .. } => false,
             };
             // §10.7：复用预检阶段生成的同一 plan（temp/backup 路径一致）。
             let recovery = if requires_wa {
-                if let crate::agent::scheduler::PreparedKind::Builtin { tool, .. } = call.kind {
+                if let crate::tool::scheduler::PreparedKind::Builtin { tool, .. } = call.kind {
                     recovery_metadata(
                         tool,
                         source,
@@ -481,10 +492,10 @@ error: invalid_arguments
                     (source_index, outcome.into_stored())
                 } else {
                     let outcome = match kind {
-                        crate::agent::scheduler::PreparedKind::Builtin { tool, args } => {
+                        crate::tool::scheduler::PreparedKind::Builtin { tool, args } => {
                             tool::execute(tool, args, &ctx, plan.as_ref()).await
                         }
-                        crate::agent::scheduler::PreparedKind::External {
+                        crate::tool::scheduler::PreparedKind::External {
                             name: _,
                             args_json,
                             adapter,
@@ -524,7 +535,7 @@ error: invalid_arguments
                     .iter()
                     .find(|p| p.source_index == index)
                     .map(|p| p.access.clone())
-                    .unwrap_or(crate::agent::scheduler::ToolAccess::Pure);
+                    .unwrap_or(crate::tool::scheduler::ToolAccess::Pure);
                 let ctx = tool_runtime.context(calls[index].call_id, None);
                 format!(
                     "{}|{}",
@@ -597,6 +608,32 @@ error: invalid_arguments
             results.insert(index, outcome);
         }
         stream_forwarder.abort();
+
+        // §13（AGENTS.md）：本 wave 含 `request_input` 且成功 → run 挂起。
+        // 该 wave 的工具结果已全部持久化（ToolRequested/ToolCompleted），
+        // 后续 wave 不再执行；由 agent run 记录 UserInputRequested 并结束。
+        let suspend_question = wave.iter().find_map(|call| {
+            let source = &calls[call.source_index];
+            if source.name != "request_input" {
+                return None;
+            }
+            let succeeded = results
+                .get(&call.source_index)
+                .is_some_and(|outcome| outcome.status == ToolStatus::Succeeded);
+            if !succeeded {
+                return None;
+            }
+            let question = serde_json::from_str::<crate::tool::request_input::RequestInputArgs>(
+                &source.arguments,
+            )
+            .ok()
+            .map(|args| args.question)
+            .unwrap_or_else(|| "请提供你的输入".to_string());
+            Some(question)
+        });
+        if let Some(question) = suspend_question {
+            return Ok(BatchEnd::SuspendRequested { question });
+        }
     }
 
     // 4. 按原 call index 回填（§12.2 第 6 条）。

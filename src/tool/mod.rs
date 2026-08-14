@@ -9,10 +9,13 @@
 pub mod command;
 pub mod edit;
 pub mod files;
+pub mod inspect;
 pub mod outcome;
 pub mod plan;
 pub mod process;
 pub mod registry;
+pub mod request_input;
+pub mod scheduler;
 pub mod search;
 pub mod selector;
 pub mod web;
@@ -163,6 +166,10 @@ pub enum BuiltinTool {
     Write,
     Bash,
     Process,
+    /// §13（AGENTS.md）：模型请求用户输入（run 挂起，非结束）。
+    RequestInput,
+    /// §15（AGENTS.md）：Runtime Introspection——查询能力快照。
+    RuntimeInspect,
     UpdatePlan,
     WebSearch,
     WebFetch,
@@ -221,6 +228,8 @@ impl BuiltinTool {
             BuiltinTool::Write => "write",
             BuiltinTool::Bash => "bash",
             BuiltinTool::Process => "process",
+            BuiltinTool::RequestInput => "request_input",
+            BuiltinTool::RuntimeInspect => "runtime_inspect",
             BuiltinTool::UpdatePlan => "update_plan",
             BuiltinTool::WebSearch => "web_search",
             BuiltinTool::WebFetch => "web_fetch",
@@ -239,6 +248,8 @@ impl BuiltinTool {
             "write" => Some(Self::Write),
             "bash" => Some(Self::Bash),
             "process" => Some(Self::Process),
+            "request_input" => Some(Self::RequestInput),
+            "runtime_inspect" => Some(Self::RuntimeInspect),
             "update_plan" => Some(Self::UpdatePlan),
             "web_search" => Some(Self::WebSearch),
             "web_fetch" => Some(Self::WebFetch),
@@ -256,6 +267,10 @@ impl BuiltinTool {
             Self::Bash => ToolExecutionClass::WorkspaceUnknown,
             // §5：process 工具读 registry / 控制 managed process，无文件副作用。
             Self::Process => ToolExecutionClass::Pure,
+            // §13：request_input 请求用户输入（无文件副作用）。
+            Self::RequestInput => ToolExecutionClass::Pure,
+            // §15：runtime_inspect 只读投影（无文件副作用）。
+            Self::RuntimeInspect => ToolExecutionClass::Pure,
             Self::UpdatePlan | Self::WebSearch | Self::WebFetch | Self::ActivateSkill => {
                 ToolExecutionClass::Pure
             }
@@ -350,6 +365,21 @@ Use wait/status only when the result is needed; do not poll an unchanged process
 Cost: list/status/output/cancel ~local I/O; wait blocks up to timeout_ms. \
 Example: process action=status id=\"p17\"; process action=wait id=\"p17\" timeout_ms=10000"
             }
+            BuiltinTool::RequestInput => {
+                "Request input from the user. Use when you need a decision, clarification, \
+permission, or additional information that only the user can provide. \
+The run SUSPENDS at this point (it does not end): the question is shown to the user, \
+their answer is recorded, and the run continues with full history. \
+Do not end the conversation with a question — call this tool instead. \
+Example: request_input question=\"should I run the full test suite?\""
+            }
+            BuiltinTool::RuntimeInspect => {
+                "Inspect the current runtime capabilities: available tools (with provider/\
+origin), discovered skills, workspace kind/identity, and managed processes. \
+Use when you need to know what you can do in this environment instead of \
+guessing from the system prompt. Read-only; takes no arguments. \
+Example: runtime_inspect"
+            }
             BuiltinTool::UpdatePlan => {
                 "Update the plan with a complete explicit snapshot (max 7 total items). Every item \
 MUST be an object {\"text\": ..., \"status\": \"pending|in_progress|completed|cancelled|blocked\"}; \
@@ -406,6 +436,10 @@ Example: activate_skill name=\"rust-review\""
             BuiltinTool::Write => schema_value::<files::WriteArgs>("write"),
             BuiltinTool::Bash => schema_value::<command::BashArgs>("bash"),
             BuiltinTool::Process => schema_value::<process::ProcessArgs>("process"),
+            BuiltinTool::RequestInput => {
+                schema_value::<request_input::RequestInputArgs>("request_input")
+            }
+            BuiltinTool::RuntimeInspect => schema_value::<inspect::InspectArgs>("runtime_inspect"),
             BuiltinTool::UpdatePlan => schema_value::<plan::UpdatePlanArgs>("update_plan"),
             BuiltinTool::WebSearch => schema_value::<web::WebSearchArgs>("web_search"),
             BuiltinTool::WebFetch => schema_value::<web::WebFetchArgs>("web_fetch"),
@@ -431,6 +465,12 @@ Example: activate_skill name=\"rust-review\""
             BuiltinTool::Write => parse_args_typed("write", arguments, ValidatedArgs::Write),
             BuiltinTool::Bash => parse_args_typed("bash", arguments, ValidatedArgs::Bash),
             BuiltinTool::Process => parse_args_typed("process", arguments, ValidatedArgs::Process),
+            BuiltinTool::RequestInput => {
+                parse_args_typed("request_input", arguments, ValidatedArgs::RequestInput)
+            }
+            BuiltinTool::RuntimeInspect => {
+                parse_args_typed("runtime_inspect", arguments, ValidatedArgs::RuntimeInspect)
+            }
             BuiltinTool::UpdatePlan => {
                 parse_args_typed("update_plan", arguments, ValidatedArgs::UpdatePlan)
             }
@@ -460,6 +500,8 @@ pub enum ValidatedArgs {
     Write(files::WriteArgs),
     Bash(command::BashArgs),
     Process(process::ProcessArgs),
+    RequestInput(request_input::RequestInputArgs),
+    RuntimeInspect(inspect::InspectArgs),
     UpdatePlan(plan::UpdatePlanArgs),
     WebSearch(web::WebSearchArgs),
     WebFetch(web::WebFetchArgs),
@@ -479,6 +521,8 @@ impl ValidatedArgs {
             Self::Write(_) => BuiltinTool::Write,
             Self::Bash(_) => BuiltinTool::Bash,
             Self::Process(_) => BuiltinTool::Process,
+            Self::RequestInput(_) => BuiltinTool::RequestInput,
+            Self::RuntimeInspect(_) => BuiltinTool::RuntimeInspect,
             Self::UpdatePlan(_) => BuiltinTool::UpdatePlan,
             Self::WebSearch(_) => BuiltinTool::WebSearch,
             Self::WebFetch(_) => BuiltinTool::WebFetch,
@@ -498,6 +542,8 @@ impl ValidatedArgs {
             Self::Write(args) => Some(&args.path),
             Self::Bash(_)
             | Self::Process(_)
+            | Self::RequestInput(_)
+            | Self::RuntimeInspect(_)
             | Self::UpdatePlan(_)
             | Self::WebSearch(_)
             | Self::WebFetch(_)
@@ -556,6 +602,8 @@ pub struct ToolContext {
     pub processes: std::sync::Arc<
         std::sync::Mutex<crate::process::managed::ProcessRegistry>,
     >,
+    /// ToolRegistry（builtin + MCP；runtime_inspect 枚举能力用；与 ToolRuntime 共享）。
+    pub registry: std::sync::Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
     /// 交互模式（`-p` 为 false；§11 移除 ask_user 后仅保留供未来交互原语使用）。
     pub interactive: bool,
 }
@@ -774,6 +822,12 @@ pub async fn execute(
         }
         (BuiltinTool::WebFetch, ValidatedArgs::WebFetch(args)) => web::web_fetch(args, ctx).await,
         (BuiltinTool::Process, ValidatedArgs::Process(args)) => process::process(args, ctx).await,
+        (BuiltinTool::RequestInput, ValidatedArgs::RequestInput(args)) => {
+            request_input::request_input(args, ctx).await
+        }
+        (BuiltinTool::RuntimeInspect, ValidatedArgs::RuntimeInspect(args)) => {
+            inspect::runtime_inspect(args, ctx).await
+        }
         // §Skills：activate_skill 是同步控制操作（读 SKILL.md）。
         (BuiltinTool::ActivateSkill, ValidatedArgs::ActivateSkill(args)) => {
             crate::skills::activate::activate_skill(args, ctx)
@@ -847,6 +901,8 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
         BuiltinTool::Write,
         BuiltinTool::Bash,
         BuiltinTool::Process,
+        BuiltinTool::RequestInput,
+        BuiltinTool::RuntimeInspect,
         BuiltinTool::UpdatePlan,
         BuiltinTool::WebSearch,
         BuiltinTool::WebFetch,
@@ -972,6 +1028,9 @@ mod tests {
             current_plan: Default::default(),
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
+            )),
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::tool::registry::ToolRegistry::new(),
             )),
             interactive: false,
             allow_outside_workspace: true,

@@ -120,6 +120,7 @@ fn doctor_report_with_home(
         processes: std::sync::Arc::new(std::sync::Mutex::new(
             crate::process::managed::ProcessRegistry::new(),
         )),
+        registry: crate::tool::registry::global_registry(),
         interactive: false,
     };
     let bash = crate::tool::command::locate_git_bash(&ctx);

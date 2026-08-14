@@ -38,9 +38,8 @@ async fn mcp_tool_executes_inside_agent_loop() {
     let mut manager = tpi::mcp::manager::McpManager::new();
     let registry = tpi::tool::registry::global_registry();
     {
-        let mut guard = registry.lock().unwrap();
         manager
-            .start_server(test_server_config("e2e-server"), &mut guard)
+            .start_server(test_server_config("e2e-server"))
             .await
             .unwrap();
     }
@@ -126,13 +125,12 @@ async fn tool_selector_filters_irrelevant_mcp_tools_from_model() {
     let mut manager = tpi::mcp::manager::McpManager::new();
     let registry = tpi::tool::registry::global_registry();
     {
-        let mut guard = registry.lock().unwrap();
         manager
-            .start_server(test_server_config("ctx-a"), &mut guard)
+            .start_server(test_server_config("ctx-a"))
             .await
             .unwrap();
         manager
-            .start_server(test_server_config("ctx-b"), &mut guard)
+            .start_server(test_server_config("ctx-b"))
             .await
             .unwrap();
     }
