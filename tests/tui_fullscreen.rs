@@ -426,7 +426,7 @@ fn session_preview_renders_in_modal_float() {
         }),
         modal: Some(tpi::tui::model::ModalState::new(
             "/sessions",
-            tpi::app::preview_lines_to_body(&preview),
+            tpi::tui::model::preview_lines_to_body(&preview),
         )),
         ..Default::default()
     };

@@ -41,10 +41,9 @@ check() {
     done < <(rg -n "$regex" $dirs --glob '*.rs' 2>/dev/null)
 }
 
-# R1: TUI 不得反向引用 app（现状：reducer.rs 的 preview_lines_to_body，
-#     P1-04 消除后删除本 allowlist 行）。
-check "R1:tui->app" "src/tui" "(use crate::app|crate::app::)" \
-    "src/tui/reducer.rs|crate::app::preview_lines_to_body"
+# R1: TUI 不得反向引用 app。已清零（P1-04 把 preview_lines_to_body 纯投影
+#     移入 src/tui/model.rs），allowlist 为空：任何 `crate::app` 引用都违规。
+check "R1:tui->app" "src/tui" "(use crate::app|crate::app::)"
 
 # R2: agent 不得引用 TUI（现状：测试构造的 ViewMode/Keymap 默认值，
 #     P1 Exit gate 要求清零后删除全部 allowlist 行）。

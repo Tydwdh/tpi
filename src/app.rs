@@ -1277,7 +1277,7 @@ workspace: {}
                 .collect();
             // §用户诉求：/sessions 悬浮窗（Modal）显示选中会话的对话预览——
             // 初始为第一个会话；↑/↓ 移动时 reducer 同步更新。
-            let preview_body = preview_lines_to_body(
+            let preview_body = crate::tui::model::preview_lines_to_body(
                 session_previews
                     .first()
                     .map(Vec::as_slice)
@@ -2386,23 +2386,6 @@ fn session_dialogue_preview(path: &std::path::Path) -> Vec<crate::tui::model::Me
         };
         out.push(crate::tui::model::MenuPreviewLine { is_user, text });
     }
-    out
-}
-
-/// 把对话预览行格式化为 Modal 正文（§用户诉求：/sessions 悬浮窗显示预览）。
-/// 每行 `你 {text}` / `AI {text}`，draw_modal 按前缀着色；空预览给占位提示。
-pub fn preview_lines_to_body(lines: &[crate::tui::model::MenuPreviewLine]) -> String {
-    if lines.is_empty() {
-        return "（无对话记录）".to_string();
-    }
-    let mut out = String::new();
-    for line in lines {
-        let prefix = if line.is_user { "你 " } else { "AI " };
-        out.push_str(prefix);
-        out.push_str(&line.text);
-        out.push('\n');
-    }
-    out.pop(); // 去掉末尾换行
     out
 }
 

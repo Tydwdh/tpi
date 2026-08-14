@@ -188,11 +188,17 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 每 PR 迁一组：assistant、tool lifecycle、process、plan/input。
 - 验收：headless sink 可直接消费所有 runtime events；无 UI drain task需求的 contract test。
 
-#### P1-04 消除 `tui::reducer -> app`
+#### P1-04 消除 `tui::reducer -> app` — **DONE（2026-08-14）**
 
 - 移动 preview 纯投影到 presentation owner。
 - 先锁定输出 tests；只改 dependency，不改预览文案。
 - 验收：架构 gate 删除该 allowlist。
+- 实施：`preview_lines_to_body` 从 `src/app.rs` 移入 `src/tui/model.rs`（MenuPreviewLine
+  宿主，presentation owner）；改 3 处调用（app.rs:1280 全限定、reducer.rs:44 本地化、
+  tui_fullscreen.rs 测试）。函数体零改动（纯移动）。`scripts/arch_gate.sh` R1 allowlist
+  清空（`tui -> app` 引用清零）：任何 `crate::app` 引用都违规。正反例验证：注入
+  `src/tui` 的 `use crate::app::` 被拒、恢复通过。tui_fullscreen/reducer/rework 输出
+  测试全绿 + 全量 44 target 绿。**P0-07 首个 allowlist 收紧完成**（R1 清零）。
 
 #### P1-05 分解 Config 输出
 

@@ -469,6 +469,25 @@ pub struct MenuPreviewLine {
     pub text: String,
 }
 
+/// 把对话预览行格式化为 Modal 正文（§用户诉求：/sessions 悬浮窗显示预览）。
+/// 每行 `你 {text}` / `AI {text}`，draw_modal 按前缀着色；空预览给占位提示。
+/// P1-04：纯投影从 `app` 移入 presentation owner（MenuPreviewLine 宿主），
+/// 消除 `tui -> app` 反向依赖（P0-07 arch_gate R1）。
+pub fn preview_lines_to_body(lines: &[MenuPreviewLine]) -> String {
+    if lines.is_empty() {
+        return "（无对话记录）".to_string();
+    }
+    let mut out = String::new();
+    for line in lines {
+        let prefix = if line.is_user { "你 " } else { "AI " };
+        out.push_str(prefix);
+        out.push_str(&line.text);
+        out.push('\n');
+    }
+    out.pop(); // 去掉末尾换行
+    out
+}
+
 /// 斜杠命令补全菜单（输入以 `/` 开头时弹出，§16.2 信息层级之外的小浮层）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuView {

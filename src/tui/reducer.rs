@@ -41,7 +41,7 @@ fn sync_session_preview(state: &mut UiState) {
     let Some(preview) = menu.session_previews.get(menu.selected) else {
         return;
     };
-    let body = crate::app::preview_lines_to_body(preview);
+    let body = crate::tui::model::preview_lines_to_body(preview);
     if let Some(modal) = &mut state.view.modal {
         modal.body = body;
         modal.scroll = 0;
