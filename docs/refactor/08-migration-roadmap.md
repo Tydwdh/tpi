@@ -158,12 +158,23 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 ### 任务
 
-#### P1-01 Run/Turn/Step/Attempt 词汇审计
+#### P1-01 Run/Turn/Step/Attempt 词汇审计 — **DONE（2026-08-14）**
 
 - 标注所有字段/事件/日志/测试中 `turn/run/retry` 的真实含义。
 - 新增 typed IDs（只在确有混用处）和文档，不大规模 rename。
 - 一次迁移一个歧义点；保持 session wire 名称。
 - 验收：state transition table 与现有 tests 对齐。
+- 产出：[13-vocabulary-audit.md](13-vocabulary-audit.md)。结论：
+  - `run` = Run（一致）；`attempt` = Attempt（一致）；`retry` = 新 Run（行为正确）。
+  - **`turn` 命名冲突**：当前代码的 `turn`（TurnStarted/max_turns/view.turn）实际是
+    **Step 级**（每次 model request）；目标词汇的 Turn（用户批次）当前不存在
+    （一个用户消息 = 一个 Run）。`max_turns` 是 session wire 字段不可改名。
+  - **typed ID 无需新增**：RunId/RequestId(=Step 身份)/ToolCallId/EventId/SessionId 已
+    覆盖全部真实边界；attempt 由 `(RequestId, u32)` 标识；TurnId 待 P8 inbox 引入。
+  - 修正 3 处误导注释（agent/mod.rs:292、session/mod.rs AssistantMessage、
+    p1_fixes.rs:1083）：`attempt`→`run`/`assistant message`，纯注释零行为影响。
+  - 遗留：`RuntimeEvent::TurnStarted`→`StepStarted`、`view.turn`→`view.step` 在
+    P1-03 live/view event 分离时一并改名（live event 非 durable，改名安全）。
 
 #### P1-02 建 domain message/content
 

@@ -33,9 +33,9 @@ pub struct RunLimits {
     pub max_tool_calls: u32,
 }
 
-/// 已提交的 assistant turn（P0-2：一个 provider assistant response 必须
-/// 原子表达——即使 `content` 为空（纯 tool-call 轮）也必须持久化，
-/// 否则 resume 重建会缺失 assistant 载体、ToolRequested 挂错位置）。
+/// 已提交的 assistant message（词汇审计 §3.3：即目标词汇的 Step 级输出——
+/// 一次 provider response 必须原子表达；即使 `content` 为空（纯 tool-call 轮）
+/// 也必须持久化，否则 resume 重建会缺失 assistant 载体、ToolRequested 挂错位置）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub content: String,

@@ -288,9 +288,10 @@ async fn run_inner<P: Provider>(
     let run_started = std::time::Instant::now();
 
     // 1. 用户提交（durable boundary）。
-    // 空 user_message = retry 语义（`/retry`）：复用已有 history（上次失败的 turn
-    // 不重复记录 UserSubmitted，也不追加新 User 消息）；仍记录 RunStarted 作为新 attempt。
-    // app 层已拦截空输入，正常对话不会传空消息。
+    // 空 user_message = retry 语义（`/retry`）：复用已有 history（上次失败的 run
+    // 不重复记录 UserSubmitted，也不追加新 User 消息）；仍记录 RunStarted 作为新 run
+    // （词汇审计 §3.2：retry 是 Run 级操作，不是 attempt）。app 层已拦截空输入，
+    // 正常对话不会传空消息。
     if !user_message.is_empty() {
         session
             .append_event(&SessionEvent::UserSubmitted {

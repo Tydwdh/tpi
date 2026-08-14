@@ -1080,12 +1080,12 @@ async fn retry_with_empty_user_message_does_not_repeat_submission() {
         user_submitted, 0,
         "retry 不得重复记录 UserSubmitted（重试 ModelTurn 而非重发 User 消息）: {events:?}"
     );
-    // RunStarted 记录新 attempt。
+    // RunStarted 记录新 run（词汇审计 §3.2：/retry = 新 Run，不是 attempt）。
     assert!(
         events
             .iter()
             .any(|e| matches!(e, SessionEvent::RunStarted { .. })),
-        "retry 必须记录 RunStarted（新 attempt）"
+        "retry 必须记录 RunStarted（新 run）"
     );
 
     // outcome.messages 不得追加新的 User 消息（复用 history 的 User）。
