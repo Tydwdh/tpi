@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::config::Config;
 
@@ -242,7 +243,47 @@ pub async fn run<P: Provider>(
     } = input;
     let run_id = session.begin_run();
     let span = tracing::info_span!("agent.run", %run_id);
-    let _enter = span.enter();
+    // O0（Medium-7）：async 函数体不能用同步 enter guard 跨 await 持有——
+    // thread-local scope 在 future yield 后仍持锁，同线程其他任务会被错误
+    // 归入当前 span，造成并发 run 的 parent/child 关系交叉（tests/
+    // trace_ancestry.rs 复现：enter 深度 = 2）。用 Future::instrument 使
+    // span 随 future 的 poll enter/exit（每次 poll 配对，yield 即释放）。
+    run_inner(
+        provider,
+        session,
+        config,
+        run_id,
+        RunInput {
+            history,
+            user_message,
+            ui,
+            cancel,
+            interactive,
+            force_compaction,
+            workspace,
+        },
+    )
+    .instrument(span)
+    .await
+}
+
+/// `run` 的实际执行体（由 `run` 以 `.instrument(span)` 包裹，见 O0）。
+async fn run_inner<P: Provider>(
+    provider: &mut P,
+    session: &mut SessionLog,
+    config: &Config,
+    run_id: crate::ids::RunId,
+    input: RunInput<'_>,
+) -> Result<AgentOutcome, RunFailure> {
+    let RunInput {
+        history,
+        user_message,
+        ui,
+        cancel,
+        interactive,
+        force_compaction,
+        workspace,
+    } = input;
     // §44：run 级耗时基线。
     let run_started = std::time::Instant::now();
 

@@ -675,6 +675,10 @@ P0 测基线后批准具体数字，至少度量：
 - 测 WorkerGuard shutdown、loss counter和 provider trace同步写入开销。
 - 验收：并发两 Run不会互相继承 span；测试用 subscriber验证 parent tree。
 
+> **现状登记（2026-08-14，P0-09 完成时）**：唯一跨 await `span.enter()` 位于 `src/agent/mod.rs` 原 `run` 顶部，已改为 `Future::instrument`（`run` wrapper + `run_inner`）；`tests/trace_ancestry.rs` 用 capture layer 断言并发 run 的 `agent.run` enter 深度 ≤ 1（修复前 = 2）。
+>
+> provider trace（`src/provider/trace.rs`）风险登记：进程级旁路（`OnceLock<Option<Mutex<File>>>` 一次决定）；每次记录同步 `write_all + flush`（stream 每 SSE chunk 一次，慢盘放大延迟）；每 chunk 抢全局 Mutex；`TPI_TRACE_PROVIDER=body` 记录完整 request body（可含用户代码）；记录无 session/run/request/attempt 关联 ID（仅 ts_ms + kind）。main.rs 标准日志：rolling daily + non_blocking，WorkerGuard `Box::leak`，EnvFilter 默认 INFO，loss counter 未暴露。Standard 日志 secret canary：src 内 `tracing::*!` 无直接记录 api_key/authorization/password/secret/token 字段的调用点。上述问题由 O2（Local TraceSink）+ O3（request reconstruction）解决，O0 不重写。
+
 ### O1：TraceContext 与 catalog
 
 - typed Trace/Turn/Step/Attempt IDs；

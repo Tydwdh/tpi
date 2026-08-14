@@ -119,13 +119,18 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - microkernel/DAG、JSONL truth、task ownership。
 - 验收：每个 alternatives/consequences/rollback 完整。
 
-#### P0-09 O0 trace integrity baseline
+#### P0-09 O0 trace integrity baseline — **DONE（2026-08-14）**
 
 - 盘点 `src/main.rs` logging guard、`src/provider/trace.rs` 同步 JSONL 和全部 `span.enter()`。
 - 为现有 `agent.run`/provider/tool 路径写 subscriber capture test，证明 `.await` 前后 parent/child 关系。
 - 用 `Future::instrument`/`#[instrument]` 修复跨 await enter guard；不顺便改业务状态机。
 - provider trace 只做测量和风险登记，本任务不先重写；记录每 chunk 写/flush、mutex wait、body 敏感字段和现有无关联 ID。
 - 验收：异步 ancestry 测试绿色；Standard 日志 secret canary 为零；before/after 开销有数据。
+- 实施：唯一 `span.enter()`（`src/agent/mod.rs` 原 `run` 顶部）已改为 `Future::instrument`——`run` 变薄 wrapper，原 body 移入 `run_inner`（`run_id` 经参数传入），span 随 future 的 poll enter/exit，yield 即释放。新增 `tests/trace_ancestry.rs`：自定义 yield provider + 并发两个 run + registry-based capture layer，断言任意时刻 `agent.run` enter 深度 ≤ 1。红灯验证：修复前深度 = 2（精确复现 Medium-7）；修复后 = 1。
+- provider trace 风险登记（O2 前不重写，仅登记）：`src/provider/trace.rs` 是进程级旁路——`OnceLock<Option<Mutex<File>>>` 一次决定；每次记录（含 stream 每个 SSE event：`sse_event`/`tool_arguments_delta` 等 8 处调用）同步 `write_all + flush`（慢盘放大流延迟）；每 chunk 抢全局 Mutex（`util::lock_mutex`）；`TPI_TRACE_PROVIDER=body` 记录完整 request body（可能含用户代码）；记录无 session_id/run_id/request_id/attempt_id 关联（仅 ts_ms + kind）。
+- main.rs logging 盘点：rolling daily + `tracing_appender::non_blocking`，WorkerGuard 被 `Box::leak`（程序生命周期内存活）；EnvFilter 默认 INFO `from_env_lossy`；Standard 日志（fmt layer）无 ANSI/无 target。loss counter 未暴露（O2 处理）。
+- secret canary：扫描 src 全部 `tracing::*!` 宏，无直接记录 api_key/authorization/password/secret/token 字段的调用点；Standard 日志路径 canary 为零。
+- 开销：trace_ancestry 修复前（红灯，0.03s）与修复后（绿灯，0.02s）无感知差异；instrument 每次 poll enter/exit 开销在异步路径不可测出。
 
 ### Exit gate
 
