@@ -866,10 +866,26 @@ async fn interactive_loop<P: Provider>(
             last_failed = match outcome.reason {
                 crate::session::CompletionReason::ProviderInterrupted
                 | crate::session::CompletionReason::ProviderUnavailable
-                | crate::session::CompletionReason::Error => Some(RetryTarget {
-                    message: retry_target,
-                    reason: outcome.reason,
-                }),
+                | crate::session::CompletionReason::Error => {
+                    // retry 失败也要明确反馈——否则用户看不到“重试未成功”，
+                    // 会盲目反复 /retry（相同提示累积刷屏，且无进展）。
+                    let label = match outcome.reason {
+                        crate::session::CompletionReason::ProviderInterrupted => "模型连接中断",
+                        crate::session::CompletionReason::ProviderUnavailable => "模型不可用",
+                        crate::session::CompletionReason::Error => {
+                            "长度限制/内容过滤/协议错误"
+                        }
+                        _ => unreachable!("失败类 reason 已穷尽"),
+                    };
+                    ui_state.view.push_line(
+                        LineKind::System,
+                        format!("⚠ 重试未成功（{label}）；可再次 /retry 或重新发送"),
+                    );
+                    Some(RetryTarget {
+                        message: retry_target,
+                        reason: outcome.reason,
+                    })
+                }
                 _ => None,
             };
             ui_state.view.push_line(LineKind::System, "─".repeat(40));
@@ -1337,14 +1353,17 @@ workspace: {}
             // §4.3：重试上一次失败/中断的 ModelTurn——不是重发 User 消息。
             // 目标消息入 pending_retry，主循环以空 user_message 发起 run，
             // 不重复记录 UserSubmitted，也不追加 User 消息（不污染对话）。
+            // 去重：相同 target 的连续重试提示只保留一行（用户反复 /retry 时
+            // 不刷屏——失败反馈由 retry run 结束后的分支给出）。
             match last_failed.clone() {
                 Some(target) => {
                     ui_state.push_retry(target.message.clone());
-                    push_system_line(
-                        &mut ui_state.view,
-                        renderer,
-                        format!("⟳ 重试上一次 turn（{}）", target.message),
-                    )?;
+                    let text = format!("⟳ 重试上一次 turn（{}）", target.message);
+                    if ui_state.view.push_line_dedup(LineKind::System, text) {
+                        renderer
+                            .draw(&mut ui_state.view)
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
                 None => {
                     push_system_line(

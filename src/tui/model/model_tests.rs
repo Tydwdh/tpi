@@ -951,4 +951,36 @@ mod p2_card_nav_tests {
         });
         assert_eq!(view.selected_text(), "running", "body 内容不受 meta 影响");
     }
+
+    /// §去重：`push_line_dedup` 连续相同文本只保留一行（/retry 反复触发不刷屏）。
+    #[test]
+    fn push_line_dedup_skips_consecutive_identical_text() {
+        let mut view = ViewModel::default();
+        // 第一次写入：返回 true，产生一行。
+        assert!(view.push_line_dedup(LineKind::System, "⟳ 重试上一次 turn（abc）"));
+        let count = view.transcript.len();
+        assert_eq!(count, 1);
+        // 连续相同文本：跳过（返回 false），不产生新行。
+        assert!(!view.push_line_dedup(LineKind::System, "⟳ 重试上一次 turn（abc）"));
+        assert_eq!(view.transcript.len(), count, "相同文本不得重复写入");
+        // 不同文本：写入。
+        assert!(view.push_line_dedup(LineKind::System, "⟳ 重试上一次 turn（def）"));
+        assert_eq!(view.transcript.len(), count + 1);
+        // 中间插入其他消息后，相同文本再次出现 → 允许写入（去重只针对连续）。
+        view.push_line(LineKind::User, "新消息");
+        assert!(view.push_line_dedup(LineKind::System, "⟳ 重试上一次 turn（abc）"));
+    }
+
+    /// §去重：`last_message_text` 跳过工具卡，返回最近一条 Message 文本。
+    #[test]
+    fn last_message_text_skips_tool_cards() {
+        let mut view = ViewModel::default();
+        view.push_line(LineKind::User, "hello");
+        view.begin_tool("c1", "bash", Some("cmd".into()), None);
+        view.finish_tool(("c1", "bash"), ToolStatus::Succeeded, 1, None, "", None);
+        // 工具卡之后仍能取到最近 Message。
+        assert_eq!(view.last_message_text(), Some("hello"));
+        view.push_line(LineKind::System, "⟳ 重试");
+        assert_eq!(view.last_message_text(), Some("⟳ 重试"));
+    }
 }

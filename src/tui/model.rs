@@ -918,6 +918,29 @@ impl ViewModel {
         self.trim_transcript();
     }
 
+    /// 最后一条 Message 条目的文本（跳过工具卡；连续去重检测用）。
+    /// 返回的是 bound 后的文本（push 时截断），与 [`Self::push_line`] 入参
+    /// 在相同输入下一致，可直接用于相等比较。
+    pub fn last_message_text(&self) -> Option<&str> {
+        self.transcript.iter().rev().find_map(|entry| match entry {
+            Entry::Message { line, .. } => Some(line.text.as_str()),
+            Entry::Tool { .. } => None,
+        })
+    }
+
+    /// push 系统行，但若最后一条消息与 `text` 相同则跳过（连续去重）。
+    ///
+    /// 用于反复触发型反馈（如 `/retry`）：相同 target 的重试提示只保留一行，
+    /// 避免用户多次操作时 transcript 被相同文本刷屏。返回是否真正写入。
+    pub fn push_line_dedup(&mut self, kind: LineKind, text: impl Into<String>) -> bool {
+        let text = text.into();
+        if self.last_message_text() == Some(text.as_str()) {
+            return false;
+        }
+        self.push_line(kind, text);
+        true
+    }
+
     /// 追加同一条流式消息（TUI v2 §7.2：写 live 区，finalize 前不进 transcript）。
     /// provider 的 token chunk 不是视觉行，不能逐 chunk 创建条目，
     /// 否则会把“你好”渲染成多条带前缀的碎片行。
