@@ -547,29 +547,37 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
         RuntimeEvent::StreamRecovering { attempt } => {
             // §4.3 第二阶段：text-only 断联后自动续写，不打断用户。
             // §用户诉求：Claude Code 式重连提示——显示时间与次数（第 N/MAX 次）。
+            // 刷屏防护：恢复是过程性事件，只对第一次（attempt == 1）追加提示行，
+            // 后续同轮恢复静默（status/footer spinner 仍在运行）；最终失败另有
+            // 总结提示（ProviderInterrupted），连续断联不再每次弹一行。
             view.reconnect_count = view.reconnect_count.saturating_add(1);
-            view.push_line(
-                LineKind::System,
-                format!(
-                    "[{}] ⟳ 模型连接中断，正在自动续写…（第 {attempt}/{} 次）",
-                    now_hhmmss(),
-                    crate::agent::MAX_STREAM_RECOVERIES
-                ),
-            );
+            if attempt == 1 {
+                view.push_line(
+                    LineKind::System,
+                    format!(
+                        "[{}] ⟳ 模型连接中断，正在自动续写…（第 {attempt}/{} 次）",
+                        now_hhmmss(),
+                        crate::agent::MAX_STREAM_RECOVERIES
+                    ),
+                );
+            }
         }
         RuntimeEvent::TurnRestarting { attempt } => {
             // §4.3 第三阶段：partial tool-call 后整个 turn 重新生成——
             // 丢弃已显示的 partial（不进 transcript），提示用户。
             view.discard_live_turn();
             view.reconnect_count = view.reconnect_count.saturating_add(1);
-            view.push_line(
-                LineKind::System,
-                format!(
-                    "[{}] ⟳ 工具调用中断，正在重新生成该轮回答…（第 {attempt}/{} 次）",
-                    now_hhmmss(),
-                    crate::agent::MAX_TURN_RESTARTS
-                ),
-            );
+            // 刷屏防护：同 StreamRecovering，只对第一次追加提示行。
+            if attempt == 1 {
+                view.push_line(
+                    LineKind::System,
+                    format!(
+                        "[{}] ⟳ 工具调用中断，正在重新生成该轮回答…（第 {attempt}/{} 次）",
+                        now_hhmmss(),
+                        crate::agent::MAX_TURN_RESTARTS
+                    ),
+                );
+            }
         }
         RuntimeEvent::CompactionNotice { message } => {
             // §用户诉求：手动 /compact 结果反馈（成功/未生效）写入系统行。

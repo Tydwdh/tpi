@@ -828,6 +828,29 @@ fn tool_target(call: &ToolCall) -> (String, Option<String>) {
                 .unwrap_or_else(|| name.to_string());
             (truncate(&target, 120), None)
         }
+        // §去重/信息：request_input（askuser）卡片主行携带问题摘要（首行）——
+        // 否则主行只有工具名，用户扫不到“模型在问什么”；完整问题由挂起提示
+        // 块展示（卡片输出不再重复，见 user_visible_output）。
+        "request_input" => {
+            let summary = parsed
+                .as_ref()
+                .and_then(|v| v.get("question"))
+                .and_then(|q| q.as_str())
+                .or_else(|| {
+                    parsed
+                        .as_ref()
+                        .and_then(|v| v.get("questions"))
+                        .and_then(|qs| qs.as_array())
+                        .and_then(|qs| qs.first())
+                        .and_then(|q| q.get("question"))
+                        .and_then(|q| q.as_str())
+                })
+                .map(|q| q.lines().next().unwrap_or("").trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("request_input {s}"))
+                .unwrap_or_else(|| "request_input".to_string());
+            (truncate(&summary, 120), None)
+        }
         name => (name.to_string(), None),
     }
 }

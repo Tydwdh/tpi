@@ -1029,6 +1029,28 @@ mod p2_card_nav_tests {
         );
     }
 
+    /// §去重：/retry 连续失败时 [提示 + 分隔线] 组合块只保留一组（中间无
+    /// 其他消息时反复 /retry 不刷屏——此前每轮都 push 一行提示 + 一行分隔线）。
+    #[test]
+    fn retry_failure_block_dedup_keeps_single_group() {
+        let mut view = ViewModel::default();
+        let block: Vec<String> = vec![
+            "⚠ 重试未成功（模型连接中断）；可再次 /retry 或重新发送".into(),
+            "─".repeat(40),
+        ];
+        // 第一次 /retry 失败：提示 + 分隔线各一行。
+        assert!(view.push_system_block_dedup(&block));
+        let count = view.transcript.len();
+        assert_eq!(count, 2);
+        // 再次 /retry 失败（中间无其他消息）：整个块跳过，不再累积。
+        assert!(!view.push_system_block_dedup(&block));
+        assert_eq!(view.transcript.len(), count, "连续 /retry 失败不得重复累积");
+        // 中间出现其他消息后（如用户重新发送消息），允许再次出现。
+        view.push_line(LineKind::User, "再试一次");
+        assert!(view.push_system_block_dedup(&block));
+        assert_eq!(view.transcript.len(), count + 1 + 2);
+    }
+
     /// §去重：超长文本按 bound 后比较——`push_line_dedup` 不因截断失效。
     #[test]
     fn push_line_dedup_compares_bounded_text() {
@@ -1041,5 +1063,71 @@ mod p2_card_nav_tests {
             "超长文本 bound 后相同也应去重"
         );
         assert_eq!(view.transcript.len(), count);
+    }
+
+    /// §askuser 刷屏防护：`has_system_block` 全局搜索相同块——中间插入
+    /// User/Assistant 消息或工具卡不影响判定（区别于只匹配末尾的连续去重）。
+    #[test]
+    fn has_system_block_finds_block_across_user_messages() {
+        let mut view = ViewModel::default();
+        let block: Vec<String> = vec![
+            "⏸ run 挂起，等待你的输入：".into(),
+            "1. 确认删除这个文件？".into(),
+            "（输入回答后继续；可直接输入选项编号 1-N 选择）".into(),
+        ];
+        // 未出现前：不存在。
+        assert!(!view.has_system_block(&block));
+        // 首次挂起：完整块写入。
+        view.push_system_block_dedup(&block);
+        assert!(view.has_system_block(&block));
+        // 用户回答 + 工具卡 + 模型文本插入后：块仍被认为“已展示过”。
+        view.push_line(LineKind::User, "是");
+        view.begin_tool("c1", "bash", Some("cmd".into()), None);
+        view.finish_tool(("c1", "bash"), ToolStatus::Succeeded, 1, None, "", None);
+        view.push_line(LineKind::Assistant, "好的，继续");
+        assert!(
+            view.has_system_block(&block),
+            "跨 User/工具卡/Assistant 后仍应判定已展示过"
+        );
+        // 不同问题（不同块）：不存在。
+        let other: Vec<String> = vec![
+            "⏸ run 挂起，等待你的输入：".into(),
+            "1. 部署到哪个环境？".into(),
+            "（输入回答后继续；可直接输入选项编号 1-N 选择）".into(),
+        ];
+        assert!(!view.has_system_block(&other));
+    }
+
+    /// §askuser 刷屏防护：`has_system_block` 对超长文本按 bound 后比较（与
+    /// push 一致），不因截断失效。
+    #[test]
+    fn has_system_block_compares_bounded_text() {
+        let mut view = ViewModel::default();
+        let long = "x".repeat(MAX_MESSAGE_CHARS + 100);
+        let block: Vec<String> = vec![long.clone()];
+        view.push_line(LineKind::System, long.clone());
+        assert!(view.has_system_block(&block), "bound 后相同也应命中");
+    }
+
+    /// §askuser 卡片净化：成功时卡片不重复 question 全文（问题已由挂起提示块
+    /// 展示）；失败（参数非法）保留 error 诊断。
+    #[test]
+    fn user_visible_output_request_input_omits_question_on_success() {
+        let success = "status: succeeded\ntool: request_input\nquestion: 1. 确认删除这个文件？\n   选项: 1. 是 / 2. 否\n\n已请求用户输入：run 已挂起，等待用户回答后继续。";
+        assert_eq!(
+            user_visible_output("request_input", success),
+            (
+                "已请求用户输入：run 已挂起，等待用户回答后继续。".into(),
+                None
+            ),
+            "成功时卡片不重复 question（防与挂起提示块重复）"
+        );
+        let rejected = "status: rejected\ntool: request_input\nerror: invalid_arguments\n\nquestion 不能为空：需要明确向用户提出的问题。";
+        let (out, _) = user_visible_output("request_input", rejected);
+        assert!(
+            out.contains("error: invalid_arguments") && out.contains("question 不能为空"),
+            "失败时保留 error 诊断: {out:?}"
+        );
+        assert!(!out.contains("status:"), "status 头必须剥掉: {out:?}");
     }
 }

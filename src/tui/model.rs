@@ -857,6 +857,30 @@ impl ViewModel {
         true
     }
 
+    /// transcript 中是否已存在与 `lines`（文本+顺序）完全相同的系统消息块
+    /// （全局搜索，跳过工具卡；User/Assistant 消息夹在中间不影响判定）。
+    ///
+    /// 与 [`Self::push_system_block_dedup`] 的“只匹配末尾连续块”不同，本方法
+    /// 回答“这个提问是否已经展示过”——用于 `request_input` 挂起提示：用户
+    /// 回答相同问题后又挂起时（中间必然插入 User 消息，连续去重失效），不再
+    /// 重复 push 完整块，只补一行轻提示。比较基于 bound 后的存储文本。
+    pub fn has_system_block(&self, lines: &[String]) -> bool {
+        if lines.is_empty() {
+            return false;
+        }
+        let bounded: Vec<String> = lines.iter().map(|l| bound_message(l)).collect();
+        let msgs: Vec<&str> = self
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Message { line, .. } => Some(line.text.as_str()),
+                Entry::Tool { .. } => None,
+            })
+            .collect();
+        msgs.windows(bounded.len())
+            .any(|window| window.iter().zip(&bounded).all(|(a, b)| a == b))
+    }
+
     /// 追加同一条流式消息（TUI v2 §7.2：写 live 区，finalize 前不进 transcript）。
     /// provider 的 token chunk 不是视觉行，不能逐 chunk 创建条目，
     /// 否则会把“你好”渲染成多条带前缀的碎片行。
@@ -2113,6 +2137,28 @@ fn user_visible_output(name: &str, text: &str) -> (String, Option<usize>) {
             let body = body.join("\n");
             if !body.is_empty() {
                 return (body, start);
+            }
+            (
+                lines
+                    .iter()
+                    .filter(|l| !is_ai_meta(l))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                None,
+            )
+        }
+        // request_input（askuser）：成功时卡片不重复 question 全文——问题已由
+        // 挂起提示块（⏸ run 挂起…）完整展示，卡片展开再显示一遍就是信息冗余；
+        // 保留一句“已请求用户输入”让卡片状态可读。模型上下文仍读完整
+        // model_payload（含 question），净化只影响 TUI 展示。失败（参数非法）
+        // 回落到默认分支，保留 error 诊断。
+        "request_input" => {
+            if text.contains("status: succeeded") {
+                return (
+                    "已请求用户输入：run 已挂起，等待用户回答后继续。".to_string(),
+                    None,
+                );
             }
             (
                 lines

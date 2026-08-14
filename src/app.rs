@@ -855,6 +855,7 @@ async fn interactive_loop<P: Provider>(
                     config,
                     history,
                     String::new(),
+                    true,
                     InteractiveIo {
                         ui_state: &mut ui_state,
                         renderer: &mut renderer,
@@ -870,7 +871,7 @@ async fn interactive_loop<P: Provider>(
                     conversation.refresh_from_log()?;
                     ui_state.view.status = crate::tui::model::StatusLine::Idle;
                     ui_state.view.turn = 0;
-                    ui_state.view.push_line(
+                    ui_state.view.push_line_dedup(
                         LineKind::System,
                         format!(
                             "run 失败，session 已保留：{}",
@@ -895,16 +896,21 @@ async fn interactive_loop<P: Provider>(
                 | crate::session::CompletionReason::Error => {
                     // retry 失败也要明确反馈——否则用户看不到“重试未成功”，
                     // 会盲目反复 /retry（相同提示累积刷屏，且无进展）。
+                    // run_interactive 在 retry 模式跳过失败类结束提示（见
+                    // run_interactive `retry` 参数），由这里统一给出一条，
+                    // 避免同一轮出现两行语义重复的提示。
                     let label = match outcome.reason {
                         crate::session::CompletionReason::ProviderInterrupted => "模型连接中断",
                         crate::session::CompletionReason::ProviderUnavailable => "模型不可用",
                         crate::session::CompletionReason::Error => "长度限制/内容过滤/协议错误",
                         _ => unreachable!("失败类 reason 已穷尽"),
                     };
-                    ui_state.view.push_line(
-                        LineKind::System,
+                    // 块级去重：连续相同 [提示 + 分隔线] 组合（中间无其他消息）
+                    // 只保留一组——用户反复 /retry 且持续失败时不再累积刷屏。
+                    ui_state.view.push_system_block_dedup(&[
                         format!("⚠ 重试未成功（{label}）；可再次 /retry 或重新发送"),
-                    );
+                        "─".repeat(40),
+                    ]);
                     Some(RetryTarget {
                         message: retry_target,
                         reason: outcome.reason,
@@ -912,7 +918,18 @@ async fn interactive_loop<P: Provider>(
                 }
                 _ => None,
             };
-            ui_state.view.push_line(LineKind::System, "─".repeat(40));
+            // retry 成功：run_interactive 已提示结束原因（如 “run 完成”），
+            // 这里只补分隔线（连续去重，防止与上一组提示粘连成重复行）。
+            if last_failed.is_none() {
+                ui_state
+                    .view
+                    .push_line_dedup(LineKind::System, "─".repeat(40));
+            }
+            // retry 结果提示（失败/成功分隔线）push 后立即刷新——否则要等
+            // 下一次按键才显示，用户看不到 retry 是否成功。
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
             continue;
         }
 
@@ -963,6 +980,7 @@ async fn interactive_loop<P: Provider>(
                     config,
                     history,
                     message.clone(),
+                    false,
                     InteractiveIo {
                         ui_state: &mut ui_state,
                         renderer: &mut renderer,
@@ -1681,6 +1699,10 @@ async fn run_interactive<P: Provider>(
     config: &Config,
     history: &[ChatMessage],
     message: String,
+    // `/retry` 发起的 run：失败类结束提示（Error/ProviderInterrupted/
+    // ProviderUnavailable）由 retry 分支统一给出，这里跳过——否则同一轮
+    // 失败会产生两行语义重复的提示（retry 分支另有“重试未成功”反馈）。
+    retry: bool,
     io: InteractiveIo<'_>,
 ) -> Result<agent::AgentOutcome, String> {
     use crate::tui::effect::UiEffect;
@@ -1850,10 +1872,12 @@ async fn run_interactive<P: Provider>(
     let outcome = outcome.map_err(|failure| failure.to_string())?;
     match outcome.reason {
         crate::session::CompletionReason::Error => {
-            ui_state.view.push_line(
-                LineKind::System,
-                "run 以 Error 结束（长度限制/内容过滤/协议错误，见 session 记录）",
-            );
+            if !retry {
+                ui_state.view.push_line(
+                    LineKind::System,
+                    "run 以 Error 结束（长度限制/内容过滤/协议错误，见 session 记录）",
+                );
+            }
         }
         crate::session::CompletionReason::ContextOverflow => {
             // P1-4：压缩与 prune 后仍超窗口——明确提示而不是让请求失败。
@@ -1865,16 +1889,20 @@ async fn run_interactive<P: Provider>(
         crate::session::CompletionReason::ProviderInterrupted => {
             // §4.3：流中断且已有 partial——partial 已保留在 transcript 与 session，
             // 明确提示而不是让用户以为整个 turn 丢了。
-            ui_state.view.push_line(
-                LineKind::System,
-                "⚠ 模型连接中断，已保留本次部分输出和 session 状态；可重新发送继续。",
-            );
+            if !retry {
+                ui_state.view.push_line(
+                    LineKind::System,
+                    "⚠ 模型连接中断，已保留本次部分输出和 session 状态；可重新发送继续。",
+                );
+            }
         }
         crate::session::CompletionReason::ProviderUnavailable => {
-            ui_state.view.push_line(
-                LineKind::System,
-                "⚠ 无法连接模型（重试后仍失败）；session 已保留，可稍后重试。",
-            );
+            if !retry {
+                ui_state.view.push_line(
+                    LineKind::System,
+                    "⚠ 无法连接模型（重试后仍失败）；session 已保留，可稍后重试。",
+                );
+            }
         }
         crate::session::CompletionReason::WallTimeExceeded => {
             // §16：watchdog 自动取消≠用户取消，明确提示。
@@ -1923,7 +1951,19 @@ async fn run_interactive<P: Provider>(
             block.push("⏸ run 挂起，等待你的输入：".to_string());
             block.extend(question.lines().map(String::from));
             block.push("（输入回答后继续；可直接输入选项编号 1-N 选择）".to_string());
-            ui_state.view.push_system_block_dedup(&block);
+            // 刷屏防护（跨回答）：askuser 的典型流程是“挂起 → 用户回答 →
+            // resume → 再挂起”，中间必然插入 User 消息，连续去重永远失效。
+            // 相同问题（同一块）在整个 transcript 中只完整展示一次；用户已
+            // 回答过该问题后又挂起时补一行轻提示（全局去重，循环也不累积），
+            // 不同问题每次完整展示（用户需要看到新提问）。
+            if ui_state.view.has_system_block(&block) {
+                let hint = "⏸ run 再次挂起（问题同上，等待你的输入）".to_string();
+                if !ui_state.view.has_system_block(std::slice::from_ref(&hint)) {
+                    ui_state.view.push_line(LineKind::System, hint);
+                }
+            } else {
+                ui_state.view.push_system_block_dedup(&block);
+            }
         }
     }
     ui_state.view.status = StatusLine::Idle;

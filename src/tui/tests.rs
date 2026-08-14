@@ -41,14 +41,28 @@ fn usage_updated_accumulates_incrementally() {
 
 /// §用户诉求：断开重连提示带时间与次数（Claude Code 式）——系统行含
 /// `[HH:MM:SS]` 时间戳、`第 N/MAX 次`；footer 的 reconnect_count 累计。
+/// §刷屏防护：恢复是过程性事件，同轮后续恢复（attempt > 1）只累计计数、
+/// 不再追加提示行（最终失败另有总结提示）——一次 run 内不再弹 N 行恢复提示。
 #[test]
 fn reconnect_prompt_shows_time_and_attempt_count() {
     let mut state = UiState::new(ViewModel::default());
+    // attempt > 1（同轮第 2 次恢复）：不追加行，仅累计 reconnect_count。
     reducer::update(
         &mut state,
         UiEvent::Agent(crate::agent::RuntimeEvent::StreamRecovering { attempt: 2 }),
     );
     assert_eq!(state.view.reconnect_count, 1);
+    assert!(
+        state.view.transcript.is_empty(),
+        "同轮后续恢复不得追加提示行（防止断联抖动刷屏）"
+    );
+
+    // 第一次恢复（attempt == 1）：追加带时间戳与次数的提示行。
+    reducer::update(
+        &mut state,
+        UiEvent::Agent(crate::agent::RuntimeEvent::StreamRecovering { attempt: 1 }),
+    );
+    assert_eq!(state.view.reconnect_count, 2);
     let text = entry_text(&state.view.transcript[0]);
     // 时间戳 [HH:MM:SS]（Claude Code 式）。
     assert!(
@@ -56,19 +70,26 @@ fn reconnect_prompt_shows_time_and_attempt_count() {
         "系统行必须带 [HH:MM:SS] 时间戳: {text}"
     );
     assert!(
-        text.contains("第 2/10 次"),
+        text.contains("第 1/10 次"),
         "必须显示第 N/MAX 次（MAX=MAX_STREAM_RECOVERIES）: {text}"
     );
 
-    // 再一次 TurnRestarting：次数累计，且显示对应 MAX（10）。
+    // TurnRestarting 第一次（attempt == 1）：同样追加。
     reducer::update(
         &mut state,
         UiEvent::Agent(crate::agent::RuntimeEvent::TurnRestarting { attempt: 1 }),
     );
-    assert_eq!(state.view.reconnect_count, 2);
+    assert_eq!(state.view.reconnect_count, 3);
     let text2 = entry_text(&state.view.transcript[1]);
     assert!(text2.contains("第 1/10 次"), "{text2}");
     assert!(text2.contains("重新生成"), "{text2}");
+    // 同轮后续 TurnRestarting（attempt > 1）：静默。
+    reducer::update(
+        &mut state,
+        UiEvent::Agent(crate::agent::RuntimeEvent::TurnRestarting { attempt: 3 }),
+    );
+    assert_eq!(state.view.reconnect_count, 4);
+    assert_eq!(state.view.transcript.len(), 2, "同轮后续重启不得追加提示行");
 }
 
 /// 取 Entry 的文本（Message 行）；测试辅助。
