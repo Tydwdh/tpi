@@ -16,6 +16,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
@@ -82,6 +83,16 @@ enum Command {
         /// 只列出将删除的文件，不实际删除。
         #[arg(long)]
         dry_run: bool,
+    },
+    /// 局域网网页接口（粗糙版）：手机发送/接收消息，不用守在电脑前。
+    /// 无 TLS；同一时刻只处理一条消息；可选 --token 做简单访问控制。
+    Serve {
+        /// 监听端口（默认 8765）。
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+        /// 访问 token（可选；设置后 API 需要 X-TPI-Token 或 ?token=）。
+        #[arg(long)]
+        token: Option<String>,
     },
     /// 自动评测（Eval Harness：真实 coding task + 可重置 repo + 验收断言）。
     ///
@@ -842,6 +853,12 @@ fn run(cli: Cli) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     tracing::info!(workspace = %workspace_root, model = %config.model.name, "tpi starting");
+
+    // 局域网网页接口：手机发送/接收消息（粗糙版，见 src/web.rs）。
+    if let Some(Command::Serve { port, token }) = &cli.command {
+        return runtime.block_on(tpi::web::serve(Arc::new(config), *port, token.clone()));
+    }
+
     runtime.block_on(app::run(
         config,
         session_target,

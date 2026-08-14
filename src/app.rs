@@ -2348,7 +2348,9 @@ pub fn resolve_session_id_prefix(
 }
 
 /// 当前 workspace 最近的 session（§18.3 `--continue`）。
-fn latest_session_id(
+/// P1-6/web：`tpi serve` 复用——恢复当前 workspace 最近 session（与 `--continue`
+/// 同一事实源；无历史时调用方新建会话）。
+pub fn latest_session_id(
     sessions_root: &std::path::Path,
     workspace_root: &Utf8PathBuf,
 ) -> Result<SessionId, String> {
