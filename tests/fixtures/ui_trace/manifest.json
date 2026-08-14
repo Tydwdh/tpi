@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "generated": "2026-08-14",
+  "note": "recorded UI trace corpus（P0-04）。回放不依赖 wall clock/network；格式见 README.md。",
+  "size": { "width": 120, "height": 40 },
+  "traces": [
+    {
+      "id": "001_input_queue",
+      "file": "001_input_queue.jsonl",
+      "assert": "pending_messages",
+      "expected": ["hi", "a"],
+      "note": "输入 h,i,x,退格 → 'hi'；Enter 提交；输入 a → Enter 提交"
+    },
+    {
+      "id": "002_scroll",
+      "file": "002_scroll.jsonl",
+      "assert": "scroll_mode_follow",
+      "note": "assistant delta 推 20 行 → PageUp/PageDown → Ctrl+End 恢复 follow；断言终态 Follow"
+    }
+  ]
+}

@@ -140,6 +140,16 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 代码行为零有意变化（除 fixture 根因和依赖卫生）；
 - 任一失败可回滚单 PR。
 
+### P0 未知项决策（2026-08-14 用户确认，对 00 文档 §8 的答复）
+
+- **#2 长时运行**：先建合成基线（P0-05 已落地，release artifact `target/perf-baseline.json`）；真实 10h 测试放 scheduled/manual gate，之后执行。
+- **#3 终端组合**：Windows Terminal + Git Bash 为主。
+- **#4 MCP 同名冲突**：不声称真实用户已遇到；Registration ABA 是独立正确性问题，按高优先级先写 red test 并修复（P4-01）。duplicate-name policy：默认拒绝重复；或必须经显式 scope/override；old disposer 绝不能删除 replacement。
+- **#5 allow_outside_workspace**：保持当前配置与默认语义，重构不得改变行为；后续 scoped capability/policy 必须能表达该配置，但不借机扩大默认权限。
+- **#6 renderer 模式**：只保留 alternate-screen；无明确需求与 UX 证据不实现双 renderer。
+- **#7 子代理用途**：第一目标 = 只读、隔离上下文的并行调查（初始规格见 P8）。
+- **#8 session 全文检索**：当前不需要；P9-02 保持关闭，不引入 SQLite；有真实搜索需求与 JSONL 扫描性能数据时才写独立 ADR。
+
 ## 4. Phase 1：统一词汇与逻辑边界
 
 ### 目标
@@ -335,6 +345,9 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 - 先写 ABA red test；entry/id 精确删除；重复名规则显式。
 - 不同 PR 再加 override API。
+- duplicate-name policy（用户决策 2026-08-14）：**默认拒绝重复注册**；覆盖必须经
+  显式 scope/override API；**old disposer 绝不能删除 replacement**（`(name,id)`
+  同时匹配才删除）。ABA 是独立正确性问题，不依赖真实冲突事故即可开工（高优先级）。
 
 #### P4-02 composition root 注入 registry
 
@@ -570,6 +583,14 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 ### 目标
 
 在 supervisor/scope/session/runtime event 成熟后增加可选子代理。
+
+> **P8 初始规格（用户决策 2026-08-14）**：第一目标 = **只读、隔离上下文的
+> 并行调查**。初始版本要求：默认关闭；`depth = 1`（不允许递归）；
+> `concurrency = 1`（单 child 稳定后再评估 bounded parallel）；fresh child
+> session；只读 capability allowlist；parent 只接收 structured report；
+> parent cancellation 必须传播；不允许共享 workspace 写入；不先接外部
+> Agent（ACP/子进程 provider）。隔离 worktree、外部 ACP provider、递归属于
+> 后续证据门控能力（各自独立 ADR）。
 
 ### 任务
 

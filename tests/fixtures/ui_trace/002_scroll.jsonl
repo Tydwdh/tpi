@@ -1,0 +1,5 @@
+{"kind":"agent","delta":"line 01\nline 02\nline 03\nline 04\nline 05\nline 06\nline 07\nline 08\nline 09\nline 10\n"}
+{"kind":"agent","delta":"line 11\nline 12\nline 13\nline 14\nline 15\nline 16\nline 17\nline 18\nline 19\nline 20\n"}
+{"kind":"key","code":"pageup"}
+{"kind":"key","code":"pagedown"}
+{"kind":"key","code":"ctrl_end"}
