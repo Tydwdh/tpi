@@ -234,3 +234,53 @@ fn bom_file_untouched_bytes_preserved() {
     assert!(after.starts_with(b"\xEF\xBB\xBF"), "BOM 必须保留");
     assert_eq!(after, "\u{FEFF}let x = 2;\n".as_bytes());
 }
+
+// P1 property：trailing-whitespace 宽容定位的不变量——
+// 成功时未变化行（context）保留实际字节（含真实 trailing）；变化行按 new_text。
+// 任意 trailing 数量与行数下都必须成立；exact 与 trailing 命中均验证。
+proptest! {
+    #[test]
+    fn trailing_tolerance_preserves_context_lines(
+        n in 3usize..10,
+        extra_trailing in 0usize..4,
+    ) {
+        let mut content = String::new();
+        for i in 0..n {
+            content.push_str(&format!("line{i}"));
+            content.push_str(&" ".repeat(extra_trailing));
+            content.push('\n');
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("f.rs")).unwrap();
+        std::fs::write(path.as_std_path(), &content).unwrap();
+        let revision = revision_of(content.as_bytes());
+        // old_text 无 trailing（模型视角）；改 line1（唯一窗口，line1/line2 相邻）。
+        let old_text = "line1\nline2".to_string();
+        let new_text = "line1\nCHANGED".to_string();
+        let result = apply_edit(
+            &path,
+            &revision,
+            &[Replacement { old_text, new_text }],
+        );
+        let Ok(result) = result else {
+            // 拒绝（理论上不会，此处为稳健）→ 文件必须零变化。
+            prop_assert_eq!(&std::fs::read_to_string(path.as_std_path()).unwrap(), &content);
+            return Ok(());
+        };
+        let plan = prepare_commit(&path);
+        commit_edit(&result, &path, &plan).unwrap();
+        let after = std::fs::read_to_string(path.as_std_path()).unwrap();
+        let lines: Vec<&str> = after.lines().collect();
+        prop_assert_eq!(lines.len(), n);
+        for (i, line) in lines.iter().enumerate() {
+            if i == 2 {
+                // 变化行（old_text 第二行 line2 → CHANGED）：由 new_text 定义。
+                prop_assert_eq!(line, &"CHANGED");
+            } else {
+                // 未变化行（含 context 行 line1）：原始内容 + trailing 逐字保留。
+                let expected = format!("line{i}{}", " ".repeat(extra_trailing));
+                prop_assert_eq!(line, &expected, "未变化行被改动: {}", i);
+            }
+        }
+    }
+}

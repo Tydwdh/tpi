@@ -77,12 +77,16 @@ fn scan_dir(dir: &PathBuf, origin: SkillOrigin) -> Vec<DiscoveredSkill> {
 /// 从所有来源发现 skills（去重：高优先级覆盖低优先级，README2 §19）。
 pub fn discover(workspace_root: &camino::Utf8PathBuf) -> Vec<DiscoveredSkill> {
     // 低 → 高 扫描，后面的覆盖同名。
-    let mut by_name: std::collections::HashMap<String, DiscoveredSkill> = std::collections::HashMap::new();
+    let mut by_name: std::collections::HashMap<String, DiscoveredSkill> =
+        std::collections::HashMap::new();
     let mut order = Vec::new();
     for (dir, origin) in [
         (builtin_skills_dir(), SkillOrigin::Builtin),
         (user_skills_dir(), SkillOrigin::User),
-        (workspace_root.join(PROJECT_SKILLS_DIR).into(), SkillOrigin::Project),
+        (
+            workspace_root.join(PROJECT_SKILLS_DIR).into(),
+            SkillOrigin::Project,
+        ),
     ] {
         for skill in scan_dir(&dir, origin) {
             let name = skill.meta.name.clone();
@@ -127,7 +131,8 @@ mod tests {
         // 这里直接验证 scan_dir + 手工合并逻辑的核心：同名覆盖。
         let user_skills = scan_dir(&user, SkillOrigin::User);
         let proj_skills = scan_dir(&project, SkillOrigin::Project);
-        let mut by_name: std::collections::HashMap<String, DiscoveredSkill> = std::collections::HashMap::new();
+        let mut by_name: std::collections::HashMap<String, DiscoveredSkill> =
+            std::collections::HashMap::new();
         for s in user_skills.into_iter().chain(proj_skills) {
             by_name.insert(s.meta.name.clone(), s);
         }

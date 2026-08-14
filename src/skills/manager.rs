@@ -79,14 +79,18 @@ impl SkillManager {
     /// 激活 skill：读取完整 SKILL.md（Level 2）。
     pub fn activate(&mut self, name: &str) -> Result<Skill, String> {
         let Some(discovered) = self.catalog.get(name).cloned() else {
-            return Err(format!("未知 skill: {name}（可用：{}）", self.available_names().join(", ")));
+            return Err(format!(
+                "未知 skill: {name}（可用：{}）",
+                self.available_names().join(", ")
+            ));
         };
         let dir = discovered.dir.clone();
         let content = std::fs::read_to_string(dir.join("SKILL.md"))
             .map_err(|e| format!("读取 {} 失败: {e}", dir.display()))?;
         let skill = parse_full(&content, dir.clone())
             .map_err(|e| format!("解析 {} 失败: {e}", dir.display()))?;
-        self.activated.insert(name.to_string(), SkillState::Activated);
+        self.activated
+            .insert(name.to_string(), SkillState::Activated);
         Ok(skill)
     }
 
@@ -116,8 +120,7 @@ impl SkillManager {
             return Err(format!("未知 skill: {name}"));
         };
         let path: PathBuf = skill.dir.join("references").join(reference);
-        std::fs::read_to_string(&path)
-            .map_err(|e| format!("读取 reference {reference} 失败: {e}"))
+        std::fs::read_to_string(&path).map_err(|e| format!("读取 reference {reference} 失败: {e}"))
     }
 }
 

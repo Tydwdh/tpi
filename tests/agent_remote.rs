@@ -10,8 +10,8 @@ use camino::Utf8PathBuf;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tpi::provider::ToolCall;
-use tpi::remote::ssh::{HostKeyDecision, RemoteHost};
 use tpi::remote::RemoteWorkspace;
+use tpi::remote::ssh::{HostKeyDecision, RemoteHost};
 use tpi::session::SessionLog;
 use tpi::workspace::ActiveWorkspace;
 
@@ -27,7 +27,10 @@ fn tool_call(name: &str, args: serde_json::Value) -> ToolCall {
 async fn setup_remote_workspace() -> (tempfile::TempDir, tpi::workspace::ActiveWorkspace) {
     let (port, root, known_hosts) = fixtures::remote_server::start_test_server().await;
     let mut probe = fixtures::remote_server::test_client(port, &known_hosts).await;
-    assert_eq!(probe.connect().await.unwrap(), HostKeyDecision::UnknownPending);
+    assert_eq!(
+        probe.connect().await.unwrap(),
+        HostKeyDecision::UnknownPending
+    );
     probe.confirm_host_key().unwrap();
     probe.disconnect().await;
 
@@ -125,7 +128,8 @@ async fn agent_solves_task_on_remote_workspace() {
         &config,
         tpi::agent::RunInput {
             history: &[],
-            user_message: "在远程机器上统计 logs/input.log 中每种错误的数量，写出脚本并运行验证。".into(),
+            user_message: "在远程机器上统计 logs/input.log 中每种错误的数量，写出脚本并运行验证。"
+                .into(),
             ui: tx,
             cancel: CancellationToken::new(),
             interactive: false,
@@ -141,7 +145,11 @@ async fn agent_solves_task_on_remote_workspace() {
 
     // 1. 任务完成（stop）。
     assert_eq!(outcome.reason, tpi::session::CompletionReason::Stop);
-    assert!(outcome.assistant_text.contains("result.csv"), "汇报含结果：{}", outcome.assistant_text);
+    assert!(
+        outcome.assistant_text.contains("result.csv"),
+        "汇报含结果：{}",
+        outcome.assistant_text
+    );
 
     // 2. result.csv 在**远端 FS**（server tempdir）真实生成——证明 bash 走了
     //    remote executor（而非本地）。
@@ -156,18 +164,12 @@ async fn agent_solves_task_on_remote_workspace() {
     //    Assistant 消息（即本轮新增的工具调用）。
     let mut tools_seen = Vec::new();
     for request in &provider.requests {
-        let last_assistant = request
-            .messages
-            .iter()
-            .rev()
-            .find_map(|m| match m {
-                tpi::provider::ChatMessage::Assistant { tool_calls, .. }
-                    if !tool_calls.is_empty() =>
-                {
-                    Some(tool_calls.clone())
-                }
-                _ => None,
-            });
+        let last_assistant = request.messages.iter().rev().find_map(|m| match m {
+            tpi::provider::ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                Some(tool_calls.clone())
+            }
+            _ => None,
+        });
         if let Some(calls) = last_assistant {
             for call in calls {
                 tools_seen.push(call.name);
@@ -179,7 +181,9 @@ async fn agent_solves_task_on_remote_workspace() {
         "必须经过 bash 工具：{tools_seen:?}"
     );
     assert!(
-        !tools_seen.iter().any(|t| t.contains("ssh") || t.contains("scp")),
+        !tools_seen
+            .iter()
+            .any(|t| t.contains("ssh") || t.contains("scp")),
         "trajectory 不得出现 ssh/scp（§63）：{tools_seen:?}"
     );
     // 顺序：list → read → write → bash → read。
@@ -194,7 +198,14 @@ async fn agent_solves_task_on_remote_workspace() {
 #[tokio::test]
 async fn agent_request_includes_workspace_identity() {
     let (_remote_fs, remote_workspace) = setup_remote_workspace().await;
-    let config = test_config(&tempfile::tempdir().unwrap().path().to_path_buf().try_into().unwrap());
+    let config = test_config(
+        &tempfile::tempdir()
+            .unwrap()
+            .path()
+            .to_path_buf()
+            .try_into()
+            .unwrap(),
+    );
     let mut session = SessionLog::create(
         &config.sessions_root,
         tempfile::tempdir().unwrap().path(),

@@ -11,9 +11,9 @@
 use camino::Utf8PathBuf;
 
 use crate::remote::ssh::SshClient;
-use crate::tool::edit::{self, FileSnapshot};
-use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus, ToolMetadata};
 use crate::tool::ToolContext;
+use crate::tool::edit::{self, FileSnapshot};
+use crate::tool::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 
 /// 远端 read 窗口参数。
 #[derive(Debug, Clone)]
@@ -105,7 +105,10 @@ pub async fn remote_read(
     let mut text = window.text;
     let mut truncated = window.truncated;
     if text.len() > crate::tool::files::DEFAULT_READ_MAX_BYTES {
-        crate::util::truncate_to_char_boundary(&mut text, crate::tool::files::DEFAULT_READ_MAX_BYTES);
+        crate::util::truncate_to_char_boundary(
+            &mut text,
+            crate::tool::files::DEFAULT_READ_MAX_BYTES,
+        );
         truncated = true;
     }
     let revision_header = edit::format_revision_header(&window.revision);
@@ -332,9 +335,7 @@ pub async fn remote_write(
         );
     }
     let revision = edit::revision_of(&new_raw);
-    let output = format!(
-        "status: succeeded\ntool: write\n[revision={revision}]\npath: {path}"
-    );
+    let output = format!("status: succeeded\ntool: write\n[revision={revision}]\npath: {path}");
     ToolOutcome::succeeded("write", output).with_metadata(ToolMetadata {
         tool: "write".into(),
         target: Some(path),

@@ -9,7 +9,7 @@
 //! <body：使用说明/工作流/知识>
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 一个 Skill 的元数据（启动时只加载这些，README2 §18 Level 1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,18 +52,27 @@ pub enum ParseError {
     #[error("SKILL.md frontmatter 缺 description 字段: {path}")]
     MissingDescription { path: PathBuf },
     #[error("SKILL.md 读取失败: {path}: {source}")]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// 解析 SKILL.md 文本（返回 meta）。
-pub fn parse_meta(content: &str, path: &PathBuf) -> Result<SkillMeta, ParseError> {
+pub fn parse_meta(content: &str, path: &Path) -> Result<SkillMeta, ParseError> {
     let Some((frontmatter, _body)) = split_frontmatter(content) else {
-        return Err(ParseError::MissingFrontmatter { path: path.clone() });
+        return Err(ParseError::MissingFrontmatter {
+            path: path.to_path_buf(),
+        });
     };
-    let name = frontmatter_field(frontmatter, "name")
-        .ok_or_else(|| ParseError::MissingName { path: path.clone() })?;
-    let description = frontmatter_field(frontmatter, "description")
-        .ok_or_else(|| ParseError::MissingDescription { path: path.clone() })?;
+    let name = frontmatter_field(frontmatter, "name").ok_or_else(|| ParseError::MissingName {
+        path: path.to_path_buf(),
+    })?;
+    let description = frontmatter_field(frontmatter, "description").ok_or_else(|| {
+        ParseError::MissingDescription {
+            path: path.to_path_buf(),
+        }
+    })?;
     Ok(SkillMeta { name, description })
 }
 
@@ -76,7 +85,7 @@ pub fn parse_full(content: &str, dir: PathBuf) -> Result<Skill, ParseError> {
     let name = frontmatter_field(frontmatter, "name")
         .ok_or_else(|| ParseError::MissingName { path: path.clone() })?;
     let description = frontmatter_field(frontmatter, "description")
-        .ok_or_else(|| ParseError::MissingDescription { path })?;
+        .ok_or(ParseError::MissingDescription { path })?;
     let references = list_subdir(&dir, "references");
     let scripts = list_subdir(&dir, "scripts");
     Ok(Skill {
@@ -110,7 +119,7 @@ fn frontmatter_field(frontmatter: &str, key: &str) -> Option<String> {
     })
 }
 
-fn list_subdir(dir: &PathBuf, sub: &str) -> Vec<String> {
+fn list_subdir(dir: &Path, sub: &str) -> Vec<String> {
     let subdir = dir.join(sub);
     let Ok(rd) = std::fs::read_dir(&subdir) else {
         return Vec::new();
@@ -128,7 +137,8 @@ fn list_subdir(dir: &PathBuf, sub: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "---\nname: hello-skill\ndescription: 问候示例\n---\n# Hello\n\n使用步骤：\n1. 打招呼\n";
+    const SAMPLE: &str =
+        "---\nname: hello-skill\ndescription: 问候示例\n---\n# Hello\n\n使用步骤：\n1. 打招呼\n";
 
     #[test]
     fn parses_meta_from_frontmatter() {
@@ -155,6 +165,12 @@ mod tests {
     #[test]
     fn missing_frontmatter_is_error() {
         assert!(parse_meta("no frontmatter", &PathBuf::from("x.md")).is_err());
-        assert!(parse_meta("---\ndescription: no name\n---\nbody", &PathBuf::from("x.md")).is_err());
+        assert!(
+            parse_meta(
+                "---\ndescription: no name\n---\nbody",
+                &PathBuf::from("x.md")
+            )
+            .is_err()
+        );
     }
 }

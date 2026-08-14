@@ -74,20 +74,39 @@ mod tests {
 
     #[test]
     fn error_kinds_map_correctly() {
-        assert_eq!(McpError::InvalidSchema("x".into()).kind(), McpErrorKind::InvalidArguments);
+        assert_eq!(
+            McpError::InvalidSchema("x".into()).kind(),
+            McpErrorKind::InvalidArguments
+        );
         assert_eq!(McpError::Timeout.kind(), McpErrorKind::Timeout);
         assert_eq!(
-            McpError::ServerError { code: -32602, message: "bad".into() }.kind(),
+            McpError::ServerError {
+                code: -32602,
+                message: "bad".into()
+            }
+            .kind(),
             McpErrorKind::ExecutionFailed
         );
-        assert_eq!(McpError::ProcessDied("crash".into()).kind(), McpErrorKind::Unavailable);
-        assert_eq!(McpError::Transport("eof".into()).kind(), McpErrorKind::Unavailable);
-        assert_eq!(McpError::Protocol("bad json".into()).kind(), McpErrorKind::Unavailable);
+        assert_eq!(
+            McpError::ProcessDied("crash".into()).kind(),
+            McpErrorKind::Unavailable
+        );
+        assert_eq!(
+            McpError::Transport("eof".into()).kind(),
+            McpErrorKind::Unavailable
+        );
+        assert_eq!(
+            McpError::Protocol("bad json".into()).kind(),
+            McpErrorKind::Unavailable
+        );
     }
 
     #[test]
     fn error_codes_are_short_and_stable() {
         assert_eq!(error_code(&McpError::Timeout), "mcp_timeout");
-        assert_eq!(error_code(&McpError::InvalidSchema("x".into())), "mcp_invalid_arguments");
+        assert_eq!(
+            error_code(&McpError::InvalidSchema("x".into())),
+            "mcp_invalid_arguments"
+        );
     }
 }

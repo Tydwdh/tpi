@@ -9,8 +9,8 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::tool::outcome::ToolOutcome;
 use crate::tool::ToolContext;
+use crate::tool::outcome::ToolOutcome;
 
 /// `runtime_inspect` 参数（无）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -39,7 +39,11 @@ pub async fn runtime_inspect(_args: InspectArgs, ctx: &ToolContext) -> ToolOutco
     let skill_lines: Vec<String> = {
         let manager = crate::skills::manager::SkillManager::global();
         let guard = crate::util::lock_mutex(&manager, "skill_manager");
-        guard.available_names().into_iter().map(|n| format!("  {n}")).collect()
+        guard
+            .available_names()
+            .into_iter()
+            .map(|n| format!("  {n}"))
+            .collect()
     };
 
     // 3. Workspace（kind + identity：local:path / ssh:host:root）。

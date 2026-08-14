@@ -140,12 +140,11 @@ Running
 仍兼容。挂起问题文本（`UserInputRequested.prompt` / `AgentOutcome.awaiting_input.text`）
 是参数渲染后的多行文本（编号 + header + 选项），session 与 TUI 展示同一事实源。
 
-**TUI 键盘选项选择器**：所有问题都带 `options` 时，挂起后自动弹出模态
-选择器面板（`ViewModel.input_choice`）——↑/↓ / Tab / Shift+Tab 在选项间
-移动（循环）、Enter / 数字 1-9 确认，多问题逐题导航，全部确认后选项文本
-按问题顺序逐行拼接 push 进待提交消息（作为用户回答继续 run）；Esc 关闭
-选择器回到自由输入。`AgentOutcome.awaiting_input` 携带结构化 `questions`
-（选择器构建源），与渲染文本同源；无选项时保持纯文本输入。
+**TUI 内联回答**：挂起问题与选项直接内联展示在 transcript（`push_system_block_dedup`），
+无模态弹窗。用户直接在输入框输入回答继续 run；**单问题带选项**时，纯数字
+`1..=N` 回答映射为对应选项文本（`app.rs::map_pending_answer`），其余输入原样
+返回。多问题按行逐条回答，不做有歧义的编号映射。`AgentOutcome.awaiting_input`
+携带结构化 `questions`（编号映射来源），与渲染文本同源；无选项时保持自由输入。
 用户回答以 `UserInputReceived.content` 记录，仍作为普通 User 消息继续。
 
 ## 8. Runtime Introspection
@@ -185,6 +184,6 @@ TUI 可以从 session 重建（--continue/--resume 还原历史与运行状态�
 - `agent::scheduler` 是 `tool::scheduler` 的 re-export（兼容既有测试引用），
   测试引用迁移完成后删除（AGENTS.md §27 清理）。
 - remote（SSH）workspace 与 MCP 的 ToolContext 构造已统一；`request_input` 已支持
-  多问题（questions 数组）+ header + options（渲染进挂起文本），TUI 提供键盘
-  选项选择器（↑/↓+Enter / 数字 1-9 选择，多问题逐题导航，Esc 关闭回到自由
-  输入）；暂无鼠标交互（键盘已覆盖）。
+  多问题（questions 数组）+ header + options（渲染进挂起文本），挂起后问题内联
+  展示在 transcript，单问题带选项时输入框可直接输入数字编号 1-N 选择；
+  暂无鼠标交互。

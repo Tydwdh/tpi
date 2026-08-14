@@ -7,7 +7,7 @@ mod fixtures;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tpi::provider::ToolCall;
-use tpi::session::{SessionLog, CompletionReason};
+use tpi::session::{CompletionReason, SessionLog};
 
 use fixtures::fake_provider::{FakeProvider, FakeResponse};
 
@@ -43,7 +43,13 @@ async fn mcp_tool_executes_inside_agent_loop() {
             .await
             .unwrap();
     }
-    assert!(registry.lock().unwrap().get("mcp::e2e-server::echo").is_some());
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .get("mcp::e2e-server::echo")
+            .is_some()
+    );
 
     // agent 请求：FakeProvider 依次调用 MCP echo → 收到结果 → 完成。
     let dir = tempfile::tempdir().unwrap();
@@ -111,7 +117,12 @@ async fn mcp_tool_executes_inside_agent_loop() {
     // 清理：卸载测试 server 工具 + 关闭进程（避免污染其他测试/留孤儿）。
     {
         let mut guard = registry.lock().unwrap();
-        for name in ["mcp::e2e-server::echo", "mcp::e2e-server::add", "mcp::e2e-server::fail", "mcp::e2e-server::sleep"] {
+        for name in [
+            "mcp::e2e-server::echo",
+            "mcp::e2e-server::add",
+            "mcp::e2e-server::fail",
+            "mcp::e2e-server::sleep",
+        ] {
             guard.unregister(name);
         }
     }

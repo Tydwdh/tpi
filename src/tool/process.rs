@@ -170,11 +170,7 @@ fn output_process(ctx: &ToolContext, id: ProcessId) -> ToolOutcome {
 }
 
 /// wait（任务书 §20）：最多等 `timeout`；完成返回终态，仍运行返回 running。
-async fn wait_process_tool(
-    ctx: &ToolContext,
-    id: ProcessId,
-    timeout: Duration,
-) -> ToolOutcome {
+async fn wait_process_tool(ctx: &ToolContext, id: ProcessId, timeout: Duration) -> ToolOutcome {
     let Some(state) = wait_process(&ctx.processes, id, timeout).await else {
         return not_found(id);
     };

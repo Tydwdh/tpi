@@ -32,18 +32,13 @@ pub struct EnvOverlay {
 /// `_` 是 bash 记住的最后一条命令路径；`BASHPID`/`PPID`/`SECONDS` 每进程不同；
 /// `SHLVL` 随 shell 嵌套变化；`PWD`/`OLDPWD` 是 cwd 派生值（cwd 已单独跟踪）。
 pub const DYNAMIC_ENV_VARS: &[&str] = &[
-    "SHLVL",
-    "PWD",
-    "OLDPWD",
-    "BASHPID",
-    "PPID",
-    "SECONDS",
-    "RANDOM",
-    "_",
+    "SHLVL", "PWD", "OLDPWD", "BASHPID", "PPID", "SECONDS", "RANDOM", "_",
 ];
 
 fn is_dynamic(name: &str) -> bool {
-    DYNAMIC_ENV_VARS.iter().any(|key| key.eq_ignore_ascii_case(name))
+    DYNAMIC_ENV_VARS
+        .iter()
+        .any(|key| key.eq_ignore_ascii_case(name))
 }
 
 /// 计算新 overlay：`diff(baseline, new)`（任务书 §20）。
@@ -51,10 +46,7 @@ fn is_dynamic(name: &str) -> bool {
 /// - `new` 相对 `baseline` 新增/改值的 key → `set`；
 /// - `baseline` 有而 `new` 没有的 key → `unset`；
 /// - 动态变量一律忽略，不进入 overlay。
-pub fn diff_env(
-    baseline: &HashMap<String, String>,
-    new: &HashMap<String, String>,
-) -> EnvOverlay {
+pub fn diff_env(baseline: &HashMap<String, String>, new: &HashMap<String, String>) -> EnvOverlay {
     let mut overlay = EnvOverlay::default();
     for (key, value) in new {
         if is_dynamic(key) {
@@ -147,7 +139,10 @@ mod tests {
     #[test]
     fn state_serialization_excludes_env_data() {
         let mut state = ShellSessionState::new(Utf8PathBuf::from("C:/proj"));
-        state.env_overlay.set.insert("HTTPS_PROXY".into(), "http://p:8080".into());
+        state
+            .env_overlay
+            .set
+            .insert("HTTPS_PROXY".into(), "http://p:8080".into());
         state.env_overlay.unset.insert("SECRET".into());
         state.baseline = Some(HashMap::from([("API_KEY".into(), "sk-123".into())]));
         state.version = 3;
@@ -173,11 +168,11 @@ mod tests {
             ("SHLVL".into(), "1".into()),
         ]);
         let new = HashMap::from([
-            ("FOO".into(), "2".into()), // 改值 → set
+            ("FOO".into(), "2".into()),    // 改值 → set
             ("BAR".into(), "keep".into()), // 不变 → 忽略
-            ("QUX".into(), "new".into()), // 新增 → set
-            ("SHLVL".into(), "2".into()), // 动态 → 忽略
-            ("PWD".into(), "/x".into()),  // 动态 → 忽略
+            ("QUX".into(), "new".into()),  // 新增 → set
+            ("SHLVL".into(), "2".into()),  // 动态 → 忽略
+            ("PWD".into(), "/x".into()),   // 动态 → 忽略
         ]);
         let overlay = diff_env(&baseline, &new);
         assert_eq!(overlay.set["FOO"], "2");

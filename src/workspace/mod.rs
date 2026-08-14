@@ -30,7 +30,10 @@ pub enum WorkspaceKind {
 pub enum WorkspaceId {
     Local(Utf8PathBuf),
     /// host 别名/地址 + 远端 root（R 阶段启用）。
-    Remote { host: String, root: String },
+    Remote {
+        host: String,
+        root: String,
+    },
 }
 
 impl std::fmt::Display for WorkspaceId {

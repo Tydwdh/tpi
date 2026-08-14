@@ -81,9 +81,7 @@ impl ToolRuntime {
             current_plan: Arc::new(Mutex::new(initial_plan)),
             shell,
             workspace,
-            processes: Arc::new(Mutex::new(
-                crate::process::managed::ProcessRegistry::new(),
-            )),
+            processes: Arc::new(Mutex::new(crate::process::managed::ProcessRegistry::new())),
             registry,
         }
     }
@@ -169,7 +167,9 @@ pub(super) enum BatchEnd {
     /// 挂起（记录 UserInputRequested），而不是继续下一轮模型请求。
     /// 携带完整参数：渲染文本（`args.render()`）供 session/TUI 展示，
     /// 结构化 questions 供 TUI 选项选择器（键盘交互）使用。
-    SuspendRequested { args: crate::tool::request_input::RequestInputArgs },
+    SuspendRequested {
+        args: crate::tool::request_input::RequestInputArgs,
+    },
 }
 
 /// Owns the mutable boundary of one tool-call batch.
@@ -629,10 +629,8 @@ error: invalid_arguments
             }
             // 工具成功执行意味着参数已通过预检；解析失败（理论不可能）
             // 时回退为空参数，由 agent 层以默认文本挂起。
-            serde_json::from_str::<crate::tool::request_input::RequestInputArgs>(
-                &source.arguments,
-            )
-            .ok()
+            serde_json::from_str::<crate::tool::request_input::RequestInputArgs>(&source.arguments)
+                .ok()
         });
         if let Some(args) = suspend_args {
             return Ok(BatchEnd::SuspendRequested { args });

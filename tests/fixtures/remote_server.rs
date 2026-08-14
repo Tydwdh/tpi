@@ -5,12 +5,12 @@
 //!（测试专用，非产品代码）。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use russh::keys::ssh_key;
-use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
 use russh::server::Server as _;
+use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
 use russh::{Channel, ChannelId};
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
@@ -218,7 +218,8 @@ impl russh_sftp::server::Handler for SftpBackend {
         };
         let mut f = std::fs::File::open(path).map_err(|_| StatusCode::Failure)?;
         use std::io::{Read, Seek, SeekFrom};
-        f.seek(SeekFrom::Start(offset)).map_err(|_| StatusCode::Failure)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|_| StatusCode::Failure)?;
         let mut buf = vec![0u8; len as usize];
         let n = f.read(&mut buf).map_err(|_| StatusCode::Failure)?;
         buf.truncate(n);
@@ -239,9 +240,11 @@ impl russh_sftp::server::Handler for SftpBackend {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false) // sftp write 语义：按 offset 覆盖，不截断其余内容
             .open(path)
             .map_err(|_| StatusCode::Failure)?;
-        f.seek(SeekFrom::Start(offset)).map_err(|_| StatusCode::Failure)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|_| StatusCode::Failure)?;
         f.write_all(&data).map_err(|_| StatusCode::Failure)?;
         Ok(Status {
             id,
@@ -391,8 +394,7 @@ pub async fn start_test_server() -> (u16, tempfile::TempDir, PathBuf) {
     let config = {
         let mut c = russh::server::Config::default();
         c.keys.push(
-            russh::keys::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519)
-                .unwrap(),
+            russh::keys::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap(),
         );
         Arc::new(c)
     };
@@ -406,7 +408,10 @@ pub async fn start_test_server() -> (u16, tempfile::TempDir, PathBuf) {
         .arg(root.path())
         .output()
         .expect("cygpath");
-    let posix_root = String::from_utf8(posix_out.stdout).expect("utf8").trim().to_string();
+    let posix_root = String::from_utf8(posix_out.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -427,9 +432,9 @@ pub async fn start_test_server() -> (u16, tempfile::TempDir, PathBuf) {
 }
 
 /// 构造连向测试 server 的 client（密码认证）。
-pub async fn test_client(port: u16, known_hosts: &PathBuf) -> SshClient {
+pub async fn test_client(port: u16, known_hosts: &Path) -> SshClient {
     let mut host = RemoteHost::direct("127.0.0.1", port, "test");
-    host.known_hosts_path = known_hosts.clone();
+    host.known_hosts_path = known_hosts.to_path_buf();
     host.password = Some(TEST_PASSWORD.into());
     SshClient::new(host)
 }

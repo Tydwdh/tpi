@@ -143,7 +143,8 @@ fn file_write(index: usize, path: &str) -> PreparedCall {
             tool: tpi::tool::BuiltinTool::Edit,
             args: tpi::tool::ValidatedArgs::Edit(tpi::tool::edit::EditArgs {
                 path: path.into(),
-                revision: "b3:0000000000000000000000000000000000000000000000000000000000000000".into(),
+                revision: "b3:0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
                 replacements: vec![tpi::tool::edit::Replacement {
                     old_text: "x".into(),
                     new_text: "y".into(),

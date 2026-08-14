@@ -11,8 +11,8 @@
 //! 执行侧在 `start_background`（P2+，接 process-host + Job Object）。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -137,7 +137,13 @@ pub struct ManagedProcess {
 }
 
 impl ManagedProcess {
-    pub fn new(id: ProcessId, workspace: String, command: String, cwd: String, env: HashMap<String, String>) -> Self {
+    pub fn new(
+        id: ProcessId,
+        workspace: String,
+        command: String,
+        cwd: String,
+        env: HashMap<String, String>,
+    ) -> Self {
         Self {
             id,
             workspace,
@@ -170,19 +176,44 @@ impl ManagedProcess {
                 runtime.as_secs_f64()
             ),
             ManagedProcessState::Starting => {
-                format!("{} starting  {}  {:.1}s", self.id, self.command, runtime.as_secs_f64())
+                format!(
+                    "{} starting  {}  {:.1}s",
+                    self.id,
+                    self.command,
+                    runtime.as_secs_f64()
+                )
             }
             ManagedProcessState::Running => {
-                format!("{} running   {}  {:.1}s", self.id, self.command, runtime.as_secs_f64())
+                format!(
+                    "{} running   {}  {:.1}s",
+                    self.id,
+                    self.command,
+                    runtime.as_secs_f64()
+                )
             }
             ManagedProcessState::Cancelled => {
-                format!("{} cancelled {}  {:.1}s", self.id, self.command, runtime.as_secs_f64())
+                format!(
+                    "{} cancelled {}  {:.1}s",
+                    self.id,
+                    self.command,
+                    runtime.as_secs_f64()
+                )
             }
             ManagedProcessState::Failed => {
-                format!("{} failed    {}  {:.1}s", self.id, self.command, runtime.as_secs_f64())
+                format!(
+                    "{} failed    {}  {:.1}s",
+                    self.id,
+                    self.command,
+                    runtime.as_secs_f64()
+                )
             }
             ManagedProcessState::Unknown => {
-                format!("{} unknown   {}  {:.1}s", self.id, self.command, runtime.as_secs_f64())
+                format!(
+                    "{} unknown   {}  {:.1}s",
+                    self.id,
+                    self.command,
+                    runtime.as_secs_f64()
+                )
             }
         }
     }
@@ -264,7 +295,12 @@ impl ProcessRegistry {
     }
 
     /// 状态迁移（terminal 后不允许再变，除非显式 reset——本阶段无 reset）。
-    pub fn transition(&mut self, id: ProcessId, state: ManagedProcessState, exit_code: Option<i32>) -> bool {
+    pub fn transition(
+        &mut self,
+        id: ProcessId,
+        state: ManagedProcessState,
+        exit_code: Option<i32>,
+    ) -> bool {
         let Some(process) = self.processes.get_mut(&id) else {
             return false;
         };
@@ -297,7 +333,9 @@ impl ProcessRegistry {
     pub fn snapshot_lines(&self, consumed: &[ProcessId]) -> Vec<String> {
         let mut lines = Vec::new();
         for process in self.iter() {
-            let recent = process.finished_at.is_some_and(|end| end.elapsed() < std::time::Duration::from_secs(60))
+            let recent = process
+                .finished_at
+                .is_some_and(|end| end.elapsed() < std::time::Duration::from_secs(60))
                 && !consumed.contains(&process.id);
             if !process.state.is_terminal() || recent {
                 lines.push(process.status_line());
@@ -388,13 +426,7 @@ pub async fn start_background(request: BackgroundStartRequest) -> Result<Process
         registry,
     } = request;
     let id = ProcessId::next();
-    let process = ManagedProcess::new(
-        id,
-        workspace,
-        command,
-        args.cwd.clone(),
-        args.env.clone(),
-    );
+    let process = ManagedProcess::new(id, workspace, command, args.cwd.clone(), args.env.clone());
     {
         let mut reg = crate::util::lock_mutex(&registry, "process_registry");
         reg.insert(process).map_err(|error| {
@@ -439,7 +471,16 @@ fn spawn_drain(
             session_id,
             registry,
         } = request;
-        if let Err(error) = drain_loop(&args, &registry, id, started_tx, &artifacts_root, &session_id).await {
+        if let Err(error) = drain_loop(
+            &args,
+            &registry,
+            id,
+            started_tx,
+            &artifacts_root,
+            &session_id,
+        )
+        .await
+        {
             tracing::error!(process = %id, %error, "managed process drain failed");
             {
                 let mut reg = crate::util::lock_mutex(&registry, "process_registry");
@@ -584,7 +625,7 @@ async fn drain_loop(
                         }
                     }
                     Ok(Some((super::MSG_EXIT, payload))) if payload.len() == 4 => {
-                        let code = i32::from_le_bytes(payload[..4].try_into().ok().expect("len=4"));
+                        let code = i32::from_le_bytes(payload[..4].try_into().expect("len=4"));
                         let spawn_failed = code == -2;
                         {
                             let mut reg = crate::util::lock_mutex(registry, "process_registry");
@@ -637,11 +678,14 @@ async fn drain_loop(
         .ok()
         .map(|record| format!("@artifact/{session_id}/{}", record.id));
     if let Some(reference) = artifact_ref {
-        crate::util::lock_mutex(&registry, "process_registry")
-            .set_runtime(id, None, Some(reference));
+        crate::util::lock_mutex(registry, "process_registry").set_runtime(
+            id,
+            None,
+            Some(reference),
+        );
     }
     // 唤醒 process wait（§20）。
-    crate::util::lock_mutex(&registry, "process_registry")
+    crate::util::lock_mutex(registry, "process_registry")
         .notify
         .notify_waiters();
     Ok(())
@@ -671,7 +715,8 @@ pub async fn wait_process(
                 .get(id)
                 .map(|p| p.state);
         }
-        let _ = tokio::time::timeout(remaining.min(Duration::from_millis(100)), notify.notified()).await;
+        let _ = tokio::time::timeout(remaining.min(Duration::from_millis(100)), notify.notified())
+            .await;
     }
 }
 
@@ -706,10 +751,16 @@ mod tests {
         let mut registry = ProcessRegistry::new();
         let id = ProcessId::next();
         registry.insert(sample(id, "sleep 5")).unwrap();
-        assert_eq!(registry.get(id).unwrap().state, ManagedProcessState::Starting);
+        assert_eq!(
+            registry.get(id).unwrap().state,
+            ManagedProcessState::Starting
+        );
 
         assert!(registry.transition(id, ManagedProcessState::Running, None));
-        assert_eq!(registry.get(id).unwrap().state, ManagedProcessState::Running);
+        assert_eq!(
+            registry.get(id).unwrap().state,
+            ManagedProcessState::Running
+        );
 
         assert!(registry.transition(id, ManagedProcessState::Exited { exit_code: 0 }, Some(0)));
         assert_eq!(
@@ -768,7 +819,10 @@ mod tests {
             registry.append_output(id, &chunk);
         }
         let process = registry.get(id).unwrap();
-        assert!(process.tail.len() <= LIVE_TAIL_BUDGET, "live tail 必须 bounded");
+        assert!(
+            process.tail.len() <= LIVE_TAIL_BUDGET,
+            "live tail 必须 bounded"
+        );
         assert_eq!(process.total_bytes, 4096 * 100, "总字节不随截断归零");
         // tail 保留的是最后一段。
         assert!(process.tail.iter().all(|b| *b == b'x'));

@@ -50,7 +50,10 @@ async fn known_host_connects_directly() {
     let mut client = fixtures::remote_server::test_client(port, &known_hosts).await;
 
     // 第一次确认。
-    assert_eq!(client.connect().await.unwrap(), HostKeyDecision::UnknownPending);
+    assert_eq!(
+        client.connect().await.unwrap(),
+        HostKeyDecision::UnknownPending
+    );
     client.confirm_host_key().unwrap();
 
     // 新 client（同 known_hosts 文件）直接 Accepted。
@@ -64,7 +67,10 @@ async fn known_host_connects_directly() {
 async fn exec_returns_output_and_exit_code() {
     let (port, _root, known_hosts) = fixtures::remote_server::start_test_server().await;
     let mut client = fixtures::remote_server::test_client(port, &known_hosts).await;
-    assert_eq!(client.connect().await.unwrap(), HostKeyDecision::UnknownPending);
+    assert_eq!(
+        client.connect().await.unwrap(),
+        HostKeyDecision::UnknownPending
+    );
     client.confirm_host_key().unwrap();
     assert_eq!(client.connect().await.unwrap(), HostKeyDecision::Accepted);
 
@@ -77,12 +83,21 @@ async fn exec_returns_output_and_exit_code() {
     assert_eq!(String::from_utf8_lossy(&r.stdout), "out1\nout2");
 
     // 失败命令（exit 非 0）。
-    let r = client.exec("exit 7", None, &Default::default(), None).await.unwrap();
+    let r = client
+        .exec("exit 7", None, &Default::default(), None)
+        .await
+        .unwrap();
     assert_eq!(r.exit_code, Some(7));
 
     // 连续两条命令（fresh channel 复用 transport 连接）。
-    let r1 = client.exec("echo one", None, &Default::default(), None).await.unwrap();
-    let r2 = client.exec("echo two", None, &Default::default(), None).await.unwrap();
+    let r1 = client
+        .exec("echo one", None, &Default::default(), None)
+        .await
+        .unwrap();
+    let r2 = client
+        .exec("echo two", None, &Default::default(), None)
+        .await
+        .unwrap();
     assert_eq!(String::from_utf8_lossy(&r1.stdout).trim(), "one");
     assert_eq!(String::from_utf8_lossy(&r2.stdout).trim(), "two");
 
@@ -94,7 +109,10 @@ async fn exec_returns_output_and_exit_code() {
 async fn write_and_read_file_roundtrip() {
     let (port, root, known_hosts) = fixtures::remote_server::start_test_server().await;
     let mut client = fixtures::remote_server::test_client(port, &known_hosts).await;
-    assert_eq!(client.connect().await.unwrap(), HostKeyDecision::UnknownPending);
+    assert_eq!(
+        client.connect().await.unwrap(),
+        HostKeyDecision::UnknownPending
+    );
     client.confirm_host_key().unwrap();
     assert_eq!(client.connect().await.unwrap(), HostKeyDecision::Accepted);
 
@@ -116,25 +134,37 @@ async fn write_and_read_file_roundtrip() {
 async fn disconnect_then_reconnect() {
     let (port, _root, known_hosts) = fixtures::remote_server::start_test_server().await;
     let mut client = fixtures::remote_server::test_client(port, &known_hosts).await;
-    assert_eq!(client.connect().await.unwrap(), HostKeyDecision::UnknownPending);
+    assert_eq!(
+        client.connect().await.unwrap(),
+        HostKeyDecision::UnknownPending
+    );
     client.confirm_host_key().unwrap();
     assert_eq!(client.connect().await.unwrap(), HostKeyDecision::Accepted);
 
-    let r = client.exec("echo before", None, &Default::default(), None).await.unwrap();
+    let r = client
+        .exec("echo before", None, &Default::default(), None)
+        .await
+        .unwrap();
     assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "before");
 
     client.disconnect().await;
     assert_eq!(client.connection_state(), ConnectionState::Disconnected);
 
     // 未连接时 exec 报 NotConnected。
-    let err = client.exec("echo x", None, &Default::default(), None).await.unwrap_err();
+    let err = client
+        .exec("echo x", None, &Default::default(), None)
+        .await
+        .unwrap_err();
     assert!(matches!(err, tpi::remote::ssh::SshError::NotConnected));
 
     // reconnect 恢复。
     let decision = client.reconnect().await.unwrap();
     assert_eq!(decision, HostKeyDecision::Accepted);
     assert_eq!(client.connection_state(), ConnectionState::Connected);
-    let r = client.exec("echo after", None, &Default::default(), None).await.unwrap();
+    let r = client
+        .exec("echo after", None, &Default::default(), None)
+        .await
+        .unwrap();
     assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "after");
 
     client.disconnect().await;
@@ -149,7 +179,10 @@ async fn wrong_password_fails_auth() {
     host.password = Some("wrong".into());
     let mut client = SshClient::new(host);
 
-    assert_eq!(client.connect().await.unwrap(), HostKeyDecision::UnknownPending);
+    assert_eq!(
+        client.connect().await.unwrap(),
+        HostKeyDecision::UnknownPending
+    );
     client.confirm_host_key().unwrap();
     let err = client.connect().await.unwrap_err();
     assert!(

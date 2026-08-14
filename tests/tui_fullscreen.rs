@@ -5,7 +5,7 @@
 //! 真实终端生命周期（alternate screen 进出）需要人工验收（§55）。
 
 use tpi::tui::draw_to_test_backend_mode;
-use tpi::tui::model::{InputChoiceItem, InputChoiceState, LineKind, ViewModel};
+use tpi::tui::model::{LineKind, ViewModel};
 use tpi::tui::terminal::ViewMode;
 
 fn busy_view(rows: usize) -> ViewModel {
@@ -21,61 +21,6 @@ fn busy_view(rows: usize) -> ViewModel {
         view.push_line(LineKind::Assistant, format!("第 {i} 行内容 中文混排"));
     }
     view
-}
-
-/// §13 升级：request_input 选项选择器面板渲染——问题/header/选项/按键提示
-/// 都出现在屏幕上（模态覆盖）。
-#[test]
-fn input_choice_panel_renders_question_header_options_and_hint() {
-    let mut view = ViewModel {
-        model_name: "fake-model".into(),
-        workspace: "tpi".into(),
-        ..Default::default()
-    };
-    view.sidebar.open = false;
-    view.input_choice = Some(InputChoiceState::new(vec![InputChoiceItem {
-        header: Some("部署".into()),
-        question: "发布到哪个环境？".into(),
-        options: vec!["生产".into(), "staging".into()],
-    }]));
-    let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
-    let all: String = row_texts(&buf).join("\n");
-    for marker in ["发布到哪个环境", "部署", "生产", "staging", "1-9", "Enter"] {
-        assert!(
-            all.contains(marker),
-            "选择器面板应含 {marker}: {all}"
-        );
-    }
-    // 面板标题边框。
-    assert!(all.contains("请选择"), "面板标题: {all}");
-}
-
-/// §13 升级：多问题选择器标题显示当前题号（问题 i/N）。
-#[test]
-fn input_choice_panel_shows_question_counter() {
-    let mut view = ViewModel {
-        model_name: "fake-model".into(),
-        workspace: "tpi".into(),
-        ..Default::default()
-    };
-    view.sidebar.open = false;
-    view.input_choice = Some(InputChoiceState::new(vec![
-        InputChoiceItem {
-            header: None,
-            question: "问题一？".into(),
-            options: vec!["a".into(), "b".into()],
-        },
-        InputChoiceItem {
-            header: None,
-            question: "问题二？".into(),
-            options: vec!["c".into(), "d".into()],
-        },
-    ]));
-    let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
-    let all: String = row_texts(&buf).join("\n");
-    // row_texts 跳过空格 cell，故“问题 1/2”匹配为 “问题1/2”。
-    assert!(all.contains("问题1/2"), "应显示当前题号: {all}");
-    assert!(all.contains("问题一"), "当前问题正文: {all}");
 }
 
 /// 收集 buffer 每行文本（跳过全空行）。

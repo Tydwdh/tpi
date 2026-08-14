@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use camino::Utf8PathBuf;
 use tokio_util::sync::CancellationToken;
-use tpi::remote::ssh::{HostKeyDecision, RemoteHost};
 use tpi::remote::RemoteWorkspace;
-use tpi::tool::command::{bash, BashArgs};
+use tpi::remote::ssh::{HostKeyDecision, RemoteHost};
+use tpi::tool::command::{BashArgs, bash};
 use tpi::tool::outcome::ToolStatus;
 use tpi::workspace::ActiveWorkspace;
 
@@ -23,7 +23,10 @@ async fn setup_remote_ctx() -> (tempfile::TempDir, tpi::tool::ToolContext) {
 
     // 先确认 host key（§34：未知 host 由"用户"确认一次）。
     let mut probe = fixtures::remote_server::test_client(port, &known_hosts).await;
-    assert_eq!(probe.connect().await.unwrap(), HostKeyDecision::UnknownPending);
+    assert_eq!(
+        probe.connect().await.unwrap(),
+        HostKeyDecision::UnknownPending
+    );
     probe.confirm_host_key().unwrap();
     probe.disconnect().await;
 
@@ -37,7 +40,10 @@ async fn setup_remote_ctx() -> (tempfile::TempDir, tpi::tool::ToolContext) {
         .arg(root.path())
         .output()
         .expect("cygpath 可用");
-    let root_posix = String::from_utf8(posix.stdout).expect("utf8").trim().to_string();
+    let root_posix = String::from_utf8(posix.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string();
     let root_path = Utf8PathBuf::from(root_posix);
     let remote = RemoteWorkspace::new(host, root_path.clone());
     let active = ActiveWorkspace::remote(remote.clone());
@@ -91,9 +97,19 @@ fn stdout_part(output: &str) -> &str {
 async fn remote_cd_persists_across_calls() {
     let (root, ctx) = setup_remote_ctx().await;
     let cancel = CancellationToken::new();
-    let base = root.path().file_name().unwrap().to_string_lossy().into_owned();
+    let base = root
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
 
-    assert!(run_bash(&ctx, "mkdir -p scripts", cancel.clone()).await.status == ToolStatus::Succeeded);
+    assert!(
+        run_bash(&ctx, "mkdir -p scripts", cancel.clone())
+            .await
+            .status
+            == ToolStatus::Succeeded
+    );
     assert!(run_bash(&ctx, "cd scripts", cancel.clone()).await.status == ToolStatus::Succeeded);
 
     let r = run_bash(&ctx, "pwd", cancel.clone()).await;
@@ -106,7 +122,11 @@ async fn remote_cd_persists_across_calls() {
 
     // session cwd 已更新为远端 scripts。
     let state = ctx.shell.lock().unwrap();
-    assert!(state.cwd.as_str().ends_with("scripts"), "session cwd = {}", state.cwd);
+    assert!(
+        state.cwd.as_str().ends_with("scripts"),
+        "session cwd = {}",
+        state.cwd
+    );
 }
 
 /// §36：远端 `export` 跨调用保持；unset 后消失。
@@ -115,7 +135,12 @@ async fn remote_export_and_unset_persist() {
     let (_root, ctx) = setup_remote_ctx().await;
     let cancel = CancellationToken::new();
 
-    assert!(run_bash(&ctx, "export TPI_FOO=abc", cancel.clone()).await.status == ToolStatus::Succeeded);
+    assert!(
+        run_bash(&ctx, "export TPI_FOO=abc", cancel.clone())
+            .await
+            .status
+            == ToolStatus::Succeeded
+    );
     let r = run_bash(&ctx, "echo \"$TPI_FOO\"", cancel.clone()).await;
     assert!(stdout_part(&r.model_payload.output).contains("abc"));
 
@@ -137,7 +162,10 @@ async fn remote_capture_does_not_leak() {
     let r = run_bash(&ctx, "echo hello", cancel.clone()).await;
     assert!(r.status == ToolStatus::Succeeded);
     let output = &r.model_payload.output;
-    assert!(!output.contains("__TPI_CAPTURE_"), "捕获标记不得泄漏：{output}");
+    assert!(
+        !output.contains("__TPI_CAPTURE_"),
+        "捕获标记不得泄漏：{output}"
+    );
     assert!(!output.contains("PATH="), "完整 env 不得泄漏：{output}");
 }
 
@@ -182,7 +210,12 @@ async fn remote_explicit_cwd_is_one_shot() {
     )
     .await;
     let out = stdout_part(&r.model_payload.output);
-    let base = root.path().file_name().unwrap().to_string_lossy().into_owned();
+    let base = root
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     assert!(
         out.contains(&base) && !out.contains("/a") && !out.contains("\\a"),
         "override 应在 root 执行：{out}"
@@ -190,5 +223,9 @@ async fn remote_explicit_cwd_is_one_shot() {
 
     // session cwd 仍是 a。
     let state = ctx.shell.lock().unwrap();
-    assert!(state.cwd.as_str().ends_with("a"), "session cwd 不变：{}", state.cwd);
+    assert!(
+        state.cwd.as_str().ends_with("a"),
+        "session cwd 不变：{}",
+        state.cwd
+    );
 }

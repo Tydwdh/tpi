@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::remote::ssh::{ConnectionState, SshClient, SshError};
+use crate::tool::ToolContext;
 use crate::tool::command::BashArgs;
 use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
-use crate::tool::ToolContext;
 
 /// Remote bash 入口（§35：SshShellExecutor）。
 pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
@@ -289,7 +289,10 @@ fn shell_quote(value: &str) -> String {
 /// 捕获远端初始环境（baseline，§20）：跑一次**不注入 overlay** 的 exec，
 /// 只输出 capture 段。结果存入 shell.baseline（仅内存，可能含 secret，
 /// 不落盘 §21）。失败（进程异常/capture 无效）只记 warn，下次重试。
-async fn capture_remote_baseline(shell: &Arc<std::sync::Mutex<crate::shell::ShellSessionState>>, client: &Arc<tokio::sync::Mutex<SshClient>>) {
+async fn capture_remote_baseline(
+    shell: &Arc<std::sync::Mutex<crate::shell::ShellSessionState>>,
+    client: &Arc<tokio::sync::Mutex<SshClient>>,
+) {
     let nonce = uuid::Uuid::now_v7().simple().to_string();
     let capture = format!(
         "printf '\\n__TPI_CAPTURE_BEGIN_{nonce}__\\n'; printf '%s\\n' \"$PWD\"; env; printf '__TPI_CAPTURE_END_{nonce}__\\n'"

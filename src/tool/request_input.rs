@@ -14,8 +14,8 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use crate::tool::ToolContext;
+use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 
 /// `request_input` 参数。
 ///
@@ -104,18 +104,20 @@ impl RequestInputArgs {
 
 /// 工具入口：成功即表示“请求已发出”，run 将挂起等待用户输入。
 pub async fn request_input(args: RequestInputArgs, _ctx: &ToolContext) -> ToolOutcome {
-    let rejected = |output: String| ToolOutcome::failed(
-        "request_input",
-        ModelPayload {
-            status: ToolStatus::Rejected,
-            program: None,
-            exit_code: None,
-            duration_ms: 0,
-            output,
-            effect: None,
-            artifact: None,
-        },
-    );
+    let rejected = |output: String| {
+        ToolOutcome::failed(
+            "request_input",
+            ModelPayload {
+                status: ToolStatus::Rejected,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output,
+                effect: None,
+                artifact: None,
+            },
+        )
+    };
     let Some(questions) = args.normalized_questions() else {
         return rejected(
             "status: rejected\ntool: request_input\nerror: invalid_arguments\n\nquestion 不能为空：需要明确向用户提出的问题。".into(),

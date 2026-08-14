@@ -36,6 +36,7 @@ impl McpServerConfig {
 /// TOML 反序列化中间层（`[mcp.servers.<name>]`）。
 #[derive(Debug, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 struct TomlFile {
     mcp: TomlMcp,
 }
@@ -52,14 +53,6 @@ struct TomlServer {
     env: Option<HashMap<String, String>>,
     enabled: Option<bool>,
     timeout_ms: Option<u64>,
-}
-
-impl Default for TomlFile {
-    fn default() -> Self {
-        Self {
-            mcp: TomlMcp::default(),
-        }
-    }
 }
 
 /// 从 `~/.tpi/config.toml` 读取 MCP servers（无配置 → 空）。
@@ -92,7 +85,10 @@ pub fn load_from_path(path: &Path) -> Vec<McpServerConfig> {
             env: server.env.unwrap_or_default(),
             enabled: server.enabled.unwrap_or(true),
             timeout: Duration::from_millis(
-                server.timeout_ms.unwrap_or(McpServerConfig::DEFAULT_TIMEOUT_MS).max(1),
+                server
+                    .timeout_ms
+                    .unwrap_or(McpServerConfig::DEFAULT_TIMEOUT_MS)
+                    .max(1),
             ),
         });
     }

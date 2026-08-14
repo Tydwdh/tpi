@@ -113,7 +113,12 @@ mod tests {
         let mut all = vec![
             desc("read", ToolOrigin::Builtin),
             desc("bash", ToolOrigin::Builtin),
-            desc("mcp::github::create_issue", ToolOrigin::Mcp { server: "github".into() }),
+            desc(
+                "mcp::github::create_issue",
+                ToolOrigin::Mcp {
+                    server: "github".into(),
+                },
+            ),
         ];
         // 无关上下文：builtin 全保留，MCP 被过滤。
         let active = selector.select(std::mem::take(&mut all), "just hello world");
@@ -125,21 +130,42 @@ mod tests {
     fn mcp_tools_selected_by_context_keywords() {
         let selector = ToolSelector::default();
         let all = vec![
-            desc("mcp::github::create_issue", ToolOrigin::Mcp { server: "github".into() }),
-            desc("mcp::db::query", ToolOrigin::Mcp { server: "db".into() }),
+            desc(
+                "mcp::github::create_issue",
+                ToolOrigin::Mcp {
+                    server: "github".into(),
+                },
+            ),
+            desc(
+                "mcp::db::query",
+                ToolOrigin::Mcp {
+                    server: "db".into(),
+                },
+            ),
         ];
         // 上下文提到 issue → github 工具相关，db 不相关。
         let active = selector.select(all, "帮我创建一个 issue 描述这个 bug");
         let names: Vec<&str> = active.iter().map(|d| d.name.as_str()).collect();
-        assert!(names.contains(&"mcp::github::create_issue"), "含相关 MCP 工具：{names:?}");
-        assert!(!names.contains(&"mcp::db::query"), "无关 MCP 工具被过滤：{names:?}");
+        assert!(
+            names.contains(&"mcp::github::create_issue"),
+            "含相关 MCP 工具：{names:?}"
+        );
+        assert!(
+            !names.contains(&"mcp::db::query"),
+            "无关 MCP 工具被过滤：{names:?}"
+        );
     }
 
     #[test]
     fn total_capped_at_max_tools() {
         let selector = ToolSelector { max_tools: 4 };
         let mut all: Vec<ToolDescriptor> = (0..10)
-            .map(|i| desc(&format!("mcp::s::t{i}"), ToolOrigin::Mcp { server: "s".into() }))
+            .map(|i| {
+                desc(
+                    &format!("mcp::s::t{i}"),
+                    ToolOrigin::Mcp { server: "s".into() },
+                )
+            })
             .collect();
         // 上下文命中所有工具名（t0..t9 关键词 t0 等无意义；用通用词）。
         let context = "t0 t1 t2 t3 t4 t5 t6 t7 t8 t9 tool 操作 相关";

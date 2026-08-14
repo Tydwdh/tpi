@@ -8,16 +8,19 @@ use std::sync::{Arc, Mutex};
 
 use camino::Utf8PathBuf;
 use tokio_util::sync::CancellationToken;
+use tpi::remote::RemoteWorkspace;
 use tpi::remote::files::{RemoteEditArgs, RemoteReadArgs, RemoteWriteArgs};
 use tpi::remote::ssh::{HostKeyDecision, RemoteHost};
-use tpi::remote::RemoteWorkspace;
 use tpi::workspace::ActiveWorkspace;
 
 /// 启动 server + 确认 host key + 返回已连接的 SshClient 和远端 root（POSIX）。
 async fn setup_connected() -> (tempfile::TempDir, tpi::remote::ssh::SshClient, String) {
     let (port, root, known_hosts) = fixtures::remote_server::start_test_server().await;
     let mut probe = fixtures::remote_server::test_client(port, &known_hosts).await;
-    assert_eq!(probe.connect().await.unwrap(), HostKeyDecision::UnknownPending);
+    assert_eq!(
+        probe.connect().await.unwrap(),
+        HostKeyDecision::UnknownPending
+    );
     probe.confirm_host_key().unwrap();
     probe.disconnect().await;
 
@@ -40,10 +43,7 @@ async fn setup_connected() -> (tempfile::TempDir, tpi::remote::ssh::SshClient, S
 /// 构造 Remote ToolContext（shell cwd = 远端 root）。
 fn remote_ctx(root_posix: &str) -> tpi::tool::ToolContext {
     let root = Utf8PathBuf::from(root_posix);
-    let remote = RemoteWorkspace::new(
-        RemoteHost::direct("127.0.0.1", 22, "test"),
-        root.clone(),
-    );
+    let remote = RemoteWorkspace::new(RemoteHost::direct("127.0.0.1", 22, "test"), root.clone());
     let active = ActiveWorkspace::remote(remote.clone());
     tpi::tool::ToolContext {
         workspace_root: root.clone(),
@@ -71,7 +71,10 @@ async fn remote_read_returns_local_style_output() {
     let (root, mut client, root_posix) = setup_connected().await;
     let ctx = remote_ctx(&root_posix);
 
-    client.write_file("hello.txt", b"line1\nline2\nline3\n").await.unwrap();
+    client
+        .write_file("hello.txt", b"line1\nline2\nline3\n")
+        .await
+        .unwrap();
     let outcome = tpi::remote::files::remote_read(
         &mut client,
         &RemoteReadArgs {
@@ -130,7 +133,10 @@ async fn remote_stale_edit_is_rejected() {
     let rev1 = tpi::tool::edit::revision_of(&r1);
 
     // 外部修改 → R2（模拟另一 SSH 会话改文件）。
-    client.write_file(&path, b"external change\n").await.unwrap();
+    client
+        .write_file(&path, b"external change\n")
+        .await
+        .unwrap();
 
     // TPI edit(R1) 必须 stale_rejected。
     let outcome = tpi::remote::files::remote_edit(
@@ -188,7 +194,11 @@ async fn remote_edit_applies_and_returns_diff() {
     )
     .await;
     assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
-    assert!(outcome.model_payload.output.contains("applied: 2"), "{}", outcome.model_payload.output);
+    assert!(
+        outcome.model_payload.output.contains("applied: 2"),
+        "{}",
+        outcome.model_payload.output
+    );
     assert!(
         outcome.session_metadata.diff.is_some(),
         "diff 必须进 metadata"
@@ -206,7 +216,10 @@ async fn remote_edit_applies_and_returns_diff() {
         .lines()
         .find(|l| l.starts_with("[revision="))
         .map(|l| l.to_string());
-    assert!(rev_in_output.unwrap().contains(&new_rev[3..]), "新 revision 应出现在输出");
+    assert!(
+        rev_in_output.unwrap().contains(&new_rev[3..]),
+        "新 revision 应出现在输出"
+    );
 }
 
 /// §41：atomic batch——任一条不匹配整体拒绝，文件不变。
@@ -239,7 +252,11 @@ async fn remote_edit_atomic_batch_rejects_partial() {
     )
     .await;
     assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Failed);
-    assert!(outcome.model_payload.output.contains("no_match"), "{}", outcome.model_payload.output);
+    assert!(
+        outcome.model_payload.output.contains("no_match"),
+        "{}",
+        outcome.model_payload.output
+    );
 
     // 文件不变（原子性）。
     let now = client.read_file(&path).await.unwrap();
@@ -254,5 +271,8 @@ async fn revision_is_content_identity_across_transport() {
     let bytes = b"same content\n\xe4\xb8\xad\xe6\x96\x87";
     let local = tpi::tool::edit::revision_of(bytes);
     let via_snapshot = tpi::tool::edit::revision_of(bytes);
-    assert_eq!(local, via_snapshot, "revision 是内容身份，与传输无关（§42）");
+    assert_eq!(
+        local, via_snapshot,
+        "revision 是内容身份，与传输无关（§42）"
+    );
 }

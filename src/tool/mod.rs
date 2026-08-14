@@ -485,11 +485,9 @@ Example: activate_skill name=\"rust-review\""
             BuiltinTool::WebFetch => {
                 parse_args_typed("web_fetch", arguments, ValidatedArgs::WebFetch)
             }
-            BuiltinTool::ActivateSkill => parse_args_typed(
-                "activate_skill",
-                arguments,
-                ValidatedArgs::ActivateSkill,
-            ),
+            BuiltinTool::ActivateSkill => {
+                parse_args_typed("activate_skill", arguments, ValidatedArgs::ActivateSkill)
+            }
         }
     }
 }
@@ -604,9 +602,7 @@ pub struct ToolContext {
     pub workspace: std::sync::Arc<std::sync::Mutex<crate::workspace::ActiveWorkspace>>,
     /// ManagedProcess registry（任务书 §8：session 级共享；background bash 注册，
     /// `process` 工具读取/取消）。
-    pub processes: std::sync::Arc<
-        std::sync::Mutex<crate::process::managed::ProcessRegistry>,
-    >,
+    pub processes: std::sync::Arc<std::sync::Mutex<crate::process::managed::ProcessRegistry>>,
     /// ToolRegistry（builtin + MCP；runtime_inspect 枚举能力用；与 ToolRuntime 共享）。
     pub registry: std::sync::Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
     /// 交互模式（`-p` 为 false；§11 移除 ask_user 后仅保留供未来交互原语使用）。
@@ -705,6 +701,44 @@ pub fn resolve_tool_path(ctx: &ToolContext, path: &str) -> Result<Utf8PathBuf, P
     resolve_write_path(&ctx.workspace_root, path, ctx.allow_outside_workspace)
 }
 
+/// Windows + Git Bash/MSYS2 环境：把 Unix 风格绝对路径（`/tmp/...`、`/c/...`）
+/// 翻译为 Windows 路径（`cygpath -w`），否则 Windows 的 `Path::is_absolute()`
+/// 会把 `/tmp` 判为绝对路径 → 解析成当前盘根 `C:\tmp`（read `/tmp/x` 报
+/// `not found: C:\tmp\x`，而 Git Bash 的 `/tmp` 实际映射到用户临时目录）。
+///
+/// 非 Windows、不是 Unix 绝对路径、或 cygpath 不可用/失败时原样返回。
+#[cfg(windows)]
+pub fn translate_msys_path(path: &str) -> String {
+    let trimmed = path.trim();
+    // Windows 绝对路径（盘符 `C:\`、UNC `\\`）不转换；
+    // 相对路径 / 盘符相对（`C:foo`）也不转换。
+    let looks_windows_abs = (trimmed.len() >= 3
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+        && trimmed.as_bytes()[1] == b':')
+        || trimmed.starts_with("\\\\");
+    if !trimmed.starts_with('/') || looks_windows_abs {
+        return trimmed.to_string();
+    }
+    // `cygpath -w`：Git Bash / MSYS2 环境可用；失败则原样返回（调用方再报错）。
+    if let Ok(out) = std::process::Command::new("cygpath")
+        .args(["-w", trimmed])
+        .output()
+        && out.status.success()
+        && let Ok(s) = String::from_utf8(out.stdout)
+    {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+#[cfg(not(windows))]
+pub fn translate_msys_path(path: &str) -> String {
+    path.trim().to_string()
+}
+
 /// 写工具提交计划/恢复元数据的路径解析（§9.1 自由模式）：
 /// `allow_outside_workspace=true` → 词法规范化（绝对路径可用，与 bash 一致）；
 /// `false` → 严格 workspace 沙箱（含 junction/symlink 写穿检查）。
@@ -718,6 +752,8 @@ pub fn resolve_write_path(
     if !allow_outside_workspace {
         return resolve_workspace_path(workspace_root, path);
     }
+    // 统一入口：先翻译 Unix 风格路径（Windows + Git Bash）。
+    let path = translate_msys_path(path);
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err(PathResolveError::Empty);
@@ -749,7 +785,9 @@ pub fn resolve_lock_path(
         return resolve_workspace_path(workspace_root, path)
             .unwrap_or_else(|_| Utf8PathBuf::from(path.trim()));
     }
-    let trimmed = path.trim();
+    // 与 resolve_write_path 同一入口翻译（Unix 风格 → Windows），保证
+    // 等价写法（`/tmp/x` vs `C:\Users\...\Temp\x`）映射到同一把锁。
+    let trimmed = translate_msys_path(path);
     let candidate = Utf8PathBuf::from(trimmed);
     let joined = if candidate.is_absolute() {
         candidate
@@ -1100,5 +1138,62 @@ mod tests {
             msg.contains("content"),
             "write: expected shape 必须含 content: {msg}"
         );
+    }
+
+    /// Windows + Git Bash：Unix 风格绝对路径（`/tmp/...`）翻译为 Windows 路径，
+    /// 不再解析成当前盘根 `C:\tmp`（read 修复）。
+    #[test]
+    fn unix_abs_path_is_translated_on_windows() {
+        let translated = translate_msys_path("/tmp/probe.txt");
+        if cfg!(windows) {
+            // 本环境（Git Bash/MSYS2）cygpath 可用 → 应翻译为 Windows 路径。
+            if cygpath_available() {
+                assert!(
+                    !translated.starts_with("\\tmp") && !translated.starts_with("/tmp"),
+                    "Unix 绝对路径必须翻译，而非原样当 Windows 绝对路径: {translated}"
+                );
+                assert!(
+                    translated.contains("\\") && translated.len() > 5,
+                    "翻译结果应为 Windows 路径: {translated}"
+                );
+            }
+        } else {
+            assert_eq!(translated, "/tmp/probe.txt");
+        }
+        // Windows 绝对路径与相对路径不翻译。
+        assert_eq!(translate_msys_path("C:\\x\\y.rs"), "C:\\x\\y.rs");
+        assert_eq!(translate_msys_path("src/main.rs"), "src/main.rs");
+    }
+
+    /// read 的 `/tmp/x` 在 Windows + Git Bash 下解析到真实临时目录，
+    /// 而不是 C 盘根。
+    #[test]
+    fn resolve_write_path_translates_unix_tmp() {
+        let workspace = Utf8PathBuf::from("C:\\ws");
+        if !cfg!(windows) || !cygpath_available() {
+            return; // 仅 Windows + cygpath 环境验证
+        }
+        let resolved = resolve_write_path(&workspace, "/tmp/probe.txt", true).unwrap();
+        let s = resolved.as_str().to_lowercase();
+        assert!(
+            s.contains("temp") || s.contains("\\tmp") || s.starts_with("c:\\"),
+            "应解析到真实临时目录，而非 C:\\tmp: {resolved}"
+        );
+        assert!(!s.starts_with("c:\\tmp"), "不得解析成 C:\\tmp: {resolved}");
+    }
+
+    #[cfg(windows)]
+    fn cygpath_available() -> bool {
+        std::process::Command::new("cygpath")
+            .arg("-w")
+            .arg("/")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(windows))]
+    fn cygpath_available() -> bool {
+        false
     }
 }

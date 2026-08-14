@@ -362,7 +362,10 @@ mod tests {
         // emoji 序列（含 ZWJ，0 宽）不得被折行拆开。
         let emoji = "👨\u{200d}💻 程序员";
         let lines = wrap_to_cell_width(emoji, 8);
-        assert!(lines[0].contains("👨\u{200d}💻"), "ZWJ 序列不得拆行: {lines:?}");
+        assert!(
+            lines[0].contains("👨\u{200d}💻"),
+            "ZWJ 序列不得拆行: {lines:?}"
+        );
     }
 
     #[test]

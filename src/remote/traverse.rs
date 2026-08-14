@@ -10,8 +10,8 @@
 use std::time::Instant;
 
 use crate::remote::ssh::SshClient;
-use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use crate::tool::ToolContext;
+use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 
 /// 与本地一致的扫描上限（§8.4）。
 pub const MAX_SCAN_FILES: u64 = 100_000;
@@ -127,7 +127,14 @@ pub async fn remote_search(
     let started = Instant::now();
 
     // 1. capability detect：远端是否有 rg。
-    let has_rg = match client.exec("command -v rg >/dev/null 2>&1", None, &Default::default(), None).await
+    let has_rg = match client
+        .exec(
+            "command -v rg >/dev/null 2>&1",
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
     {
         Ok(r) => r.exit_code == Some(0),
         Err(_) => false,
@@ -137,7 +144,11 @@ pub async fn remote_search(
     let max_results = args.max_results.clamp(1, MAX_SEARCH_RESULTS);
     let mut cmd = String::new();
     let include_globs: Vec<String> = args.include.iter().map(|g| format!("--glob={g}")).collect();
-    let exclude_globs: Vec<String> = args.exclude.iter().map(|g| format!("--glob=!{g}")).collect();
+    let exclude_globs: Vec<String> = args
+        .exclude
+        .iter()
+        .map(|g| format!("--glob=!{g}"))
+        .collect();
     if has_rg {
         // rg --no-heading --line-number -m N --glob=include --glob=!exclude pattern path
         cmd.push_str(&format!(
@@ -161,13 +172,13 @@ pub async fn remote_search(
             shell_quote(&root),
         ));
     }
-    let exec_result = match client.exec(&cmd, None, &Default::default(), Some(&ctx.cancel)).await {
+    let exec_result = match client
+        .exec(&cmd, None, &Default::default(), Some(&ctx.cancel))
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
-            return failed(
-                "search",
-                &format!("远端搜索失败: {e}"),
-            );
+            return failed("search", &format!("远端搜索失败: {e}"));
         }
     };
     let stdout = String::from_utf8_lossy(&exec_result.stdout);
@@ -251,7 +262,11 @@ pub async fn remote_glob(
     }
     // 按 mtime 降序，同 mtime 按路径字典序。
     items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let items: Vec<String> = items.into_iter().map(|(p, _)| p).take(MAX_RESULTS).collect();
+    let items: Vec<String> = items
+        .into_iter()
+        .map(|(p, _)| p)
+        .take(MAX_RESULTS)
+        .collect();
     build_scan_outcome("glob", items, scanned_files, 0, started, "complete")
 }
 
@@ -277,9 +292,7 @@ fn build_scan_outcome(
         output.push_str(&format!("\n{body}"));
     }
     if stop_reason == "result_limit" {
-        output.push_str(
-            "\n\n结果达上限。可加 exclude 排除目录或收窄 path 后重新搜索。",
-        );
+        output.push_str("\n\n结果达上限。可加 exclude 排除目录或收窄 path 后重新搜索。");
     }
     let mut outcome = ToolOutcome::succeeded(tool, output);
     outcome.session_metadata = crate::tool::outcome::ToolMetadata {
@@ -315,7 +328,10 @@ fn relative_of(root: &str, dir: &str, name: &str) -> String {
     if dir == root {
         name.to_string()
     } else {
-        let rel_dir = dir.strip_prefix(root).unwrap_or(dir).trim_start_matches('/');
+        let rel_dir = dir
+            .strip_prefix(root)
+            .unwrap_or(dir)
+            .trim_start_matches('/');
         format!("{rel_dir}/{name}")
     }
 }
@@ -385,7 +401,10 @@ mod tests {
 
     #[test]
     fn strip_root_prefix_removes_absolute() {
-        assert_eq!(strip_root_prefix("/p", "/p/src/main.rs:3:x"), "src/main.rs:3:x");
+        assert_eq!(
+            strip_root_prefix("/p", "/p/src/main.rs:3:x"),
+            "src/main.rs:3:x"
+        );
         assert_eq!(strip_root_prefix("/p", "main.rs:1:hi"), "main.rs:1:hi");
     }
 

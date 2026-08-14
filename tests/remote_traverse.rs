@@ -7,16 +7,19 @@ use std::sync::{Arc, Mutex};
 
 use camino::Utf8PathBuf;
 use tokio_util::sync::CancellationToken;
+use tpi::remote::RemoteWorkspace;
 use tpi::remote::ssh::{HostKeyDecision, RemoteHost};
 use tpi::remote::traverse::{RemoteGlobArgs, RemoteListArgs, RemoteSearchArgs};
-use tpi::remote::RemoteWorkspace;
 use tpi::workspace::ActiveWorkspace;
 
 /// 启动 server + 确认 host key + 返回已连接 client 和远端 root（POSIX）。
 async fn setup_connected() -> (tempfile::TempDir, tpi::remote::ssh::SshClient, String) {
     let (port, root, known_hosts) = fixtures::remote_server::start_test_server().await;
     let mut probe = fixtures::remote_server::test_client(port, &known_hosts).await;
-    assert_eq!(probe.connect().await.unwrap(), HostKeyDecision::UnknownPending);
+    assert_eq!(
+        probe.connect().await.unwrap(),
+        HostKeyDecision::UnknownPending
+    );
     probe.confirm_host_key().unwrap();
     probe.disconnect().await;
 
@@ -65,7 +68,15 @@ async fn remote_list_format_matches_local() {
     let (_root, mut client, root_posix) = setup_connected().await;
     let ctx = remote_ctx(&root_posix);
     client.write_file("a.txt", b"x\n").await.unwrap();
-    client.exec(&format!("mkdir -p {root_posix}/src"), None, &Default::default(), None).await.unwrap();
+    client
+        .exec(
+            &format!("mkdir -p {root_posix}/src"),
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
     client.write_file("src/b.txt", b"y\n").await.unwrap();
 
     let outcome = tpi::remote::traverse::remote_list(
@@ -81,7 +92,10 @@ async fn remote_list_format_matches_local() {
     let out = &outcome.model_payload.output;
     assert!(out.contains("status: succeeded"), "{out}");
     // tempdir 里还有 server 的 known_hosts 文件，scanned_files 含它；只断言 >= 2。
-    assert!(out.contains("scanned_files: 2") || out.contains("scanned_files: 3"), "{out}");
+    assert!(
+        out.contains("scanned_files: 2") || out.contains("scanned_files: 3"),
+        "{out}"
+    );
     assert!(out.contains("stop_reason: complete"), "{out}");
     assert!(out.contains("a.txt"), "{out}");
     assert!(out.contains("src/"), "目录带斜杠：{out}");
@@ -93,7 +107,10 @@ async fn remote_list_format_matches_local() {
 async fn remote_search_finds_matches() {
     let (_root, mut client, root_posix) = setup_connected().await;
     let ctx = remote_ctx(&root_posix);
-    client.write_file("log.txt", b"error: bad thing\nerror: worse thing\nok\n").await.unwrap();
+    client
+        .write_file("log.txt", b"error: bad thing\nerror: worse thing\nok\n")
+        .await
+        .unwrap();
 
     let outcome = tpi::remote::traverse::remote_search(
         &mut client,
@@ -119,8 +136,14 @@ async fn remote_search_finds_matches() {
 async fn remote_glob_matches_pattern() {
     let (_root, mut client, root_posix) = setup_connected().await;
     let ctx = remote_ctx(&root_posix);
-    client.write_file("main.rs", b"fn main() {}\n").await.unwrap();
-    client.write_file("lib.rs", b"pub fn lib() {}\n").await.unwrap();
+    client
+        .write_file("main.rs", b"fn main() {}\n")
+        .await
+        .unwrap();
+    client
+        .write_file("lib.rs", b"pub fn lib() {}\n")
+        .await
+        .unwrap();
     client.write_file("notes.md", b"# notes\n").await.unwrap();
 
     let outcome = tpi::remote::traverse::remote_glob(
@@ -144,7 +167,10 @@ async fn remote_glob_matches_pattern() {
 async fn remote_output_does_not_leak_transport() {
     let (_root, mut client, root_posix) = setup_connected().await;
     let ctx = remote_ctx(&root_posix);
-    client.write_file("data.txt", b"hello world\n").await.unwrap();
+    client
+        .write_file("data.txt", b"hello world\n")
+        .await
+        .unwrap();
 
     for outcome in [
         tpi::remote::traverse::remote_list(

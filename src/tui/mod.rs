@@ -634,15 +634,6 @@ fn render_frame(
         draw_overlay(frame, Rect::new(x, y, w, h), view, theme);
     }
 
-    // §13 升级：`request_input` 选项选择器（模态覆盖；键盘选择，最高层）。
-    if view.input_choice.is_some() {
-        let w = modal_width(main_area.width);
-        let h = modal_height(trans_area.height);
-        let x = main_area.x + (main_area.width.saturating_sub(w)) / 2;
-        let y = trans_area.y + trans_area.height.saturating_sub(h) / 2;
-        draw_input_choice(frame, Rect::new(x, y, w, h), view, theme);
-    }
-
     draw_input(frame, input_area, view, theme);
 
     // §用户诉求：右侧边栏（todo + 用户消息大纲）。贯穿整个主区高度。
@@ -2253,10 +2244,8 @@ fn draw_sidebar(
                 };
                 // §用户诉求：todo 长文本折行显示完整（不截断）；marker 占 4 列
                 // （3 字符 + 空格），续行缩进 4 列对齐。CJK 双宽按 2 cells 折行。
-                let wrapped = crate::tui::text::wrap_to_cell_width(
-                    &item.text,
-                    content_w.saturating_sub(4),
-                );
+                let wrapped =
+                    crate::tui::text::wrap_to_cell_width(&item.text, content_w.saturating_sub(4));
                 for (index, segment) in wrapped.iter().enumerate() {
                     let prefix = if index == 0 {
                         format!("{marker} ")
@@ -2460,15 +2449,11 @@ fn draw_footer(
     if view.cache_read_tokens > 0 {
         let mut text = format!(" · ⇄{}", fmt_tokens(view.cache_read_tokens));
         if view.input_tokens > 0 {
-            let pct = ((view.cache_read_tokens as f64 / view.input_tokens as f64)
-                * 100.0)
+            let pct = ((view.cache_read_tokens as f64 / view.input_tokens as f64) * 100.0)
                 .min(100.0) as u64;
             text.push_str(&format!("({pct}%)"));
         }
-        spans.push(Span::styled(
-            text,
-            Style::default().fg(theme.success),
-        ));
+        spans.push(Span::styled(text, Style::default().fg(theme.success)));
     }
     // §用户诉求：Claude Code 式重连提示——本次 run 断线重连/重启累计次数。
     if view.reconnect_count > 0 {
@@ -2615,7 +2600,7 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: t
     if should_show_input_cursor(
         &view.status,
         view.input.is_empty(),
-        view.modal.is_some() || view.overlay.is_some() || view.input_choice.is_some(),
+        view.modal.is_some() || view.overlay.is_some(),
         view.search.is_some(),
     ) {
         frame.set_cursor_position((x, y));
@@ -2907,85 +2892,6 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
         .border_style(Style::default().fg(theme.primary))
         .title(border_title);
     // 先清空 Overlay 覆盖区域，否则底层 transcript 文字会透过内容间隙显示（用户反馈“思考悬浮窗被其他文字干扰背景”）。
-    frame.render_widget(ratatui::widgets::Clear, rect);
-    frame.render_widget(
-        ratatui::widgets::Paragraph::new(window)
-            .block(block)
-            .scroll((0, 0)),
-        rect,
-    );
-}
-
-/// §13 升级：`request_input` 选项选择器面板（模态覆盖显示）。
-///
-/// 展示当前问题的 header/question 与全部选项（选中行高亮 ▶），底部按键提示。
-/// 多问题逐题导航：标题显示 `问题 i/N`；确认一项后由 reducer 推进到下一题。
-fn draw_input_choice(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: theme::Theme) {
-    let Some(choice) = &view.input_choice else {
-        return;
-    };
-    let inner_w = rect.width.saturating_sub(2).max(1) as usize;
-    let inner_h = rect.height.saturating_sub(2).max(1) as usize;
-    let Some(item) = choice.items.get(choice.current) else {
-        return;
-    };
-
-    let mut content: Vec<Line<'static>> = Vec::new();
-    let title = if choice.items.len() > 1 {
-        format!("请选择（问题 {}/{}）", choice.current + 1, choice.items.len())
-    } else {
-        "请选择".to_string()
-    };
-    content.push(Line::styled(
-        title,
-        Style::default()
-            .fg(theme.primary)
-            .add_modifier(Modifier::BOLD),
-    ));
-    content.push(Line::default());
-    // header（可选分组标题）+ 问题文本。
-    if let Some(header) = item.header.as_deref().filter(|h| !h.trim().is_empty()) {
-        content.push(Line::styled(
-            format!("[{header}]"),
-            Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
-        ));
-    }
-    content.push(Line::styled(
-        item.question.clone(),
-        Style::default().fg(theme.text),
-    ));
-    content.push(Line::default());
-    // 选项列表（选中高亮；窗口跟随 choice.scroll，reducer 维护）。
-    for (i, option) in item.options.iter().enumerate().skip(choice.scroll) {
-        let selected = i == choice.selected;
-        let marker = if selected { "▶ " } else { "  " };
-        let style = if selected {
-            Style::default()
-                .fg(theme.primary)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.text)
-        };
-        content.push(Line::styled(format!("{marker}{}. {option}", i + 1), style));
-    }
-    content.push(Line::default());
-    content.push(Line::styled(
-        "↑/↓ 选择 · Enter 确认 · 1-9 直接选 · Esc 取消",
-        Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
-    ));
-
-    // 内部滚动（逻辑行按 inner_w 折行后窗口化；与 draw_overlay 一致）。
-    let rows = wrap_with_semantic(content, Vec::new(), &[], inner_w, EntryId(0));
-    let wrapped: Vec<Line<'static>> = rows.into_iter().map(|r| r.line).collect();
-    let total = wrapped.len();
-    let start = choice.scroll.min(total.saturating_sub(inner_h));
-    let end = (start + inner_h).min(wrapped.len());
-    let window = wrapped[start..end].to_vec();
-
-    let block = ratatui::widgets::Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
-        .border_style(Style::default().fg(theme.primary))
-        .title(" 请选择 ");
     frame.render_widget(ratatui::widgets::Clear, rect);
     frame.render_widget(
         ratatui::widgets::Paragraph::new(window)

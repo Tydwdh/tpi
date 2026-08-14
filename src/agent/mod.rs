@@ -17,7 +17,7 @@ pub mod limits;
 /// （src/tool/scheduler.rs）。此处 re-export 仅兼容既有 `agent::scheduler`
 /// 引用（测试契约）；新代码请直接用 `crate::tool::scheduler`，
 /// 测试引用迁移完成后删除本行（AGENTS.md §27 清理）。
-pub use crate::tool::scheduler as scheduler;
+pub use crate::tool::scheduler;
 mod tool_runtime;
 use self::tool_runtime::{BatchEnd, ToolBatchExecutor, ToolRuntime};
 use crate::ids::{EventId, RequestId, ToolCallId};
@@ -97,7 +97,7 @@ pub struct AgentOutcome {
 ///
 /// `text` 是参数渲染后的多行文本（编号 + header + 选项），session 的
 /// `UserInputRequested.prompt` 与 TUI 展示共用；`questions` 是结构化问题
-/// 列表（TUI 据此构建键盘选项选择器；无选项时为空列表）。
+/// 列表（TUI 内联展示在 transcript，单问题带选项时支持数字编号回答）。
 pub struct AwaitingInput {
     pub text: String,
     pub questions: Vec<crate::tool::request_input::RequestInputQuestion>,
@@ -645,8 +645,8 @@ pub async fn run<P: Provider>(
                                         content: content.clone(),
                                         tool_calls: Vec::new(),
                                     });
-                                // §16：区分取消来源——watchdog 超时不是用户取消。
                                 }
+                                // §16：区分取消来源——watchdog 超时不是用户取消。
                                 let cause = cancel_cause.load(std::sync::atomic::Ordering::SeqCst);
                                 let cancel_reason =
                                     crate::agent::limits::cancel_reason_for_cause(cause);
@@ -1343,7 +1343,9 @@ fn system_prompt_text(config: &Config, ephemeral_system: Option<&str>) -> String
         .map(|manager| manager.available())
         .unwrap_or_default();
     if !available.is_empty() {
-        system.push_str("\n\n[Available skills]（metadata-only；用 activate_skill 激活后获取完整说明）：\n");
+        system.push_str(
+            "\n\n[Available skills]（metadata-only；用 activate_skill 激活后获取完整说明）：\n",
+        );
         for skill in available {
             system.push_str(&format!("  {} — {}\n", skill.name, skill.description));
         }

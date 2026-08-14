@@ -123,6 +123,10 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
     let line_count = args.line_count.clamp(1, MAX_READ_LINES);
     match edit::snapshot_file(&path) {
         Ok(snapshot) => {
+            // P0a：read 输出头的空白元信息——模型据此构造 old_text，闭合
+            // read→edit 协议（tab 缩进文件不再“看不见差异”）。正文保持原样
+            //（复制即精确），不引入不可逆的视觉字符。须在 snapshot 移动前分析。
+            let ws = crate::tool::edit::analyze_whitespace(&snapshot);
             let window = edit::read_window_from_snapshot(&snapshot, args.start_line, line_count);
             crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
             let mut text = window.text;
@@ -143,11 +147,24 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
                 )
             };
             let numbered = number_lines(&text, window.start_line);
+            let indentation = match ws.indentation {
+                crate::tool::edit::IndentationSummary::Tabs => "tabs".to_string(),
+                crate::tool::edit::IndentationSummary::Spaces => "spaces".to_string(),
+                crate::tool::edit::IndentationSummary::Mixed => "mixed".to_string(),
+                crate::tool::edit::IndentationSummary::None_ => "none".to_string(),
+            };
+            let line_endings = match ws.line_endings {
+                crate::tool::edit::LineEndingsSummary::Lf => "LF",
+                crate::tool::edit::LineEndingsSummary::Crlf => "CRLF",
+                crate::tool::edit::LineEndingsSummary::Mixed => "mixed",
+            };
             let mut output = format!(
-                "{revision_header}\npath: {}\nlines: {line_range} of {}{}\n\n{}",
+                "{revision_header}\npath: {}\nlines: {line_range} of {}{}\nindentation: {indentation} (tab_width {})\nline_endings: {line_endings}\ntrailing_whitespace: {}\n\n{}",
                 display_path(&ctx.workspace_root, &path),
                 window.total_lines,
                 if truncated { " (truncated)" } else { "" },
+                ws.tab_width_display,
+                if ws.trailing_whitespace { "yes" } else { "no" },
                 numbered,
             );
             // §工具改进：截断续读指引——不再让模型/用户反复猜。
@@ -439,6 +456,7 @@ pub fn write(
                 current_revision: revision.clone(),
                 applied: 1,
                 skipped_noops: 0,
+                tier: crate::tool::edit::MatchTier::Exact,
                 previous_raw: Vec::new(),
                 new_raw: new_raw.clone(),
             });
@@ -486,6 +504,7 @@ fn rewrite_with_revision(
         current_revision: crate::tool::edit::revision_of(content),
         applied: 1,
         skipped_noops: 0,
+        tier: crate::tool::edit::MatchTier::Exact,
         previous_raw,
         new_raw: content.to_vec(),
     };
@@ -527,8 +546,25 @@ fn failed_outcome(tool: &str, error: EditError) -> ToolOutcome {
         EditError::StaleRevision { current, .. } => format!(
             "\nhint: 文件已变化（current_revision {current}）。可直接用该 revision 重试 edit（无需重新 read）；需要确认内容时再 read。"
         ),
-        EditError::NoMatch { .. } => {
-            "\nhint: old_text 在文件中不存在；请先 read 确认实际内容，再调整 old_text。".into()
+        EditError::NoMatch { diagnostic, .. } => {
+            if let Some(d) = diagnostic {
+                let detail = match d.kind {
+                    crate::tool::edit::MismatchKind::Indentation => format!(
+                        "差异类型: 缩进（候选行 {}~{}，第 {} 行 lstrip 后内容相同，但缩进不同：old 提供 {}，文件实际 {}）",
+                        d.lines.0, d.lines.1, d.line.unwrap_or(0) + 1, d.provided_indent.as_deref().unwrap_or("?"), d.expected_indent.as_deref().unwrap_or("?")
+                    ),
+                    crate::tool::edit::MismatchKind::Textual => format!(
+                        "差异类型: 文本（候选行 {}~{}，相似度 {:.2}；首个不同行：\n  old: {:?}\n  file: {:?}）",
+                        d.lines.0, d.lines.1, d.similarity_bp as f64 / 100.0, d.first_difference.as_ref().map(|(a, _)| a.as_str()), d.first_difference.as_ref().map(|(_, b)| b.as_str())
+                    ),
+                    crate::tool::edit::MismatchKind::None => {
+                        format!("差异类型: 未定位到相似候选（行 {}~{})", d.lines.0, d.lines.1)
+                    }
+                };
+                format!("\nhint: old_text 在文件中不存在。{detail}。请按文件实际内容调整 old_text（缩进/行尾空白需与文件一致）。")
+            } else {
+                "\nhint: old_text 在文件中不存在；请先 read 确认实际内容，再调整 old_text。".into()
+            }
         }
         EditError::MultipleMatches { .. } => {
             "\nhint: old_text 出现多次；请包含更多上下文使匹配唯一。".into()
@@ -774,5 +810,75 @@ mod tests {
             std::fs::read(path.as_std_path()).unwrap(),
             b"line1\nline2\n"
         );
+    }
+
+    /// P0a：read 输出头含空白元信息（indentation/line_endings/trailing_whitespace）
+    /// ——模型据此构造 old_text，闭合 read→edit 协议（tab 缩进不再“看不见”）。
+    #[test]
+    fn read_output_includes_whitespace_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("tabbed.rs")).unwrap();
+        // tab 缩进 + CRLF + 行尾空白。
+        let content = "fn a() {\r\n\twork(); \r\n}\r\n";
+        std::fs::write(path.as_std_path(), content).unwrap();
+        let local = crate::workspace::LocalWorkspace::new(workspace.clone(), true);
+        let ctx = ToolContext {
+            workspace_root: workspace.clone(),
+            shell: local.shell.clone(),
+            workspace: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::workspace::ActiveWorkspace::local(local),
+            )),
+            cancel: CancellationToken::new(),
+            artifacts_root: dir.path().join("artifacts"),
+            session_id: "test-session".into(),
+            call_id: crate::ids::ToolCallId::new_v7(),
+            output_tx: None,
+            scan_snapshots: Default::default(),
+            shell_path: None,
+            snapshot_store: Default::default(),
+            current_plan: Default::default(),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::process::managed::ProcessRegistry::new(),
+            )),
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::tool::registry::ToolRegistry::new(),
+            )),
+            interactive: false,
+            allow_outside_workspace: true,
+        };
+        let outcome = read(
+            ReadArgs {
+                path: path.to_string(),
+                start_line: 1,
+                line_count: 10,
+            },
+            &ctx,
+        );
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        let output = &outcome.model_payload.output;
+        assert!(
+            output.contains("indentation: tabs (tab_width 4)"),
+            "read 必须标注 tab 缩进: {output}"
+        );
+        assert!(output.contains("line_endings: CRLF"), "{output}");
+        assert!(output.contains("trailing_whitespace: yes"), "{output}");
+        // 正文不受影响（行号前缀保留）。
+        assert!(output.contains("1: fn a() {"), "{output}");
+        // 纯空格缩进 + LF + 无 trailing：另一个文件。
+        let path2 = Utf8PathBuf::from_path_buf(dir.path().join("spaced.rs")).unwrap();
+        std::fs::write(path2.as_std_path(), "fn b() {\n    work();\n}\n").unwrap();
+        let outcome2 = read(
+            ReadArgs {
+                path: path2.to_string(),
+                start_line: 1,
+                line_count: 10,
+            },
+            &ctx,
+        );
+        let out2 = &outcome2.model_payload.output;
+        assert!(out2.contains("indentation: spaces"), "{out2}");
+        assert!(out2.contains("line_endings: LF"), "{out2}");
+        assert!(out2.contains("trailing_whitespace: no"), "{out2}");
     }
 }

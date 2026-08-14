@@ -14,13 +14,8 @@ async fn runtime_inspect_reports_capabilities() {
     let ctx = fixtures::test_tool_context(&workspace);
 
     let args = tpi::tool::ValidatedArgs::RuntimeInspect(tpi::tool::inspect::InspectArgs {});
-    let outcome = tpi::tool::execute(
-        tpi::tool::BuiltinTool::RuntimeInspect,
-        args,
-        &ctx,
-        None,
-    )
-    .await;
+    let outcome =
+        tpi::tool::execute(tpi::tool::BuiltinTool::RuntimeInspect, args, &ctx, None).await;
     assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
 
     let out = &outcome.model_payload.output;

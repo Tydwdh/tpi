@@ -70,7 +70,12 @@ async fn background_bash_returns_immediately_and_process_keeps_running() {
     );
     // §49/§50：工具调用成功（start succeeded），但模型可见文本是 status: running，
     // 进程本身仍在后台——两个状态分离。
-    assert_eq!(outcome.status, ToolStatus::Succeeded, "{} (启动工具调用成功)", outcome.model_text());
+    assert_eq!(
+        outcome.status,
+        ToolStatus::Succeeded,
+        "{} (启动工具调用成功)",
+        outcome.model_text()
+    );
     let text = outcome.model_text();
     assert!(text.contains("status: running"), "{text}");
     let pid_text = text
@@ -91,7 +96,12 @@ async fn background_bash_returns_immediately_and_process_keeps_running() {
     assert_eq!(command, "sleep 5");
 
     // 等待完成（§20：wait 最多等 timeout；完成返回终态）。
-    let terminal = wait_process(&ctx.processes, process_id, std::time::Duration::from_secs(10)).await;
+    let terminal = wait_process(
+        &ctx.processes,
+        process_id,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
     assert_eq!(
         terminal,
         Some(ManagedProcessState::Exited { exit_code: 0 }),
@@ -147,7 +157,12 @@ async fn background_bash_reports_exit_code() {
         .expect("process_id")
         .to_string();
     let process_id: ProcessId = pid_text.parse().unwrap();
-    let terminal = wait_process(&ctx.processes, process_id, std::time::Duration::from_secs(10)).await;
+    let terminal = wait_process(
+        &ctx.processes,
+        process_id,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
     assert_eq!(
         terminal,
         Some(ManagedProcessState::Exited { exit_code: 7 }),
@@ -187,17 +202,22 @@ async fn background_bash_completes_pipeline() {
         .expect("process_id")
         .to_string();
     let process_id: ProcessId = pid_text.parse().unwrap();
-    let terminal = wait_process(&ctx.processes, process_id, std::time::Duration::from_secs(10)).await;
-    assert_eq!(
-        terminal,
-        Some(ManagedProcessState::Exited { exit_code: 0 })
-    );
+    let terminal = wait_process(
+        &ctx.processes,
+        process_id,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(terminal, Some(ManagedProcessState::Exited { exit_code: 0 }));
     // 输出被持续 drain 到 live tail（§15/§16）。
     let tail = {
         let reg = ctx.processes.lock().unwrap();
         String::from_utf8_lossy(&reg.get(process_id).unwrap().tail).into_owned()
     };
-    assert!(tail.contains("background-ok"), "live tail 必须包含输出: {tail}");
+    assert!(
+        tail.contains("background-ok"),
+        "live tail 必须包含输出: {tail}"
+    );
 }
 
 /// P4（任务书 §58）：process 工具 status/output 可查看后台进程状态与输出。
@@ -244,7 +264,10 @@ async fn process_tool_reports_status_and_output() {
     assert_eq!(status.status, ToolStatus::Succeeded);
     let status_text = status.model_text();
     assert!(status_text.contains("status: running"), "{status_text}");
-    assert!(status_text.contains(&format!("process_id: {process_id}")), "{status_text}");
+    assert!(
+        status_text.contains(&format!("process_id: {process_id}")),
+        "{status_text}"
+    );
 
     let output = tpi::tool::process::process(
         tpi::tool::process::ProcessArgs {
@@ -256,7 +279,10 @@ async fn process_tool_reports_status_and_output() {
     )
     .await;
     let output_text = output.model_text();
-    assert!(output_text.contains("ready-line"), "output 必须包含已产生输出: {output_text}");
+    assert!(
+        output_text.contains("ready-line"),
+        "output 必须包含已产生输出: {output_text}"
+    );
 
     // wait：等 4 秒 sleep 结束 → 返回 exited 0（任务书 §20：不是错误）。
     let waited = tpi::tool::process::process(
@@ -323,10 +349,17 @@ async fn process_cancel_terminates_tree_and_marks_cancelled() {
         cancel_text.contains("status: cancelled"),
         "cancel 必须返回 cancelled（§22）：{cancel_text}"
     );
-    assert!(cancel_text.contains("process_tree_terminated"), "{cancel_text}");
+    assert!(
+        cancel_text.contains("process_tree_terminated"),
+        "{cancel_text}"
+    );
     // 状态已迁移到 Cancelled。
     let state = ctx.processes.lock().unwrap().get(process_id).unwrap().state;
-    assert_eq!(state, ManagedProcessState::Cancelled, "drain task 必须迁移到 Cancelled");
+    assert_eq!(
+        state,
+        ManagedProcessState::Cancelled,
+        "drain task 必须迁移到 Cancelled"
+    );
 
     // 已结束的进程再次 cancel → rejected（not_running），不伪造成功。
     let again = tpi::tool::process::process(
@@ -339,7 +372,11 @@ async fn process_cancel_terminates_tree_and_marks_cancelled() {
     )
     .await;
     assert_eq!(again.status, ToolStatus::Rejected);
-    assert!(again.model_text().contains("not_running"), "{}", again.model_text());
+    assert!(
+        again.model_text().contains("not_running"),
+        "{}",
+        again.model_text()
+    );
 }
 
 /// P4：process list 展示全部（含已结束）；未知 id 的 status → rejected。
@@ -372,7 +409,12 @@ async fn process_list_and_unknown_id() {
         .to_string();
     let process_id: ProcessId = pid_text.parse().unwrap();
     // 等它结束。
-    let _ = wait_process(&ctx.processes, process_id, std::time::Duration::from_secs(10)).await;
+    let _ = wait_process(
+        &ctx.processes,
+        process_id,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
 
     let list = tpi::tool::process::process(
         tpi::tool::process::ProcessArgs {
@@ -384,8 +426,15 @@ async fn process_list_and_unknown_id() {
     )
     .await;
     assert_eq!(list.status, ToolStatus::Succeeded);
-    assert!(list.model_text().contains("processes:"), "{}", list.model_text());
-    assert!(list.model_text().contains(&pid_text), "list 必须包含刚启动的进程");
+    assert!(
+        list.model_text().contains("processes:"),
+        "{}",
+        list.model_text()
+    );
+    assert!(
+        list.model_text().contains(&pid_text),
+        "list 必须包含刚启动的进程"
+    );
 
     let unknown = tpi::tool::process::process(
         tpi::tool::process::ProcessArgs {
@@ -397,7 +446,11 @@ async fn process_list_and_unknown_id() {
     )
     .await;
     assert_eq!(unknown.status, ToolStatus::Rejected);
-    assert!(unknown.model_text().contains("not_found"), "{}", unknown.model_text());
+    assert!(
+        unknown.model_text().contains("not_found"),
+        "{}",
+        unknown.model_text()
+    );
 }
 
 /// P4：wait 的 timeout 语义——进程未完成时返回 running（不是错误）。
@@ -439,7 +492,11 @@ async fn process_wait_timeout_returns_running_not_error() {
     )
     .await;
     assert_eq!(waited.status, ToolStatus::Succeeded);
-    assert!(waited.model_text().contains("status: running"), "{}", waited.model_text());
+    assert!(
+        waited.model_text().contains("status: running"),
+        "{}",
+        waited.model_text()
+    );
 
     // 清理：取消，避免测试进程残留。
     let _ = tpi::tool::process::process(
@@ -504,7 +561,12 @@ async fn background_inherits_snapshot_and_never_commits_shell_state() {
         .expect("process_id")
         .to_string();
     let process_id: ProcessId = pid_text.parse().unwrap();
-    let _ = wait_process(&ctx.processes, process_id, std::time::Duration::from_secs(10)).await;
+    let _ = wait_process(
+        &ctx.processes,
+        process_id,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
 
     // 1) 后台进程继承了启动时的 env 快照（TPI_BG_TEST=1）。文件写在继承的
     //    cwd（workspace/sub）下——这本身就是 cwd 继承的证明。
@@ -521,7 +583,10 @@ async fn background_inherits_snapshot_and_never_commits_shell_state() {
     // 3) 后台运行期间/结束后，session cwd/env 均未被反向修改（§10/§44）。
     let (session_cwd, session_env) = {
         let state = ctx.shell.lock().unwrap();
-        (state.cwd.to_string(), state.env_overlay.set.get("TPI_BG_TEST").cloned())
+        (
+            state.cwd.to_string(),
+            state.env_overlay.set.get("TPI_BG_TEST").cloned(),
+        )
     };
     assert!(
         session_cwd.ends_with("sub"),
@@ -568,14 +633,22 @@ async fn background_inner_cd_export_are_isolated() {
         .expect("process_id")
         .to_string();
     let process_id: ProcessId = pid_text.parse().unwrap();
-    let _ = wait_process(&ctx.processes, process_id, std::time::Duration::from_secs(10)).await;
+    let _ = wait_process(
+        &ctx.processes,
+        process_id,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
 
     let after = {
         let state = ctx.shell.lock().unwrap();
         (state.cwd.to_string(), state.version)
     };
     assert_eq!(before.0, after.0, "session cwd 不得被后台 cd 修改");
-    assert_eq!(before.1, after.1, "session version 不得因后台命令递增（无 commit）");
+    assert_eq!(
+        before.1, after.1,
+        "session version 不得因后台命令递增（无 commit）"
+    );
 }
 
 /// 检查本机是否有 python（web server 场景依赖；无则跳过）。
@@ -600,7 +673,12 @@ async fn start_background(ctx: &tpi::tool::ToolContext, command: &str) -> Proces
         ctx,
     )
     .await;
-    assert_eq!(outcome.status, ToolStatus::Succeeded, "{}", outcome.model_text());
+    assert_eq!(
+        outcome.status,
+        ToolStatus::Succeeded,
+        "{}",
+        outcome.model_text()
+    );
     let pid_text = outcome
         .model_text()
         .lines()
@@ -633,7 +711,9 @@ async fn web_server_background_lifecycle() {
     for _ in 0..40 {
         let r = bash(
             BashArgs {
-                command: format!("curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{port}/"),
+                command: format!(
+                    "curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{port}/"
+                ),
                 cwd: None,
                 timeout_ms: 10_000,
                 background: false,
@@ -659,7 +739,11 @@ async fn web_server_background_lifecycle() {
         &ctx,
     )
     .await;
-    assert!(cancelled.model_text().contains("status: cancelled"), "{}", cancelled.model_text());
+    assert!(
+        cancelled.model_text().contains("status: cancelled"),
+        "{}",
+        cancelled.model_text()
+    );
 
     // server 已停止：curl 应失败（连接拒绝）。
     let mut stopped = false;
@@ -688,7 +772,9 @@ async fn web_server_background_lifecycle() {
     for _ in 0..40 {
         let r = bash(
             BashArgs {
-                command: format!("curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{port}/"),
+                command: format!(
+                    "curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{port}/"
+                ),
                 cwd: None,
                 timeout_ms: 10_000,
                 background: false,
@@ -729,11 +815,14 @@ async fn multiple_processes_are_isolated() {
     let port = 18766;
 
     // p1 server、p2 长 sleep、p3 输出标记行。
+    // p3 标记行输出完后必须继续运行：后面的检查点（700ms 状态断言、
+    // cancel p2 后的隔离断言）都要求 p3 仍 running--脚本自身在 ~0.6s 退出
+    // 会让 Exited{0} 与 Running 的断言变成竞态（本机实测必败）。
     let p1 = start_background(&ctx, &format!("python -m http.server {port}")).await;
     let p2 = start_background(&ctx, "sleep 3").await;
     let p3 = start_background(
         &ctx,
-        "python -u -c \"import time;\nfor i in range(3): print('p3-line-', i); time.sleep(0.2)\"",
+        "python -u -c \"import time\nfor i in range(3): print('p3-line-', i); time.sleep(0.2)\ntime.sleep(30)\"",
     )
     .await;
 
@@ -755,8 +844,14 @@ async fn multiple_processes_are_isolated() {
             String::from_utf8_lossy(&reg.get(p3).unwrap().tail).into_owned(),
         )
     };
-    assert!(p3_tail.contains("p3-line-"), "p3 输出必须被 drain: {p3_tail}");
-    assert!(!p1_tail.contains("p3-line-"), "p1 输出不得混入 p3: {p1_tail}");
+    assert!(
+        p3_tail.contains("p3-line-"),
+        "p3 输出必须被 drain: {p3_tail}"
+    );
+    assert!(
+        !p1_tail.contains("p3-line-"),
+        "p1 输出不得混入 p3: {p1_tail}"
+    );
 
     // cancel p2 不影响 p1/p3。
     let c = tpi::tool::process::process(
@@ -768,7 +863,11 @@ async fn multiple_processes_are_isolated() {
         &ctx,
     )
     .await;
-    assert!(c.model_text().contains("status: cancelled"), "{}", c.model_text());
+    assert!(
+        c.model_text().contains("status: cancelled"),
+        "{}",
+        c.model_text()
+    );
     let after = {
         let reg = ctx.processes.lock().unwrap();
         (

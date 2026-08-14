@@ -15,9 +15,9 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use russh::client::{self, Handle};
 use russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path};
 use russh::keys::ssh_key;
-use russh::client::{self, Handle};
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
 
 /// R0 模块的错误类型。
@@ -64,13 +64,12 @@ pub struct RemoteHost {
 impl RemoteHost {
     /// 从 `~/.ssh/config` 解析 Host 别名（§33）。
     pub fn from_alias(alias: &str) -> Result<Self, SshError> {
-        let config = russh_config::parse_home(alias)
-            .map_err(|e| match e {
-                russh_config::Error::HostNotFound => SshError::HostNotFound {
-                    alias: alias.to_string(),
-                },
-                other => SshError::Config(other.to_string()),
-            })?;
+        let config = russh_config::parse_home(alias).map_err(|e| match e {
+            russh_config::Error::HostNotFound => SshError::HostNotFound {
+                alias: alias.to_string(),
+            },
+            other => SshError::Config(other.to_string()),
+        })?;
         let hc = &config.host_config;
         let identity_file = hc
             .identity_file
@@ -289,9 +288,7 @@ impl SshClient {
             Err(e) => {
                 let decision = self.decision.lock().unwrap().clone();
                 match decision {
-                    HostKeyDecision::Accepted => {
-                        return Err(SshError::Connect(e.to_string()))
-                    }
+                    HostKeyDecision::Accepted => return Err(SshError::Connect(e.to_string())),
                     HostKeyDecision::UnknownPending | HostKeyDecision::Changed => {
                         *self.state.lock().unwrap() = ConnectionState::Disconnected;
                         return Ok(decision);
@@ -328,23 +325,27 @@ impl SshClient {
             .identity_file
             .clone()
             .or_else(RemoteHost::probe_identity_file);
-        if let Some(path) = identity {
-            if path.is_file() {
-                if let Ok(key_pair) = russh::keys::load_secret_key(&path, None) {
-                    let auth = session
-                        .authenticate_publickey(
-                            &self.host.user,
-                            russh::keys::PrivateKeyWithHashAlg::new(
-                                Arc::new(key_pair),
-                                session.best_supported_rsa_hash().await.ok().flatten().flatten(),
-                            ),
-                        )
-                        .await
-                        .map_err(|e| SshError::Auth(e.to_string()))?;
-                    if auth.success() {
-                        return Ok(());
-                    }
-                }
+        if let Some(path) = identity
+            && path.is_file()
+            && let Ok(key_pair) = russh::keys::load_secret_key(&path, None)
+        {
+            let auth = session
+                .authenticate_publickey(
+                    &self.host.user,
+                    russh::keys::PrivateKeyWithHashAlg::new(
+                        Arc::new(key_pair),
+                        session
+                            .best_supported_rsa_hash()
+                            .await
+                            .ok()
+                            .flatten()
+                            .flatten(),
+                    ),
+                )
+                .await
+                .map_err(|e| SshError::Auth(e.to_string()))?;
+            if auth.success() {
+                return Ok(());
             }
         }
         // 2. 密码。
@@ -396,10 +397,7 @@ impl SshClient {
         env: &std::collections::HashMap<String, String>,
         cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<ExecResult, SshError> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or(SshError::NotConnected)?;
+        let session = self.session.as_mut().ok_or(SshError::NotConnected)?;
         let mut channel = session
             .channel_open_session()
             .await
@@ -452,10 +450,7 @@ impl SshClient {
 
     /// 打开 SFTP 会话（每次调用新建 channel；复用 transport 连接）。
     async fn sftp(&mut self) -> Result<russh_sftp::client::SftpSession, SshError> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or(SshError::NotConnected)?;
+        let session = self.session.as_mut().ok_or(SshError::NotConnected)?;
         let channel = session
             .channel_open_session()
             .await
@@ -489,7 +484,10 @@ impl SshClient {
         let sftp = self.sftp().await?;
         let tmp = format!("{path}.tpi-tmp-{}", uuid::Uuid::now_v7().simple());
         let mut file = sftp
-            .open_with_flags(&tmp, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE)
+            .open_with_flags(
+                &tmp,
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            )
             .await
             .map_err(|e| SshError::Sftp(e.to_string()))?;
         use tokio::io::AsyncWriteExt;

@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Mutex;
 
+use crate::tool::ToolContext;
 use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use crate::tool::registry::{Tool, ToolOrigin};
-use crate::tool::ToolContext;
 
 use super::client::McpClient;
 use super::error::error_code;
@@ -123,10 +123,7 @@ impl Tool for McpToolAdapter {
                 );
                 // server 进程层错误 → 标记不可用（README2 §12：server died →
                 // mark unavailable）。
-                if matches!(
-                    error.kind(),
-                    super::error::McpErrorKind::Unavailable
-                ) {
+                if matches!(error.kind(), super::error::McpErrorKind::Unavailable) {
                     self.available.store(false, Ordering::SeqCst);
                 }
                 mcp_outcome(error_code(&error), format!("{error}"))
@@ -152,7 +149,10 @@ fn format_mcp_result(result: &serde_json::Value) -> String {
                 if !out.is_empty() {
                     out.push('\n');
                 }
-                out.push_str(&format!("[binary {} bytes]", blob.as_str().map(|s| s.len()).unwrap_or(0)));
+                out.push_str(&format!(
+                    "[binary {} bytes]",
+                    blob.as_str().map(|s| s.len()).unwrap_or(0)
+                ));
             }
         }
         if !out.is_empty() {

@@ -41,6 +41,31 @@ fn push_system_line(
     renderer.draw(view).map_err(|e| e.to_string())
 }
 
+/// §13（内联）：`request_input` 挂起时的待回答输入。
+///
+/// 问题与选项直接内联展示在 transcript（无模态弹窗）；用户在输入框
+/// 输入回答或选项编号。`options` 仅在单问题带选项时非空（数字映射用；
+/// 多问题按行回答，不做有歧义的编号映射）。
+struct PendingInput {
+    /// 单问题时的选项列表（数字编号 → 选项文本映射；多问题/无选项为空）。
+    options: Vec<String>,
+}
+
+/// §13（内联）：挂起时用户提交的回答——单问题带选项时，纯数字（1..=N）
+/// 映射为对应选项文本；其他输入原样返回。
+fn map_pending_answer(pending: &PendingInput, answer: &str) -> String {
+    let trimmed = answer.trim();
+    if !pending.options.is_empty()
+        && let Ok(n) = trimmed.parse::<usize>()
+        && n >= 1
+        && n <= pending.options.len()
+    {
+        pending.options[n - 1].clone()
+    } else {
+        answer.to_string()
+    }
+}
+
 /// 会话定位方式（§18.3）。
 pub enum SessionTarget {
     New,
@@ -663,9 +688,10 @@ async fn interactive_loop<P: Provider>(
     // `/retry` 目标：上一次因 provider 失败而中断的 turn。
     // reason 决定是否先移除 TUI 中未提交的 partial；成功后必须清空。
     let mut last_failed: Option<RetryTarget> = None;
-    // §13（AGENTS.md）：run 因 request_input 挂起时，模型提出的问题；
-    // 用户下一条普通消息即是对该问题的回答（记录 UserInputReceived 后继续）。
-    let mut pending_question: Option<String> = None;
+    // §13（AGENTS.md）：run 因 request_input 挂起时，模型提出的问题与选项
+    //（内联展示在 transcript）；用户下一条普通消息即是对该问题的回答
+    //（记录 UserInputReceived 后继续；单问题带选项时支持数字编号选择）。
+    let mut pending_question: Option<PendingInput> = None;
     // §InteractionRefactor：统一指针状态机（idle 与 run 共用），
     // 取代旧的 mouse_down/drag_selecting 两套路径。
     let mut pointer_gesture = crate::tui::interaction::PointerGesture::default();
@@ -872,9 +898,7 @@ async fn interactive_loop<P: Provider>(
                     let label = match outcome.reason {
                         crate::session::CompletionReason::ProviderInterrupted => "模型连接中断",
                         crate::session::CompletionReason::ProviderUnavailable => "模型不可用",
-                        crate::session::CompletionReason::Error => {
-                            "长度限制/内容过滤/协议错误"
-                        }
+                        crate::session::CompletionReason::Error => "长度限制/内容过滤/协议错误",
                         _ => unreachable!("失败类 reason 已穷尽"),
                     };
                     ui_state.view.push_line(
@@ -915,8 +939,13 @@ async fn interactive_loop<P: Provider>(
 
             conversation.ensure_started(&config.sessions_root, &config.workspace_root)?;
             // §13：若上一个 run 因 request_input 挂起，本次提交就是对该问题的回答
-            // ——app 层先记录 UserInputReceived（durable 事实），再以普通 User
-            // 消息继续（投影 + 完整历史）。
+            //（内联：输入框直接输入）。单问题带选项时，纯数字回答映射为选项文本，
+            // 记录 UserInputReceived（durable 事实）与继续 run 都用映射后的文本。
+            let message = if let Some(pending) = &pending_question {
+                map_pending_answer(pending, &message)
+            } else {
+                message
+            };
             let resume_answer = pending_question.take().map(|_| message.clone());
             let run_result = {
                 let (session_log, history) = conversation.parts_for_run()?;
@@ -974,14 +1003,19 @@ async fn interactive_loop<P: Provider>(
             // P0-3：统一从 durable log 重建 history——Cancel/ProviderInterrupted/
             // 正常完成都由 session 事实源投影，杜绝 runtime 与 log 分叉。
             conversation.refresh_from_log()?;
-            // §13（AGENTS.md）：request_input 挂起 → 记录待回答问题，
-            // 用户下一条普通消息即作为回答继续（UserInputReceived 已在此前分支记录）。
-            // 选择器确认的选项也走同一条 pending_messages 路径。
+            // §13（AGENTS.md）：request_input 挂起 → 记录待回答问题与选项
+            //（内联展示，输入框直接回答；单问题带选项支持数字编号选择）。
             if outcome.reason == crate::session::CompletionReason::AwaitingUserInput {
-                pending_question = outcome
-                    .awaiting_input
-                    .as_ref()
-                    .map(|awaiting| awaiting.text.clone());
+                pending_question = outcome.awaiting_input.as_ref().map(|awaiting| {
+                    PendingInput {
+                        // 单问题带选项才启用编号映射；多问题按行回答不做歧义映射。
+                        options: if awaiting.questions.len() == 1 {
+                            awaiting.questions[0].options.clone()
+                        } else {
+                            Vec::new()
+                        },
+                    }
+                });
             }
             // 成功（或正常中断）后清空 retry 目标；ProviderInterrupted 是失败类，
             // 保留以便用户 /retry。
@@ -1010,6 +1044,11 @@ async fn interactive_loop<P: Provider>(
 /// 分派 slash 命令（从 `interactive_loop` 内联块提取）：命令在循环内短路
 /// run 路径。返回 [`SlashAction`] 由主循环解释；错误（draw/IO）向上传播，
 /// 与原内联 `?` 语义一致。
+///
+/// 8 个参数是 interactive_loop 的局部状态（config/会话/取消/渲染），每个
+/// 分支都用其子集；聚合 struct 需给 300 行函数体机械加前缀、无行为收益，
+/// 故保留扁平签名并 allow 阈值 lint。
+#[allow(clippy::too_many_arguments)]
 fn handle_slash_command(
     message: &str,
     ui_state: &mut UiState,
@@ -1883,28 +1922,8 @@ async fn run_interactive<P: Provider>(
             let mut block: Vec<String> = Vec::with_capacity(question.lines().count() + 2);
             block.push("⏸ run 挂起，等待你的输入：".to_string());
             block.extend(question.lines().map(String::from));
-            block.push(
-                "（输入回答后继续；↑/↓ + Enter 可从选项中选择，Esc 关闭后自由输入）".to_string(),
-            );
+            block.push("（输入回答后继续；可直接输入选项编号 1-N 选择）".to_string());
             ui_state.view.push_system_block_dedup(&block);
-            // 全部问题都有选项 → 打开键盘选择器（逐题导航，确认后作为回答）。
-            // 与提示块去重独立：即使提示被去重（连续挂起），选择器仍要重新打开
-            //（用户上次可能 Esc 关闭了）。
-            if let Some(questions) = awaiting.map(|a| &a.questions)
-                && !questions.is_empty()
-                && questions.iter().all(|q| !q.options.is_empty())
-            {
-                let items: Vec<crate::tui::model::InputChoiceItem> = questions
-                    .iter()
-                    .map(|q| crate::tui::model::InputChoiceItem {
-                        header: q.header.clone(),
-                        question: q.question.clone(),
-                        options: q.options.clone(),
-                    })
-                    .collect();
-                ui_state.view.input_choice =
-                    Some(crate::tui::model::InputChoiceState::new(items));
-            }
         }
     }
     ui_state.view.status = StatusLine::Idle;
@@ -2411,6 +2430,29 @@ mod tests {
         assert!(is_actionable_key_kind(KeyEventKind::Press));
         assert!(is_actionable_key_kind(KeyEventKind::Repeat));
         assert!(!is_actionable_key_kind(KeyEventKind::Release));
+    }
+
+    /// §13（内联）：挂起时回答——单问题带选项时纯数字映射为选项文本；
+    /// 非数字 / 越界 / 无选项时原样保留。
+    #[test]
+    fn map_pending_answer_maps_digit_to_option_otherwise_passthrough() {
+        let pending = PendingInput {
+            options: vec!["生产".into(), "staging".into()],
+        };
+        assert_eq!(map_pending_answer(&pending, "1"), "生产");
+        assert_eq!(
+            map_pending_answer(&pending, " 2 "),
+            "staging",
+            "容忍首尾空白"
+        );
+        assert_eq!(map_pending_answer(&pending, "3"), "3", "越界数字原样");
+        assert_eq!(map_pending_answer(&pending, "0"), "0", "0 不映射");
+        assert_eq!(map_pending_answer(&pending, "生产"), "生产", "非数字原样");
+        // 无选项（多问题/自由回答）：任何输入原样。
+        let free = PendingInput {
+            options: Vec::new(),
+        };
+        assert_eq!(map_pending_answer(&free, "1"), "1", "无选项时数字原样");
     }
 
     /// §用户诉求：--resume 前缀匹配——完整 UUID 直解、唯一前缀补全（大小写

@@ -62,9 +62,7 @@ impl McpClient {
         }
         #[cfg(windows)]
         {
-            command.creation_flags(
-                windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
-            );
+            command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
         }
         let mut child = command
             .spawn()
@@ -145,10 +143,7 @@ impl McpClient {
                 .await
                 .map_err(|_| McpError::Timeout)?
                 .ok_or_else(|| {
-                    McpError::Transport(format!(
-                        "stdout 关闭（{} 可能已退出）",
-                        self.config.name
-                    ))
+                    McpError::Transport(format!("stdout 关闭（{} 可能已退出）", self.config.name))
                 })?;
             let parsed: serde_json::Value = serde_json::from_str(&line)
                 .map_err(|e| McpError::Protocol(format!("非法 JSON: {e}")))?;
@@ -300,7 +295,10 @@ impl McpClient {
         let transport_err = |e: std::io::Error| {
             McpError::Transport(format!("写入 stdin 失败（server 可能已退出）: {e}"))
         };
-        self.stdin.write_all(line.as_bytes()).await.map_err(transport_err)?;
+        self.stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(transport_err)?;
         self.stdin.write_all(b"\n").await.map_err(transport_err)?;
         self.stdin.flush().await.map_err(transport_err)
     }

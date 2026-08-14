@@ -39,7 +39,9 @@ fn fixture_path() -> String {
 /// §15 Discovery：连接 → initialize → tools/list 发现 4 工具。
 #[tokio::test]
 async fn discovery_finds_four_tools() {
-    let mut client = McpClient::start(test_server_config("test-server")).await.unwrap();
+    let mut client = McpClient::start(test_server_config("test-server"))
+        .await
+        .unwrap();
     let init = client.init_result().cloned().unwrap();
     assert_eq!(init.server_name, "mcp-test-server");
     assert_eq!(init.protocol_version, "2024-11-05");
@@ -53,7 +55,9 @@ async fn discovery_finds_four_tools() {
 /// §15 Tool Call：echo/add 正常返回。
 #[tokio::test]
 async fn tool_call_echo_and_add() {
-    let mut client = McpClient::start(test_server_config("test-server")).await.unwrap();
+    let mut client = McpClient::start(test_server_config("test-server"))
+        .await
+        .unwrap();
     let _ = client.tools_list().await.unwrap();
 
     let echo = client
@@ -74,18 +78,30 @@ async fn tool_call_echo_and_add() {
 /// §15 Error：fail 工具返回 isError result（不崩溃）。
 #[tokio::test]
 async fn tool_call_fail_returns_is_error() {
-    let mut client = McpClient::start(test_server_config("test-server")).await.unwrap();
+    let mut client = McpClient::start(test_server_config("test-server"))
+        .await
+        .unwrap();
     let _ = client.tools_list().await.unwrap();
-    let result = client.call_tool("fail", serde_json::json!({})).await.unwrap();
+    let result = client
+        .call_tool("fail", serde_json::json!({}))
+        .await
+        .unwrap();
     assert_eq!(result["isError"].as_bool(), Some(true));
-    assert!(result["content"][0]["text"].as_str().unwrap().contains("预期"));
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("预期")
+    );
     client.shutdown().await;
 }
 
 /// §15 Error：不存在的 tool → JSON-RPC error。
 #[tokio::test]
 async fn tool_call_unknown_tool_returns_error() {
-    let mut client = McpClient::start(test_server_config("test-server")).await.unwrap();
+    let mut client = McpClient::start(test_server_config("test-server"))
+        .await
+        .unwrap();
     let _ = client.tools_list().await.unwrap();
     let err = client
         .call_tool("no_such_tool", serde_json::json!({}))
@@ -118,10 +134,20 @@ async fn server_crash_marks_unavailable() {
     let config = test_server_config("crash-server");
     let count = manager.start_server(config).await.unwrap();
     assert_eq!(count, 4);
-    assert!(registry.lock().unwrap().get("mcp::crash-server::echo").is_some());
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .get("mcp::crash-server::echo")
+            .is_some()
+    );
 
     // 通过 adapter 调用 echo 成功。
-    let echo_tool = registry.lock().unwrap().get("mcp::crash-server::echo").unwrap();
+    let echo_tool = registry
+        .lock()
+        .unwrap()
+        .get("mcp::crash-server::echo")
+        .unwrap();
     let ctx = fixtures::test_tool_context(&camino::Utf8PathBuf::from("."));
     let outcome = echo_tool.execute(r#"{"text":"x"}"#, &ctx).await;
     assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
@@ -146,7 +172,9 @@ async fn server_crash_marks_unavailable() {
 /// §15 Lifecycle：shutdown 后无残留进程（child 已终止）。
 #[tokio::test]
 async fn lifecycle_no_orphan_process() {
-    let mut client = McpClient::start(test_server_config("test-server")).await.unwrap();
+    let mut client = McpClient::start(test_server_config("test-server"))
+        .await
+        .unwrap();
     let _ = client.tools_list().await.unwrap();
     let pid = client.pid();
     client.shutdown().await;
@@ -164,8 +192,20 @@ async fn manager_registers_tools_and_reports_status() {
     let config = test_server_config("ui-server");
     let count = manager.start_server(config).await.unwrap();
     assert_eq!(count, 4);
-    assert!(registry.lock().unwrap().get("mcp::ui-server::echo").is_some());
-    assert!(registry.lock().unwrap().get("mcp::ui-server::add").is_some());
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .get("mcp::ui-server::echo")
+            .is_some()
+    );
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .get("mcp::ui-server::add")
+            .is_some()
+    );
 
     let statuses = manager.statuses();
     assert_eq!(statuses.len(), 1);
@@ -179,7 +219,13 @@ async fn manager_registers_tools_and_reports_status() {
     let configs = vec![test_server_config("ui-server")];
     let again = manager.restart_server("ui-server", &configs).await.unwrap();
     assert_eq!(again, 4);
-    assert!(registry.lock().unwrap().get("mcp::ui-server::echo").is_some());
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .get("mcp::ui-server::echo")
+            .is_some()
+    );
 
     manager.shutdown_all().await;
 }
@@ -196,20 +242,29 @@ async fn raii_registrations_unregister_on_shutdown() {
         let mut manager = McpManager::with_registry(registry.clone());
         let count = manager.start_server(config).await.unwrap();
         assert_eq!(count, 4);
-        assert!(registry
-            .lock()
-            .unwrap()
-            .get("mcp::raii-server::echo")
-            .is_some());
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .get("mcp::raii-server::echo")
+                .is_some()
+        );
         // 主动 restart：旧工具必须先注销再重新注册（restart 内部 drop 旧句柄）。
         let configs = vec![test_server_config("raii-server")];
-        manager.restart_server("raii-server", &configs).await.unwrap();
+        manager
+            .restart_server("raii-server", &configs)
+            .await
+            .unwrap();
         // manager 在此作用域结束时 drop → 所有 RAII 句柄自动注销。
         count
     };
     assert_eq!(count, 4);
     // manager 已 drop：该 server 的工具必须全部消失。
-    for name in ["mcp::raii-server::echo", "mcp::raii-server::add", "mcp::raii-server::sleep"] {
+    for name in [
+        "mcp::raii-server::echo",
+        "mcp::raii-server::add",
+        "mcp::raii-server::sleep",
+    ] {
         assert!(
             registry.lock().unwrap().get(name).is_none(),
             "drop McpManager 后 {name} 应被自动注销"
@@ -224,11 +279,13 @@ fn tool_registration_drop_unregisters() {
     let adapter = tpi::tool::registry::BuiltinToolAdapter::new(tpi::tool::BuiltinTool::Read);
     let registration =
         tpi::tool::registry::ToolRegistry::register_owned(&registry, std::sync::Arc::new(adapter));
-    assert!(registry
-        .lock()
-        .unwrap()
-        .get(tpi::tool::BuiltinTool::Read.name())
-        .is_some());
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .get(tpi::tool::BuiltinTool::Read.name())
+            .is_some()
+    );
     drop(registration);
     assert!(
         registry

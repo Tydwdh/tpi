@@ -42,7 +42,8 @@ fn setup_workspace_with_skills() -> (tempfile::TempDir, Utf8PathBuf) {
     );
     // references + scripts 文件。
     std::fs::write(
-        dir.path().join(".agent/skills/rust-review/references/error-handling.md"),
+        dir.path()
+            .join(".agent/skills/rust-review/references/error-handling.md"),
         "# 错误处理要点\n\n- 优先 thiserror\n- 不 panic\n",
     )
     .unwrap();
@@ -95,7 +96,9 @@ async fn read_reference_on_demand() {
     let manager = tpi::skills::SkillManager::global();
     let mut manager = manager.lock().unwrap();
     manager.refresh(&workspace);
-    let content = manager.read_reference("rust-review", "error-handling.md").unwrap();
+    let content = manager
+        .read_reference("rust-review", "error-handling.md")
+        .unwrap();
     assert!(content.contains("thiserror"));
     assert!(manager.read_reference("rust-review", "missing.md").is_err());
 }
@@ -146,7 +149,10 @@ async fn metadata_only_keeps_startup_cost_flat() {
     let metas = manager.available();
     assert_eq!(metas.len(), 30);
     // metadata 总大小 = 30 * (name + description)，远小于 30 * 2KB body。
-    let meta_bytes: usize = metas.iter().map(|m| m.name.len() + m.description.len()).sum();
+    let meta_bytes: usize = metas
+        .iter()
+        .map(|m| m.name.len() + m.description.len())
+        .sum();
     assert!(
         meta_bytes < 2048 * 30 / 4,
         "metadata 必须远小于全量 body（progressive disclosure）：{meta_bytes} bytes"

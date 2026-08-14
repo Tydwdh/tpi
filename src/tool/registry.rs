@@ -7,15 +7,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::tool::outcome::ToolOutcome;
 use crate::tool::ToolContext;
+use crate::tool::outcome::ToolOutcome;
 
 /// 工具来源（README2 §2.1：只能作为 metadata，Agent Loop 不据此分支执行）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolOrigin {
     Builtin,
     /// MCP server 提供的工具。
-    Mcp { server: String },
+    Mcp {
+        server: String,
+    },
 }
 
 impl std::fmt::Display for ToolOrigin {
@@ -53,16 +55,9 @@ pub struct ToolDescriptor {
 
 /// 工具注册表（README2 §4：只管理 Tool，不管 MCP 生命周期）。
 /// 不 derive Debug：`Arc<dyn Tool>` 不实现 Debug。
+#[derive(Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
-}
-
-impl Default for ToolRegistry {
-    fn default() -> Self {
-        Self {
-            tools: HashMap::new(),
-        }
-    }
 }
 
 impl ToolRegistry {
@@ -244,9 +239,7 @@ pub fn global_registry() -> Arc<std::sync::Mutex<ToolRegistry>> {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<Arc<std::sync::Mutex<ToolRegistry>>> = OnceLock::new();
     REGISTRY
-        .get_or_init(|| {
-            Arc::new(std::sync::Mutex::new(builtin_registry()))
-        })
+        .get_or_init(|| Arc::new(std::sync::Mutex::new(builtin_registry())))
         .clone()
 }
 
@@ -284,9 +277,9 @@ mod tests {
                 crate::tool::edit::SnapshotStore::new(4, 2),
             )),
             current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            shell: std::sync::Arc::new(std::sync::Mutex::new(crate::shell::ShellSessionState::new(
-                camino::Utf8PathBuf::from("/tmp"),
-            ))),
+            shell: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::shell::ShellSessionState::new(camino::Utf8PathBuf::from("/tmp")),
+            )),
             workspace: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::workspace::ActiveWorkspace::local(crate::workspace::LocalWorkspace::new(
                     camino::Utf8PathBuf::from("/tmp"),
@@ -307,4 +300,3 @@ mod tests {
         assert!(outcome.model_payload.output.contains("invalid_arguments"));
     }
 }
-

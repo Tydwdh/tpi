@@ -87,6 +87,88 @@ pub enum LineEnding {
     Crlf,
 }
 
+/// 匹配宽容策略（P1/P2：按文件类型决定最高 relaxation level）。
+///
+/// 原则：relaxation 只发生在 **where**（定位），不传播到 **what**（重建）——
+/// 定位用归一化视图，替换仍作用于原始字节区间，未触及字节原样保留。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WhitespacePolicy {
+    /// 不允许任何 whitespace tolerance（全部精确匹配）。
+    Exact,
+    /// 允许 trailing whitespace 归一化定位（行尾空白无语义，安全）。
+    TrailingInsensitive,
+    /// 允许 uniform outer-indent reconciliation（默认；块整体平移）。
+    /// 不做 tab==spaces 换算：只接受**每行共同前缀**的整体偏移。
+    UniformOuterIndent,
+}
+
+/// 一次 replacement 实际命中的匹配层级（诊断/测试用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MatchTier {
+    Exact,
+    TrailingInsensitive,
+    UniformOuterIndent,
+}
+
+/// 行尾摘要（read 元信息，P0a）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEndingsSummary {
+    Lf,
+    Crlf,
+    Mixed,
+}
+
+/// 主导缩进类型（read 元信息，P0a）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndentationSummary {
+    Tabs,
+    Spaces,
+    Mixed,
+    None_,
+}
+
+/// read 输出头的空白元信息（P0a：模型据此构造 old_text，闭合 read→edit 协议）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhitespaceInfo {
+    pub line_endings: LineEndingsSummary,
+    pub indentation: IndentationSummary,
+    /// 展示用 tab 宽度（非规范；仅提示）。
+    pub tab_width_display: u8,
+    /// 文件是否存在行尾空白。
+    pub trailing_whitespace: bool,
+}
+
+/// 差异类型（no_match 结构化诊断，P0b）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MismatchKind {
+    /// 缩进差异（lstrip 后内容相同）。
+    Indentation,
+    /// 文本差异（内容本身不同）。
+    Textual,
+    /// 无法定位（无相似候选）。
+    None,
+}
+
+/// no_match 结构化诊断（P0b：模型免 read 即可知道差异在哪）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoMatchDiagnostic {
+    /// 最相似候选的行范围（1-based）。
+    pub lines: (usize, usize),
+    /// 相似度（万分比 0..=10000；10000 = 完全相等）。
+    pub similarity_bp: u16,
+    pub kind: MismatchKind,
+    /// 首个差异行（相对候选起点，0-based）。
+    pub line: Option<usize>,
+    /// 文件实际缩进（old_text 应匹配的目标；转义显示）。
+    pub expected_indent: Option<String>,
+    /// old_text 提供的缩进（转义显示）。
+    pub provided_indent: Option<String>,
+    /// 该行 lstrip 后内容是否相等（区分缩进/文本差异）。
+    pub content_equal_after_lstrip: Option<bool>,
+    /// 文本差异：首个不同行 (old_text 行, 实际行)。
+    pub first_difference: Option<(String, String)>,
+}
+
 /// 文件快照（§10.1）。
 #[derive(Debug)]
 pub struct FileSnapshot {
@@ -260,6 +342,9 @@ pub enum EditError {
         index: usize,
         /// 当前文件相关区域上下文（模型免 read 自纠；§修复）。
         context: Option<String>,
+        /// 结构化差异诊断（P0b；None = 无相似候选）。
+        /// Box：诊断仅在错误路径构造，避免撑大 NoMatch variant（result_large_err）。
+        diagnostic: Option<Box<NoMatchDiagnostic>>,
     },
     #[error("multiple matches for replacements[{index}] in {path} (must be unique)")]
     MultipleMatches { path: Utf8PathBuf, index: usize },
@@ -326,6 +411,8 @@ struct PreparedReplacement {
     logical_start: usize,
     logical_end: usize,
     new_logical: String,
+    /// 命中的匹配层级（P1/P2 宽容定位时非 Exact）。
+    tier: MatchTier,
 }
 
 /// 应用 replacement 后的结果。
@@ -337,6 +424,8 @@ pub struct EditResult {
     pub applied: usize,
     /// 因 old_text == new_text 而跳过的 no-op 条目数（§修复）。
     pub skipped_noops: usize,
+    /// 本批所有 replacement 命中的最低匹配层级（P1/P2；全部 exact 为 Exact）。
+    pub tier: MatchTier,
     /// 编辑前原始字节（unified diff 与诊断用）。
     pub previous_raw: Vec<u8>,
     pub new_raw: Vec<u8>,
@@ -397,6 +486,428 @@ pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
         start = match_start.saturating_add(advance);
     }
     count
+}
+
+/// 文件类型 → 最高宽容层级（P2b）。Makefile 的 `\t` 是语法：即使视觉
+/// 列数相同，tab 与空格也不等价 → 禁用 uniform-indent（只允许 trailing）。
+pub fn whitespace_policy_for(path: &Utf8PathBuf) -> WhitespacePolicy {
+    let name = path
+        .file_name()
+        .map(|n| n.to_lowercase())
+        .unwrap_or_default();
+    let is_makefile = matches!(name.as_str(), "makefile" | "gnumakefile") || name.ends_with(".mk");
+    if is_makefile {
+        WhitespacePolicy::TrailingInsensitive
+    } else {
+        WhitespacePolicy::UniformOuterIndent
+    }
+}
+
+/// 行边界：[start, end)，end 含换行符（`\n`）位置；不含则到文本末尾。
+/// 末尾 `\n` 后的空段不产生行（与 `str::lines` 一致）。
+fn line_bounds(text: &str) -> Vec<(usize, usize)> {
+    let mut bounds = Vec::new();
+    let mut start = 0usize;
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            bounds.push((start, i + 1));
+            start = i + 1;
+        }
+    }
+    if start < text.len() {
+        bounds.push((start, text.len()));
+    }
+    bounds
+}
+
+/// 去掉行尾空白与换行符（比较基准：行内容本身）。
+/// 注意：old_text 末行可能无换行，而对应实际行有换行——比较必须统一去掉。
+fn trim_trailing_ws(line: &str) -> &str {
+    line.trim_end_matches([' ', '\t', '\n'])
+}
+
+/// Tier 2：trailing-whitespace 归一化定位。两侧每行去行尾空白后逐行相等；
+/// 返回命中的**原始** logical 区间（含真实 trailing——未触及字节保留）。
+/// 唯一命中才返回；歧义（多个位置）返回 None（安全失败，不自动替换）。
+fn locate_trailing_insensitive(haystack: &str, old_text: &str) -> Option<(usize, usize)> {
+    let old_lines = line_bounds(old_text);
+    if old_lines.is_empty() {
+        return None;
+    }
+    let old_norm: Vec<&str> = old_lines
+        .iter()
+        .map(|&(s, e)| trim_trailing_ws(&old_text[s..e]))
+        .collect();
+    let hay_lines = line_bounds(haystack);
+    if hay_lines.len() < old_lines.len() {
+        return None;
+    }
+    let mut hits = Vec::new();
+    for win in 0..=hay_lines.len() - old_lines.len() {
+        let mut ok = true;
+        for i in 0..old_lines.len() {
+            let (hs, he) = hay_lines[win + i];
+            let actual = trim_trailing_ws(&haystack[hs..he]);
+            if actual != old_norm[i] {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            let last = win + old_lines.len() - 1;
+            hits.push((hay_lines[win].0, hay_lines[last].1));
+        }
+    }
+    if hits.len() == 1 { Some(hits[0]) } else { None }
+}
+
+/// Tier 3：uniform outer-indent reconciliation。要求每行 lstrip 后内容相等，
+/// 且实际行缩进 = 统一前缀 P + old_text 行缩进（P 对全部**非空行**相同；
+/// 字符级 strip_suffix，不做 tab==space 换算）。返回 (命中区间, P)。
+///
+/// 安全边界：只接受“块整体平移”（坐标系偏移），relative indentation 变化
+/// （如 Python 嵌套层级）直接失败；Makefile 等由 policy 禁用本层。
+fn locate_uniform_indent(haystack: &str, old_text: &str) -> Option<(usize, usize, String)> {
+    let old_lines = line_bounds(old_text);
+    if old_lines.is_empty() {
+        return None;
+    }
+    let mut old_rows = Vec::with_capacity(old_lines.len());
+    for &(s, e) in &old_lines {
+        let line = &old_text[s..e];
+        let content_start = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let (indent, content) = line.split_at(content_start);
+        old_rows.push((indent, content));
+    }
+    let hay_lines = line_bounds(haystack);
+    if hay_lines.len() < old_lines.len() {
+        return None;
+    }
+    let mut hits = Vec::new();
+    'win: for win in 0..=hay_lines.len() - old_lines.len() {
+        let mut prefix: Option<String> = None;
+        for i in 0..old_lines.len() {
+            let (hs, he) = hay_lines[win + i];
+            let hay_line = &haystack[hs..he];
+            let h_content_start = hay_line.len() - hay_line.trim_start_matches([' ', '\t']).len();
+            let (h_indent, h_content) = hay_line.split_at(h_content_start);
+            let (o_indent, o_content) = old_rows[i];
+            // 内容（lstrip + 去行尾空白/换行）必须逐行相等。
+            let h_core = h_content.trim_end_matches([' ', '\t', '\n']);
+            let o_core = o_content.trim_end_matches([' ', '\t', '\n']);
+            if h_core != o_core {
+                continue 'win;
+            }
+            // 纯空白行不参与前缀推导/校验（indent 无语义）。
+            if o_core.trim().is_empty() {
+                continue;
+            }
+            match h_indent.strip_suffix(o_indent) {
+                Some(p) => match &prefix {
+                    None => prefix = Some(p.to_string()),
+                    Some(existing) if existing == p => {}
+                    Some(_) => continue 'win,
+                },
+                None => continue 'win,
+            }
+        }
+        if let Some(p) = prefix {
+            let last = win + old_lines.len() - 1;
+            hits.push((hay_lines[win].0, hay_lines[last].1, p));
+        }
+    }
+    if hits.len() == 1 {
+        Some(hits.swap_remove(0))
+    } else {
+        None
+    }
+}
+
+/// Tier 3：把 new_text 每行（非空行）加上统一前缀 P（重建缩进坐标系）。
+/// 空行/纯空白行不加，避免在空白行制造无意义空白。
+fn reindent_new_text(new_text: &str, prefix: &str) -> String {
+    if prefix.is_empty() {
+        return new_text.to_string();
+    }
+    let mut out = String::with_capacity(new_text.len() + prefix.len());
+    for line in new_text.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            out.push_str(line);
+        } else {
+            out.push_str(prefix);
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// 行内容 core：去掉行尾空白与换行（保留行首 indent；用于“未变化行”判定）。
+fn line_core(line: &str) -> &str {
+    line.trim_end_matches([' ', '\t', '\n'])
+}
+
+/// new_text 与 old_text 的缩进相对结构一致性（Tier3 前置校验）：
+/// 对所有非空行，new_indent_i 与 old_indent_i 存在**恒定整体偏移**（任一方向：
+/// new = Q + old 或 old = Q + new，Q 对全部行相同）。防止模型在 new_text 里
+/// 改变 relative indentation（如 Python 嵌套层级写平）后被静默重建。
+fn new_text_relative_consistent(old_text: &str, new_text: &str) -> bool {
+    let old_lines = line_bounds(old_text);
+    let new_lines = line_bounds(new_text);
+    if old_lines.len() != new_lines.len() {
+        // 行数不同：无法逐行对齐，交由 reconcile 的 fallback（整体重建）。
+        return true;
+    }
+    let mut expect: Option<(String, bool)> = None; // (前缀, true=new=Q+old)
+    for i in 0..old_lines.len() {
+        let o = &old_text[old_lines[i].0..old_lines[i].1];
+        let n = &new_text[new_lines[i].0..new_lines[i].1];
+        let o_core = line_core(o);
+        if o_core.trim().is_empty() {
+            continue;
+        }
+        let o_indent = &o[..o.len() - o.trim_start_matches([' ', '\t']).len()];
+        let n_core = line_core(n);
+        if n_core.trim().is_empty() {
+            continue;
+        }
+        let n_indent = &n[..n.len() - n.trim_start_matches([' ', '\t']).len()];
+        // new = Q + old，或 old = Q + new（Q 恒定）。
+        let forward = n_indent
+            .strip_suffix(o_indent)
+            .map(|q| (q.to_string(), true));
+        let backward = o_indent
+            .strip_suffix(n_indent)
+            .map(|q| (q.to_string(), false));
+        let this = forward.or(backward);
+        match (&expect, this) {
+            (None, Some(x)) => expect = Some(x),
+            (Some((eq, ed)), Some((q, d))) if *eq == q && *ed == d => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// 合并未变化行（P1 核心原则：match normalized view, mutate original view）。
+///
+/// new_text 中与 old_text 内容（core）相同的行——即 patch 的 context 行——
+/// 保持**实际文件字节**（含真实 trailing whitespace；Tier3 时含统一前缀 P），
+/// 只替换真正变化的行。避免宽容定位把 context 行的真实空白写丢（Codex
+/// issue #30505 类问题）。行数不一致时无法逐行对齐 → 整体用 new_text。
+fn reconcile_lines(old_text: &str, new_text: &str, actual: &str, prefix: &str) -> String {
+    let old_lines = line_bounds(old_text);
+    let new_lines = line_bounds(new_text);
+    let act_lines = line_bounds(actual);
+    if old_lines.len() != new_lines.len() || new_lines.len() != act_lines.len() {
+        return reindent_new_text(new_text, prefix);
+    }
+    let mut out = String::with_capacity(actual.len() + new_text.len());
+    for i in 0..old_lines.len() {
+        let o = &old_text[old_lines[i].0..old_lines[i].1];
+        let n = &new_text[new_lines[i].0..new_lines[i].1];
+        if line_core(o) == line_core(n) {
+            // 未变化行：保持实际字节（含真实 trailing / Tier3 前缀）。
+            out.push_str(&actual[act_lines[i].0..act_lines[i].1]);
+        } else {
+            out.push_str(prefix);
+            out.push_str(n);
+            // 末行：new_text 无换行但实际行有换行 → 补（模型未写 \n 不意味
+            // 着要删除该行的换行）。
+            if i == old_lines.len() - 1
+                && !n.ends_with('\n')
+                && actual[act_lines[i].0..act_lines[i].1].ends_with('\n')
+            {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// 宽容定位（Tier 2/3 分发）。返回 (logical_start, logical_end, new_logical, tier)。
+/// 只改变“命中哪几行”；new_logical 仅 Tier3 按真实前缀重建，Tier2 原样。
+fn locate_lenient(
+    text: &str,
+    replacement: &Replacement,
+    policy: WhitespacePolicy,
+) -> Option<(usize, usize, String, MatchTier)> {
+    if policy >= WhitespacePolicy::TrailingInsensitive
+        && let Some((start, end)) = locate_trailing_insensitive(text, &replacement.old_text)
+    {
+        let actual = &text[start..end];
+        let merged = reconcile_lines(&replacement.old_text, &replacement.new_text, actual, "");
+        return Some((start, end, merged, MatchTier::TrailingInsensitive));
+    }
+    if policy >= WhitespacePolicy::UniformOuterIndent
+        && let Some((start, end, prefix)) = locate_uniform_indent(text, &replacement.old_text)
+    {
+        // new_text 内部 relative indentation 变化 → 拒绝（防静默写错层级）。
+        if !new_text_relative_consistent(&replacement.old_text, &replacement.new_text) {
+            return None;
+        }
+        let actual = &text[start..end];
+        let merged = reconcile_lines(
+            &replacement.old_text,
+            &replacement.new_text,
+            actual,
+            &prefix,
+        );
+        return Some((start, end, merged, MatchTier::UniformOuterIndent));
+    }
+    None
+}
+
+/// 分析文件的空白概况（P0a：read 输出头元信息，模型据此构造 old_text）。
+pub fn analyze_whitespace(snapshot: &FileSnapshot) -> WhitespaceInfo {
+    // 行尾：扫描原始字节统计 CRLF 与孤立 LF（raw 保留真实行尾）。
+    let raw = &snapshot.raw;
+    let mut crlf = 0usize;
+    let mut lf = 0usize;
+    let mut i = 0usize;
+    while i < raw.len() {
+        if raw[i] == b'\n' {
+            if i > 0 && raw[i - 1] == b'\r' {
+                crlf += 1;
+            } else {
+                lf += 1;
+            }
+        }
+        i += 1;
+    }
+    let line_endings = match (crlf, lf) {
+        (0, _) => LineEndingsSummary::Lf,
+        (_, 0) => LineEndingsSummary::Crlf,
+        _ => LineEndingsSummary::Mixed,
+    };
+    // 缩进与 trailing：基于 logical 文本逐行。
+    let mut tabs = 0usize;
+    let mut spaces = 0usize;
+    let mut mixed = 0usize;
+    let mut trailing = false;
+    for line in snapshot.logical_lf_text.split('\n') {
+        if line.ends_with(' ') || line.ends_with('\t') {
+            trailing = true;
+        }
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        if trimmed.len() == line.len() {
+            continue;
+        }
+        let indent = &line[..line.len() - trimmed.len()];
+        let has_tab = indent.contains('\t');
+        let has_space = indent.contains(' ');
+        match (has_tab, has_space) {
+            (true, false) => tabs += 1,
+            (false, true) => spaces += 1,
+            _ => mixed += 1,
+        }
+    }
+    let indentation = if tabs > 0 && spaces == 0 && mixed == 0 {
+        IndentationSummary::Tabs
+    } else if spaces > 0 && tabs == 0 && mixed == 0 {
+        IndentationSummary::Spaces
+    } else if tabs > 0 || spaces > 0 || mixed > 0 {
+        IndentationSummary::Mixed
+    } else {
+        IndentationSummary::None_
+    };
+    WhitespaceInfo {
+        line_endings,
+        indentation,
+        tab_width_display: 4,
+        trailing_whitespace: trailing,
+    }
+}
+
+/// 缩进转义显示（tab → `\t`，可 round-trip 复制）。
+fn escape_ws(s: &str) -> String {
+    format!("{s:?}")
+}
+
+/// no_match 结构化诊断（P0b）：定位最相似候选窗口，标注首个差异（缩进/文本）。
+pub fn diagnose_no_match(text: &str, old_text: &str) -> Option<NoMatchDiagnostic> {
+    let old_lines = line_bounds(old_text);
+    let hay_lines = line_bounds(text);
+    if old_lines.is_empty() || hay_lines.is_empty() {
+        return None;
+    }
+    let old_rows: Vec<(&str, &str, &str)> = old_lines
+        .iter()
+        .map(|&(s, e)| {
+            let line = &old_text[s..e];
+            let content_start = line.len() - line.trim_start_matches([' ', '\t']).len();
+            let (indent, content) = line.split_at(content_start);
+            (indent, content.trim(), line)
+        })
+        .collect();
+    let max_windows = hay_lines.len().saturating_sub(old_lines.len()) + 1;
+    let mut best: Option<(usize, f64, usize)> = None; // (win, similarity, first_diff)
+    for win in 0..max_windows {
+        let mut same = 0usize;
+        let mut first_diff = None;
+        for i in 0..old_lines.len() {
+            let (hs, he) = hay_lines[win + i];
+            let hay_line = &text[hs..he];
+            let h_content_start = hay_line.len() - hay_line.trim_start_matches([' ', '\t']).len();
+            let (h_indent, h_content) = hay_line.split_at(h_content_start);
+            let (o_indent, o_content, _) = old_rows[i];
+            // 相似度按“内容（lstrip+去尾空白/换行）相等”计，缩进差异不降分
+            //（整体 outer-indent 偏移是常见场景，应给出高相似度诊断），
+            // 但缩进不同的行记入 first_diff 供标注。
+            let h_core = h_content.trim_end_matches([' ', '\t', '\n']);
+            let o_core = o_content.trim_end_matches([' ', '\t', '\n']);
+            if h_core == o_core {
+                same += 1;
+                if h_indent != o_indent && first_diff.is_none() {
+                    first_diff = Some(i);
+                }
+            } else if first_diff.is_none() {
+                first_diff = Some(i);
+            }
+        }
+        let sim = same as f64 / old_lines.len() as f64;
+        if best
+            .as_ref()
+            .map(|(_, bsim, _)| sim > *bsim)
+            .unwrap_or(true)
+        {
+            best = Some((win, sim, first_diff.unwrap_or(0)));
+        }
+    }
+    let (win, similarity, first_diff) = best?;
+    let mut kind = MismatchKind::None;
+    let mut expected_indent = None;
+    let mut provided_indent = None;
+    let mut content_equal = None;
+    let mut first_difference = None;
+    if let Some((o_indent, o_content, _)) = old_rows.get(first_diff) {
+        let (hs, he) = hay_lines[win + first_diff];
+        let hay_line = &text[hs..he];
+        let h_content_start = hay_line.len() - hay_line.trim_start_matches([' ', '\t']).len();
+        let (h_indent, h_content) = hay_line.split_at(h_content_start);
+        let h_core = h_content.trim_end_matches([' ', '\t', '\n']);
+        let o_core = o_content.trim_end_matches([' ', '\t', '\n']);
+        if h_core == o_core {
+            kind = MismatchKind::Indentation;
+            // expected = 文件实际（old_text 应匹配的目标）；provided = old_text 提供。
+            expected_indent = Some(escape_ws(h_indent));
+            provided_indent = Some(escape_ws(o_indent));
+            content_equal = Some(true);
+        } else {
+            kind = MismatchKind::Textual;
+            let (os, oe) = old_lines[first_diff];
+            first_difference = Some((old_text[os..oe].to_string(), hay_line.to_string()));
+        }
+    }
+    Some(NoMatchDiagnostic {
+        lines: (win + 1, win + old_lines.len()),
+        similarity_bp: ((similarity * 10000.0).round() as u16).min(10000),
+        kind,
+        line: Some(first_diff),
+        expected_indent,
+        provided_indent,
+        content_equal_after_lstrip: content_equal,
+        first_difference,
+    })
 }
 
 /// 执行 revision-bound exact edit（§10.3）。
@@ -473,16 +984,9 @@ fn apply_edit_to_snapshot(
             skipped_noops += 1;
             continue;
         }
+        // Tier 1：exact。歧义（>1）直接拒绝，不降级——安全失败优先于
+        // 模糊命中的“危险成功”（P1 原则：relaxation 只发生在 where）。
         let occurrences = count_occurrences(&snapshot.logical_lf_text, &replacement.old_text);
-        if occurrences == 0 {
-            precheck_error = Some(EditError::NoMatch {
-                path: snapshot.path.clone(),
-                index,
-                // §修复 #3：定位失败处当前文件内容，模型免 read 自纠。
-                context: locate_context(&snapshot.logical_lf_text, &replacement.old_text),
-            });
-            break;
-        }
         if occurrences > 1 {
             precheck_error = Some(EditError::MultipleMatches {
                 path: snapshot.path.clone(),
@@ -490,29 +994,63 @@ fn apply_edit_to_snapshot(
             });
             break;
         }
-        // occurrences == 1 已保证唯一；find 失败意味着计数与查找不一致
-        // （内部不变量被破坏）——按 NoMatch 处理并记录日志，不 panic。
-        let logical_start = match snapshot.logical_lf_text.find(&replacement.old_text) {
-            Some(start) => start,
-            None => {
-                tracing::error!(
-                    path = %snapshot.path,
-                    index,
-                    "edit: count_occurrences 与 find 不一致（内部不变量破坏）",
-                );
-                precheck_error = Some(EditError::NoMatch {
-                    path: snapshot.path.clone(),
-                    index,
-                    context: None,
-                });
-                break;
+        // 定位结果：(start, end, new_logical, tier)。宽容定位只改变“命中
+        // 哪几行”，new_logical 仅在 Tier3 按实际前缀重建（统一前缀平移）。
+        let (logical_start, logical_end, new_logical, tier) = if occurrences == 1 {
+            let logical_start = match snapshot.logical_lf_text.find(&replacement.old_text) {
+                Some(start) => start,
+                None => {
+                    tracing::error!(
+                        path = %snapshot.path,
+                        index,
+                        "edit: count_occurrences 与 find 不一致（内部不变量破坏）",
+                    );
+                    precheck_error = Some(EditError::NoMatch {
+                        path: snapshot.path.clone(),
+                        index,
+                        context: None,
+                        diagnostic: None,
+                    });
+                    break;
+                }
+            };
+            (
+                logical_start,
+                logical_start + replacement.old_text.len(),
+                replacement.new_text.clone(),
+                MatchTier::Exact,
+            )
+        } else {
+            // Tier 2/3：宽容定位（按文件类型 policy；只定位不重建）。
+            match locate_lenient(
+                &snapshot.logical_lf_text,
+                replacement,
+                whitespace_policy_for(&snapshot.path),
+            ) {
+                Some(found) => found,
+                None => {
+                    precheck_error = Some(EditError::NoMatch {
+                        path: snapshot.path.clone(),
+                        index,
+                        // §修复 #3：定位失败处当前文件内容，模型免 read 自纠。
+                        context: locate_context(&snapshot.logical_lf_text, &replacement.old_text),
+                        // P0b：结构化诊断（缩进/文本差异逐项标注）。
+                        diagnostic: diagnose_no_match(
+                            &snapshot.logical_lf_text,
+                            &replacement.old_text,
+                        )
+                        .map(Box::new),
+                    });
+                    break;
+                }
             }
         };
         prepared.push(PreparedReplacement {
             index,
             logical_start,
-            logical_end: logical_start + replacement.old_text.len(),
-            new_logical: replacement.new_text.clone(),
+            logical_end,
+            new_logical,
+            tier,
         });
     }
 
@@ -609,6 +1147,12 @@ fn apply_edit_to_snapshot(
         current_revision,
         applied: prepared.len(),
         skipped_noops,
+        // 本批命中层级 = 最低（最大）tier；全部 exact 为 Exact。
+        tier: prepared
+            .iter()
+            .map(|p| p.tier)
+            .max()
+            .unwrap_or(MatchTier::Exact),
         previous_raw: snapshot.raw.to_vec(),
         new_raw,
     })
@@ -1732,6 +2276,7 @@ mod tests {
             current_revision: revision_of(&new_raw),
             applied: 1,
             skipped_noops: 0,
+            tier: MatchTier::Exact,
             previous_raw,
             new_raw,
         };
@@ -1751,6 +2296,240 @@ mod tests {
         assert_eq!(window.total_lines, 5);
         assert!(window.truncated);
         assert_eq!(window.text, "2\n3");
+    }
+
+    // ---- P1/P2 宽容匹配单元测试 ----
+
+    #[test]
+    fn policy_makefile_disables_uniform_indent_but_keeps_trailing() {
+        let makefile = Utf8PathBuf::from("Makefile");
+        let gnu = Utf8PathBuf::from("GNUmakefile");
+        let mk = Utf8PathBuf::from("build.mk");
+        let rs = Utf8PathBuf::from("src/main.rs");
+        for p in [&makefile, &gnu, &mk] {
+            assert_eq!(
+                whitespace_policy_for(p),
+                WhitespacePolicy::TrailingInsensitive,
+                "{p}: Makefile 的 tab 是语法，禁用 uniform-indent"
+            );
+        }
+        assert_eq!(
+            whitespace_policy_for(&rs),
+            WhitespacePolicy::UniformOuterIndent
+        );
+    }
+
+    #[test]
+    fn line_bounds_handles_newline_terminated_and_open_ended() {
+        assert_eq!(line_bounds("a\nb\n"), vec![(0, 2), (2, 4)]);
+        assert_eq!(line_bounds("a\nb"), vec![(0, 2), (2, 3)]);
+        assert_eq!(line_bounds("a\n\nb"), vec![(0, 2), (2, 3), (3, 4)]);
+        assert!(line_bounds("").is_empty());
+    }
+
+    #[test]
+    fn trailing_insensitive_locate_unique_and_preserves_original_range() {
+        let hay = "fn a() {   \n    work();\n}\n";
+        // old_text 无 trailing：命中唯一；区间为完整行（含真实 trailing 与换行）。
+        let (start, end) = locate_trailing_insensitive(hay, "fn a() {\n    work();").unwrap();
+        assert_eq!(&hay[start..end], "fn a() {   \n    work();\n");
+        // 歧义：两处 trailing 不同的相同行 → 拒绝（安全失败）。
+        let dup = "x()   \nx()\n";
+        assert!(locate_trailing_insensitive(dup, "x()").is_none());
+        // old_text 自身带 trailing 也能匹配（双向归一化）。
+        let (s2, e2) = locate_trailing_insensitive(hay, "fn a() {   \n    work();").unwrap();
+        assert_eq!(&hay[s2..e2], "fn a() {   \n    work();\n");
+        // old_text 末行带 \n：区间同样为完整行。
+        let (s3, e3) = locate_trailing_insensitive(hay, "fn a() {\n    work();\n").unwrap();
+        assert_eq!(&hay[s3..e3], "fn a() {   \n    work();\n");
+    }
+
+    #[test]
+    fn uniform_indent_locate_accepts_outer_shift_rejects_relative_change() {
+        // 整体少 8 空格（坐标系平移）：命中，P = 8 空格；区间为完整行。
+        let hay = "fn main() {\n        if x {\n            foo();\n        }\n}\n";
+        let old = "if x {\n    foo();\n}";
+        let (start, end, prefix) = locate_uniform_indent(hay, old).unwrap();
+        assert_eq!(
+            &hay[start..end],
+            "        if x {\n            foo();\n        }\n"
+        );
+        assert_eq!(prefix, "        ");
+        // relative indentation 破坏（第二行少缩进）：拒绝。
+        let bad_old = "if x {\nfoo();\n}";
+        assert!(
+            locate_uniform_indent(hay, bad_old).is_none(),
+            "relative indent 变化必须拒绝"
+        );
+        // 内容不同：拒绝。
+        assert!(locate_uniform_indent(hay, "if x {\n    bar();\n}").is_none());
+        // 歧义（两处同构且内容相同的缩进块）：拒绝。
+        let dup = "    if a {\n        x();\n    }\n    if a {\n        x();\n    }\n";
+        assert!(locate_uniform_indent(dup, "if a {\n    x();\n}").is_none());
+    }
+
+    #[test]
+    fn reindent_adds_prefix_to_non_blank_lines_only() {
+        assert_eq!(
+            reindent_new_text("if x {\n    foo();\n}\n", "    "),
+            "    if x {\n        foo();\n    }\n"
+        );
+        // 空行不加前缀。
+        assert_eq!(reindent_new_text("a\n\nb\n", "  "), "  a\n\n  b\n");
+        assert_eq!(reindent_new_text("x", ""), "x");
+    }
+
+    #[test]
+    fn analyze_whitespace_reports_tabs_crlf_and_trailing() {
+        let path = Utf8PathBuf::from("t.rs");
+        let raw = b"fn a() {\r\n\twork(); \r\n}\r\n";
+        let snapshot = build_snapshot(path, raw.to_vec()).unwrap();
+        let ws = analyze_whitespace(&snapshot);
+        assert_eq!(ws.line_endings, LineEndingsSummary::Crlf);
+        assert_eq!(ws.indentation, IndentationSummary::Tabs);
+        assert!(ws.trailing_whitespace);
+        // 空格缩进 + LF + 无 trailing。
+        let path2 = Utf8PathBuf::from("s.rs");
+        let raw2 = b"fn b() {\n    work();\n}\n";
+        let ws2 = analyze_whitespace(&build_snapshot(path2, raw2.to_vec()).unwrap());
+        assert_eq!(ws2.indentation, IndentationSummary::Spaces);
+        assert_eq!(ws2.line_endings, LineEndingsSummary::Lf);
+        assert!(!ws2.trailing_whitespace);
+        // 混合缩进。
+        let path3 = Utf8PathBuf::from("m.rs");
+        let raw3 = b"a()\n\tb()\n  c()\n";
+        let ws3 = analyze_whitespace(&build_snapshot(path3, raw3.to_vec()).unwrap());
+        assert_eq!(ws3.indentation, IndentationSummary::Mixed);
+    }
+
+    #[test]
+    fn diagnose_no_match_distinguishes_indentation_vs_textual() {
+        // 缩进差异：lstrip 后内容相同。
+        let text = "fn main() {\n        if x {\n            foo();\n        }\n}\n";
+        let old = "if x {\n    foo();\n}";
+        let d = diagnose_no_match(text, old).unwrap();
+        assert_eq!(d.kind, MismatchKind::Indentation);
+        assert_eq!(d.content_equal_after_lstrip, Some(true));
+        assert!(d.similarity_bp >= 5000);
+        // expected = 文件实际缩进（8 空格）；provided = old_text 首行缩进
+        //（old 首行 `if x {` 无缩进 → 空）。
+        assert_eq!(
+            d.expected_indent.as_deref(),
+            Some("\"        \""),
+            "expected 必须是文件实际缩进"
+        );
+        assert_eq!(
+            d.provided_indent.as_deref(),
+            Some("\"\""),
+            "provided 必须是 old_text 提供的缩进"
+        );
+        // 文本差异。
+        let old2 = "if y {\n    foo();\n}";
+        let d2 = diagnose_no_match(text, old2).unwrap();
+        assert_eq!(d2.kind, MismatchKind::Textual);
+        assert!(d2.first_difference.is_some());
+    }
+
+    /// P1：trailing 宽容定位应用后，未触及字节（真实 trailing）原样保留。
+    #[test]
+    fn edit_trailing_tolerance_preserves_untouched_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
+        let content = "fn a() {   \n    work();\n}\n";
+        std::fs::write(path.as_std_path(), content).unwrap();
+        let revision = revision_of(content.as_bytes());
+        let result = apply_edit(
+            &path,
+            &revision,
+            &[Replacement {
+                old_text: "fn a() {\n    work();".into(),
+                new_text: "fn a() {\n    run();".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(result.tier, MatchTier::TrailingInsensitive);
+        commit_edit(&result, &path, &prepare_commit(&path)).unwrap();
+        let after = std::fs::read_to_string(path.as_std_path()).unwrap();
+        // 行尾 3 空格必须保留（未触及字节）。
+        assert_eq!(after, "fn a() {   \n    run();\n}\n");
+    }
+
+    /// P2：uniform outer-indent 应用后，new_text 按实际前缀重建缩进。
+    #[test]
+    fn edit_uniform_indent_rebuilds_new_text_with_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("f.rs")).unwrap();
+        let content = "fn main() {\n        if x {\n            foo();\n        }\n}\n";
+        std::fs::write(path.as_std_path(), content).unwrap();
+        let revision = revision_of(content.as_bytes());
+        let result = apply_edit(
+            &path,
+            &revision,
+            &[Replacement {
+                old_text: "if x {\n    foo();\n}".into(),
+                new_text: "if x {\n    bar();\n}".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(result.tier, MatchTier::UniformOuterIndent);
+        commit_edit(&result, &path, &prepare_commit(&path)).unwrap();
+        let after = std::fs::read_to_string(path.as_std_path()).unwrap();
+        assert_eq!(
+            after,
+            "fn main() {\n        if x {\n            bar();\n        }\n}\n"
+        );
+    }
+
+    /// P2：relative indentation 破坏 → 拒绝（不模糊替换）。
+    #[test]
+    fn edit_uniform_indent_rejects_relative_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("g.rs")).unwrap();
+        let content = "fn main() {\n        if x {\n            foo();\n        }\n}\n";
+        std::fs::write(path.as_std_path(), content).unwrap();
+        let revision = revision_of(content.as_bytes());
+        let err = apply_edit(
+            &path,
+            &revision,
+            &[Replacement {
+                old_text: "if x {\nfoo();\n}".into(),
+                new_text: "if x {\nbar();\n}".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(err, EditError::NoMatch { .. }), "{err:?}");
+    }
+
+    /// P2b：Makefile 的 tab 缩进不宽容——空格版 old_text 对 tab 行仍 no_match。
+    #[test]
+    fn edit_makefile_tab_indent_is_not_lenient() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("Makefile")).unwrap();
+        let content = "target:\n\tcommand\n";
+        std::fs::write(path.as_std_path(), content).unwrap();
+        let revision = revision_of(content.as_bytes());
+        // 空格版（模型可能给 4 空格）：uniform-indent 被 policy 禁用 → NoMatch。
+        let err = apply_edit(
+            &path,
+            &revision,
+            &[Replacement {
+                old_text: "target:\n    command".into(),
+                new_text: "target:\n    newcmd".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(err, EditError::NoMatch { .. }), "{err:?}");
+        // 精确 tab 版本正常。
+        let ok = apply_edit(
+            &path,
+            &revision,
+            &[Replacement {
+                old_text: "target:\n\tcommand".into(),
+                new_text: "target:\n\tnewcmd".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(ok.tier, MatchTier::Exact);
     }
 }
 

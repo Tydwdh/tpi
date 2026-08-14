@@ -4,8 +4,8 @@
 //! shutdown）都在本模块；ToolRegistry 只拿到已适配的 [`crate::tool::registry::Tool`]
 //!（McpToolAdapter），Agent Loop 不知道 MCP 细节（README2 §6/§28）。
 
+pub mod adapter;
 pub mod client;
 pub mod config;
 pub mod error;
 pub mod manager;
-pub mod adapter;

@@ -291,36 +291,35 @@ error: process_execution_failed
     // 的执行终点误写成 session cwd；命令自身 `cd` 才构成 state mutation。
     // §20：env 用 diff(baseline, new) 得到新 overlay；无 baseline（捕获失败）
     // 时跳过 env 更新。cwd 或 env 任一变化才递增 version。
-    if result.ended_by == crate::process::EndReason::Exited {
-        if let Some(capture) = result.capture.as_deref() {
-            let (new_cwd, captured_env) = parse_capture(capture);
-            let mut state = crate::util::lock_mutex(&ctx.shell, "shell");
-            let mut changed = false;
-            if let Some(new_cwd) = new_cwd {
-                let changed_cwd =
-                    norm_path_for_compare(&new_cwd) != norm_path_for_compare(&exec_cwd);
-                if changed_cwd {
-                    match validate_session_cwd(ctx, &new_cwd) {
-                        Ok(validated) => {
-                            state.cwd = validated;
-                            changed = true;
-                        }
-                        Err(error) => {
-                            tracing::warn!(error = %error, "shell cwd 越界；保持 last confirmed cwd");
-                        }
+    if result.ended_by == crate::process::EndReason::Exited
+        && let Some(capture) = result.capture.as_deref()
+    {
+        let (new_cwd, captured_env) = parse_capture(capture);
+        let mut state = crate::util::lock_mutex(&ctx.shell, "shell");
+        let mut changed = false;
+        if let Some(new_cwd) = new_cwd {
+            let changed_cwd = norm_path_for_compare(&new_cwd) != norm_path_for_compare(&exec_cwd);
+            if changed_cwd {
+                match validate_session_cwd(ctx, &new_cwd) {
+                    Ok(validated) => {
+                        state.cwd = validated;
+                        changed = true;
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "shell cwd 越界；保持 last confirmed cwd");
                     }
                 }
             }
-            if let Some(baseline) = &state.baseline {
-                let overlay = crate::shell::diff_env(baseline, &captured_env);
-                if overlay != state.env_overlay {
-                    state.env_overlay = overlay;
-                    changed = true;
-                }
+        }
+        if let Some(baseline) = &state.baseline {
+            let overlay = crate::shell::diff_env(baseline, &captured_env);
+            if overlay != state.env_overlay {
+                state.env_overlay = overlay;
+                changed = true;
             }
-            if changed {
-                state.version += 1;
-            }
+        }
+        if changed {
+            state.version += 1;
         }
     }
     let artifact_result = artifact.finish();
@@ -454,7 +453,12 @@ async fn local_bash_background(args: BashArgs, ctx: &ToolContext) -> ToolOutcome
     // background 命令原样执行（无 capture wrapper：不捕获、不 commit §10）。
     let run_args = RunArgs {
         program: bash_exe,
-        args: vec!["--noprofile".into(), "--norc".into(), "-c".into(), args.command.clone()],
+        args: vec![
+            "--noprofile".into(),
+            "--norc".into(),
+            "-c".into(),
+            args.command.clone(),
+        ],
         cwd: exec_cwd,
         // §45/§46：background 无默认短 timeout（进程寿命由 lifecycle 管理）。
         timeout_ms: 0,
@@ -574,11 +578,7 @@ printf '__TPI_CAPTURE_END_{nonce}__\\n'"
 /// 风格（含盘符冒号）或 UNC 则原样返回。
 fn msys_path_to_windows(path: &str) -> String {
     let bytes = path.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0] == b'/'
-        && bytes[1].is_ascii_alphabetic()
-        && bytes[2] == b'/'
-    {
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
         let mut out = String::with_capacity(path.len());
         out.push(bytes[1].to_ascii_uppercase() as char);
         out.push(':');
@@ -598,7 +598,7 @@ fn validate_session_cwd(ctx: &ToolContext, candidate: &str) -> Result<camino::Ut
     if ctx.allow_outside_workspace {
         return Ok(path);
     }
-    let root = norm_path_for_compare(&ctx.workspace_root.as_str());
+    let root = norm_path_for_compare(ctx.workspace_root.as_str());
     let cand = norm_path_for_compare(candidate);
     if cand.starts_with(&root) {
         let rest = &cand[root.len()..];

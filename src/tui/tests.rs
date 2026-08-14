@@ -1331,7 +1331,10 @@ fn sidebar_todo_wraps_long_text_by_cell_width() {
         }
     }
     // 找到 todo 首行（含 [>]），其后的行（用户消息标题之前）都是续行。
-    let first = rows.iter().position(|r| r.contains("[>]")).expect("todo 首行");
+    let first = rows
+        .iter()
+        .position(|r| r.contains("[>]"))
+        .expect("todo 首行");
     let todo_rows = rows[first..]
         .iter()
         .take_while(|r| !r.contains("用户消息"))
@@ -1346,7 +1349,10 @@ fn sidebar_todo_wraps_long_text_by_cell_width() {
         "首行应保留头部: {todo_rows:?}"
     );
     // 折行：至少 2 行，且续行包含尾部文本（完整显示，无 “…” 截断）。
-    assert!(todo_rows.len() >= 2, "长 todo 必须折行而不是单行截断: {todo_rows:?}");
+    assert!(
+        todo_rows.len() >= 2,
+        "长 todo 必须折行而不是单行截断: {todo_rows:?}"
+    );
     let tail_text: String = compact[1..].join("");
     assert!(
         tail_text.contains("长文本折行显示"),
@@ -1435,8 +1441,14 @@ fn sidebar_keeps_terminal_history_when_open_items_exist() {
         sidebar_text.push('\n');
     }
     let compact: String = sidebar_text.chars().filter(|c| *c != ' ').collect();
-    assert!(compact.contains("进行中的任务"), "开放项必须显示: {sidebar_text}");
-    assert!(compact.contains("已完成的任务"), "有开放项时历史保留（沉底）: {sidebar_text}");
+    assert!(
+        compact.contains("进行中的任务"),
+        "开放项必须显示: {sidebar_text}"
+    );
+    assert!(
+        compact.contains("已完成的任务"),
+        "有开放项时历史保留（沉底）: {sidebar_text}"
+    );
     assert!(
         !compact.contains("(无活动计划)"),
         "有开放项时不得显示无活动计划: {sidebar_text}"

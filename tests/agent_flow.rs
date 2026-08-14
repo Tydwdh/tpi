@@ -615,8 +615,14 @@ async fn resume_after_suspend_records_input_and_continues() {
         })
         .collect();
     let joined = joined.join("\n");
-    assert!(joined.contains("要跑测试吗"), "resume 上下文应含问题: {joined}");
-    assert!(joined.contains("跑吧"), "resume 上下文应含用户回答: {joined}");
+    assert!(
+        joined.contains("要跑测试吗"),
+        "resume 上下文应含问题: {joined}"
+    );
+    assert!(
+        joined.contains("跑吧"),
+        "resume 上下文应含用户回答: {joined}"
+    );
 }
 
 /// AGENTS.md §13（对标 AskUserQuestion）：`request_input` 一次请求多个问题
@@ -680,10 +686,16 @@ async fn request_input_multi_question_suspends_with_rendered_prompt() {
     assert!(prompt.contains("发布到哪个环境"), "prompt: {prompt}");
     assert!(prompt.contains("staging"), "prompt: {prompt}");
     // 两个问题都编号。
-    assert!(prompt.contains("1. ") && prompt.contains("2. "), "prompt: {prompt}");
+    assert!(
+        prompt.contains("1. ") && prompt.contains("2. "),
+        "prompt: {prompt}"
+    );
     // 结构化 questions 供 TUI 选择器使用：全部问题 + 选项保留。
     assert_eq!(awaiting.questions.len(), 2, "结构化问题数");
-    assert_eq!(awaiting.questions[0].options, vec!["是，运行全部", "只跑单元测试", "跳过"]);
+    assert_eq!(
+        awaiting.questions[0].options,
+        vec!["是，运行全部", "只跑单元测试", "跳过"]
+    );
     assert_eq!(awaiting.questions[1].header.as_deref(), Some("部署"));
     assert_eq!(awaiting.questions[1].options, vec!["生产", "staging"]);
 
@@ -746,7 +758,10 @@ async fn request_input_legacy_single_question_still_works() {
     let awaiting = outcome.awaiting_input.expect("挂起信息");
     let prompt = &awaiting.text;
     assert!(prompt.contains("要运行完整测试套件吗"), "prompt: {prompt}");
-    assert!(prompt.contains("是") && prompt.contains("否"), "prompt: {prompt}");
+    assert!(
+        prompt.contains("是") && prompt.contains("否"),
+        "prompt: {prompt}"
+    );
     // 兼容格式同样产出结构化问题（供选择器）。
     assert_eq!(awaiting.questions.len(), 1);
     assert_eq!(awaiting.questions[0].options, vec!["是", "否"]);
