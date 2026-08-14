@@ -752,11 +752,33 @@ pub fn replay_messages(path: &Path) -> std::io::Result<Vec<ChatMessage>> {
     Ok(project_messages(&events))
 }
 
+/// 从 durable log 重建 **domain messages**（P1-02：session projection 先输出
+/// domain message，provider converter 再生成旧 `ChatMessage`）。
+/// 等价性：`replay_domain_messages -> ChatMessage::from` 与 `replay_messages`
+/// 语义等价（`tests/domain_message.rs` golden parity 验证）。
+pub fn replay_domain_messages(path: &Path) -> std::io::Result<Vec<crate::message::DomainMessage>> {
+    let events = read_events_with_seq(path)?;
+    Ok(project_domain_messages(&events))
+}
+
 /// 投影 + recent prune（replay 语义，P0-3）：被 compaction 保留的 recent
 /// 消息（事件 seq ∈ [covered.end, compaction 事件 seq)）应用与 runtime
 /// 相同的 deterministic prune（§15.3）——compaction 后 runtime 保留的是
 /// pruned 版本，replay 必须一致。
+///
+/// P1-02：内部投影先产出 `DomainMessage`，再转回 provider wire `ChatMessage`
+/// （direction: events -> domain -> provider）。
 pub fn project_messages(events: &[(u64, SessionEvent)]) -> Vec<ChatMessage> {
+    project_domain_messages(events)
+        .into_iter()
+        .map(|message| ChatMessage::from(&message))
+        .collect()
+}
+
+/// events -> domain messages（无 recent-prune；`project_messages` 的 domain 形态）。
+pub fn project_domain_messages(
+    events: &[(u64, SessionEvent)],
+) -> Vec<crate::message::DomainMessage> {
     let ranges = project_messages_with_ranges(events);
     let (Some(end), Some(comp_seq), _) = compacted_range(events) else {
         return ranges.into_iter().map(|(m, _, _)| m).collect();
@@ -764,9 +786,9 @@ pub fn project_messages(events: &[(u64, SessionEvent)]) -> Vec<ChatMessage> {
     let mut result = Vec::with_capacity(ranges.len());
     for (message, start, _) in ranges {
         if start >= end && start < comp_seq {
-            let single = crate::context::prune_messages(vec![message]);
+            let single = crate::context::prune_messages(vec![ChatMessage::from(&message)]);
             match single.into_iter().next() {
-                Some(item) => result.push(item),
+                Some(item) => result.push(crate::message::DomainMessage::from(&item)),
                 None => {
                     // prune 不改变消息数量是不变量；异常时丢日志并跳过该消息
                     // （保留其余消息，避免整个投影失败）。
@@ -827,7 +849,8 @@ pub fn compacted_range(
 /// （只覆盖真正被压缩的事件，runtime 保留的 recent 在 replay 端也必须保留）。
 pub fn project_messages_with_ranges(
     events: &[(u64, SessionEvent)],
-) -> Vec<(ChatMessage, u64, u64)> {
+) -> Vec<(crate::message::DomainMessage, u64, u64)> {
+    use crate::message::{DomainContentBlock, DomainMessage, DomainRole};
     // 1. 最新 compaction 覆盖范围（P0-8：covered.end exclusive，跳过 seq < end）。
     let (compacted_up_to, _, summary_text) = compacted_range(events);
 
@@ -835,7 +858,9 @@ pub fn project_messages_with_ranges(
     // pending_calls 在所有事件上收集（P0-3/§18.2 防御）：ToolRequested 即使
     // 被覆盖也不影响其 ToolCompleted 的关联（正常路径下消息单元原子，
     // 不会出现 request 覆盖而 completed 保留）。
-    let mut raw: Vec<(u64, ChatMessage)> = Vec::new();
+    // P1-02：投影直接产出 DomainMessage（events -> domain），provider wire
+    // 由调用方（project_messages）经 adapter 生成。
+    let mut raw: Vec<(u64, DomainMessage)> = Vec::new();
     let mut last_assistant_idx: Option<usize> = None;
     let mut pending_calls: std::collections::HashMap<ToolCallId, ToolCall> =
         std::collections::HashMap::new();
@@ -850,35 +875,54 @@ pub fn project_messages_with_ranges(
         }
         match event {
             SessionEvent::UserSubmitted { content } => {
-                raw.push((*seq, ChatMessage::User(content.clone())));
+                raw.push((*seq, DomainMessage::text(DomainRole::User, content.clone())));
                 last_assistant_idx = None;
             }
             SessionEvent::AssistantMessageCommitted { message } => {
+                let mut blocks = Vec::with_capacity(message.tool_calls.len() + 1);
+                if !message.content.is_empty() {
+                    blocks.push(DomainContentBlock::Text(message.content.clone()));
+                }
+                blocks.extend(
+                    message
+                        .tool_calls
+                        .iter()
+                        .cloned()
+                        .map(DomainContentBlock::ToolCall),
+                );
                 raw.push((
                     *seq,
-                    ChatMessage::Assistant {
-                        content: message.content.clone(),
-                        tool_calls: message.tool_calls.clone(),
+                    DomainMessage {
+                        role: DomainRole::Assistant,
+                        content: blocks,
                     },
                 ));
                 last_assistant_idx = Some(raw.len() - 1);
             }
             SessionEvent::ToolRequested { call } => {
                 if let Some(idx) = last_assistant_idx
-                    && let (_, ChatMessage::Assistant { tool_calls, .. }) = &mut raw[idx]
-                    && !tool_calls.iter().any(|c| c.call_id == call.call_id)
+                    && let (_, DomainMessage {
+                        role: DomainRole::Assistant,
+                        content: blocks,
+                    }) = &mut raw[idx]
+                    && !blocks
+                        .iter()
+                        .any(|b| matches!(b, DomainContentBlock::ToolCall(c) if c.call_id == call.call_id))
                 {
-                    tool_calls.push(call.clone());
+                    blocks.push(DomainContentBlock::ToolCall(call.clone()));
                 }
             }
             SessionEvent::ToolCompleted { call_id, outcome } => {
                 if let Some(call) = pending_calls.remove(call_id) {
                     raw.push((
                         *seq,
-                        ChatMessage::Tool {
-                            tool_call_id: call.provider_id,
-                            name: call.name,
-                            content: outcome.model_payload.output.clone(),
+                        DomainMessage {
+                            role: DomainRole::Tool,
+                            content: vec![DomainContentBlock::ToolResult {
+                                tool_call_id: call.provider_id,
+                                name: call.name,
+                                content: outcome.model_payload.output.clone(),
+                            }],
                         },
                     ));
                 }
@@ -889,7 +933,7 @@ pub fn project_messages_with_ranges(
 
     // 3. 每条消息的 seq 边界（end = 下一条消息的 start；最后一条 = max_seq + 1）。
     let max_seq = events.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
-    let mut out: Vec<(ChatMessage, u64, u64)> = Vec::with_capacity(raw.len() + 1);
+    let mut out: Vec<(DomainMessage, u64, u64)> = Vec::with_capacity(raw.len() + 1);
     for (i, (start, message)) in raw.iter().enumerate() {
         let end = raw
             .get(i + 1)
@@ -903,9 +947,10 @@ pub fn project_messages_with_ranges(
         out.insert(
             0,
             (
-                ChatMessage::User(format!(
-                    "（此前会话的压缩摘要，见 CompactionCommitted）\n{summary}"
-                )),
+                DomainMessage::text(
+                    DomainRole::User,
+                    format!("（此前会话的压缩摘要，见 CompactionCommitted）\n{summary}"),
+                ),
                 0,
                 0,
             ),
