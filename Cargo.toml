@@ -68,11 +68,6 @@ syntect = { version = "5.3", default-features = false, features = ["default-fanc
 # bat 同源扩展语法包：补齐 TSX、TOML、Go、Kotlin、Terraform、Vue、Svelte 等。
 # 使用 fancy-regex 后端，避免引入 oniguruma C 依赖。
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
-windows-sys = { version = "0.61", features = [
-  "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_JobObjects",
-  "Win32_System_Threading", "Win32_System_Console", "Win32_System_Pipes",
-  "Win32_System_DataExchange", "Win32_System_Memory", "Win32_Security"
-] }
 russh = "0.62.6"
 # russh-keys 0.49.2 曾为直接依赖但 src/tests 零直接引用（cargo machete 确认），
 # russh 自带 keys 模块（ssh-key =0.7.0-rc.11），删除以避免重复加密栈
@@ -87,6 +82,15 @@ proptest = "1"
 socket2 = "0.6"
 rand = "0.10.2"
 serial_test = "3"
+
+# P7-03 feature audit：windows-sys 只应在 Windows 编译（非目标平台不解析
+# Win32 依赖；代码侧已有 #[cfg(windows)] 保护，依赖侧一并 target-gate）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_JobObjects",
+  "Win32_System_Threading", "Win32_System_Console", "Win32_System_Pipes",
+  "Win32_System_DataExchange", "Win32_System_Memory", "Win32_Security"
+] }
 
 [profile.release]
 lto = "thin"

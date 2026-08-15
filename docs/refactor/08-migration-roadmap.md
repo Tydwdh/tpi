@@ -1021,7 +1021,7 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   validate_artifact_component 下沉 util.rs。DAG dry run 现为 **OK（0 反向引用）**，
   连续两阶段无反向 import 的条件已满足，可开始拆 crate。
 
-#### P7-02 依次拆 crate — **进行中（第 1 步完成：tpi-core 已拆出）**
+#### P7-02 依次拆 crate — **DONE（2026-08-14，7 crate 全拆出）**
 
 - 顺序：core -> session -> capabilities -> agent -> TUI -> adapters/CLI。
 - 每个 PR 只拆一个 crate；零行为变化；必要 re-export 有删除阶段。
@@ -1055,10 +1055,20 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   config/agent/tui），主 crate = adapters 层（app/main/web/doctor/eval/
   clipboard + 测试）。拆包完成。
 
-#### P7-03 feature audit
+#### P7-03 feature audit — **DONE（2026-08-14）**
 
 - platform/provider/remote features 由 composition crate控制；禁止 feature unification 意外启用高权限能力。
 - `cargo hack` 或等价 feature matrix。
+- 实施：全 workspace 0 features 定义（无 unification 风险面）；平台依赖审计：
+  capabilities 的 `windows-sys` 已在 `[target.'cfg(windows)'.dependencies]`；
+  主 crate（adapters）的 `windows-sys`（含 Win32_System_DataExchange 等，
+  clipboard/doctor/main 用）**未 target-gate**——已移至 `[target.'cfg(windows)'.
+  dependencies]`（P7-03 修正：非目标平台不再解析 Win32 依赖；代码侧原有
+  `#[cfg(windows)]` 保护，依赖侧一并 gate）。russh/keyring 是跨平台库（编译
+  全平台、无高权限意外启用）；release 构建验证通过。
+- 验收达成：platform 依赖 target-gate ✓；无 feature unification 面（无
+  features）✓；release 构建 ✓；全量 56 target 绿。`cargo hack` 等价检查：
+  单 features 集（全默认）下用 release 构建验证 feature matrix 平凡。
 
 #### P7-04 public SDK 最小化
 
