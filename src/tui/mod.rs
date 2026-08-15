@@ -566,7 +566,9 @@ fn render_frame(
     // 先画 Modal 再画菜单：菜单浮在最上，列表永不被悬浮窗盖住。
     let is_menu_browser = matches!(
         view.menu.as_ref().map(|m| m.kind),
-        Some(model::MenuKind::Session) | Some(model::MenuKind::Theme)
+        Some(model::MenuKind::Session)
+            | Some(model::MenuKind::Theme)
+            | Some(model::MenuKind::Model)
     );
     if view.modal.is_some() {
         let w = modal_width(main_area.width);
@@ -2915,6 +2917,7 @@ fn menu_item_texts(menu: &model::MenuView, name: &str, desc: &str) -> (String, S
             format!("(id {}…)", name.chars().take(13).collect::<String>()),
         ),
         model::MenuKind::Theme => (name.to_string(), desc.to_string()),
+        model::MenuKind::Model => (name.to_string(), desc.to_string()),
     }
 }
 
@@ -2949,13 +2952,16 @@ fn menu_title(kind: model::MenuKind) -> &'static str {
         model::MenuKind::File => " 文件 ",
         model::MenuKind::Session => " 会话 ",
         model::MenuKind::Theme => " 主题 ",
+        model::MenuKind::Model => " 模型 ",
     }
 }
 
 /// 菜单底部快捷键提示（按类型）。
 fn menu_hint(kind: model::MenuKind) -> &'static str {
     match kind {
-        model::MenuKind::Session | model::MenuKind::Theme => "↑/↓ 选择 · Enter 应用 · Esc 取消",
+        model::MenuKind::Session | model::MenuKind::Theme | model::MenuKind::Model => {
+            "↑/↓ 选择 · Enter 应用 · Esc 取消"
+        }
         _ => "↑/↓ 选择 · Enter 选中 · Esc 取消",
     }
 }

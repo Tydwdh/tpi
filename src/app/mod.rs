@@ -222,13 +222,17 @@ impl AppServices<OpenAiCompatClient> {
 ///
 /// 返回最终答案由调用方（`run` facade）打印 stdout——use case 不直接写
 /// stdout，便于 fake ports 测试断言返回值。
-pub async fn run_with_services<P: Provider>(
+pub async fn run_with_services<P: Provider, R>(
     services: AppServices<P>,
     prompt: &str,
     non_interactive: bool,
-) -> Result<Option<String>, String> {
+    rebuild_provider: R,
+) -> Result<Option<String>, String>
+where
+    R: FnMut(&crate::config::ModelConfig) -> Result<P, String> + Send,
+{
     let AppServices {
-        config,
+        mut config,
         workspace_root,
         sessions_root,
         mut provider,
@@ -280,9 +284,12 @@ pub async fn run_with_services<P: Provider>(
 
     // README2 Phase 3：MCP server 生命周期由 interactive_loop 管理。
     interactive_loop(
-        &mut provider,
+        ProviderSlot {
+            provider,
+            rebuild: rebuild_provider,
+        },
         &mut conversation,
-        &config,
+        &mut config,
         prompt,
         current_cancel.clone(),
         &mut mcp_manager,
@@ -304,7 +311,24 @@ pub async fn run(
     no_session: bool,
 ) -> Result<(), String> {
     let services = AppServices::from_config(config, session_target, no_session)?;
-    if let Some(text) = run_with_services(services, prompt, non_interactive).await? {
+    // /model 切换：重建 provider（run 是非泛型入口，P 具体 = OpenAiCompatClient）。
+    let rebuild_provider = |model: &crate::config::ModelConfig| -> Result<
+        crate::provider::openai_compat::OpenAiCompatClient,
+        String,
+    > {
+        let api_key = crate::config::read_api_key_for(model)?;
+        Ok(crate::provider::openai_compat::OpenAiCompatClient::new(
+            model.base_url.clone(),
+            model.name.clone(),
+            api_key,
+            model.reasoning.clone(),
+            model.max_output_tokens,
+            model.context_window,
+        ))
+    };
+    if let Some(text) =
+        run_with_services(services, prompt, non_interactive, rebuild_provider).await?
+    {
         println!("{text}");
     }
     Ok(())
@@ -510,15 +534,26 @@ pub async fn run_prompt_once<P: Provider>(
 ///
 /// 键盘由独立线程持续读取（运行中也响应输入/翻页/折叠，对标成熟 TUI Agent）；
 /// 输入事件立即标 dirty，动画时钟只在 run 中推进（§16.1）。
-async fn interactive_loop<P: Provider>(
-    provider: &mut P,
+/// 可替换 provider（/model 切换：重建 + 替换）。
+struct ProviderSlot<P, R> {
+    provider: P,
+    rebuild: R,
+}
+
+async fn interactive_loop<P: Provider, R>(
+    mut slot: ProviderSlot<P, R>,
     conversation: &mut Conversation,
-    config: &Config,
+    config: &mut Config,
     initial_prompt: &str,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     mcp_manager: &mut crate::mcp::manager::McpManager,
     registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    R: FnMut(&crate::config::ModelConfig) -> Result<P, String> + Send,
+{
+    let provider = &mut slot.provider;
+    let rebuild_provider = &mut slot.rebuild;
     use crate::tui::event::UiEvent;
     use crate::tui::model::LineKind;
     use crate::tui::state::UiState;
@@ -1057,6 +1092,40 @@ async fn interactive_loop<P: Provider>(
                 .map_err(|e| e.to_string())?;
         }
 
+        // 模型切换（/model 菜单 Enter）：重建 provider + 更新 config.model。
+        if let Some(model_name) = ui_state.pending_model.take() {
+            if let Some(model) = config.models.iter().find(|m| m.name == model_name) {
+                match (rebuild_provider)(model) {
+                    Ok(new_provider) => {
+                        *provider = new_provider;
+                        config.model = model.clone();
+                        ui_state.view.push_line(
+                            LineKind::System,
+                            format!(
+                                "已切换到模型 {}（{}）",
+                                config.model.name, config.model.provider
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        ui_state
+                            .view
+                            .push_line(LineKind::System, format!("切换模型失败: {error}"));
+                    }
+                }
+            } else {
+                ui_state.view.push_line(
+                    LineKind::System,
+                    format!("模型 {model_name} 不在可用列表（/settings 查看）"),
+                );
+            }
+            ui_state.view.menu = None;
+            ui_state.view.modal = None;
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+        }
+
         // 会话恢复选择（/sessions 菜单 Enter）。
         if let Some(session_id) = ui_state.pending_session.take() {
             match parse_session_id(&session_id) {
@@ -1403,36 +1472,47 @@ web_search: DuckDuckGo（免费，无需 API key）
             Ok(SlashAction::Consumed)
         }
         "/model" => {
+            // 模型切换菜单（P8）：列出全部可用模型（primary + profiles），
+            // 当前模型标记；↑/↓ 选择 Enter 应用（app 重建 provider）。
+            let items: Vec<(String, String)> = config
+                .models
+                .iter()
+                .map(|m| {
+                    let marker = if m.name == config.model.name {
+                        "（当前）"
+                    } else {
+                        ""
+                    };
+                    (m.name.clone(), format!("{}{}", m.provider, marker))
+                })
+                .collect();
+            if items.is_empty() {
+                ui_state.view.open_modal(
+                    "/model",
+                    "没有可用模型（请在配置 [model.primary] 中设置）".to_string(),
+                );
+                renderer
+                    .draw(&mut ui_state.view)
+                    .map_err(|e| e.to_string())?;
+                return Ok(SlashAction::Consumed);
+            }
+            ui_state.view.menu = Some(crate::tui::model::MenuView {
+                items,
+                selected: config
+                    .models
+                    .iter()
+                    .position(|m| m.name == config.model.name)
+                    .unwrap_or(0),
+                kind: crate::tui::model::MenuKind::Model,
+                session_previews: Vec::new(),
+            });
             ui_state.view.open_modal(
                 "/model",
                 format!(
-                    "primary:
-  名称: {}
-  provider: {}
-  base_url: {}
-  reasoning: {}
-  max_output_tokens: {}
-  context_window: {}
-  api_key_env: {}",
-                    config.model.name,
-                    config.model.provider,
-                    config.model.base_url,
-                    config
-                        .model
-                        .reasoning
-                        .clone()
-                        .unwrap_or_else(|| "默认".to_string()),
-                    config
-                        .model
-                        .max_output_tokens
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "默认".to_string()),
-                    config
-                        .model
-                        .context_window
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "未配置".to_string()),
-                    config.model.api_key_env,
+                    "当前模型: {}（{}）
+
+↑/↓ 选择 · Enter 切换（重建连接）· Esc 取消",
+                    config.model.name, config.model.provider
                 ),
             );
             renderer

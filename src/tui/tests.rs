@@ -3259,3 +3259,63 @@ fn live_compact_tool_cards_have_no_gap_between() {
         plan.window
     );
 }
+
+/// P8：/model 菜单 Enter → pending_model 设置 + 菜单关闭（app 执行切换）。
+#[test]
+fn model_menu_enter_sets_pending_model() {
+    let mut state = UiState::new(ViewModel::default());
+    // 挂载模型菜单（app 的 /model 分支等价构造）。
+    state.view.menu = Some(crate::tui::model::MenuView {
+        items: vec![
+            ("gpt-4o".to_string(), "openai（当前）".to_string()),
+            ("claude-sonnet".to_string(), "anthropic".to_string()),
+        ],
+        selected: 1,
+        kind: crate::tui::model::MenuKind::Model,
+        session_previews: Vec::new(),
+    });
+    state.view.modal = Some(crate::tui::model::ModalState::new(
+        "/model",
+        "当前模型".to_string(),
+    ));
+    let effects = reducer::update(
+        &mut state,
+        UiEvent::Key(key_event(ratatui::crossterm::event::KeyCode::Enter)),
+    );
+    assert_eq!(
+        state.pending_model.as_deref(),
+        Some("claude-sonnet"),
+        "选中项写入 pending_model"
+    );
+    assert!(state.view.menu.is_none(), "菜单关闭");
+    assert!(state.view.modal.is_none(), "modal 关闭");
+    // 菜单 Enter 短路：不产生任何 effect（切换由 app 层消费 pending_model 执行）。
+    assert!(effects.is_empty(), "菜单选中不产生 effect");
+}
+
+/// 菜单上下移动（↑/↓）不触发 refresh（Model 菜单保持，导航不清除）。
+#[test]
+fn model_menu_navigation_keeps_menu() {
+    let mut state = UiState::new(ViewModel::default());
+    state.view.menu = Some(crate::tui::model::MenuView {
+        items: vec![
+            ("gpt-4o".to_string(), "openai".to_string()),
+            ("claude-sonnet".to_string(), "anthropic".to_string()),
+        ],
+        selected: 0,
+        kind: crate::tui::model::MenuKind::Model,
+        session_previews: Vec::new(),
+    });
+    let _ = reducer::update(
+        &mut state,
+        UiEvent::Key(key_event(ratatui::crossterm::event::KeyCode::Down)),
+    );
+    assert!(state.view.menu.is_some(), "模型菜单导航后保持");
+    assert_eq!(state.view.menu.as_ref().unwrap().selected, 1);
+}
+
+/// 构造简单 Key 事件（reducer 不检查 kind；app 层已过滤）。
+fn key_event(code: ratatui::crossterm::event::KeyCode) -> ratatui::crossterm::event::KeyEvent {
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+    KeyEvent::new(code, KeyModifiers::NONE)
+}

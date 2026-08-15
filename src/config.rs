@@ -728,24 +728,28 @@ fn read_system_md(path: &std::path::Path) -> Result<Option<String>, String> {
 
 /// 读取 API key（§18.4：环境变量显式覆盖；keyring 属 M6）。
 pub fn read_api_key(config: &Config) -> Result<String, String> {
-    // §18.4 + P8：优先级——环境变量（显式覆盖）> 配置文件 api_key（用户需求
-    // 直存）> Windows Credential Manager（`tpi auth set`）。
-    if let Ok(key) = std::env::var(&config.model.api_key_env)
+    read_api_key_for(&config.model)
+}
+
+/// 对指定模型配置读 API key（P8：TUI /model 切换时对目标模型读取）。
+/// 优先级——环境变量（显式覆盖）> 配置文件 api_key > Windows Credential Manager。
+pub fn read_api_key_for(model: &ModelConfig) -> Result<String, String> {
+    if let Ok(key) = std::env::var(&model.api_key_env)
         && !key.is_empty()
     {
         return Ok(key);
     }
-    if let Some(key) = &config.model.api_key
+    if let Some(key) = &model.api_key
         && !key.trim().is_empty()
     {
         return Ok(key.clone());
     }
-    if let Some(key) = crate::auth::auth_get(&config.model.provider)? {
+    if let Some(key) = crate::auth::auth_get(&model.provider)? {
         return Ok(key);
     }
     Err(format!(
         "未找到 API key：请在配置文件的 model.api_key、环境变量 {} 中设置，或运行 `tpi auth set {}` 写入凭据（§18.4）",
-        config.model.api_key_env, config.model.provider
+        model.api_key_env, model.provider
     ))
 }
 

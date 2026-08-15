@@ -80,10 +80,14 @@ async fn fake_ports_drive_minimal_controller() {
         },
     );
 
-    let text = run_with_services(services, "hello", true)
-        .await
-        .expect("use case 成功")
-        .expect("非交互模式应返回最终答案");
+    let text = run_with_services(services, "hello", true, |_model| {
+        Ok(EchoProvider {
+            text: "P1-06 ok".into(),
+        })
+    })
+    .await
+    .expect("use case 成功")
+    .expect("非交互模式应返回最终答案");
     assert_eq!(text, "P1-06 ok");
 }
 
@@ -98,7 +102,13 @@ async fn empty_prompt_is_rejected_without_calling_provider() {
             text: String::new(),
         },
     );
-    let err = run_with_services(services, "", true).await.unwrap_err();
+    let err = run_with_services(services, "", true, |_model| {
+        Ok(EchoProvider {
+            text: String::new(),
+        })
+    })
+    .await
+    .unwrap_err();
     assert!(err.contains("prompt"), "空 prompt 应报错: {err}");
 }
 

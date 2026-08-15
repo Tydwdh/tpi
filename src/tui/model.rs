@@ -511,6 +511,8 @@ pub enum MenuKind {
     Session,
     /// `/theme` 主题列表：Enter 应用选中主题（UI + 代码高亮）。
     Theme,
+    /// `/model` 模型列表：Enter 切换到选中模型（重建 provider）。
+    Model,
 }
 
 /// 流式消息（TUI v2 §7.2：live 区，finalize 前不进 transcript）。
@@ -1975,6 +1977,10 @@ impl ViewModel {
             }
             MenuKind::Theme => {
                 // 主题选择由 app 层处理（应用主题 + 写配置），这里只关闭菜单。
+                self.menu = None;
+            }
+            MenuKind::Model => {
+                // 模型切换由 app 层处理（重建 provider），这里只关闭菜单。
                 self.menu = None;
             }
         }

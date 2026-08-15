@@ -53,7 +53,7 @@ fn refresh_menus(state: &mut UiState) {
     // 无关——↑/↓/Tab 等导航不得经命令菜单刷新把它们清掉。
     if matches!(
         state.view.menu.as_ref().map(|m| m.kind),
-        Some(MenuKind::Session) | Some(MenuKind::Theme)
+        Some(MenuKind::Session) | Some(MenuKind::Theme) | Some(MenuKind::Model)
     ) {
         return;
     }
@@ -210,6 +210,14 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                         state.view.modal = None;
                         return effects;
                     }
+                    MenuKind::Model => {
+                        // 模型切换由 app 执行（重建 provider + 更新 config.model）。
+                        // /model = Modal + 菜单一个整体：选中后一并关闭。
+                        state.pending_model = Some(label);
+                        state.view.menu = None;
+                        state.view.modal = None;
+                        return effects;
+                    }
                     _ => state.view.complete_menu_command(),
                 }
             }
@@ -267,7 +275,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 // /sessions、/theme 浏览器 = Modal + 菜单一个整体：Esc 一次关闭两者。
                 if matches!(
                     state.view.menu.as_ref().map(|m| m.kind),
-                    Some(MenuKind::Session) | Some(MenuKind::Theme)
+                    Some(MenuKind::Session) | Some(MenuKind::Theme) | Some(MenuKind::Model)
                 ) {
                     state.view.menu = None;
                 }

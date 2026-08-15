@@ -21,6 +21,8 @@ pub struct UiState {
     pub pending_session: Option<String>,
     /// /theme 菜单 Enter 选中的主题名（app 应用主题 + 写配置）。
     pub pending_theme: Option<String>,
+    /// /model 菜单 Enter 选中的模型名（app 重建 provider + 更新 config.model）。
+    pub pending_model: Option<String>,
     /// 待重试的上一次失败 turn（`/retry`；app 消费时以空 user_message 发起 run，
     /// 不重复记录 UserSubmitted，也不追加 User 消息）。
     pub pending_retry: Option<String>,
@@ -52,6 +54,7 @@ impl UiState {
             pending_messages: VecDeque::new(),
             pending_session: None,
             pending_theme: None,
+            pending_model: None,
             pending_retry: None,
             running: false,
             force_compaction: false,

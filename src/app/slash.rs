@@ -30,7 +30,7 @@ pub const fn spec(name: &'static str, desc: &'static str, dangerous: bool) -> Sl
 pub const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     spec("help", "显示帮助与快捷键", false),
     spec("settings", "查看生效配置及来源", false),
-    spec("model", "查看当前模型", false),
+    spec("model", "查看/切换模型（primary + profiles）", false),
     spec("session", "查看会话与成本", false),
     spec("sessions", "浏览并恢复历史会话", false),
     spec("theme", "切换主题（UI + 代码高亮）", false),
