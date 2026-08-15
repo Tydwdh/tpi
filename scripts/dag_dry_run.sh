@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.." || exit 1
 declare -A LAYER
 LAYER[core]="crates/tpi-core/src"
 LAYER[session]="crates/tpi-session/src"
-LAYER[capabilities]="src/tool src/shell src/workspace src/process src/mcp"
+LAYER[capabilities]="crates/tpi-capabilities/src"
 LAYER[agent]="src/agent src/context src/provider"
 LAYER[tui]="src/tui"
 LAYER[adapters]="src/app.rs src/app src/web.rs src/doctor.rs src/eval src/auth src/clipboard src/main.rs"
