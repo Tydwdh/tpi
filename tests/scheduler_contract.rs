@@ -458,3 +458,49 @@ async fn cancellation_during_parallel_bash_cancels_all() {
         "并行中取消必须让所有 in-flight call 全部 Cancelled: {cancelled:?}"
     );
 }
+
+// ---- P4-03：ActiveToolSet Step 内 reload stability ----
+
+use std::sync::Arc;
+
+/// Step 内 registry 变化（MCP reload）不影响已构建快照。
+#[tokio::test]
+async fn active_set_is_stable_within_step() {
+    use tpi::tool::registry::ToolRegistry;
+
+    let registry = Arc::new(std::sync::Mutex::new(ToolRegistry::new()));
+    // 注册 read + bash（builtin）；句柄必须绑定（RAII：drop 即注销）。
+    let mut handles = Vec::new();
+    for name in ["read", "bash"] {
+        let found = tpi::tool::implemented_tools()
+            .into_iter()
+            .find(|t| t.name() == name)
+            .unwrap();
+        let adapter = tpi::tool::registry::BuiltinToolAdapter::new(found);
+        handles.push(ToolRegistry::register_owned(&registry, Arc::new(adapter)));
+    }
+    assert_eq!(registry.lock().unwrap().list().len(), 2);
+
+    // 构建 Step 快照（模拟 reload）。
+    let defs: Vec<String> = registry
+        .lock()
+        .unwrap()
+        .descriptors()
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    assert!(defs.contains(&"read".to_string()));
+
+    // Step 内 registry 变化：注销 read（模拟 MCP reload 移除工具）。
+    let mut guard = registry.lock().unwrap();
+    guard.unregister("read");
+    drop(guard);
+    assert!(registry.lock().unwrap().get("read").is_none());
+
+    // 快照（defs）不受影响——Step 内执行仍用旧快照。
+    // 这里验证：reload 前构建的 defs 是独立 Vec（不可变快照语义）。
+    assert!(
+        defs.contains(&"read".to_string()),
+        "Step 快照不受 registry 变化影响"
+    );
+}

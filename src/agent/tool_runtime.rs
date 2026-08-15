@@ -37,6 +37,21 @@ pub(super) struct ToolRuntime {
     /// ToolRegistry（builtin + MCP；agent 工具目录，README2 Phase 5）。
     /// Mutex：Phase 3 的 McpManager 运行时注册 MCP 工具。
     registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
+    /// P4-03：当前 Step 的不可变工具快照（reload 构建，Step 内复用）。
+    /// Mutex：ToolRuntime 需跨线程（web spawn）；Step 内锁一次 clone 复用。
+    active: std::sync::Mutex<Option<ActiveToolSet>>,
+}
+
+/// P4-03：Step 内不可变工具快照（descriptors + external lookup 共用）。
+/// Step 开始构建一次；Step 内执行不再锁 registry（MCP reload 不改变当前 Step）。
+#[derive(Clone)]
+pub(super) struct ActiveToolSet {
+    /// 发给模型的工具定义（selector 结果；P4-06 canonical output 会消费）。
+    #[allow(dead_code)]
+    pub defs: Vec<crate::provider::ToolDef>,
+    /// 外部工具 lookup（MCP adapter；builtin 经 BuiltinTool::from_name）。
+    pub external:
+        std::collections::HashMap<String, std::sync::Arc<dyn crate::tool::registry::Tool>>,
 }
 
 #[derive(Clone)]
@@ -74,6 +89,7 @@ impl ToolRuntime {
                 artifacts_root: policy.artifacts_root,
                 shell_path: policy.shell_path,
             },
+            active: std::sync::Mutex::new(None),
             cancel,
             session_id,
             interactive,
@@ -91,12 +107,12 @@ impl ToolRuntime {
         crate::util::lock_mutex(&self.current_plan, "current_plan").clone()
     }
 
-    /// 发给模型的工具定义（Phase 5：builtin + 已注册 MCP 工具，经 ToolSelector
-    /// 按上下文选择——MCP 大量工具不一次塞给 LLM，README2 §14）。
-    pub(super) fn active_tool_defs(&self, context: &str) -> Vec<crate::provider::ToolDef> {
+    /// P4-03：构建当前 Step 的不可变工具快照并返回 defs（Step 内执行共用）。
+    /// 每次 reload 在 Step 边界锁 registry；Step 内执行不再锁。
+    pub(super) fn reload(&self, context: &str) -> Vec<crate::provider::ToolDef> {
         let registry = self.registry.lock().unwrap();
         let selector = crate::tool::selector::ToolSelector::default();
-        selector
+        let defs: Vec<crate::provider::ToolDef> = selector
             .select(registry.descriptors(), context)
             .into_iter()
             .map(|d| crate::provider::ToolDef {
@@ -104,7 +120,30 @@ impl ToolRuntime {
                 description: d.description,
                 parameters: d.parameters,
             })
-            .collect()
+            .collect();
+        let external: std::collections::HashMap<
+            String,
+            std::sync::Arc<dyn crate::tool::registry::Tool>,
+        > = registry
+            .list()
+            .into_iter()
+            .filter(|tool| BuiltinTool::from_name(tool.name()).is_none())
+            .map(|tool| (tool.name().to_string(), tool))
+            .collect();
+        *self.active.lock().unwrap() = Some(ActiveToolSet {
+            defs: defs.clone(),
+            external,
+        });
+        defs
+    }
+
+    /// 当前 Step 快照（reload 后有效；Step 内执行用同一快照，clone 复用）。
+    pub(super) fn active_set(&self) -> ActiveToolSet {
+        self.active
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("active set 未 reload")
     }
 
     /// 注册外部工具（MCP manager 调用；Phase 5 交付时由 app 接线）。
@@ -297,8 +336,8 @@ async fn execute_batch<P: Provider, S: crate::session::store::SessionStore>(
         *tool_calls_total += 1;
         // §Phase 5：先按 builtin 解析；失败则查 ToolRegistry（MCP 工具）。
         let Some(tool) = BuiltinTool::from_name(&call.name) else {
-            // 外部工具（MCP adapter）？
-            if let Some(adapter) = tool_runtime.registry.lock().unwrap().get(&call.name) {
+            // 外部工具（MCP adapter）？P4-03：用 Step 快照（不锁 registry）。
+            if let Some(adapter) = tool_runtime.active_set().external.get(&call.name).cloned() {
                 prepared.push(PreparedCall {
                     source_index: index,
                     kind: crate::tool::scheduler::PreparedKind::External {

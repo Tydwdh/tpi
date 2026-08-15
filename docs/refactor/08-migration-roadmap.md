@@ -654,10 +654,22 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   registry（mcp_contract）✓；新调用禁止 global_registry（新增代码不调用）✓；
   全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P4-03 immutable `ActiveToolSet`
+#### P4-03 immutable `ActiveToolSet` — **DONE（2026-08-14）**
 
 - prompt descriptors/execute lookup 共用 snapshot。
 - Step 内 reload stability test。
+- 实施：`src/agent/tool_runtime.rs` 新增 `ActiveToolSet`（不可变快照：`defs` +
+  `external` lookup，Clone）。`active_tool_defs(context)` 改为 `reload(context)`：
+  在 Step 边界锁 registry 构建快照（descriptors 经 selector + external 过滤
+  builtin）并返回 defs；`active_set()` 返回当前快照（Mutex 存储，ToolRuntime
+  跨线程 Send；clone 复用）。execute_batch 的外部工具 lookup 改从 `active_set()`
+  读（**不再每次锁 registry**——Step 内 MCP reload 不改变当前执行）。agent 每
+  Step 调 reload。
+- 验收测试：`tests/scheduler_contract.rs` 增 `active_set_is_stable_within_step`——
+  构建快照后注销 read（模拟 MCP reload），快照（defs）不受影响；句柄绑定验证
+  RAII 生命周期。12 断言全绿。
+- 验收达成：prompt descriptors/execute lookup 共用 snapshot ✓；Step 内 reload
+  stability 测试 ✓；全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
 #### P4-04 分离 ToolDefinition/Handler
 

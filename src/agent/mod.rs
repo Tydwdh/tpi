@@ -528,7 +528,8 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
     let mut tool_calls_total = 0u32;
     // §Phase 5：工具定义来自 ToolRegistry（builtin + MCP），经 ToolSelector
     // 按用户消息选择——MCP 大量工具不一次塞给 LLM（README2 §14）。
-    let tool_defs: Vec<crate::provider::ToolDef> = tool_runtime.active_tool_defs(&user_message);
+    // P4-03：Step 开始 reload 工具快照（defs + external lookup 共用）。
+    let tool_defs: Vec<crate::provider::ToolDef> = tool_runtime.reload(&user_message);
 
     let mut assistant_text = String::new();
     // §13：`request_input` 挂起时模型的问题（随 AgentOutcome 返回给 app 层显示）。
