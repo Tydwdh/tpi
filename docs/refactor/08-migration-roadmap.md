@@ -1142,7 +1142,8 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 #### P8-04 in-process read-only child — **DONE（2026-08-14）**
 
-- concurrency 1、depth 1、default off；parent cancel。
+- concurrency 1、depth 1；parent cancel。（2026-08-14 接线后：工具注册进
+  registry，模型可发起；仍默认 depth=1/concurrency=1 不递归不并发。）
 - 实施：`src/subagent/child.rs`——`InProcessChildProvider<P, F>`（make_provider
   工厂 + config + workspace）实现 `SubagentProvider`：
   - 复用进程内 `agent::run` 执行只读调查（depth 1 不递归；concurrency 1）；
@@ -1157,6 +1158,15 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收测试（subagent 5 断言）：structured report（child_session 匹配 + summary
   + evidence 提取）；parent cancel 传播（cancel 后 child 立即失败）；只读
   registry 排除写工具（bash/edit/write/web_fetch 不可用）。
+- **接线完成（2026-08-14，提交 53cd682）**：此前引擎只有契约+测试、无业务
+  调用方（agent 无法实际发起调查）。新增 `subagent/tool.rs`——`SubagentTool`
+  实现 Tool trait（参数 instruction + 可选 capabilities 白名单，默认
+  read/list/search/glob；depth=1、concurrency=1）+ `register_subagent_tool`
+  （composition root 注册辅助）；`app/from_config` 用 OpenAiCompatClient 工厂
+  闭包（每 child 独立 provider 实例）+ Arc<Config> 注册——**模型现在可发起
+  只读调查**。测试 +5（execute 端到端/空 instruction/未知能力/name-schema/
+  register 注入），subagent 17 断言全绿。child.rs F 约束 FnMut→Fn
+  （make_provider 只调一次，Tool: Send+Sync 需要）。
 
 #### P8-05 bounded parallel children — **DONE（2026-08-14）**
 
