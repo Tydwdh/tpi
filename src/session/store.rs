@@ -37,6 +37,19 @@ pub fn workspace_id_for(workspace_root: &Path) -> String {
 ///
 /// 单写者：同一时刻只有一个 `&mut S` 持有者（Rust 借用保证）；seq 由实现
 /// 维护（append 返回新 seq）；recovery/单写者/seq 契约由 adapter 测试验证。
+///
+/// # Durability barrier（P2-04）
+///
+/// 三种刷盘意图类型化，**不改实际时序**（底层仍是 append + sync）：
+///
+/// - [`Self::commit`]：普通事实提交（用户消息/assistant 消息/plan 等）；
+/// - [`Self::commit_pre_effect`]：写工具副作用**前**的 write-ahead（ToolStarted
+///   + sync，崩溃后据此恢复）；
+/// - [`Self::commit_terminal`]：run 终态（RunCompleted）——终态必须落盘后
+///   才算 run 结束。
+///
+/// 调用方表达意图而非裸 `sync_data()`；`sync_data` 保留为底层 flush（幂等，
+/// 无 pending 时 no-op）。
 pub trait SessionStore {
     /// 当前 run 边界（durable RunStarted 前调用）。
     fn begin_run(&mut self) -> RunId;
@@ -65,6 +78,31 @@ pub trait SessionStore {
     /// 读取全部事件（含 seq）——投影/恢复的最小读取接口。
     /// agent 不直接碰文件路径（P2-02：path() 仅诊断用）。
     fn events_with_seq(&self) -> std::io::Result<Vec<(u64, SessionEvent)>>;
+
+    // ---- P2-04 durability barrier：类型化刷盘意图（不改时序）----
+
+    /// 普通事实提交：append + sync。
+    fn commit(&mut self, event: &SessionEvent) -> std::io::Result<u64> {
+        let seq = self.append_event(event)?;
+        self.sync_data()?;
+        Ok(seq)
+    }
+
+    /// 写工具副作用前的 write-ahead（ToolStarted + sync）：崩溃后据此恢复。
+    fn commit_pre_effect(
+        &mut self,
+        call_id: ToolCallId,
+        recovery: Option<RecoveryMetadata>,
+    ) -> std::io::Result<()> {
+        self.write_ahead_tool(call_id, recovery)
+    }
+
+    /// run 终态提交（RunCompleted + sync）：落盘后 run 才算结束。
+    fn commit_terminal(&mut self, event: &SessionEvent) -> std::io::Result<u64> {
+        let seq = self.append_event(event)?;
+        self.sync_data()?;
+        Ok(seq)
+    }
 }
 
 /// Append-only session 日志（JSONL adapter，实现 [`SessionStore`]）。

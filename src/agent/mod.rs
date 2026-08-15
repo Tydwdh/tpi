@@ -361,14 +361,13 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
     // 正常对话不会传空消息。
     if !user_message.is_empty() {
         session
-            .append_event(&SessionEvent::UserSubmitted {
+            .commit(&SessionEvent::UserSubmitted {
                 content: user_message.clone(),
             })
-            .and_then(|_| session.sync_data())
             .map_err(|e| RunFailure::Session(e.to_string()))?;
     }
     session
-        .append_event(&SessionEvent::RunStarted {
+        .commit(&SessionEvent::RunStarted {
             model: ModelRef {
                 name: config.model.name.clone(),
                 provider: config.model.provider.clone(),
@@ -378,7 +377,6 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                 max_tool_calls: config.limits.max_tool_calls,
             },
         })
-        .and_then(|_| session.sync_data())
         .map_err(|e| RunFailure::Session(e.to_string()))?;
 
     // watchdog 必须覆盖手动 compaction 在内的整个模型工作阶段，并通过
@@ -536,11 +534,10 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
         // §用户诉求：max_model_turns=0 = 不限制（默认）。
         if config.limits.max_model_turns > 0 && turn >= config.limits.max_model_turns {
             session
-                .append_event(&SessionEvent::RunCompleted {
+                .commit_terminal(&SessionEvent::RunCompleted {
                     reason: CompletionReason::MaxTurns,
                     usage: usage_total,
                 })
-                .and_then(|_| session.sync_data())
                 .map_err(|e| RunFailure::Session(e.to_string()))?;
             break CompletionReason::MaxTurns;
         }
@@ -582,11 +579,10 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
                             session
-                                .append_event(&SessionEvent::RunCompleted {
+                                .commit_terminal(&SessionEvent::RunCompleted {
                                     reason: CompletionReason::ContextOverflow,
                                     usage: usage_total,
                                 })
-                                .and_then(|_| session.sync_data())
                                 .map_err(|e| RunFailure::Session(e.to_string()))?;
                             break 'run_loop CompletionReason::ContextOverflow;
                         }
@@ -608,11 +604,10 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
                             session
-                                .append_event(&SessionEvent::RunCompleted {
+                                .commit_terminal(&SessionEvent::RunCompleted {
                                     reason: CompletionReason::ContextOverflow,
                                     usage: usage_total,
                                 })
-                                .and_then(|_| session.sync_data())
                                 .map_err(|e| RunFailure::Session(e.to_string()))?;
                             break 'run_loop CompletionReason::ContextOverflow;
                         }
@@ -741,14 +736,12 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                                 // 记录 Cancelled 原因并保留 session，而不是让 run 以错误退出。
                                 if !content.is_empty() {
                                     assistant_text = content.clone();
-                                    session
-                                        .append_event(&SessionEvent::AssistantMessageCommitted {
+                                    session.commit(&SessionEvent::AssistantMessageCommitted {
                                             message: AssistantMessage {
                                                 content: content.clone(),
                                                 tool_calls: Vec::new(),
                                             },
                                         })
-                                        .and_then(|_| session.sync_data())
                                         .map_err(|e| RunFailure::Session(e.to_string()))?;
                                     // P1-1：已提交 session 的内容必须同步进 outcome.messages，
                                     // 否则继续对话时模型上下文与 session 事实不一致。
@@ -761,12 +754,10 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                                 let cause = cancel_cause.load(std::sync::atomic::Ordering::SeqCst);
                                 let cancel_reason =
                                     crate::agent::limits::cancel_reason_for_cause(cause);
-                                session
-                                    .append_event(&SessionEvent::RunCompleted {
+                                session.commit_terminal(&SessionEvent::RunCompleted {
                                         reason: cancel_reason,
                                         usage: usage_total,
                                     })
-                                    .and_then(|_| session.sync_data())
                                     .map_err(|e| RunFailure::Session(e.to_string()))?;
                                 break 'run_loop cancel_reason;
                             }
@@ -805,14 +796,12 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                                 && stream_recoveries < MAX_STREAM_RECOVERIES
                             {
                                 let cause = interrupt_cause(&e);
-                                session
-                                    .append_event(&SessionEvent::AssistantAttemptInterrupted {
+                                session.commit(&SessionEvent::AssistantAttemptInterrupted {
                                         request_id,
                                         content: content.clone(),
                                         cause,
                                         saw_tool_calls: false,
                                     })
-                                    .and_then(|_| session.sync_data())
                                     .map_err(|e2| RunFailure::Session(e2.to_string()))?;
                                 let _ = ui
                                     .send(LiveEvent::StreamRecovering {
@@ -833,14 +822,12 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                                 && turn_restarts < MAX_TURN_RESTARTS
                             {
                                 let cause = interrupt_cause(&e);
-                                session
-                                    .append_event(&SessionEvent::AssistantAttemptInterrupted {
+                                session.commit(&SessionEvent::AssistantAttemptInterrupted {
                                         request_id,
                                         content: content.clone(),
                                         cause,
                                         saw_tool_calls: true,
                                     })
-                                    .and_then(|_| session.sync_data())
                                     .map_err(|e2| RunFailure::Session(e2.to_string()))?;
                                 let _ = ui
                                     .send(LiveEvent::TurnRestarting {
@@ -881,32 +868,26 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                                 // 不提交为 AssistantMessageCommitted，写入记录型事件。
                                 if saw_any_semantic {
                                     let cause = interrupt_cause(&e);
-                                    session
-                                        .append_event(&SessionEvent::AssistantAttemptInterrupted {
+                                    session.commit(&SessionEvent::AssistantAttemptInterrupted {
                                             request_id,
                                             content: content.clone(),
                                             cause,
                                             saw_tool_calls,
                                         })
-                                        .and_then(|_| session.sync_data())
                                         .map_err(|e2| RunFailure::Session(e2.to_string()))?;
-                                    session
-                                        .append_event(&SessionEvent::RunCompleted {
+                                    session.commit_terminal(&SessionEvent::RunCompleted {
                                             reason: CompletionReason::ProviderInterrupted,
                                             usage: usage_total,
                                         })
-                                        .and_then(|_| session.sync_data())
                                         .map_err(|e2| RunFailure::Session(e2.to_string()))?;
                                     // 保留 partial 供 UI/outcome 展示，但不动 messages（不是已提交事实）。
                                     assistant_text = content.clone();
                                     break 'run_loop CompletionReason::ProviderInterrupted;
                                 }
-                                session
-                                    .append_event(&SessionEvent::RunCompleted {
+                                session.commit_terminal(&SessionEvent::RunCompleted {
                                         reason: CompletionReason::ProviderUnavailable,
                                         usage: usage_total,
                                     })
-                                    .and_then(|_| session.sync_data())
                                     .map_err(|e2| RunFailure::Session(e2.to_string()))?;
                                 return Err(RunFailure::Provider(e.to_string()));
                             }
@@ -971,13 +952,12 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
         // text+tool 轮 push 的 content 为空，live projection != resume projection）。
         assistant_text = content.clone();
         session
-            .append_event(&SessionEvent::AssistantMessageCommitted {
+            .commit(&SessionEvent::AssistantMessageCommitted {
                 message: AssistantMessage {
                     content: content.clone(),
                     tool_calls: response.tool_calls.clone(),
                 },
             })
-            .and_then(|_| session.sync_data())
             .map_err(|e| RunFailure::Session(e.to_string()))?;
         messages.push(ChatMessage::Assistant {
             content: content.clone(),
@@ -1013,17 +993,15 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                 };
                 let questions = args.normalized_questions().unwrap_or_default();
                 session
-                    .append_event(&SessionEvent::UserInputRequested {
+                    .commit(&SessionEvent::UserInputRequested {
                         prompt: text.clone(),
                     })
-                    .and_then(|_| session.sync_data())
                     .map_err(|e| RunFailure::Session(e.to_string()))?;
                 session
-                    .append_event(&SessionEvent::RunCompleted {
+                    .commit_terminal(&SessionEvent::RunCompleted {
                         reason: CompletionReason::AwaitingUserInput,
                         usage: usage_total,
                     })
-                    .and_then(|_| session.sync_data())
                     .map_err(|e| RunFailure::Session(e.to_string()))?;
                 awaiting_input = Some(AwaitingInput { text, questions });
                 break 'run_loop CompletionReason::AwaitingUserInput;
@@ -1032,11 +1010,10 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                 // P1-2：工具预算超限用独立 reason（此前归为 Error，
                 // 用户/模型会误以为是协议错误）。
                 session
-                    .append_event(&SessionEvent::RunCompleted {
+                    .commit_terminal(&SessionEvent::RunCompleted {
                         reason: CompletionReason::MaxToolCalls,
                         usage: usage_total,
                     })
-                    .and_then(|_| session.sync_data())
                     .map_err(|e| RunFailure::Session(e.to_string()))?;
                 break 'run_loop CompletionReason::MaxToolCalls;
             }
@@ -1052,11 +1029,10 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
             | crate::provider::FinishReason::Error => CompletionReason::Error,
         };
         session
-            .append_event(&SessionEvent::RunCompleted {
+            .commit_terminal(&SessionEvent::RunCompleted {
                 reason,
                 usage: usage_total,
             })
-            .and_then(|_| session.sync_data())
             .map_err(|e| RunFailure::Session(e.to_string()))?;
         break reason;
     };
@@ -1411,13 +1387,12 @@ async fn compact_turn<P: Provider, S: crate::session::store::SessionStore>(
         return Err(CompactionFailure::NotSignificant);
     }
     session
-        .append_event(&SessionEvent::CompactionCommitted {
+        .commit(&SessionEvent::CompactionCommitted {
             covered,
             summary: crate::session::CompactSummary {
                 text: summary_text.clone(),
             },
         })
-        .and_then(|_| session.sync_data())
         .map_err(|e| CompactionFailure::Session(e.to_string()))?;
 
     // 5. 重建投影：最新 summary + 保留的最近 turns（§15.4：旧 raw 不重复注入）。

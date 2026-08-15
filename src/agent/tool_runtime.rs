@@ -387,8 +387,7 @@ error: invalid_arguments
         // session 事件按原 index 顺序（§12.2 第 6 条）。
         for call in wave.iter().map(|p| &calls[p.source_index]) {
             session
-                .append_event(&SessionEvent::ToolRequested { call: call.clone() })
-                .and_then(|_| session.sync_data())
+                .commit(&SessionEvent::ToolRequested { call: call.clone() })
                 .map_err(|e| RunFailure::Session(e.to_string()))?;
         }
 
@@ -562,8 +561,7 @@ error: invalid_arguments
                 let plan = tool_runtime.plan_snapshot();
                 if let Some(plan) = plan {
                     session
-                        .append_event(&SessionEvent::PlanReplaced { plan: plan.clone() })
-                        .and_then(|_| session.sync_data())
+                        .commit(&SessionEvent::PlanReplaced { plan: plan.clone() })
                         .map_err(|e| RunFailure::Session(e.to_string()))?;
                     let _ = ui.send(LiveEvent::PlanUpdated { plan }).await;
                 }

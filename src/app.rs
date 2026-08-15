@@ -23,6 +23,7 @@ use crate::ids::SessionId;
 use crate::provider::openai_compat::OpenAiCompatClient;
 use crate::provider::{ChatMessage, Provider};
 use crate::session::conversation::Conversation;
+use crate::session::store::SessionStore;
 use crate::session::{self, SessionEvent, SessionLog};
 use crate::tui::effect::UiEffect;
 use crate::tui::state::UiState;
@@ -1182,10 +1183,9 @@ async fn interactive_loop<P: Provider>(
                 let (session_log, history) = conversation.parts_for_run()?;
                 if let Some(answer) = &resume_answer {
                     session_log
-                        .append_event(&SessionEvent::UserInputReceived {
+                        .commit(&SessionEvent::UserInputReceived {
                             content: answer.clone(),
                         })
-                        .and_then(|_| session_log.sync_data())
                         .map_err(|e| e.to_string())?;
                 }
                 run_interactive(

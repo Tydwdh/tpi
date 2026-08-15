@@ -334,11 +334,29 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   走 events_with_seq + rebuild（golden 语义不变，conversation 测试全过）；
   全量 48 target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P2-04 durability barrier 类型化
+#### P2-04 durability barrier 类型化 — **DONE（2026-08-14）**
 
 - 让 pre-effect/commit/shutdown sync 意图显式，不改实际刷盘时序。
 - fault injection 覆盖每个 barrier。
 - 验收：recovery matrix 不退化。
+- 实施：`SessionStore` 新增 3 个类型化 barrier 方法（默认实现 = append + sync，
+  时序不变）：
+  - `commit(event)`：普通事实提交（User/Assistant/Plan/ToolRequested/
+    AssistantAttemptInterrupted/UserInputRequested/CompactionCommitted）；
+  - `commit_pre_effect(call_id, recovery)`：写工具副作用前 write-ahead
+    （ToolStarted + sync；转发 write_ahead_tool）；
+  - `commit_terminal(event)`：run 终态（RunCompleted + sync）。
+  迁移 agent/mod.rs 18 处、tool_runtime.rs 2 处、app.rs 1 处 `.and_then(|_|
+  session.sync_data())` 链 → 类型化方法（RunCompleted→commit_terminal，其余→
+  commit）。`sync_data` 保留为底层 flush（幂等，无 pending 时 no-op）。
+- fault injection 测试 `tests/durability_barrier.rs`（5 断言）：FaultyStore
+  （append 成功、sync 可故障）验证三种 barrier 的 sync 失败都传播错误、
+  append 已计入 seq（可重试）、fault 清除后成功、类型化方法 == append+sync
+  （无 fault 时完全等价）。
+- 验收达成：pre-effect/commit/shutdown 意图显式（barrier 类型化）；fault
+  injection 覆盖 commit/commit_terminal/commit_pre_effect；recovery_matrix
+  既有 5 个 crash 场景全过（不退化）；全量 49 target 绿；fmt/clippy/arch_gate
+  清洁。
 
 #### P2-05 `Supervisor` walking skeleton
 
