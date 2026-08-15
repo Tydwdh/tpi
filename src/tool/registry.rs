@@ -677,3 +677,22 @@ async fn setup_transaction_rolls_back_on_fault() {
     assert!(!reg.overlay_has("read"), "事务失败后不得留下 read overlay");
     assert!(!reg.overlay_has("bash"), "事务失败后不得留下 bash overlay");
 }
+
+/// P8-04：只读 registry——只注册只读调查工具（read/list/search/glob）。
+/// child subagent 用它限制能力（写/进程/网络工具不存在于 registry → 不可调用）。
+pub fn read_only_registry(caps: &[crate::subagent::ReadOnlyCapability]) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    for tool in crate::tool::implemented_tools() {
+        let allowed = match tool.name() {
+            "read" => caps.contains(&crate::subagent::ReadOnlyCapability::Read),
+            "list" => caps.contains(&crate::subagent::ReadOnlyCapability::List),
+            "search" => caps.contains(&crate::subagent::ReadOnlyCapability::Search),
+            "glob" => caps.contains(&crate::subagent::ReadOnlyCapability::Glob),
+            _ => false,
+        };
+        if allowed {
+            registry.register(Arc::new(BuiltinToolAdapter::new(tool)));
+        }
+    }
+    registry
+}

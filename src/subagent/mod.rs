@@ -6,6 +6,8 @@
 //!
 //! 本模块定义契约 + fake；P8-04 in-process child 在其上实现。
 
+pub mod child;
+
 use crate::ids::SessionId;
 
 /// 子代理只读能力白名单（P8 初始规格：只读调查）。
