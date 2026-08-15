@@ -944,3 +944,67 @@ async fn foreground_and_background_cancel_both_cancelled() {
     // 无残留进程（registry 空）。
     assert_eq!(ctx.processes.lock().unwrap().active_count(), 0);
 }
+
+/// P8 gate：100 次 spawn/cancel 无泄漏——registry 每次 cancel 后无残留，
+/// 100 次后 active_count 归零（进程/任务不泄漏）。
+#[tokio::test]
+async fn hundred_spawn_cancel_cycles_leave_no_leak() {
+    fixtures::point_host_at_real_tpi();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let ctx = fixtures::test_tool_context(&workspace);
+    if tpi::tool::command::locate_git_bash(&ctx).is_none() {
+        eprintln!("本机未安装 Git Bash，跳过（§11.2 环境依赖）");
+        return;
+    }
+    for i in 0..100 {
+        let outcome = bash(
+            BashArgs {
+                command: "sleep 60".into(),
+                cwd: None,
+                timeout_ms: 120_000,
+                background: true,
+            },
+            &ctx,
+        )
+        .await;
+        let pid_text = outcome
+            .model_text()
+            .lines()
+            .find_map(|line| line.strip_prefix("process_id: "))
+            .expect("process_id")
+            .to_string();
+        let process_id: ProcessId = pid_text.parse().unwrap();
+        // cancel（不等待自然退出；立即取消，验证 cancel 路径无残留）。
+        let cancelled = tpi::tool::process::process(
+            tpi::tool::process::ProcessArgs {
+                action: tpi::tool::process::ProcessAction::Cancel,
+                id: Some(pid_text.clone()),
+                timeout_ms: 1000,
+            },
+            &ctx,
+        )
+        .await;
+        assert_eq!(cancelled.status, tpi::outcome::ToolStatus::Succeeded);
+        // 每轮 cancel 后 registry 无残留（状态迁移到 Cancelled 并移除）。
+        if let Some(proc) = ctx.processes.lock().unwrap().get(process_id) {
+            assert_eq!(
+                proc.state,
+                tpi::process::managed::ManagedProcessState::Cancelled,
+                "第 {i} 轮 cancel 后状态为 Cancelled"
+            );
+        }
+    }
+    // 全部 cancel 后：等待 drain task 移除所有已取消进程（最多 5s）。
+    for _ in 0..50 {
+        if ctx.processes.lock().unwrap().active_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        ctx.processes.lock().unwrap().active_count(),
+        0,
+        "100 次 spawn/cancel 后 registry 无残留（无泄漏）"
+    );
+}
