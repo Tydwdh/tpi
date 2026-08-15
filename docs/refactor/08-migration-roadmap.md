@@ -687,10 +687,19 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收达成：builtin adapter facade 保持 ✓；registration 验证 name/schema ✓；
   全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P4-05 pipeline skeleton
+#### P4-05 pipeline skeleton — **DONE（2026-08-14）**
 
 - 显式 stage result，先包一个 Pure builtin；再 read、process、write。
 - 每次迁移后跑 existing scheduler/recovery suites。
+- 实施：`src/tool/pipeline.rs`：`StageResult`（Parsed/Planned/Executed/Output，每
+  stage 显式产出供 inspector/审计）+ `run_pure_pipeline`（parse → execute →
+  output；Pure 无 write-ahead）。先包 Pure builtin（read）验证结构；read/process/
+  write 的逐步迁移在 P4-06 canonical output 时接入。现有 scheduler（横切调度 +
+  write-ahead + batch）不动，pipeline 是垂直 stage 骨架。
+- 验收测试（pipeline 2 断言）：read 经 pipeline 产出 Output（或 Executed-Failed
+  stage）；StageResult 携带 tool_name（可审计）。scheduler/recovery suites 全过。
+- 验收达成：显式 stage result ✓；Pure builtin 包裹 ✓；全量 54 target 绿；
+  fmt/clippy/arch_gate 清洁。
 
 #### P4-06 canonical output
 

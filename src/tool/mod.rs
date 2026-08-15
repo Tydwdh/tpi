@@ -11,6 +11,7 @@ pub mod edit;
 pub mod files;
 pub mod inspect;
 pub mod outcome;
+pub mod pipeline;
 pub mod plan;
 pub mod process;
 pub mod registry;
