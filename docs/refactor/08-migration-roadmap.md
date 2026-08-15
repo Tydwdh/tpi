@@ -731,10 +731,20 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   每项行为保持（agent/tool_runtime 测试全过）✓；全量 54 target 绿；
   fmt/clippy/arch_gate 清洁。
 
-#### P4-08 scoped overlays/setup transaction
+#### P4-08 scoped overlays/setup transaction — **DONE（2026-08-14）**
 
 - root/session/agent lookup；setup fault rollback。
 - 默认静态 roster snapshot 保持。
+- 实施：`ToolRegistry` 新增 `overlay` 层（session/agent scope 覆盖 root；`get` 先查
+  overlay 再 root，`list` overlay 去重合并）；`register_overlay(registry, tool)` 返回
+  RAII `OverlayRegistration`（按 `(name,id)` 注销，ABA 安全）；`setup_overlay_transaction`
+  ——先验证全部工具（不写入），任一失败**零副作用回滚**（setup fault rollback）；
+  `overlay_has` 供 scope lookup。root 层 `register`/`register_owned` 行为不变（默认
+  静态 roster snapshot 保持）。
+- 验收测试（registry 2 断言）：overlay 覆盖 root + 按 id 注销后 root 恢复可见；
+  transaction 含非法工具失败后无任何 overlay 副作用（rollback）。8 断言全绿。
+- 验收达成：root/session overlay lookup ✓；setup fault rollback ✓；默认静态 roster
+  保持 ✓；全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
 #### P4-09 MCP generation reload
 
