@@ -1044,9 +1044,16 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   7 模块约 1.4 万行 git mv；`tpi_home` 下沉 tpi-core::util；`ReadOnlyCapability`
   下沉 capabilities::tool::registry（subagent re-export）；capabilities 独立
   158 断言绿；全量 56 target 绿。
-- **剩余**：agent（agent/context/provider/subagent）-> TUI（17524）-> adapters/
-  CLI（约 1.1 万行）。后续每步：目标模块移入新 crate + 全局 `crate::X` 引用改
-  `tpi_xxx::X` + 主 crate re-export 兼容 + 零行为验证。
+- **第 4~7 步（2026-08-14）**：拆出 tpi-ui-types（ViewMode/Keymap，解
+  config→tui 环）→ tpi-config（Config/AgentConfig/auth）→ tpi-agent
+  （agent/context/provider/subagent/trace）→ tpi-tui（17.5k 行界面层）。
+  adapters/CLI（app/main/web/doctor/eval/clipboard）作为最终消费者保留在主
+  crate（引用全部层，拆出仅换依赖方向、价值低）。验证：tpi-tui 独立 241 断言、
+  tpi-agent 67、tpi-config 13、tpi-ui-types 10、tpi-capabilities 158、
+  tpi-session 26、tpi-core 17；全量 56 target 绿；DAG/arch_gate 清洁。
+- **P7-02 结论**：7 个 crate 全部拆出（core/session/capabilities/ui-types/
+  config/agent/tui），主 crate = adapters 层（app/main/web/doctor/eval/
+  clipboard + 测试）。拆包完成。
 
 #### P7-03 feature audit
 
