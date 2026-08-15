@@ -958,6 +958,31 @@ mod tests {
         }
     }
 
+    /// P7-02 拆 crate：core 的 tool_recovery_policy 名字表必须与 execution_class
+    /// 映射一致（单一事实源防漂移；core 不依赖 capabilities，此断言在 tpi 侧）。
+    #[test]
+    fn recovery_policy_consistent_with_execution_class() {
+        for tool in implemented_tools() {
+            let expected = match tool.execution_class() {
+                ToolExecutionClass::Pure
+                | ToolExecutionClass::FileReadExact
+                | ToolExecutionClass::FileReadRecursive => {
+                    crate::outcome::ToolRecoveryPolicy::NoEffect
+                }
+                ToolExecutionClass::FileWriteExact => {
+                    crate::outcome::ToolRecoveryPolicy::FileCommit
+                }
+                ToolExecutionClass::WorkspaceUnknown => crate::outcome::ToolRecoveryPolicy::Unknown,
+            };
+            assert_eq!(
+                crate::outcome::tool_recovery_policy(tool.name()),
+                expected,
+                "core 策略与 BuiltinTool 执行分类一致: {}",
+                tool.name()
+            );
+        }
+    }
+
     /// §4 ACI：工具 description 必须含典型调用示例（书中：示例提升工具准确率 72%→90%），
     /// 高频工具（bash/search/web_fetch/edit）必须含执行代价或边界说明。
     #[test]

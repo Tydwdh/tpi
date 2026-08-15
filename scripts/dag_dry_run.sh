@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 # 层 → 目录/文件映射（当前单 crate 内的模块近似）。
 declare -A LAYER
-LAYER[core]="src/ids.rs src/message.rs src/plan.rs src/util.rs"
+LAYER[core]="crates/tpi-core/src"
 LAYER[session]="src/session"
 LAYER[capabilities]="src/tool src/shell src/workspace src/process src/mcp"
 LAYER[agent]="src/agent src/context src/provider"

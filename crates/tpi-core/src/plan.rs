@@ -28,7 +28,9 @@ impl PlanStatus {
     /// 是否仍是开放项（Pending/InProgress/Blocked）。
     /// 供 plan_snapshot（全部终态 → 空快照）与 TUI 侧边栏（全部终态 →
     /// Todo 自动清空）共用同一判定。
-    pub(crate) fn is_open(self) -> bool {
+    /// 是否仍处于未决状态（Pending/InProgress/Blocked）。
+    /// 跨 crate：tpi（agent/context/tui）与 core 共用。
+    pub fn is_open(self) -> bool {
         matches!(self, Self::Pending | Self::InProgress | Self::Blocked)
     }
 }

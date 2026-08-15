@@ -278,22 +278,7 @@ mod recovery_policy_tests {
         );
     }
 
-    /// 与 BuiltinTool 的 execution_class 映射一致（单一事实源防漂移）。
-    #[test]
-    fn consistent_with_builtin_tool() {
-        use crate::tool::ToolExecutionClass as C;
-        for tool in crate::tool::implemented_tools() {
-            let expected = match tool.execution_class() {
-                C::Pure | C::FileReadExact | C::FileReadRecursive => ToolRecoveryPolicy::NoEffect,
-                C::FileWriteExact => ToolRecoveryPolicy::FileCommit,
-                C::WorkspaceUnknown => ToolRecoveryPolicy::Unknown,
-            };
-            assert_eq!(
-                tool_recovery_policy(tool.name()),
-                expected,
-                "core 策略与 BuiltinTool 执行分类一致: {}",
-                tool.name()
-            );
-        }
-    }
+    // 与 BuiltinTool 执行分类的一致性在集成测试
+    // tests/tool_recovery_consistency.rs 验证（拆 crate：core 不依赖
+    // capabilities，跨层断言放 tpi 侧）。
 }
