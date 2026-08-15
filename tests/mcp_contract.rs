@@ -278,7 +278,8 @@ fn tool_registration_drop_unregisters() {
     let registry = Arc::new(Mutex::new(ToolRegistry::new()));
     let adapter = tpi::tool::registry::BuiltinToolAdapter::new(tpi::tool::BuiltinTool::Read);
     let registration =
-        tpi::tool::registry::ToolRegistry::register_owned(&registry, std::sync::Arc::new(adapter));
+        tpi::tool::registry::ToolRegistry::register_owned(&registry, std::sync::Arc::new(adapter))
+            .unwrap();
     assert!(
         registry
             .lock()

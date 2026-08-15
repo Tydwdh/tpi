@@ -477,7 +477,7 @@ async fn active_set_is_stable_within_step() {
             .find(|t| t.name() == name)
             .unwrap();
         let adapter = tpi::tool::registry::BuiltinToolAdapter::new(found);
-        handles.push(ToolRegistry::register_owned(&registry, Arc::new(adapter)));
+        handles.push(ToolRegistry::register_owned(&registry, Arc::new(adapter)).unwrap());
     }
     assert_eq!(registry.lock().unwrap().list().len(), 2);
 

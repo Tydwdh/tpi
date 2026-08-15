@@ -671,10 +671,21 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收达成：prompt descriptors/execute lookup 共用 snapshot ✓；Step 内 reload
   stability 测试 ✓；全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P4-04 分离 ToolDefinition/Handler
+#### P4-04 分离 ToolDefinition/Handler — **DONE（2026-08-14）**
 
 - builtin adapter 保持 facade；schema/origin/execute 不改。
 - registration 时验证 name/schema/limits。
+- 实施：`Tool` trait 新增 `definition()`（ToolDefinition 纯数据投影：name/description/
+  parameters/origin）与 `validate_definition()`（默认实现：name 非空无空白、input_schema
+  是 JSON object）。`ToolDefinition` 新结构。`register_owned` 改为 `Result`——注册时
+  验证，违规拒绝不插入；新增 `register_validated`（进程级内置路径验证）。调用点适配：
+  mcp/manager（map_err McpError::Protocol）、mcp_contract、scheduler_contract、
+  registry 测试（unwrap/match）。builtin adapter 保持 facade（definition 默认从基础
+  方法组装，schema/origin/execute 不改）。
+- 验收测试（registry 2 断言）：registration 验证（空 name / schema 非 object 拒绝、
+  合法工具通过）；ToolDefinition 投影与基础方法一致。6 断言全绿。
+- 验收达成：builtin adapter facade 保持 ✓；registration 验证 name/schema ✓；
+  全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
 #### P4-05 pipeline skeleton
 

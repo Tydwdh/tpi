@@ -42,6 +42,42 @@ pub trait Tool: Send + Sync {
     fn input_schema(&self) -> serde_json::Value;
     fn origin(&self) -> ToolOrigin;
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome;
+
+    /// P4-04：definition 投影（name/schema/origin 的不可变描述；handler 保持
+    /// `execute`）。默认从基础方法组装；自定义实现可覆写（如带 limits 的声明）。
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            parameters: self.input_schema(),
+            origin: self.origin(),
+        }
+    }
+
+    /// P4-04：registration 时验证 name/schema（违规定义拒绝注册）。
+    fn validate_definition(&self) -> Result<(), String> {
+        let name = self.name();
+        if name.trim().is_empty() {
+            return Err("工具 name 不能为空".into());
+        }
+        if name.contains(char::is_whitespace) {
+            return Err(format!("工具 name 不能含空白: {name:?}"));
+        }
+        let schema = self.input_schema();
+        if !schema.is_object() {
+            return Err(format!("工具 {name} 的 input_schema 必须是 JSON object"));
+        }
+        Ok(())
+    }
+}
+
+/// P4-04：工具 definition（纯数据；与 handler `execute` 分离的只读描述）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+    pub origin: ToolOrigin,
 }
 
 /// 工具描述（发给模型的 schema，对齐现有 `ToolDef`）。
@@ -83,10 +119,12 @@ impl ToolRegistry {
     ///
     /// 需要 `Arc<Mutex<Self>>`：Drop 清理必须能访问 registry；`&mut self` 的
     /// [`ToolRegistry::register`] 留给进程级/内置注册（生命周期与 registry 同长）。
+    /// P4-04：注册 + 验证 name/schema（违规拒绝并返回 Err，不插入）。
     pub fn register_owned(
         registry: &Arc<std::sync::Mutex<ToolRegistry>>,
         tool: Arc<dyn Tool>,
-    ) -> ToolRegistration {
+    ) -> Result<ToolRegistration, String> {
+        tool.validate_definition()?;
         let name = tool.name().to_string();
         let id = crate::ids::RegistrationId::new_v7();
         registry
@@ -94,11 +132,18 @@ impl ToolRegistry {
             .unwrap()
             .tools
             .insert(name.clone(), (id, tool));
-        ToolRegistration {
+        Ok(ToolRegistration {
             registry: Some(registry.clone()),
             name,
             id,
-        }
+        })
+    }
+
+    /// P4-04：注册时验证（无 RAII 句柄；进程级内置路径）。
+    pub fn register_validated(&mut self, tool: Arc<dyn Tool>) -> Result<(), String> {
+        tool.validate_definition()?;
+        self.register(tool);
+        Ok(())
     }
 
     pub fn unregister(&mut self, name: &str) {
@@ -343,13 +388,13 @@ async fn aba_old_disposer_never_deletes_replacement() {
     };
     // 场景 1：register_owned A → unregister（手动）→ 再 register_owned A（新 id）→
     // 旧句柄 drop 不得删除新条目。
-    let handle_a = ToolRegistry::register_owned(&registry, make("read"));
+    let handle_a = ToolRegistry::register_owned(&registry, make("read")).unwrap();
     // 手动注销（等价 MCP restart 的 drop 前的显式 unregister）。
     let mut h = handle_a;
     h.unregister();
     assert!(registry.lock().unwrap().get("read").is_none());
     // replacement（同名重新注册，新 id）。
-    let _handle_b = ToolRegistry::register_owned(&registry, make("read"));
+    let _handle_b = ToolRegistry::register_owned(&registry, make("read")).unwrap();
     assert!(registry.lock().unwrap().get("read").is_some());
     // 旧句柄 h 已 unregister（id=旧），drop 不删 replacement。
     drop(h);
@@ -359,9 +404,9 @@ async fn aba_old_disposer_never_deletes_replacement() {
     );
 
     // 场景 2：直接 drop 旧句柄（不显式 unregister）也不删 replacement。
-    let handle_c = ToolRegistry::register_owned(&registry, make("bash"));
+    let handle_c = ToolRegistry::register_owned(&registry, make("bash")).unwrap();
     drop(handle_c); // 旧 id 注销
-    let _handle_d = ToolRegistry::register_owned(&registry, make("bash"));
+    let _handle_d = ToolRegistry::register_owned(&registry, make("bash")).unwrap();
     assert!(registry.lock().unwrap().get("bash").is_some());
     // 若 handle_c drop 误删 replacement，这里会失败（ABA 复现）。
     assert!(
@@ -382,8 +427,8 @@ async fn duplicate_name_replacement_keeps_new_entry() {
                 .unwrap(),
         ))
     };
-    let handle_old = ToolRegistry::register_owned(&registry, make("read"));
-    let handle_new = ToolRegistry::register_owned(&registry, make("read"));
+    let handle_old = ToolRegistry::register_owned(&registry, make("read")).unwrap();
+    let handle_new = ToolRegistry::register_owned(&registry, make("read")).unwrap();
     assert!(registry.lock().unwrap().get("read").is_some());
     drop(handle_old);
     assert!(
@@ -392,4 +437,82 @@ async fn duplicate_name_replacement_keeps_new_entry() {
     );
     drop(handle_new);
     assert!(registry.lock().unwrap().get("read").is_none());
+}
+
+/// P4-04：registration 时验证 name/schema——违规定义拒绝注册。
+#[tokio::test]
+async fn registration_validates_definition() {
+    let registry = Arc::new(std::sync::Mutex::new(ToolRegistry::new()));
+
+    // 合法工具注册成功。
+    let ok_tool = Arc::new(BuiltinToolAdapter::new(
+        crate::tool::implemented_tools()
+            .into_iter()
+            .find(|t| t.name() == "read")
+            .unwrap(),
+    ));
+    assert!(ToolRegistry::register_owned(&registry, ok_tool).is_ok());
+
+    // 空 name：拒绝。
+    struct BadName;
+    #[async_trait::async_trait]
+    impl Tool for BadName {
+        fn name(&self) -> &str {
+            ""
+        }
+        fn description(&self) -> &str {
+            "bad"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn origin(&self) -> ToolOrigin {
+            ToolOrigin::Builtin
+        }
+        async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolOutcome {
+            unreachable!()
+        }
+    }
+    let err = match ToolRegistry::register_owned(&registry, Arc::new(BadName)) {
+        Ok(_) => panic!("空 name 必须拒绝"),
+        Err(e) => e,
+    };
+    assert!(err.contains("name"), "{err}");
+
+    // schema 非 object：拒绝。
+    struct BadSchema;
+    #[async_trait::async_trait]
+    impl Tool for BadSchema {
+        fn name(&self) -> &str {
+            "bad_schema"
+        }
+        fn description(&self) -> &str {
+            "bad"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!("not-an-object")
+        }
+        fn origin(&self) -> ToolOrigin {
+            ToolOrigin::Builtin
+        }
+        async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolOutcome {
+            unreachable!()
+        }
+    }
+    let err = match ToolRegistry::register_owned(&registry, Arc::new(BadSchema)) {
+        Ok(_) => panic!("schema 非 object 必须拒绝"),
+        Err(e) => e,
+    };
+    assert!(err.contains("object"), "{err}");
+}
+
+/// P4-04：ToolDefinition 投影与基础方法一致。
+#[test]
+fn definition_projection_matches_accessors() {
+    let adapter = BuiltinToolAdapter::new(crate::tool::BuiltinTool::Read);
+    let def = adapter.definition();
+    assert_eq!(def.name, adapter.name());
+    assert_eq!(def.description, adapter.description());
+    assert_eq!(def.parameters, adapter.input_schema());
+    assert_eq!(def.origin, adapter.origin());
 }

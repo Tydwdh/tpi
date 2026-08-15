@@ -81,10 +81,10 @@ impl McpManager {
                 client.clone(),
                 available.clone(),
             );
-            registrations.push(ToolRegistry::register_owned(
-                &self.registry,
-                Arc::new(adapter),
-            ));
+            registrations.push(
+                ToolRegistry::register_owned(&self.registry, Arc::new(adapter))
+                    .map_err(McpError::Protocol)?,
+            );
         }
         self.servers.insert(
             server_id.clone(),
