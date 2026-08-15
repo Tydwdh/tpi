@@ -106,6 +106,8 @@ enum TerminalInput {
         text: String,
     },
     FinishKeyStreamPaste(crate::tui::paste::FinishedKeyStreamPaste),
+    /// P3-06：终端读取错误（线程退出前通知主循环；不遗留线程）。
+    TerminalError(String),
 }
 
 /// 应用入口。
@@ -604,7 +606,8 @@ async fn interactive_loop<P: Provider>(
     // 解析完整控制序列。旧终端若退化成逐键流，字符仍一律立即转发，只把紧跟
     // 可插入字符的普通 Enter 改写为 Shift+Enter；不再缓冲/回溯整串输入。
     let (key_tx, mut key_rx) = mpsc::channel::<TerminalInput>(128);
-    std::thread::spawn(move || {
+    // P3-06：保存 JoinHandle（退出时显式 join，不遗留线程）。
+    let key_thread = std::thread::spawn(move || {
         use crate::tui::paste;
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         // 待处理事件队列：bracketed-paste 前后缀探测读出的非控制事件放回
@@ -638,7 +641,12 @@ async fn interactive_loop<P: Provider>(
                     } else {
                         match event::read() {
                             Ok(e) => e,
-                            Err(_) => return,
+                            Err(e) => {
+                                let _ = key_tx.blocking_send(TerminalInput::TerminalError(
+                                    format!("terminal read 失败: {e}"),
+                                ));
+                                return;
+                            }
                         }
                     };
                     if !matches!(
@@ -988,6 +996,11 @@ async fn interactive_loop<P: Provider>(
                             renderer.autoresize().map_err(|e| e.to_string())?;
                             need_draw = true;
                         }
+                        // P3-06：终端读取错误 → 明确提示并退出（不遗留线程）。
+                        Some(TerminalInput::TerminalError(message)) => {
+                            eprintln!("终端输入错误，退出 TUI: {message}");
+                            break;
+                        }
                         _ => {}
                     }
                 }
@@ -1271,6 +1284,12 @@ async fn interactive_loop<P: Provider>(
             }
             ui_state.view.push_line(LineKind::System, "─".repeat(40));
         }
+    }
+
+    // P3-06：显式 join 键盘线程（drop receiver 触发线程退出；join 不遗留）。
+    drop(key_rx);
+    if let Err(panic) = key_thread.join() {
+        eprintln!("键盘线程异常退出: {:?}", panic);
     }
 
     // README2 Phase 3：退出前关闭所有 MCP server（不留孤儿进程，§9）。

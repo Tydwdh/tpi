@@ -590,11 +590,20 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   versioned JSON + 明确退出码 ✓；与 TUI 同一 fake provider 等价业务终态 ✓；
   全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P3-06 Terminal input adapter ownership
+#### P3-06 Terminal input adapter ownership — **DONE（2026-08-14）**
 
 - 先给现有 blocking thread 添加 start/shutdown/join contract。
 - EventStream spike 延后到 Phase 6，避免同时改 app 和 paste。
 - 验收：退出/terminal error/ctrl-c 不遗留线程。
+- 实施（src/app/mod.rs）：键盘线程 `std::thread::spawn` 的 JoinHandle 保存为
+  `key_thread`；`TerminalInput` 新增 `TerminalError(String)` 变体（线程 read Err
+  时发送后返回，主循环感知）；interactive_loop 空闲 select 处理 TerminalError →
+  eprintln 明确提示 + break 退出；函数返回前 `drop(key_rx)`（触发线程退出）+
+  `key_thread.join()`（显式 join，不遗留线程），join 失败（panic）记录不阻塞退出。
+  EventStream spike 按计划延后到 P6-06。
+- 验收达成：退出路径显式 join（不遗留线程）✓；terminal error 明确提示并退出 ✓；
+  ctrl-c（Cancel）由既有 Ctrl-C handler 走 cancel（线程随 channel 关闭退出）✓；
+  全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
 ### Exit gate
 
