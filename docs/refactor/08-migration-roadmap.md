@@ -176,11 +176,20 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   - 遗留：`RuntimeEvent::TurnStarted`→`StepStarted`、`view.turn`→`view.step` 在
     P1-03 live/view event 分离时一并改名（live event 非 durable，改名安全）。
 
-#### P1-02 建 domain message/content
+#### P1-02 建 domain message/content — **DONE（2026-08-14）**
 
 - 新类型与现有 `provider::ChatMessage` 并存；写双向 test adapter。
 - session projection 先输出 domain message，provider converter 再生成旧 ChatMessage。
 - 验收：所有 golden model requests byte/semantic 等价；provider-specific field 不进入 domain。
+- 实施（此前已完成，本次补验收标记）：`src/message.rs` 定义 `DomainRole/DomainContentBlock/
+  DomainMessage`（UI/provider agnostic）+ 双向 adapter（ChatMessage→Domain→ChatMessage 往返
+  语义等价）。`src/session/store.rs` 投影链 `events -> project_domain_messages -> ChatMessage`
+  （`replay_domain_messages`/`project_domain_messages`），Conversation 投影经 domain 中间层。
+  provider-specific field（base_url/finish reason 等）不进入 domain。
+- 验收测试 `tests/domain_message.rs`（8 断言）：双向往返语义等价；golden model requests
+  byte/semantic 等价；corpus parity（001_tool_loop 真实 session）。
+- 验收达成：golden model requests byte/semantic 等价 ✓；provider-specific field 不进入
+  domain ✓；全量 52 target 绿。
 
 #### P1-03 拆 live runtime 与 view event — **DONE（2026-08-14）**
 
@@ -218,11 +227,24 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   `src/tui` 的 `use crate::app::` 被拒、恢复通过。tui_fullscreen/reducer/rework 输出
   测试全绿 + 全量 44 target 绿。**P0-07 首个 allowlist 收紧完成**（R1 清零）。
 
-#### P1-05 分解 Config 输出
+#### P1-05 分解 Config 输出 — **DONE（2026-08-14）**
 
 - 保留一个 resolver；引入 domain-specific resolved views。
 - 每次只让一个 owner 接收窄 config。
 - 验收：字段级 merge/unknown rejection 全部保持；default snapshot 不变。
+- 实施（窄视图此前已定义，本次补齐 owner 消费）：`Config` 保留 composition
+  resolver（merge/unknown rejection/default snapshot 不变）；窄视图
+  `AgentConfig`（model/limits/safety_reserve/system_prompt_extra/workspace_root）、
+  `ToolPolicy`（allow_outside_workspace/shell/artifacts/sessions/web_summary）、
+  `UiConfig`（theme/mode/keymap/collapsed_lines）已定义。本次迁移：
+  - `agent::run_inner/compact_turn/build_context` 开头 `config.agent_config()` 投影，
+    函数体内只读 `agent_cfg.*`（不再直接 config.model/limits 等）；
+  - `system_prompt_text(&Config,...)` → `system_prompt_text(Option<&str>,...)`
+    （窄参数：只传 system_prompt_extra）；5 处调用点更新；
+  - tool_runtime 已用 `tool_policy()` 窄视图（P1-05 前完成）。
+- 验收达成：字段级 merge/unknown rejection 由 Config resolver 测试保持；default
+  snapshot 不变；agent owner 只读窄视图。agent 17 + agent_flow 15 断言全绿；
+  全量测试通过；fmt/clippy/arch_gate 清洁。
 
 #### P1-06 main/app composition inventory — **DONE（2026-08-14）**
 

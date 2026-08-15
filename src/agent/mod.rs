@@ -294,6 +294,8 @@ pub async fn run<P: Provider, S: crate::session::store::SessionStore>(
         workspace,
     } = input;
     let run_id = session.begin_run();
+    // P1-05：agent 只读窄视图 AgentConfig（owner 不直接消费全 Config）。
+    let agent_cfg = config.agent_config();
     // O1（P1-07）：一次 public Agent Run = 一个 TraceId；span 用 SpanId。
     // 只在真实边界注入（这里是 agent 的入口边界），后续 follow-up 新 run
     // 生成新 TraceId，跨 run 因果用显式 link（O8/P8 子代理时落地）。
@@ -341,6 +343,8 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
         force_compaction,
         workspace,
     } = input;
+    // P1-05：run_inner 只读窄视图 AgentConfig。
+    let agent_cfg = config.agent_config();
     // §44：run 级耗时基线。
     let run_started = std::time::Instant::now();
 
@@ -359,12 +363,12 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
     session
         .commit(&SessionEvent::RunStarted {
             model: ModelRef {
-                name: config.model.name.clone(),
-                provider: config.model.provider.clone(),
+                name: agent_cfg.model.name.clone(),
+                provider: agent_cfg.model.provider.clone(),
             },
             limits: RunLimits {
-                max_turns: config.limits.max_model_turns,
-                max_tool_calls: config.limits.max_tool_calls,
+                max_turns: agent_cfg.limits.max_model_turns,
+                max_tool_calls: agent_cfg.limits.max_tool_calls,
             },
         })
         .map_err(|e| RunFailure::Session(e.to_string()))?;
@@ -379,11 +383,11 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
     // P2-06：watchdog 逻辑由 Supervisor 直接承载（不再嵌套 spawn_watchdog 的
     // 内部 spawn；保留 limits::spawn_watchdog 供测试与诊断）。
     let mut watchdog_supervisor = crate::process::supervisor::Supervisor::new();
-    if config.limits.max_wall_time_minutes > 0 {
+    if agent_cfg.limits.max_wall_time_minutes > 0 {
         let warn_ui = ui.clone();
         let cause_for_watchdog = cancel_cause.clone();
         let run_cancel = cancel.clone();
-        let wall_secs = config.limits.max_wall_time_minutes.saturating_mul(60);
+        let wall_secs = agent_cfg.limits.max_wall_time_minutes.saturating_mul(60);
         watchdog_supervisor.spawn("agent.watchdog", move |sup_cancel| async move {
             let wall = std::time::Duration::from_secs(wall_secs.max(1));
             let deadline = tokio::time::Instant::now() + wall;
@@ -506,7 +510,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
     // §R4：workspace 由调用方注入（测试可传 remote）；None = Local。
     let active_workspace = workspace.unwrap_or_else(|| {
         let local = crate::workspace::LocalWorkspace::new(
-            config.workspace_root.clone(),
+            agent_cfg.workspace_root.clone(),
             config.allow_outside_workspace,
         );
         crate::workspace::ActiveWorkspace::local(local)
@@ -535,7 +539,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
     let mut compaction_failed = false;
     let final_reason: CompletionReason = 'run_loop: loop {
         // §用户诉求：max_model_turns=0 = 不限制（默认）。
-        if config.limits.max_model_turns > 0 && turn >= config.limits.max_model_turns {
+        if agent_cfg.limits.max_model_turns > 0 && turn >= agent_cfg.limits.max_model_turns {
             session
                 .commit_terminal(&SessionEvent::RunCompleted {
                     reason: CompletionReason::MaxTurns,
@@ -553,13 +557,13 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
         // §15.4：compaction 检查（只在下一次请求前；完整 boundary 之后）。
         // P0-9：投影用请求级估算（system prompt + 计划工具轮 + 工具 schema），
         // 只算 messages 会低估实际请求，导致 compaction 触发过晚。
-        if let Some(context_window) = config.model.context_window {
+        if let Some(context_window) = agent_cfg.model.context_window {
             let usable = crate::context::usable_input(
                 context_window,
-                config.model.max_output_tokens.unwrap_or(0) as u64,
-                config.safety_reserve_tokens,
+                agent_cfg.model.max_output_tokens.unwrap_or(0) as u64,
+                agent_cfg.safety_reserve_tokens,
             );
-            let system_prompt = system_prompt_text(config, None);
+            let system_prompt = system_prompt_text(agent_cfg.system_prompt_extra.as_deref(), None);
             let projected = crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
             if crate::context::should_compact(projected, usable) && !compaction_failed {
                 match compact_turn(
@@ -577,7 +581,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                         ensure_plan_state_messages(&mut messages, plan.as_ref());
                         // P1-4：compaction 成功后若仍无法容纳（窗口过小），
                         // 不再发起普通请求（必然 length error），明确结束并提示用户。
-                        let system_prompt = system_prompt_text(config, None);
+                        let system_prompt = system_prompt_text(agent_cfg.system_prompt_extra.as_deref(), None);
                         let after =
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
@@ -602,7 +606,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                         let plan = tool_runtime.plan_snapshot();
                         ensure_plan_state_messages(&mut messages, plan.as_ref());
                         // P1-4：prune 后仍超窗口（如 user 消息本身巨大）→ 明确结束。
-                        let system_prompt = system_prompt_text(config, None);
+                        let system_prompt = system_prompt_text(agent_cfg.system_prompt_extra.as_deref(), None);
                         let after =
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
@@ -644,7 +648,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
             // §用户诉求（软着陆）：max_model_turns 已配且这是最后一轮时，
             // 在既有 ephemeral 指令上追加收尾提示（turn 在循环开头已 ++，
             // 第 max 轮检查通过后 ++ 到 max = 最后一轮）。
-            if config.limits.max_model_turns > 0 && turn == config.limits.max_model_turns {
+            if agent_cfg.limits.max_model_turns > 0 && turn == agent_cfg.limits.max_model_turns {
                 let base = ephemeral_system.take().unwrap_or_default();
                 ephemeral_system = Some(if base.is_empty() {
                     FINAL_TURN_INSTRUCTION.to_string()
@@ -659,7 +663,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
             let ws_snapshot = tool_runtime.workspace_snapshot();
             let process_snapshot = tool_runtime.processes_snapshot();
             let request = ModelRequest {
-                model: config.model.name.clone(),
+                model: agent_cfg.model.name.clone(),
                 messages: build_context(
                     config,
                     &messages,
@@ -669,18 +673,18 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                     process_snapshot.as_deref(),
                 ),
                 tools: tool_defs.clone(),
-                max_output_tokens: config.model.max_output_tokens,
-                reasoning: config.model.reasoning.clone(),
-                context_window: config.model.context_window,
+                max_output_tokens: agent_cfg.model.max_output_tokens,
+                reasoning: agent_cfg.model.reasoning.clone(),
+                context_window: agent_cfg.model.context_window,
             };
             // 上下文占用投影（TUI 用量条；请求前发送）。
-            if let Some(window) = config.model.context_window {
+            if let Some(window) = agent_cfg.model.context_window {
                 let usable = crate::context::usable_input(
                     window,
-                    config.model.max_output_tokens.unwrap_or(0) as u64,
-                    config.safety_reserve_tokens,
+                    agent_cfg.model.max_output_tokens.unwrap_or(0) as u64,
+                    agent_cfg.safety_reserve_tokens,
                 );
-                let system_prompt = system_prompt_text(config, ephemeral_system.as_deref());
+                let system_prompt = system_prompt_text(agent_cfg.system_prompt_extra.as_deref(), ephemeral_system.as_deref());
                 let projected =
                     crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                 let _ = ui.send(LiveEvent::ContextUsage { projected, usable }).await;
@@ -939,7 +943,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
         // 什么 finish reason、多少 token”的诊断行。
         tracing::debug!(
             turn,
-            model = %config.model.name,
+            model = %agent_cfg.model.name,
             tool_count = response.tool_calls.len(),
             finish_reason = ?response.finish_reason,
             input_tokens = response.usage.input_tokens,
@@ -1279,6 +1283,8 @@ async fn compact_turn<P: Provider, S: crate::session::store::SessionStore>(
     cancel: &CancellationToken,
     usage_total: &mut Usage,
 ) -> Result<(), CompactionFailure> {
+    // P1-05：compact_turn 只读窄视图 AgentConfig。
+    let agent_cfg = config.agent_config();
     // 1. 先 prune 大 tool output（§15.3）。
     // P0-3：以 runtime messages 计算压缩内容（与调用方看到的上下文一致）；
     // 用 session 投影计算 covered 边界——正常路径下两者消息数一致，
@@ -1330,14 +1336,14 @@ async fn compact_turn<P: Provider, S: crate::session::store::SessionStore>(
     // 若先等 stream 返回再收事件，事件数超过 channel 容量时双方互相等待（死锁）。
     let (event_tx, mut event_rx) = mpsc::channel(crate::provider::EVENT_CHANNEL_CAPACITY);
     let request = ModelRequest {
-        model: config.model.name.clone(),
+        model: agent_cfg.model.name.clone(),
         messages: crate::context::compaction_request_messages(&history),
         tools: Vec::new(), // §15.4：compaction request 不提供任何工具 schema。
         // §用户诉求：摘要输出预算 1024 → 2048——大历史（300k 窗口）下
         // 1024 token 偏小，摘要被截断更容易丢核心字段。
         max_output_tokens: Some(2048),
-        reasoning: config.model.reasoning.clone(),
-        context_window: config.model.context_window,
+        reasoning: agent_cfg.model.reasoning.clone(),
+        context_window: agent_cfg.model.context_window,
     };
     let stream = provider.stream(request, event_tx, cancel.clone());
     tokio::pin!(stream);
@@ -1421,9 +1427,9 @@ fn accumulate_usage(total: &mut Usage, additional: Usage) {
 ///
 /// `ephemeral_system` 是 harness control metadata（如续写 recovery instruction）：
 /// 只在本次 request 出现，不进 session、不进对话投影，也不伪装成 User 消息。
-fn system_prompt_text(config: &Config, ephemeral_system: Option<&str>) -> String {
+fn system_prompt_text(system_prompt_extra: Option<&str>, ephemeral_system: Option<&str>) -> String {
     let mut system = DEFAULT_SYSTEM_PROMPT.to_string();
-    if let Some(extra) = &config.system_prompt_extra {
+    if let Some(extra) = system_prompt_extra {
         system.push_str("\n\n");
         system.push_str(extra);
     }
@@ -1479,9 +1485,11 @@ fn build_context(
     workspace: Option<&crate::workspace::ActiveWorkspace>,
     process_snapshot: Option<&str>,
 ) -> Vec<ChatMessage> {
+    // P1-05：build_context 只读窄视图 AgentConfig。
+    let agent_cfg = config.agent_config();
     let mut out = Vec::with_capacity(messages.len() + 3);
     out.push(ChatMessage::System(system_prompt_text(
-        config,
+        agent_cfg.system_prompt_extra.as_deref(),
         ephemeral_system,
     )));
     // §53：workspace identity 属于 Harness Context——每轮注入一条 system
