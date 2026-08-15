@@ -537,11 +537,21 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   引用 Crossterm/Ratatui ✓；全量 53 target 绿；fmt/clippy/arch_gate 清洁。
   P3-03（slash registry）/P3-05（headless）基于 controller。
 
-#### P3-03 Slash command registry
+#### P3-03 Slash command registry — **DONE（2026-08-14）**
 
 - 仅把命令 parse/dispatch 从 giant match 移到 typed command definitions；危险命令保留确认 policy。
 - 命令 registration 暂时静态，不急于开放第三方。
 - 验收：help/completion/dispatch 来自同一 snapshot；旧命令 golden。
+- 实施：`src/app/slash.rs` 新增 typed registry：`SlashCommandSpec{name,desc,dangerous}` +
+  `SLASH_COMMANDS`（14 条单一来源）+ `command_from_slash`（dispatch，从 P3-01 移入
+  registry 同源）+ `help_lines`。TUI 的 `SLASH_COMMANDS` 改为 registry 投影（形状兼容）；
+  app/mod.rs 迭代改 spec 字段。危险命令标记（new/compact/retry/quit）；确认 policy 由
+  dispatcher（旧 pump）保留。
+- 验收测试：`app::slash` 3 断言（dispatch 覆盖 registry 且无孤儿、name 唯一、首项 help
+  安全）；`tests/app_intent.rs` 增 golden（TUI 投影 == registry，help/completion/dispatch
+  同一 snapshot）。旧命令 golden（slash 映射与旧 pump 一致）由 app_intent 既有测试保持。
+- 验收达成：help/completion/dispatch 来自同一 snapshot ✓；旧命令 golden ✓；全量 53
+  target 绿；fmt/clippy/arch_gate 清洁。
 
 #### P3-04 Platform effects adapter
 

@@ -162,3 +162,15 @@ fn slash_commands_map_to_app_commands() {
     assert_eq!(command_from_slash("普通消息"), None);
     assert_eq!(command_from_slash("/unknown-cmd"), None);
 }
+
+/// P3-03 golden：TUI 的 SLASH_COMMANDS 投影与 app::slash registry 完全一致
+/// （help/completion 来自同一 snapshot，双份数据不允许漂移）。
+#[test]
+fn tui_slash_commands_match_registry() {
+    let tui_list: Vec<(&str, &str)> = tpi::tui::SLASH_COMMANDS.to_vec();
+    let registry: Vec<(&str, &str)> = tpi::app::slash::SLASH_COMMANDS
+        .iter()
+        .map(|s| (s.name, s.desc))
+        .collect();
+    assert_eq!(tui_list, registry, "TUI 投影必须与 registry 一致");
+}

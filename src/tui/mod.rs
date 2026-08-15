@@ -69,10 +69,9 @@ pub fn activity_height(rows: u16) -> u16 {
 /// spinner 动画帧（§16.1：动画时钟独立，活动时推进）。
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// 斜杠命令单一来源（/help 与补全菜单共用；描述原生中文，§16.3）。
+/// 斜杠命令单一来源（P3-03：由 app::slash registry 投影；help/补全共用）。
+/// 内容与 `app::slash::SLASH_COMMANDS` 一致（golden 测试强制同步）。
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
-    // “/ + 回车”默认选中第一项：首项必须是安全命令（help），
-    // 不能是 quit，否则探索菜单时输“/”再回车会直接退出。
     ("help", "显示帮助与快捷键"),
     ("settings", "查看生效配置及来源"),
     ("model", "查看当前模型"),
