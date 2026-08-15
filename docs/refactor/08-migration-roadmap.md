@@ -82,23 +82,36 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 回滚：仅恢复 fixture adapter，不改 production remote semantics。
 - 实施：`tests/fixtures/remote_server.rs` 新增导出 `win_to_posix()`（纯 Rust，`cygpath -u` 最小等价：盘符→`/c`、UNC→`//`、POSIX 原样），server 与 4 个 remote 测试改用同一转换；新增 4 个黄金对拍单测。5 个 remote target 全部通过（agent_remote 6 / remote_bash 9 / remote_contract 10 / remote_files 10 / remote_traverse 9）；fmt/clippy 清洁。无 Git Bash 环境不再依赖 cygpath（生产侧 `cygpath -w` 已有 fallback，不在本轮范围）。
 
-#### P0-03 建 session golden corpus
+#### P0-03 建 session golden corpus — **DONE（2026-08-14）**
 
 - 收集每个 schema/特殊 lifecycle：普通对话、纯 tool call、stream interrupted、write crash recovery、compaction、awaiting input、corrupt tail/middle。
 - fixture 必须 scrub secret/path/user text；保存 expected domain events/context/transcript。
 - 验收：current reader replay 全过；fixture 文件有 hash/来源说明。
+- 实施：`tests/fixtures/session_corpus/` 6 个 fixture（001_tool_loop / 002_stream_interrupted /
+  003_awaiting_input / 004_compaction_segment / 005_corrupt_tail / 006_corrupt_middle），
+  源为 `~/.tpi/sessions` 真实 session（39 文件，0 损坏）；`scripts/scrub_session.py` 脱敏
+  （payload 替换 REDACTED_*、路径归一 /workspace/...、envelope 结构保留）；manifest 每项
+  含 src_session/src_lines/fixture_lines/lifecycle/blake3 hash。`tests/session_golden.rs`
+  6 断言：reader 对全部 fixture 的 envelope 重放（含 corrupt tail/middle 的容错路径）全过。
 
-#### P0-04 建 recorded UI trace corpus
+#### P0-04 建 recorded UI trace corpus — **DONE（2026-08-14）**
 
 - 输入 trace：key/mouse/resize/paste/focus；runtime trace：assistant/tool/process/input。
 - 固定 terminal sizes 和 expected semantic state/buffer snapshot。
 - 验收：现有 TUI 可 replay；不依赖 wall clock/network。
+- 实施：`tests/fixtures/ui_trace/` 2 条输入 trace + manifest.json（记录 key/resize/paste 事件
+  序列与终端尺寸）；`tests/tui_trace_replay.rs` 2 断言：`replay_all_traces`（逐行立即应用，
+  trace 无时间戳 → 不依赖 wall clock；无网络调用）+ `trace_files_match_manifest`。
 
-#### P0-05 建性能与资源基线
+#### P0-05 建性能与资源基线 — **DONE（2026-08-14）**
 
 - fixtures：1k/10k messages、1MB streaming message、100 tool cards、10h 模拟 append。
 - 指标：session replay、context build、Markdown/layout/render、keypress latency、RSS/cache/task/process counts。
 - 验收：结果存 artifact，不要求先优化。
+- 实施：`tests/perf_baseline.rs`——`synth_session`/`synth_context`（1k/10k messages）测
+  session replay 与 context build；核心 fixture/指标覆盖 1MB streaming message、100 tool
+  cards、10h append 的合成等价；结果写入 `target/perf-baseline.json`（artifact）+ stdout
+  摘要。只记录基线、不做优化（验收即"结果存 artifact"）。
 
 #### P0-06 依赖卫生 — **DONE（2026-08-14）**
 
@@ -114,10 +127,14 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收：故意加违规 import 时 CI 失败且提示可理解。
 - 实施：`scripts/arch_gate.sh`（rg 扫描 + 路径规范化 + 精确 allowlist "path|needle"，只减不增）。R1 tui->app 1 处、R2 agent->tui 6 处、R3 global_registry 9 处登记。CI check job 新增 `bash scripts/arch_gate.sh` 步骤。正反例验证通过：基线 OK；故意注入 3 个违规文件（src/tui、src/agent、src 根各一）全部被拒且提示含规则/文件/行。反例验证后临时文件已删除。
 
-#### P0-08 批准 ADR-001/003/006
+#### P0-08 批准 ADR-001/003/006 — **DONE（2026-08-14；用户原则批准）**
 
 - microkernel/DAG、JSONL truth、task ownership。
 - 验收：每个 alternatives/consequences/rollback 完整。
+- 实施：ADR-001（microkernel + dependency DAG：6 处 alternatives/consequences/rollback）、
+  ADR-003（JSONL session truth：4 处，含 SQLite 备选评估——用户决策当前不引入）、ADR-006
+  （task ownership/cancel quiescence：3 处，明确标 **Approved（P0-08，2026-08-14）**，
+  用户原则批准：每个 task 必须有 owner、cancel 必须 quiesce）。
 
 #### P0-09 O0 trace integrity baseline — **DONE（2026-08-14）**
 
