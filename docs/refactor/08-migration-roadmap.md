@@ -1171,9 +1171,18 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收测试（3 断言）：max_concurrent=2 时 4 请求峰值并发 <= 2 + source order
   保持；max_concurrent=1 严格串行；output cap 截断。subagent 共 8 断言全绿。
 
-#### P8-06 child TUI
+#### P8-06 child TUI - **DONE（2026-08-14，summary card 数据链路）**
 
 - summary card/tree/details/cancel；不把 raw stream默认灌主 transcript。
+- 实施：`LiveEvent::SubagentReported` + `RuntimeEvent::SubagentReported`
+  （child_session/summary/evidence）；`InProcessChildProvider.with_report_tx`
+  （child 完成时经 report 通道发事件，None = 不投影 TUI）；child 内部 ui_tx
+  仍 drain（child 流式事件不投影主 transcript，raw stream 不灌入）；app
+  project_live_event 映射 + headless json_event 归入 notice；tui reducer 投影
+  为系统行（summary + evidence 列表）。tree/details/cancel 依赖 child 进程内
+  状态展示，需 P8-06 完整 UI 组件（当前为 summary 行级展示）。
+- 验收测试：child 发 SubagentReported（summary 与 report 一致）；TUI 投影系统
+  行（summary + evidence）。
 
 #### P8-07 isolated worktree provider
 
