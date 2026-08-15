@@ -1480,8 +1480,31 @@ fn build_transcript_text(
         let decor_cells = line_width.saturating_sub(text_width);
         // 有装饰前缀（rail/icon）时记住首个 span：wrap 折行后续行补同一前缀
         // （§用户诉求：换行竖线不截断）。纯装饰/空行（decor=0）无 rail。
+        //
+        // BUG 修复（长行折行重复）：System/Tool 行用 `Line::styled` 构造，
+        // 整个"前缀 + 正文"是**单个 span**——若直接取首个 span 作 rail，
+        // 折行时每行续段都会 push 完整长文本，屏幕出现整段重复（用户报告：
+        // "长系统提示打印了两行重复的"）。rail 必须只含前缀（decor_cells
+        // 宽），超宽时按 cell 宽度截取；User 行的独立短 rail span 不受影响。
         let rail = if decor_cells > 0 {
-            line.spans.first().cloned()
+            line.spans.first().cloned().map(|span| {
+                let span_w = unicode_width::UnicodeWidthStr::width(span.content.as_ref());
+                if span_w <= decor_cells {
+                    span
+                } else {
+                    let mut taken = String::new();
+                    let mut w = 0usize;
+                    for ch in span.content.chars() {
+                        let cw = crate::text::char_cell_width(ch);
+                        if w + cw > decor_cells {
+                            break;
+                        }
+                        taken.push(ch);
+                        w += cw;
+                    }
+                    Span::styled(taken, span.style)
+                }
+            })
         } else {
             None
         };

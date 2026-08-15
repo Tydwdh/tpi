@@ -1169,6 +1169,71 @@ fn overlay_clears_background_before_rendering() {
     );
 }
 
+/// 用户报告：长系统提示本应折成两行，却打印了两行重复内容。
+/// 用窄视口渲染一条超长 System 行，断言屏幕行内容互不相同且无重复。
+///
+/// 注意：TestBackend 中 CJK 双宽字符占用两个 cell（第二个为空白占位），
+/// 逐 cell 拼接会混入空格——本测试用**纯 ASCII** 长文本触发同一 bug
+///（单 span 长行 → rail 误取整个 span），避免表示层干扰。
+#[test]
+fn long_system_line_wraps_without_duplication() {
+    let mut view = ViewModel::default();
+    // 每个 token 唯一，便于检测重复。
+    let long_text: String = (0..40)
+        .map(|i| format!("word{i} "))
+        .collect::<String>()
+        .repeat(2);
+    view.push_line(LineKind::System, long_text.clone());
+    let width = 30u16;
+    // 高度要容纳全部折行行（follow 窗口只显示底部 N 行，窄视口会滚出开头）。
+    let buf = draw_to_test_backend(&mut view, width, 30);
+    // 提取每行渲染出的文本（去掉尾部空白）。
+    let mut rendered_lines: Vec<String> = Vec::new();
+    for y in 0..30u16 {
+        let mut row = String::new();
+        for x in 0..width {
+            row.push_str(buf[(x, y)].symbol());
+        }
+        let trimmed = row.trim_end().to_string();
+        if !trimmed.is_empty() {
+            rendered_lines.push(trimmed);
+        }
+    }
+    assert!(
+        rendered_lines.len() > 1,
+        "超长行必须折成多行: {:?}",
+        rendered_lines
+    );
+    // 不允许出现完全相同的两行（重复折行 bug 的特征：每行都从头重复同一段）。
+    let mut seen = std::collections::HashSet::new();
+    for line in &rendered_lines {
+        assert!(
+            seen.insert(line.clone()),
+            "折行结果出现重复行（重复渲染 bug）: {line:?}\n全部行: {rendered_lines:?}"
+        );
+    }
+    // 语义校验：整段文本被完整呈现（剥离 "系统 " 前缀后拼接）。
+    let joined: String = rendered_lines.join("");
+    for token in ["word0", "word5", "word20", "word39"] {
+        assert!(
+            joined.contains(token),
+            "折行不得丢失内容片段 {token}: {rendered_lines:?}"
+        );
+    }
+    // 每行必须前进（续行从上次断点继续，而不是回到开头）。
+    // 第一行应包含行首 token，最后一行应包含行尾 token（内容完整覆盖）。
+    assert!(
+        rendered_lines.first().unwrap().contains("word0"),
+        "首行必须从内容开头开始: {:?}",
+        rendered_lines.first()
+    );
+    assert!(
+        rendered_lines.iter().any(|l| l.contains("word39")),
+        "末段内容必须出现（不得被吞）: {:?}",
+        rendered_lines
+    );
+}
+
 /// Menu also floats over the transcript: unselected rows must not bleed background text.
 #[test]
 fn menu_clears_background_before_rendering() {
@@ -3830,3 +3895,4 @@ mod question_modal_tests {
         }
     }
 }
+
