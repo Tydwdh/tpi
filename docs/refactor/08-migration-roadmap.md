@@ -1039,10 +1039,14 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   tpi-core/revision.rs（tool::edit 与 context re-export 保持路径）；session 内部
   引用改 tpi_core::；主 crate `pub use tpi_session as session` 保持 `crate::session`
   路径零改动；tpi-session 独立 26 断言绿；全量 56 target 绿。
-- **剩余**：capabilities（tool 10768/shell/workspace/process/mcp）-> agent（3257）
-  -> TUI（17524）-> adapters/CLI（约 1.1 万行）。后续每步：目标模块移入新
-  crate + 全局 `crate::X` 引用改 `tpi_xxx::X` + 主 crate re-export 兼容 +
-  零行为验证。
+- **第 3 步（2026-08-14，提交 1be20ee）**：拆出 `tpi-capabilities` crate
+  （crates/tpi-capabilities）——tool/shell/workspace/process/mcp/remote/skills
+  7 模块约 1.4 万行 git mv；`tpi_home` 下沉 tpi-core::util；`ReadOnlyCapability`
+  下沉 capabilities::tool::registry（subagent re-export）；capabilities 独立
+  158 断言绿；全量 56 target 绿。
+- **剩余**：agent（agent/context/provider/subagent）-> TUI（17524）-> adapters/
+  CLI（约 1.1 万行）。后续每步：目标模块移入新 crate + 全局 `crate::X` 引用改
+  `tpi_xxx::X` + 主 crate re-export 兼容 + 零行为验证。
 
 #### P7-03 feature audit
 
