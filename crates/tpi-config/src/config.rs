@@ -92,6 +92,8 @@ pub struct ContextFile {
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct ShellFile {
+    /// 预留的 shell 类型（如 `git-bash`）。**尚未接线**：运行时只消费 `path`
+    /// （未配置时自动查找 Git Bash），设置 `kind` 不会改变行为（ISSUE-020）。
     pub kind: Option<String>,
     /// 显式 Git Bash 路径（§11.2 解析顺序第 1 位）。
     pub path: Option<String>,
@@ -181,14 +183,15 @@ pub struct Config {
     pub system_prompt_extra: Option<String>,
     /// 配置来源（`/settings` 展示用）。
     pub source: String,
-    /// §16.3 [ui] theme：omp / dark / light（P2：主题可选，默认 omp）。
+    /// §16.3 [ui] theme：omp / dark / light / opencode / onedarkpro；默认
+    /// **onedarkpro**（无 `[ui]` 配置时的实际值；未知主题回退 omp）。
     pub ui_theme: String,
     /// §1 [ui] mode：fullscreen（默认）/ inline（兼容模式）。
     pub ui_mode: tpi_ui_types::ViewMode,
     /// §成熟化 [ui] keymap：动作 → 按键覆盖（未配置动作保持内建默认）。
     pub ui_keymap: tpi_ui_types::Keymap,
     /// §用户诉求 [ui] collapsed_lines：卡片折叠时显示的正文行数（thinking/工具
-    /// 卡片统一）；默认 10；0 = 折叠态只显示主行摘要。
+    /// 卡片统一）；默认 0 = 折叠态只显示主行摘要。配置如 `collapsed_lines = 10`。
     pub ui_collapsed_lines: usize,
     /// §9.1：文件工具（read/edit/write/list/search）是否允许访问 workspace 外路径。
     /// 默认 true（bash 本来就能自由访问，保持一致）；false 恢复严格沙箱。

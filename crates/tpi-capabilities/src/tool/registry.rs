@@ -245,31 +245,44 @@ impl ToolRegistry {
             .map(|(_, tool)| tool.clone())
     }
 
-    /// 全量目录（Phase 5 的 ToolSelector 在此之上做选择；overlay 优先去重）。
+    /// 全量目录（Phase 5 的 ToolSelector 在此之上做选择）。
+    /// ISSUE-011：必须与 [`Self::get`] 的 **overlay 优先**语义一致——overlay
+    /// 覆盖同名 root 时，列表里必须是 overlay 工具（此前 list/descriptors 展示
+    /// root，执行却用 overlay，模型按错误 schema 构造参数）。
     pub fn list(&self) -> Vec<Arc<dyn Tool>> {
-        let mut out: Vec<Arc<dyn Tool>> =
-            self.tools.values().map(|(_, tool)| tool.clone()).collect();
-        // overlay 覆盖同名 root（只追加 overlay 独有的）。
-        for (name, (_, tool)) in &self.overlay {
-            if !self.tools.contains_key(name) {
-                out.push(tool.clone());
-            }
+        let mut out: Vec<Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .filter(|(name, _)| !self.overlay.contains_key(name.as_str()))
+            .map(|(_, (_, tool))| tool.clone())
+            .collect();
+        for (_, tool) in self.overlay.values() {
+            out.push(tool.clone());
         }
         out
     }
 
-    /// 发给模型的描述（Phase 5 前 = 全量）。
+    /// 发给模型的描述（Phase 5 前 = 全量；overlay 优先语义同 [`Self::list`]）。
     pub fn descriptors(&self) -> Vec<ToolDescriptor> {
         let mut out: Vec<ToolDescriptor> = self
             .tools
-            .values()
-            .map(|(_, tool)| ToolDescriptor {
+            .iter()
+            .filter(|(name, _)| !self.overlay.contains_key(name.as_str()))
+            .map(|(_, (_, tool))| ToolDescriptor {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
                 parameters: tool.input_schema(),
                 origin: tool.origin(),
             })
             .collect();
+        for (_, tool) in self.overlay.values() {
+            out.push(ToolDescriptor {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.input_schema(),
+                origin: tool.origin(),
+            });
+        }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -636,6 +649,19 @@ async fn overlay_covers_root_and_unregisters_by_id() {
     let overlay = ToolRegistry::register_overlay(&registry, make("read")).unwrap();
     assert!(registry.lock().unwrap().overlay_has("read"));
     assert!(registry.lock().unwrap().get("read").is_some());
+    // ISSUE-011：list/descriptors 必须与 get 同源（overlay 优先）——
+    // overlay 覆盖 root 时只展示 overlay 工具，不展示被遮蔽的 root。
+    {
+        let reg = registry.lock().unwrap();
+        let listed: Vec<String> = reg.list().iter().map(|t| t.name().to_string()).collect();
+        assert_eq!(
+            listed,
+            vec!["read"],
+            "overlay 覆盖 root 时列表只含 overlay: {listed:?}"
+        );
+        let desc: Vec<String> = reg.descriptors().iter().map(|d| d.name.clone()).collect();
+        assert_eq!(desc, vec!["read"], "descriptors 同样只含 overlay: {desc:?}");
+    }
     // 注销 overlay（按 id）→ root 的 read 恢复可见。
     let mut overlay = overlay;
     overlay.unregister();
@@ -644,6 +670,7 @@ async fn overlay_covers_root_and_unregisters_by_id() {
         registry.lock().unwrap().get("read").is_some(),
         "root 层不受 overlay 注销影响"
     );
+    assert_eq!(registry.lock().unwrap().list().len(), 1);
 }
 
 /// P4-08：setup transaction——任一工具验证失败时全部回滚（无副作用）。

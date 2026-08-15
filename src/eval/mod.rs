@@ -544,8 +544,16 @@ pub async fn run_task(
     };
 
     // 5. 事件统计（读取 session 文件）。
-    let events =
-        read_events_with_ts(session.path()).map_err(|e| format!("读取 session 事件失败: {e}"))?;
+    // ISSUE-028：读取失败（如超时取消后留下半行 session 尾部）必须**降级**为
+    // 空统计而不是向上传播——否则超时评测不落任何结果文件（wall_time/verify
+    // 全丢）。统计只是诊断信息，验收断言（verify）才是核心判定。
+    let events = match read_events_with_ts(session.path()) {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::warn!("读取 session 事件失败（降级为空统计）: {e}");
+            Vec::new()
+        }
+    };
     let stats = stats_from_events(&events);
 
     // 6. 验收断言。

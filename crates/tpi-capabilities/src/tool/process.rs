@@ -217,7 +217,7 @@ async fn cancel_process(ctx: &ToolContext, id: ProcessId) -> ToolOutcome {
                 "status: cancelled\nprocess_id: {id}\neffect: process_tree_terminated\n\n进程树已终止（TerminateJobObject）。"
             ),
         ),
-        Some(state) => {
+        Some(state) if state.is_terminal() => {
             // 终止已发生但状态分类不同（如进程恰在取消窗口内自行退出）。
             ToolOutcome::succeeded(
                 "process",
@@ -227,6 +227,15 @@ async fn cancel_process(ctx: &ToolContext, id: ProcessId) -> ToolOutcome {
                 ),
             )
         }
+        // ISSUE-010：超时仍未进入终态（拒绝快速终止的进程树）——
+        // 取消**已发出**但终止**未确认**，必须如实报告而非宣称已终止。
+        Some(state) => ToolOutcome::succeeded(
+            "process",
+            format!(
+                "status: {}\nprocess_id: {id}\nnote: 取消请求已发送，但 3 秒内未确认进程树终止（可能仍有子进程未响应）；可再次 status/wait 确认，或用 kill 强制。",
+                state.name()
+            ),
+        ),
         None => not_found(id),
     }
 }

@@ -58,8 +58,20 @@ pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
             state.env_overlay.unset.clone(),
         )
     };
+    // 远端路径按字面（POSIX）；相对 cwd 必须基于远端 session cwd 解析
+    // （ISSUE-022：远端每次 fresh exec channel 初始 cwd 是登录主目录，
+    // 相对路径直接 `cd 'src'` 会相对 `~` 解析，与本地语义不一致）。
     let exec_cwd = match &args.cwd {
-        Some(path) => path.clone(), // 远端路径按字面（POSIX）
+        Some(path) if path.starts_with('/') => path.clone(),
+        Some(path) => {
+            // 相对路径：拼到 session cwd 后（`cd '/repo/src'`），
+            // 避免误落到登录主目录。
+            if session_cwd.ends_with('/') {
+                format!("{session_cwd}{path}")
+            } else {
+                format!("{session_cwd}/{path}")
+            }
+        }
         None => session_cwd.clone(),
     };
 
@@ -67,13 +79,18 @@ pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
     // 保留用户命令的真实 exit code（同本地 wrapper 语义）。
     let nonce = uuid::Uuid::now_v7().simple().to_string();
     let mut prefix = String::new();
+    // ISSUE-039：env key 也必须 shell_quote——远端 env 可能含 shell 元字符
+    // 的变量名（`env 'A;B=1'`），未引用直接拼进 `export` 前缀可被展开执行
+    //（模型已有 shell 权限，属防御纵深）。
     for (k, v) in &overlay_set {
-        prefix.push_str(&format!("export {k}={}; ", shell_quote(v)));
+        prefix.push_str(&format!("export {}={}; ", shell_quote(k), shell_quote(v)));
     }
     for k in &overlay_unset {
-        prefix.push_str(&format!("unset {k}; "));
+        prefix.push_str(&format!("unset {}; ", shell_quote(k)));
     }
-    prefix.push_str(&format!("cd {}; ", shell_quote(&exec_cwd)));
+    // ISSUE-022：cd 失败必须中止（`cd x || exit 127`），否则命令在错误
+    // 目录继续执行并污染 session cwd 语义。
+    prefix.push_str(&format!("cd {} || exit 127; ", shell_quote(&exec_cwd)));
     let capture = format!(
         "printf '\\n__TPI_CAPTURE_BEGIN_{nonce}__\\n'; printf '%s\\n' \"$PWD\"; env; printf '__TPI_CAPTURE_END_{nonce}__\\n'"
     );
@@ -297,6 +314,10 @@ async fn capture_remote_baseline(
     let capture = format!(
         "printf '\\n__TPI_CAPTURE_BEGIN_{nonce}__\\n'; printf '%s\\n' \"$PWD\"; env; printf '__TPI_CAPTURE_END_{nonce}__\\n'"
     );
+    // ISSUE-007：baseline 捕获必须受超时约束（与本地 capture_baseline 一致）。
+    // 此前裸 .await——SSH 连接半死时 `channel.wait()` 无限挂起，且执行期间
+    // 持有 client 锁，后续所有远端命令排队。超时/失败只记 warn（下次重试），
+    // 不阻塞主命令。
     let result = {
         let mut client = client.lock().await;
         if client.connection_state() != ConnectionState::Connected {
@@ -309,10 +330,19 @@ async fn capture_remote_baseline(
             }
         }
         let empty: HashMap<String, String> = HashMap::new();
-        match client.exec(&capture, None, &empty, None).await {
-            Ok(r) => r,
-            Err(e) => {
+        let guarded = tokio::time::timeout(
+            std::time::Duration::from_millis(crate::tool::command::DEFAULT_TIMEOUT_MS),
+            client.exec(&capture, None, &empty, None),
+        )
+        .await;
+        match guarded {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "remote baseline capture 执行失败；env 跟踪跳过");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("remote baseline capture 超时；env 跟踪跳过");
                 return;
             }
         }

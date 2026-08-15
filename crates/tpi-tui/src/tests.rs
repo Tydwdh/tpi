@@ -1717,6 +1717,28 @@ fn search_highlight_underlines_matched_entries() {
     assert!(unmatched_not_underlined, "未命中条目不得带下划线");
 }
 
+/// ISSUE-030：搜索词清空后必须恢复 follow（此前视口停在旧命中位置，
+/// 用户关闭搜索后以为内容丢了）。
+#[test]
+fn clearing_search_query_restores_follow() {
+    use crate::scroll::ScrollMode;
+    let mut view = ViewModel::default();
+    view.push_line(LineKind::Assistant, "第一条 hello 内容");
+    view.push_line(LineKind::Assistant, "第二条 world 内容");
+    view.open_search();
+    // 命中 → 锁定（离开 follow）。
+    view.update_search_query("hello");
+    assert!(matches!(view.scroll_mode, ScrollMode::Locked(_)));
+    // 删空搜索词 → 恢复 follow（ISSUE-030）。
+    view.update_search_query("");
+    assert!(
+        matches!(view.scroll_mode, ScrollMode::Follow),
+        "空搜索词必须恢复 follow: {:?}",
+        view.scroll_mode
+    );
+    assert_eq!(view.pending_below, 0);
+}
+
 /// §视觉瘦身：不再有常驻 header（信息并入 footer）；消息双角色 rail（you/AI）。
 #[test]
 fn role_rails_render_without_header() {

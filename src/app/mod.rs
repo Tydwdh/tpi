@@ -647,7 +647,7 @@ where
     };
     view.push_line(
         LineKind::System,
-        "TPI：/help 查看命令与快捷键 · Esc 取消当前 run · 空闲 Ctrl+C 连按两次退出",
+        "TPI：/help 查看命令与快捷键 · Esc 取消当前 run · Ctrl+C 复制选区 · Ctrl+D 退出",
     );
     // README2 Phase 3：启动 MCP servers（从 ~/.tpi/config.toml；无配置则无操作）。
     {
@@ -1796,7 +1796,7 @@ web_search: DuckDuckGo（免费，无需 API key）
                         Ctrl+Home 顶部 · Ctrl+End 最新 · Modal ↑/↓ 滚动 ·
                         点击工具卡片（任意行）展开 · 悬停卡片微高亮 ·
                         点击链接打开 · 拖选自动滚动 ·
-                        Esc 取消 run · Ctrl+C 有选区复制/运行中取消/空闲连按两次退出
+                        Esc 取消 run · Ctrl+C 复制选区 · Ctrl+D 退出（运行中先取消）
                         键位可在配置 [ui.keymap] 中自定义（/settings 查看当前绑定）",
             );
             ui_state.view.open_modal("/help", text);
@@ -2422,13 +2422,23 @@ async fn run_interactive<P: Provider>(
                                         }
                                     }
                                 }
-                                UiEffect::Quit
-                                | UiEffect::ResumeSession(_)
+                                UiEffect::Quit => {
+                                    // ISSUE-015：运行中 Ctrl+D 此前被静默丢弃
+                                    //（注释"run 中不会产生"为假——reducer 对
+                                    // QuitApp 无条件产出 Quit）。运行中直接退出
+                                    // 会丢失 run 状态；改为取消当前 run，并在
+                                    // run 结束后提示用户再次 Ctrl+D 退出。
+                                    cancel.cancel();
+                                    ui_state.view.transient_hint = Some(
+                                        "已取消当前 run（Ctrl+D 需空闲时再次按下才退出）".into(),
+                                    );
+                                }
+                                UiEffect::ResumeSession(_)
                                 | UiEffect::OpenUrl(_)
                                 | UiEffect::CopyText(_)
                                 | UiEffect::QuestionSubmitted(_)
                                 | UiEffect::QuestionRejected => {
-                                    // run 中不会产生（reducer 仅空闲时产生）。
+                                    // 上述效果 run 中不会产生（reducer 仅空闲时产生）。
                                 }
                             }
                         }

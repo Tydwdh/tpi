@@ -542,8 +542,12 @@ fn locate_trailing_insensitive(haystack: &str, old_text: &str) -> Option<(usize,
     if hay_lines.len() < old_lines.len() {
         return None;
     }
+    // ISSUE-003：全窗口 O(N×L) 扫描在百万行文件上可达数十秒；宽容定位只需
+    // 在邻近区域找到唯一命中，限定窗口上限（找不到时安全返回 None，由
+    // diagnose_no_match 给出结构化诊断）。
+    const MAX_LOCATE_WINDOWS: usize = 20_000;
     let mut hits = Vec::new();
-    for win in 0..=hay_lines.len() - old_lines.len() {
+    for win in 0..=(hay_lines.len() - old_lines.len()).min(MAX_LOCATE_WINDOWS) {
         let mut ok = true;
         for i in 0..old_lines.len() {
             let (hs, he) = hay_lines[win + i];
@@ -583,8 +587,11 @@ fn locate_uniform_indent(haystack: &str, old_text: &str) -> Option<(usize, usize
     if hay_lines.len() < old_lines.len() {
         return None;
     }
+    // ISSUE-003：全窗口 O(N×L) 扫描在百万行文件上可达数十秒；宽容定位只需
+    // 在邻近区域找到唯一命中，限定窗口上限（找不到时安全返回 None）。
+    const MAX_LOCATE_WINDOWS: usize = 20_000;
     let mut hits = Vec::new();
-    'win: for win in 0..=hay_lines.len() - old_lines.len() {
+    'win: for win in 0..=(hay_lines.len() - old_lines.len()).min(MAX_LOCATE_WINDOWS) {
         let mut prefix: Option<String> = None;
         for i in 0..old_lines.len() {
             let (hs, he) = hay_lines[win + i];
@@ -830,6 +837,12 @@ pub fn diagnose_no_match(text: &str, old_text: &str) -> Option<NoMatchDiagnostic
     if old_lines.is_empty() || hay_lines.is_empty() {
         return None;
     }
+    // ISSUE-003：扫描复杂度是 O(窗口数 × old 行数)，每次比较又是 O(行长)。
+    // 大文件（≤64MiB / 百万行）上可能数秒到数十秒。诊断只需近似定位——
+    // 限定参与扫描的行数（窗口与 old 行都设上限），超出后仍返回近似结果。
+    const MAX_DIAGNOSE_WINDOWS: usize = 20_000;
+    const MAX_DIAGNOSE_OLD_LINES: usize = 200;
+    let old_lines = &old_lines[..old_lines.len().min(MAX_DIAGNOSE_OLD_LINES)];
     let old_rows: Vec<(&str, &str, &str)> = old_lines
         .iter()
         .map(|&(s, e)| {
@@ -839,7 +852,8 @@ pub fn diagnose_no_match(text: &str, old_text: &str) -> Option<NoMatchDiagnostic
             (indent, content.trim(), line)
         })
         .collect();
-    let max_windows = hay_lines.len().saturating_sub(old_lines.len()) + 1;
+    let max_windows =
+        (hay_lines.len().saturating_sub(old_lines.len()) + 1).min(MAX_DIAGNOSE_WINDOWS);
     let mut best: Option<(usize, f64, usize)> = None; // (win, similarity, first_diff)
     for win in 0..max_windows {
         let mut same = 0usize;
@@ -895,7 +909,11 @@ pub fn diagnose_no_match(text: &str, old_text: &str) -> Option<NoMatchDiagnostic
         } else {
             kind = MismatchKind::Textual;
             let (os, oe) = old_lines[first_diff];
-            first_difference = Some((old_text[os..oe].to_string(), hay_line.to_string()));
+            // ISSUE-003：单行可达 64MiB，差异行只存有界片段（char 边界安全）。
+            const DIFF_LINE_BUDGET: usize = 200;
+            let provided: String = old_text[os..oe].chars().take(DIFF_LINE_BUDGET).collect();
+            let actual: String = hay_line.chars().take(DIFF_LINE_BUDGET).collect();
+            first_difference = Some((provided, actual));
         }
     }
     Some(NoMatchDiagnostic {
@@ -1190,10 +1208,14 @@ fn locate_context(text: &str, old_text: &str) -> Option<String> {
         .enumerate()
     {
         let no = start_line_0 + offset + 1;
+        // ISSUE-003：单行可达 MAX_SNAPSHOT_BYTES（64MiB），整行 append 会把
+        // 诊断输出撑到数 MiB 进模型上下文；先按行预算截断（char 边界安全）。
+        const LINE_BUDGET: usize = 120;
+        let display: String = line.chars().take(LINE_BUDGET).collect();
         if no == line_no {
-            snippet.push_str(&format!(">> {no}: {line}\n"));
+            snippet.push_str(&format!(">> {no}: {display}\n"));
         } else {
-            snippet.push_str(&format!("   {no}: {line}\n"));
+            snippet.push_str(&format!("   {no}: {display}\n"));
         }
         if snippet.len() > MAX_CTX_CHARS {
             snippet.push_str("...[truncated]\n");
@@ -1203,7 +1225,9 @@ fn locate_context(text: &str, old_text: &str) -> Option<String> {
     // 找不到任何定位（空文件/全空行）：回退文件头几行。
     if snippet.is_empty() {
         for (offset, line) in text.lines().take(RADIUS_LINES * 2 + 1).enumerate() {
-            snippet.push_str(&format!("   {}: {line}\n", offset + 1));
+            const LINE_BUDGET: usize = 120;
+            let display: String = line.chars().take(LINE_BUDGET).collect();
+            snippet.push_str(&format!("   {}: {display}\n", offset + 1));
             if snippet.len() > MAX_CTX_CHARS {
                 break;
             }
@@ -1436,7 +1460,10 @@ pub fn commit_edit(
             &result.previous_revision,
             error,
         );
-        if matches!(recovered, Err(EditError::CommitFailed { .. })) {
+        // ISSUE-013：`recover_after_failure` 返回 Ok 意味着 target 已是新内容
+        // （提交实际成功），temp 已无价值必须清理；CommitFailed 同理。
+        // CommitRecoveryFailed 保留 temp 是刻意证据设计（无法证明恢复完成）。
+        if recovered.is_ok() || matches!(recovered, Err(EditError::CommitFailed { .. })) {
             let _ = std::fs::remove_file(temp_path);
         }
         return recovered;
@@ -2428,6 +2455,49 @@ mod tests {
         let d2 = diagnose_no_match(text, old2).unwrap();
         assert_eq!(d2.kind, MismatchKind::Textual);
         assert!(d2.first_difference.is_some());
+    }
+
+    /// ISSUE-003：超长单行/海量行文件的失败诊断必须**有界**——
+    /// 此前 locate_context 先整行 append 再截断（64MiB 单行直接突破），
+    /// diagnose_no_match 全窗口扫描 + 整行存储（百万行文件数十秒 + 数 MiB 输出）。
+    #[test]
+    fn issue_003_failure_diagnostics_are_bounded_on_huge_files() {
+        // 1) locate_context：单行 1MiB，诊断输出必须 ≤ 400 字符预算。
+        let huge_line = "x".repeat(1024 * 1024);
+        let text = format!("before\n{huge_line}\nafter\n");
+        let ctx = locate_context(&text, "nonexistent token");
+        let ctx = ctx.expect("locate_context 必须返回兜底片段");
+        assert!(
+            ctx.len() <= 512,
+            "单行超长时 locate_context 必须截断: {} 字节",
+            ctx.len()
+        );
+
+        // 2) diagnose_no_match：百万行文件 + 多行 old_text，输出与耗时都有界。
+        let mut hay = String::with_capacity(8 * 1024 * 1024);
+        for i in 0..200_000 {
+            hay.push_str(&format!("line {i}\n"));
+        }
+        // old_text 首行与 hay 相似但内容不同（必然 no match）。
+        let old = "line 99999\nline 100000\nline 100001\nline CHANGED";
+        let start = std::time::Instant::now();
+        let d = diagnose_no_match(&hay, old);
+        let elapsed = start.elapsed();
+        assert!(d.is_some(), "应给出近似诊断");
+        assert!(
+            elapsed.as_secs() < 5,
+            "百万行级别诊断必须快速返回（窗口上限）: {elapsed:?}"
+        );
+        if let Some(diag) = &d {
+            if let Some((provided, actual)) = &diag.first_difference {
+                assert!(
+                    provided.len() <= 220,
+                    "差异行必须截断: {} 字节",
+                    provided.len()
+                );
+                assert!(actual.len() <= 220, "差异行必须截断: {} 字节", actual.len());
+            }
+        }
     }
 
     /// P1：trailing 宽容定位应用后，未触及字节（真实 trailing）原样保留。

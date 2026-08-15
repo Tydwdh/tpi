@@ -574,8 +574,11 @@ printf '__TPI_CAPTURE_END_{nonce}__\\n'"
     state.baseline = Some(env);
 }
 
-/// msys POSIX 路径 → Windows 路径：`/c/foo` → `C:\\foo`；已是 Windows
-/// 风格（含盘符冒号）或 UNC 则原样返回。
+/// msys POSIX 路径 → Windows 路径：`/c/foo` → `C:\\foo`；`/c`（根目录）→
+/// `C:\`；已是 Windows 风格（含盘符冒号）或 UNC 则原样返回。
+/// ISSUE-043：`/c` 只有 2 字节，此前不转换——cygpath 缺失时 session cwd 被
+/// 写成 `/c`，Windows `Command::current_dir("/c")` 解析成 `C:\c`（不存在），
+/// 后续所有 bash 调用 spawn 失败。
 fn msys_path_to_windows(path: &str) -> String {
     let bytes = path.as_bytes();
     if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
@@ -584,6 +587,13 @@ fn msys_path_to_windows(path: &str) -> String {
         out.push(':');
         out.push('\\');
         out.push_str(&path[3..].replace('/', "\\"));
+        out
+    } else if bytes.len() == 2 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() {
+        // `/c`：盘根目录。
+        let mut out = String::with_capacity(3);
+        out.push(bytes[1].to_ascii_uppercase() as char);
+        out.push(':');
+        out.push('\\');
         out
     } else {
         path.to_string()

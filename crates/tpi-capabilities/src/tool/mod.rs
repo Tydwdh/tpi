@@ -777,10 +777,26 @@ pub fn resolve_lock_path(
     } else {
         workspace_root.join(candidate)
     };
-    normalize_lexical(joined.as_std_path())
+    let resolved = normalize_lexical(joined.as_std_path())
         .ok()
         .and_then(|p| Utf8PathBuf::from_path_buf(p).ok())
-        .unwrap_or(joined)
+        .unwrap_or(joined);
+    casefold_lock_path(resolved)
+}
+
+/// Windows 文件系统大小写不敏感：`C:\ws\main.rs` 与 `C:\ws\MAIN.rs` 是**同一
+/// 物理文件**。锁身份必须大小写无关，否则同一文件的两笔写被调度为不同资源锁、
+/// 并行执行，后完成者覆盖先完成者且双方都报 succeeded（ISSUE-004 静默丢内容）。
+/// 统一小写是安全的身份收敛（不会把不同文件误并为同一把锁）。非 Windows 的
+/// 大小写敏感文件系统不做处理。
+#[cfg(windows)]
+fn casefold_lock_path(path: Utf8PathBuf) -> Utf8PathBuf {
+    Utf8PathBuf::from(path.as_str().to_lowercase())
+}
+
+#[cfg(not(windows))]
+fn casefold_lock_path(path: Utf8PathBuf) -> Utf8PathBuf {
+    path
 }
 /// 对路径本身做 canonicalize；失败时逐级向上解析最近存在的祖先。
 ///
@@ -1198,5 +1214,30 @@ mod tests {
     #[cfg(not(windows))]
     fn cygpath_available() -> bool {
         false
+    }
+
+    /// ISSUE-004：Windows 大小写不敏感文件系统下，锁身份必须大小写无关——
+    /// `main.rs` 与 `MAIN.rs` 是同一物理文件，必须映射到同一把锁（否则两笔
+    /// 并行写会静默丢内容）。非 Windows 保持大小写敏感语义。
+    #[test]
+    fn lock_path_is_casefolded_on_windows() {
+        let root = camino::Utf8PathBuf::from("C:\\ws");
+        let lower = resolve_lock_path(&root, "src/main.rs", true);
+        let upper = resolve_lock_path(&root, "src/MAIN.rs", true);
+        let mixed = resolve_lock_path(&root, "SRC/Main.Rs", true);
+        #[cfg(windows)]
+        {
+            assert_eq!(lower, upper, "大小写变体必须映射到同一把锁");
+            assert_eq!(lower, mixed);
+            assert_eq!(
+                lower.as_str(),
+                lower.as_str().to_lowercase(),
+                "Windows 锁路径必须统一小写"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_ne!(lower, upper, "大小写敏感文件系统上不同大小写是不同文件");
+        }
     }
 }

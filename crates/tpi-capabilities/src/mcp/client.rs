@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use super::config::McpServerConfig;
 use super::error::McpError;
@@ -43,7 +44,7 @@ pub struct McpClient {
     child: Child,
     stdin: ChildStdin,
     id: AtomicU64,
-    reader_rx: UnboundedReceiver<String>,
+    reader_rx: Receiver<String>,
     init: Option<InitializeResult>,
     tools: Vec<McpToolInfo>,
     /// P2-07：stderr/stdout reader 任务的 owner（shutdown/kill 时 join，
@@ -96,29 +97,63 @@ impl McpClient {
 
         // stderr → tracing（完整错误进 debug log，README2 §11）。
         // P2-07：reader 由 Supervisor 跟踪（shutdown 时 join）。
+        // ISSUE-006：reader 必须在 select 中响应取消 token——否则 server 衍生
+        // 孙进程持有管道句柄时 `next_line()` 永不 EOF，shutdown 的 tracker.wait()
+        // 永久挂起（Windows 上 kill 不传播到进程树）。
         let mut reader_supervisor = crate::process::supervisor::Supervisor::new();
         if let Some(stderr) = stderr {
             let name = config.name.clone();
-            reader_supervisor.spawn("mcp.stderr_reader", move |_| async move {
+            reader_supervisor.spawn("mcp.stderr_reader", move |cancel| async move {
                 let mut reader = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    tracing::debug!(server = %name, line = %line, "MCP server stderr");
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        line = reader.next_line() => match line {
+                            Ok(Some(line)) => tracing::debug!(server = %name, line = %line, "MCP server stderr"),
+                            Ok(None) | Err(_) => break,
+                        },
+                    }
                 }
             });
         }
 
         // stdout 后台读取循环 → 逐行发到 channel。
-        let (tx, rx): (UnboundedSender<String>, UnboundedReceiver<String>) =
-            tokio::sync::mpsc::unbounded_channel();
+        // ISSUE-021：用**有界** channel（此前 unbounded——server 空闲期主动
+        // 刷通知/日志且无人消费时消息无限堆积）。满时丢弃**新**行（保留旧行：
+        // 等待中的响应已入队，不应被洪泛通知挤掉；通知本身可丢）。
+        const STDOUT_CHANNEL_CAPACITY: usize = 1024;
+        let (tx, rx): (Sender<String>, Receiver<String>) =
+            tokio::sync::mpsc::channel(STDOUT_CHANNEL_CAPACITY);
         let stdout_tx = tx.clone();
-        reader_supervisor.spawn("mcp.stdout_reader", move |_| async move {
+        let stdout_name = config.name.clone();
+        reader_supervisor.spawn("mcp.stdout_reader", move |cancel| async move {
             let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if stdout_tx.send(line).is_err() {
-                    break;
+            let mut dropped_notifications = 0usize;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    line = lines.next_line() => match line {
+                        Ok(Some(line)) => {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            match stdout_tx.try_send(line) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_)) => {
+                                    dropped_notifications += 1;
+                                    if dropped_notifications % 1000 == 1 {
+                                        tracing::warn!(
+                                            server = %stdout_name,
+                                            dropped_notifications,
+                                            "MCP stdout channel 满，丢弃新行（通知洪泛）"
+                                        );
+                                    }
+                                }
+                                Err(TrySendError::Closed(_)) => break,
+                            }
+                        }
+                        Ok(None) | Err(_) => break,
+                    },
                 }
             }
         });

@@ -98,6 +98,9 @@ impl UiState {
     /// 入队一条待提交消息（Enter 提交）。超上限时丢弃最旧并写入系统行提示
     /// （避免无限增长，同时让“消息被丢弃”对用户可见）。
     pub fn push_pending(&mut self, message: String) {
+        // ISSUE-026：占位符机制只豁免编辑/上屏阶段，提交时超限仍会被截断——
+        // 必须让用户看到截断发生（此前静默截断且无提示）。
+        let was_truncated = message.len() > crate::editor::MAX_INPUT_BYTES;
         let message = crate::text::truncate_middle_utf8(
             &message,
             crate::editor::MAX_INPUT_BYTES,
@@ -105,6 +108,15 @@ impl UiState {
         );
         if message.is_empty() {
             return;
+        }
+        if was_truncated {
+            self.view.push_line(
+                crate::model::LineKind::System,
+                format!(
+                    "输入超过 {} KiB 上限，已截断中段（首尾保留）",
+                    crate::editor::MAX_INPUT_BYTES / 1024
+                ),
+            );
         }
         if self.pending_messages.len() >= PENDING_CAP {
             let dropped = self.pending_messages.pop_front().unwrap_or_default();
@@ -116,6 +128,8 @@ impl UiState {
                     crate::text::truncate_middle_utf8(&dropped, 160, "…")
                 ),
             );
+            // ISSUE-052：丢弃分支也要同步 footer 计数（此前 return 前漏调）。
+            self.sync_pending_len();
             return;
         }
         self.pending_messages.push_back(message);

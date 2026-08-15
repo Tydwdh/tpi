@@ -115,11 +115,25 @@ impl SkillManager {
     }
 
     /// 读取 skill 的 reference 文件（Level 3，按需）。
+    /// ISSUE-036：`reference` 必须限定在 `references/` 目录内——拒绝路径分隔
+    /// 与 `..`（否则 `../../config` 可读取 skill 目录外的任意文件）。
     pub fn read_reference(&self, name: &str, reference: &str) -> Result<String, String> {
         let Some(skill) = self.catalog.get(name) else {
             return Err(format!("未知 skill: {name}"));
         };
-        let path: PathBuf = skill.dir.join("references").join(reference);
+        let trimmed = reference.trim();
+        if trimmed.is_empty()
+            || trimmed.contains('/')
+            || trimmed.contains('\\')
+            || trimmed == ".."
+            || trimmed.starts_with("..")
+            || trimmed.contains('\0')
+        {
+            return Err(format!(
+                "reference 必须是 references/ 目录内的文件名: {reference:?}"
+            ));
+        }
+        let path: PathBuf = skill.dir.join("references").join(trimmed);
         std::fs::read_to_string(&path).map_err(|e| format!("读取 reference {reference} 失败: {e}"))
     }
 }

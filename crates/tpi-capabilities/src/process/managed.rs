@@ -234,6 +234,11 @@ pub struct ProcessRegistry {
     notify: Arc<Notify>,
 }
 
+/// 保留的进程条目总数上限（ISSUE-005：每个终态进程留存 tail≤64KiB +
+/// env 快照，长期会话无界增长会耗尽内存）。超过后淘汰**最早的终态**进程
+/// （active 进程永不淘汰，`process status` 仍可查询最近进程）。
+pub const MAX_RETAINED_PROCESSES: usize = 64;
+
 impl Default for ProcessRegistry {
     fn default() -> Self {
         Self {
@@ -261,6 +266,8 @@ impl ProcessRegistry {
         self.order.push(process.id);
         self.cancels.insert(process.id, cancel);
         self.processes.insert(process.id, process);
+        // 新条目可能把总量推过上限（大量终态进程时），顺带淘汰最旧终态。
+        self.evict_terminal();
         Ok(())
     }
 
@@ -311,8 +318,35 @@ impl ProcessRegistry {
         process.exit_code = exit_code;
         if state.is_terminal() {
             process.finished_at = Some(Instant::now());
+            // 终态后立即腾出空间（先完成时间戳再淘汰，保证淘汰逻辑可读）。
+            self.evict_terminal();
         }
         true
+    }
+
+    /// ISSUE-005：淘汰最早的终态进程，直到条目总数 ≤ [`MAX_RETAINED_PROCESSES`]。
+    /// active（Starting/Running）进程永不淘汰；`process status` 仍可查询最近
+    /// 终态进程。淘汰同时释放 tail/env 内存与取消 token。
+    fn evict_terminal(&mut self) {
+        while self.processes.len() > MAX_RETAINED_PROCESSES {
+            // order 按插入序：找第一个终态进程淘汰（头部是 active 时向后找）。
+            let Some(&victim) = self.order.iter().find(|id| {
+                self.processes
+                    .get(id)
+                    .map(|p| p.state.is_terminal())
+                    .unwrap_or(true)
+            }) else {
+                break; // 全部 active：无法淘汰（上限检查在 insert 已保证 active 数）。
+            };
+            self.remove_entry(victim);
+        }
+    }
+
+    /// 移除一个进程的全部记录（order/processes/cancels）。
+    fn remove_entry(&mut self, id: ProcessId) {
+        self.order.retain(|existing| *existing != id);
+        self.processes.remove(&id);
+        self.cancels.remove(&id);
     }
 
     /// 设置运行时 metadata（真实 pid / artifact 引用）。
@@ -345,11 +379,10 @@ impl ProcessRegistry {
     }
 
     /// 标记一批进程的状态已向模型展示（§25：避免上下文膨胀）。
+    /// 内存回收不依赖本方法——终态进程由 [`Self::evict_terminal`] 在超过
+    /// [`MAX_RETAINED_PROCESSES`] 时按最旧淘汰（本方法保持 no-op，只依赖
+    /// snapshot 的 60s 展示窗口）。
     pub fn mark_consumed(&mut self, ids: &[ProcessId]) {
-        // 本阶段用简单哨兵：已消费的 terminal 进程直接从 registry 移除——
-        // 但用户可能还想 process status 查看旧进程，因此不删除，只记录时间戳。
-        // 简化：snapshot 用「完成 <60s 且未被消费」判定；mark_consumed 记录完成时间戳。
-        // 为了不过度设计，P1 先实现为 no-op + 文档说明（P6 再精化）。
         let _ = ids;
     }
 
@@ -844,5 +877,68 @@ mod tests {
         assert!(line.contains(&id.to_string()));
         assert!(line.contains("running"));
         assert!(line.contains("python server.py"));
+    }
+
+    /// ISSUE-005：终态进程超过 [`MAX_RETAINED_PROCESSES`] 时淘汰最旧的终态，
+    /// active 进程永不淘汰；内存（tail/env/取消 token）随之释放。
+    #[test]
+    fn issue_005_evicts_oldest_terminal_but_keeps_active() {
+        let mut registry = ProcessRegistry::new();
+        // 塞满上限。
+        let mut active = ProcessId::next();
+        for i in 0..MAX_RETAINED_PROCESSES {
+            let id = ProcessId::next();
+            registry.insert(sample(id, &format!("proc {i}"))).unwrap();
+            registry.transition(id, ManagedProcessState::Exited { exit_code: 0 }, Some(0));
+            if i == 0 {
+                active = id;
+            }
+        }
+        assert_eq!(registry.processes.len(), MAX_RETAINED_PROCESSES);
+
+        // 再插一个终态进程：最旧终态被淘汰，总量保持上限。
+        let newest = ProcessId::next();
+        registry.insert(sample(newest, "newest")).unwrap();
+        registry.transition(
+            newest,
+            ManagedProcessState::Exited { exit_code: 0 },
+            Some(0),
+        );
+        assert_eq!(
+            registry.processes.len(),
+            MAX_RETAINED_PROCESSES,
+            "总量必须被限制"
+        );
+        assert!(registry.get(newest).is_some(), "最新进程必须保留");
+        assert!(registry.get(active).is_none(), "最早的终态进程必须被淘汰");
+        // 淘汰的进程不再占用取消 token / order 条目。
+        assert!(!registry.cancels.contains_key(&active));
+        assert!(!registry.order.contains(&active));
+
+        // active 进程永不淘汰：把第一个进程保持 Running，其余终态塞满。
+        let mut registry2 = ProcessRegistry::new();
+        let running = ProcessId::next();
+        registry2.insert(sample(running, "keep running")).unwrap();
+        registry2.transition(running, ManagedProcessState::Running, None);
+        let mut first_terminal = None;
+        for i in 0..MAX_RETAINED_PROCESSES + 1 {
+            let id = ProcessId::next();
+            registry2.insert(sample(id, &format!("term {i}"))).unwrap();
+            registry2.transition(id, ManagedProcessState::Exited { exit_code: 0 }, Some(0));
+            if first_terminal.is_none() {
+                first_terminal = Some(id);
+            }
+        }
+        assert!(registry2.get(running).is_some(), "active 进程不得被淘汰");
+        assert_eq!(registry2.active_count(), 1);
+        assert_eq!(
+            registry2.processes.len(),
+            MAX_RETAINED_PROCESSES,
+            "总量仍受上限约束"
+        );
+        assert!(
+            registry2.get(first_terminal.unwrap()).is_none(),
+            "最旧的终态被淘汰"
+        );
     }
 }

@@ -65,6 +65,24 @@ pub struct WriteArgs {
 }
 
 pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
+    // ISSUE-044：start_line=0 是无效请求（行号 1-indexed；0 此前被静默当作 1，
+    // 模型用 0 翻页会与上次窗口重叠/死循环）。明确拒绝并引导。
+    if args.start_line == 0 {
+        return ToolOutcome::failed(
+            "read",
+            ModelPayload {
+                status: ToolStatus::Rejected,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output:
+                    "status: rejected\ntool: read\nerror: invalid_start_line\n\nstart_line 必须是 ≥1 的整数（行号 1-indexed）；从文件开头读请省略该参数或填 1。"
+                        .into(),
+                effect: None,
+                artifact: None,
+            },
+        );
+    }
     // §10.1：read 在合理文件大小下保存完整 snapshot（stale 诊断用）。
     // §8.4：模型通过 opaque `@artifact/<session>/<id>` 有界读取完整输出。
     if let Some(reference) = args.path.strip_prefix("@artifact/") {

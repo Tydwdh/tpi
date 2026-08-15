@@ -108,7 +108,23 @@ impl Supervisor {
         // JoinError 捕获但 wait() 不返回逐条结果——walking skeleton 阶段
         // 以 tracked==0 为 quiescence 验收；P2-06 迁 watchdog 时引入
         // join_handles 收集错误汇总。
-        self.tracker.wait().await;
+        //
+        // ISSUE-006 兜底：wait 加总超时（30s）。所有任务都应响应 cancel，
+        // 但任何阻塞在不可取消 IO 上的未来任务都不应让应用退出路径永久挂起；
+        // 超时后放弃 join（任务随 runtime 销毁），并记录告警供诊断。
+        const SHUTDOWN_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        match tokio::time::timeout(SHUTDOWN_WAIT_TIMEOUT, self.tracker.wait()).await {
+            Ok(()) => {}
+            Err(_) => {
+                let remaining = self.tracker.len();
+                tracing::warn!(
+                    remaining,
+                    "supervisor shutdown: {} 个任务未在 {}s 内结束（可能阻塞在不可取消 IO）；放弃等待",
+                    remaining,
+                    SHUTDOWN_WAIT_TIMEOUT.as_secs(),
+                );
+            }
+        }
         Ok(())
     }
 

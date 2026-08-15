@@ -37,6 +37,11 @@ pub enum SshError {
     Exec(String),
     #[error("SFTP 失败: {0}")]
     Sftp(String),
+    /// SFTP 明确返回 SSH_FX_NO_SUCH_FILE(2)："文件不存在"是确定事实。
+    /// 单独区分——网络/权限/协议等其他 SFTP 错误**不得**被当作"文件不存在"
+    /// 处理（否则 remote_write 会在网络抖动时跳过 revision 校验覆盖远端文件）。
+    #[error("SFTP 文件不存在: {0}")]
+    SftpNoSuchFile(String),
     #[error("IO 失败: {0}")]
     Io(#[from] std::io::Error),
     #[error("未连接")]
@@ -44,7 +49,8 @@ pub enum SshError {
 }
 
 /// 远端主机描述（§33：从 ~/.ssh/config 解析，或显式直连参数）。
-#[derive(Debug, Clone)]
+/// ISSUE-038：手动实现 Debug——`password` 必须打码，绝不允许出现在日志中。
+#[derive(Clone)]
 pub struct RemoteHost {
     /// 用户输入的别名（如 `gpu`）；无 config 时即 hostname。
     pub alias: String,
@@ -59,6 +65,21 @@ pub struct RemoteHost {
     pub strict_host_key_checking: bool,
     /// 可选密码（config 不存密码；由用户显式提供）。
     pub password: Option<String>,
+}
+
+impl std::fmt::Debug for RemoteHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteHost")
+            .field("alias", &self.alias)
+            .field("hostname", &self.hostname)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("identity_file", &self.identity_file)
+            .field("known_hosts_path", &self.known_hosts_path)
+            .field("strict_host_key_checking", &self.strict_host_key_checking)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl RemoteHost {
@@ -158,6 +179,9 @@ pub struct ExecResult {
     pub exit_code: Option<u32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// 输出在传输层被硬上限截断（ISSUE-008：与本地 `MAX_OUTPUT_BUDGET` 对齐，
+    /// 防止远端 `cat /dev/urandom` 式输出耗尽进程内存）。
+    pub truncated: bool,
 }
 
 /// 待用户确认的 server key（connect 失败后由 confirm_host_key 消费）。
@@ -405,12 +429,14 @@ impl SshClient {
         // cwd 通过 cd 前缀；env 通过 export 前缀（远端 shell 每次 fresh）。
         // 注意：`shell_quote` 已产出 `'value'`，不能再套 `{:?}`（Debug 引号会
         // 变成字面量进入值，且 `"..."` 内 `$` 会被远端 shell 展开）。
+        // ISSUE-039：env key 同样 shell_quote（远端 env 变量名可能含 shell
+        // 元字符，未引用直接拼进 export 前缀可被展开执行）。
         let mut prefix = String::new();
         for (k, v) in env {
-            prefix.push_str(&format!("export {k}={}; ", shell_quote(v)));
+            prefix.push_str(&format!("export {}={}; ", shell_quote(k), shell_quote(v)));
         }
         if let Some(dir) = cwd {
-            prefix.push_str(&format!("cd {}; ", shell_quote(dir)));
+            prefix.push_str(&format!("cd {} || exit 127; ", shell_quote(dir)));
         }
         let full = format!("{prefix}{command}");
         channel
@@ -421,7 +447,11 @@ impl SshClient {
             exit_code: None,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            truncated: false,
         };
+        // ISSUE-008：传输层硬上限（与本地 MAX_OUTPUT_BUDGET 一致）。超限后
+        // 继续读会耗尽内存；截断后丢弃剩余数据，只标记 truncated 由调用方展示。
+        const REMOTE_EXEC_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
         loop {
             let msg = if let Some(cancel) = cancel {
                 tokio::select! {
@@ -441,8 +471,32 @@ impl SshClient {
             };
             use russh::ChannelMsg;
             match msg {
-                ChannelMsg::Data { ref data } => result.stdout.extend_from_slice(data),
-                ChannelMsg::ExtendedData { ref data, .. } => result.stderr.extend_from_slice(data),
+                ChannelMsg::Data { ref data } => {
+                    if result.stdout.len() < REMOTE_EXEC_OUTPUT_LIMIT {
+                        let room = REMOTE_EXEC_OUTPUT_LIMIT - result.stdout.len();
+                        result
+                            .stdout
+                            .extend_from_slice(&data[..data.len().min(room)]);
+                        if data.len() > room {
+                            result.truncated = true;
+                        }
+                    } else {
+                        result.truncated = true;
+                    }
+                }
+                ChannelMsg::ExtendedData { ref data, .. } => {
+                    if result.stderr.len() < REMOTE_EXEC_OUTPUT_LIMIT {
+                        let room = REMOTE_EXEC_OUTPUT_LIMIT - result.stderr.len();
+                        result
+                            .stderr
+                            .extend_from_slice(&data[..data.len().min(room)]);
+                        if data.len() > room {
+                            result.truncated = true;
+                        }
+                    } else {
+                        result.truncated = true;
+                    }
+                }
                 ChannelMsg::ExitStatus { exit_status } => result.exit_code = Some(exit_status),
                 _ => {}
             }
@@ -463,21 +517,33 @@ impl SshClient {
             .map_err(|e| SshError::Sftp(e.to_string()))?;
         russh_sftp::client::SftpSession::new(channel.into_stream())
             .await
-            .map_err(|e| SshError::Sftp(e.to_string()))
+            .map_err(sftp_error)
     }
 
     /// 读取远端文件（§R0 primitive；R2 接入 read 工具）。
+    /// ISSUE-008：有界读取——先 stat 拒绝超大文件，再 `.take()` 兜底防 TOCTOU
+    /// 超限分配（与本地 `MAX_SNAPSHOT_BYTES` 一致）。
     pub async fn read_file(&mut self, path: &str) -> Result<Vec<u8>, SshError> {
+        const REMOTE_FILE_LIMIT: u64 = 64 * 1024 * 1024;
         let sftp = self.sftp().await?;
-        let mut file = sftp
-            .open(path)
-            .await
-            .map_err(|e| SshError::Sftp(e.to_string()))?;
+        let meta = sftp.metadata(path).await.map_err(sftp_error)?;
+        if meta.size.unwrap_or(0) > REMOTE_FILE_LIMIT {
+            return Err(SshError::Sftp(format!(
+                "远端文件超过 {REMOTE_FILE_LIMIT} 字节上限：{path}"
+            )));
+        }
+        let file = sftp.open(path).await.map_err(sftp_error)?;
         let mut bytes = Vec::new();
         use tokio::io::AsyncReadExt;
-        file.read_to_end(&mut bytes)
+        file.take(REMOTE_FILE_LIMIT.saturating_add(1))
+            .read_to_end(&mut bytes)
             .await
-            .map_err(|e| SshError::Sftp(e.to_string()))?;
+            .map_err(SshError::Io)?;
+        if bytes.len() as u64 > REMOTE_FILE_LIMIT {
+            return Err(SshError::Sftp(format!(
+                "远端文件超过 {REMOTE_FILE_LIMIT} 字节上限：{path}"
+            )));
+        }
         Ok(bytes)
     }
 
@@ -491,36 +557,29 @@ impl SshClient {
                 OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
             )
             .await
-            .map_err(|e| SshError::Sftp(e.to_string()))?;
+            .map_err(sftp_error)?;
         use tokio::io::AsyncWriteExt;
-        file.write_all(bytes)
-            .await
-            .map_err(|e| SshError::Sftp(e.to_string()))?;
-        file.close()
-            .await
-            .map_err(|e| SshError::Sftp(e.to_string()))?;
+        file.write_all(bytes).await.map_err(SshError::Io)?;
+        file.close().await.map_err(SshError::Io)?;
         // atomic rename（覆盖目标；远端 FS 不支持时由调用方降级——任务书 §44）。
-        sftp.rename(&tmp, path)
-            .await
-            .map_err(|e| SshError::Sftp(format!("rename {} -> {}: {e}", tmp, path)))?;
+        // ISSUE-023：rename 失败时尽力清理 temp，避免远端累积 `.tpi-tmp-*` 垃圾。
+        if let Err(e) = sftp.rename(&tmp, path).await {
+            let _ = sftp.remove_file(&tmp).await;
+            return Err(SshError::Sftp(format!("rename {} -> {}: {e}", tmp, path)));
+        }
         Ok(())
     }
 
     /// 远端文件元数据（R3 list 用）。
     pub async fn stat(&mut self, path: &str) -> Result<FileAttributes, SshError> {
         let sftp = self.sftp().await?;
-        sftp.metadata(path)
-            .await
-            .map_err(|e| SshError::Sftp(e.to_string()))
+        sftp.metadata(path).await.map_err(sftp_error)
     }
 
     /// 列出远端目录（R3 list 用）：返回 (名称, 是否目录)。
     pub async fn read_dir(&mut self, path: &str) -> Result<Vec<(String, bool)>, SshError> {
         let sftp = self.sftp().await?;
-        let entries = sftp
-            .read_dir(path)
-            .await
-            .map_err(|e| SshError::Sftp(e.to_string()))?;
+        let entries = sftp.read_dir(path).await.map_err(sftp_error)?;
         Ok(entries
             .map(|entry| (entry.file_name(), entry.file_type().is_dir()))
             .collect())
@@ -529,9 +588,22 @@ impl SshClient {
     /// 删除远端文件（edit/write 回滚用）。
     pub async fn remove_file(&mut self, path: &str) -> Result<(), SshError> {
         let sftp = self.sftp().await?;
-        sftp.remove_file(path)
-            .await
-            .map_err(|e| SshError::Sftp(e.to_string()))
+        sftp.remove_file(path).await.map_err(sftp_error)
+    }
+}
+
+/// 把 russh-sftp 的 client error 归类为 [`SshError`]，保留 SFTP 状态码语义：
+/// 明确返回 SSH_FX_NO_SUCH_FILE(2) 的才算"文件不存在"，其余（权限/网络/协议）
+/// 都归为普通 SFTP 错误。调用方据此区分"文件确实不存在"与"无法确认文件状态"，
+/// 不得把网络抖动当作文件不存在处理（否则会跳过 revision 校验覆盖远端文件）。
+fn sftp_error(error: russh_sftp::client::error::Error) -> SshError {
+    match &error {
+        russh_sftp::client::error::Error::Status(status)
+            if status.status_code == russh_sftp::protocol::StatusCode::NoSuchFile =>
+        {
+            SshError::SftpNoSuchFile(error.to_string())
+        }
+        _ => SshError::Sftp(error.to_string()),
     }
 }
 
@@ -558,5 +630,47 @@ mod tests {
         assert_eq!(host.port, 22);
         assert_eq!(host.user, "dev");
         assert!(host.strict_host_key_checking);
+    }
+
+    /// ISSUE-002：只有 SFTP 明确返回 NoSuchFile 才算"文件不存在"；
+    /// 权限/网络/其他状态码错误都不得被误判（否则 remote_write 会在网络
+    /// 抖动时跳过 revision 校验覆盖远端文件）。
+    #[test]
+    fn sftp_error_classifies_only_no_such_file() {
+        use russh_sftp::client::error::Error as SftpClientError;
+        use russh_sftp::protocol::{Status, StatusCode};
+
+        let no_such = SshError::SftpNoSuchFile("no such file".into());
+        assert!(
+            matches!(&no_such, SshError::SftpNoSuchFile(_)),
+            "NoSuchFile 必须单独分类"
+        );
+
+        // 权限错误 → 普通 Sftp 错误（不是 no_such_file）。
+        let permission = SftpClientError::Status(Status {
+            id: 1,
+            status_code: StatusCode::PermissionDenied,
+            error_message: "denied".into(),
+            language_tag: String::new(),
+        });
+        assert!(matches!(sftp_error(permission), SshError::Sftp(_)));
+
+        // 连接类错误 → 普通 Sftp 错误。
+        assert!(matches!(
+            sftp_error(SftpClientError::IO("connection lost".into())),
+            SshError::Sftp(_)
+        ));
+
+        // 明确 NoSuchFile → SftpNoSuchFile。
+        let no_such_status = SftpClientError::Status(Status {
+            id: 1,
+            status_code: StatusCode::NoSuchFile,
+            error_message: "no such file".into(),
+            language_tag: String::new(),
+        });
+        assert!(matches!(
+            sftp_error(no_such_status),
+            SshError::SftpNoSuchFile(_)
+        ));
     }
 }

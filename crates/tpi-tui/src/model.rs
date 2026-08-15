@@ -1288,13 +1288,18 @@ impl ViewModel {
     }
 
     /// 更新搜索词并重新计算命中；命中时锁定到第一个命中。
+    /// ISSUE-030：清空搜索词（Backspace 删光）时恢复 follow——否则视口停
+    /// 留在旧命中位置，用户关闭搜索后以为丢了内容（与 Esc 不跳回的意图无关，
+    /// 空查询没有"命中"可锁定）。
     pub fn update_search_query(&mut self, query: &str) {
         let Some(search) = &mut self.search else {
             return;
         };
         search.query = crate::text::truncate_middle_utf8(query, MAX_SEARCH_QUERY, "…");
         search.recompute(&mut self.transcript);
-        if let Some(first) = search.hits.first().copied() {
+        if search.hits.is_empty() {
+            self.follow_tail();
+        } else if let Some(first) = search.hits.first().copied() {
             self.lock_to(first, 0);
         }
     }

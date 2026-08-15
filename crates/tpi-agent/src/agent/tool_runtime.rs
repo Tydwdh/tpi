@@ -298,10 +298,20 @@ async fn execute_batch<P: Provider, S: tpi_session::store::SessionStore>(
     for (index, call) in calls.iter().enumerate() {
         // §用户诉求：max_tool_calls=0 = 不限制（默认）。
         if config.limits.max_tool_calls > 0 && *tool_calls_total >= config.limits.max_tool_calls {
-            // §PointerHit 2：预算超限时，为剩余 tool calls 合成标准化拒绝结果
-            // 并持久化——否则 assistant.tool_calls 有 call 但无对应 tool result，
-            // 下一轮/resume 的 history 是非法消息序列（provider 可能拒绝）。
-            for skipped in &calls[index..] {
+            // §PointerHit 2：预算超限时，为**本批全部未执行**的 tool calls 合成
+            // 标准化拒绝结果并持久化——否则 assistant.tool_calls 有 call 但无
+            // 对应 tool result，下一轮/resume 的 history 是非法消息序列
+            // （provider 可能拒绝）。
+            //
+            // 覆盖两类调用：
+            // 1) calls[index..]：尚未计入预算（预检未执行到）；
+            // 2) calls[..index] 中已 prepared（参数合法、已计数）但从未执行——
+            //    waves 尚未构建，提前 return 会让这些调用悬空（ISSUE-001）。
+            //    已 rejected 的（非法参数/未知工具）在预检时已持久化，跳过。
+            for (skipped_index, skipped) in calls.iter().enumerate() {
+                if rejected.contains_key(&skipped_index) {
+                    continue;
+                }
                 // builtin 或外部（MCP）工具都生成标准化拒绝（history 合法）。
                 let name = skipped.name.clone();
                 let tool_label = BuiltinTool::from_name(&name)

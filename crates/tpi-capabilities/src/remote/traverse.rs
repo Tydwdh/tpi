@@ -179,13 +179,27 @@ pub async fn remote_search(
             shell_quote(&root),
         ));
     }
-    let exec_result = match client
-        .exec(&cmd, None, &Default::default(), Some(&ctx.cancel))
-        .await
+    // ISSUE-024：远端 rg/grep 执行必须带 deadline（此前只有 cancel token，
+    // 病态正则可无限阻塞 agent 循环并烧远端 CPU；本地 search 有 deadline）。
+    // 超时按失败返回（模型可缩小范围重试）。
+    let exec_result = match tokio::time::timeout(
+        SCAN_DEADLINE,
+        client.exec(&cmd, None, &Default::default(), Some(&ctx.cancel)),
+    )
+    .await
     {
-        Ok(r) => r,
-        Err(e) => {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             return failed("search", &format!("远端搜索失败: {e}"));
+        }
+        Err(_) => {
+            return failed(
+                "search",
+                &format!(
+                    "远端搜索超时（>{}s）；请缩小搜索范围或简化正则后重试",
+                    SCAN_DEADLINE.as_secs()
+                ),
+            );
         }
     };
     let stdout = String::from_utf8_lossy(&exec_result.stdout);
@@ -232,14 +246,18 @@ pub async fn remote_glob(
     let started = Instant::now();
     let mut items: Vec<(String, u64)> = Vec::new();
     let mut scanned_files = 0u64;
+    // ISSUE-049：截断原因如实报告（此前恒为 complete，模型无法得知结果不完整）。
+    let mut stopped = "";
 
     // 迭代式 DFS。
     let mut stack: Vec<String> = vec![root.clone()];
     'scan: while let Some(dir) = stack.pop() {
         if ctx.cancel.is_cancelled() {
+            stopped = "cancelled";
             break;
         }
         if started.elapsed() > SCAN_DEADLINE {
+            stopped = "deadline";
             break;
         }
         let entries = match client.read_dir(&dir).await {
@@ -255,6 +273,7 @@ pub async fn remote_glob(
             }
             scanned_files = scanned_files.saturating_add(1);
             if scanned_files >= MAX_SCAN_FILES {
+                stopped = "scan_limit";
                 break 'scan;
             }
             // mtime（glob 按最近修改降序，同本地语义）。
@@ -274,7 +293,14 @@ pub async fn remote_glob(
         .map(|(p, _)| p)
         .take(MAX_RESULTS)
         .collect();
-    build_scan_outcome("glob", items, scanned_files, 0, started, "complete")
+    let stop_reason = if !stopped.is_empty() {
+        stopped
+    } else if scanned_files >= MAX_SCAN_FILES {
+        "scan_limit"
+    } else {
+        "complete"
+    };
+    build_scan_outcome("glob", items, scanned_files, 0, started, stop_reason)
 }
 
 // ---------------------------------------------------------------------------

@@ -662,6 +662,68 @@ async fn retry_respects_cancel_during_backoff() {
     assert!(matches!(result, Ok(Err(ProviderError::Cancelled))));
 }
 
+/// ISSUE-009：确定性 4xx（400 请求格式/内容策略）与认证错误不得重试——
+/// 此前被当传输错误指数退避重试（最多 ~100 次无效请求）。mock server 计数
+/// 收到的请求数，断言 400/auth 只触发一次请求。
+#[tokio::test]
+async fn deterministic_4xx_and_auth_do_not_retry() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn run_with_status(status: &'static str) -> (ProviderError, usize) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_in_task = hits.clone();
+        let server = tokio::spawn(async move {
+            // 接受所有连接，每次返回固定错误状态。
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                hits_in_task.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n");
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        let mut client = OpenAiCompatClient::new(
+            format!("http://{addr}/v1"),
+            "m".into(),
+            "k".into(),
+            None,
+            None,
+            None,
+        );
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::User("hi".into())],
+            tools: Vec::new(),
+            max_output_tokens: None,
+            reasoning: None,
+            context_window: None,
+        };
+        let (tx, _rx) = mpsc::channel(16);
+        let error = client.stream(request, tx, CancellationToken::new()).await;
+        server.abort();
+        (error.unwrap_err(), hits.load(Ordering::SeqCst))
+    }
+
+    // 400（确定性协议错误）：1 次请求，错误为 Protocol。
+    let (error, hits) = run_with_status("400 Bad Request").await;
+    assert!(matches!(error, ProviderError::Protocol(_)), "{error}");
+    assert_eq!(hits, 1, "400 不得重试（ISSUE-009）");
+
+    // 401（认证）：1 次请求，错误为 Auth。
+    let (error, hits) = run_with_status("401 Unauthorized").await;
+    assert!(matches!(error, ProviderError::Auth(_)), "{error}");
+    assert_eq!(hits, 1, "401 不得重试（ISSUE-009）");
+    // 注意：500 等瞬时错误的重试行为已由 retry_respects_cancel_during_backoff
+    // 与 retryable_status_error 单测覆盖；此处不重复（完整退避 ~226s 太慢）。
+}
+
 /// §30 第 9 条：invalid tool args（schema 校验失败）产生 observation，
 /// 模型可见失败原因，session 不被破坏、run 正常继续。
 #[tokio::test]

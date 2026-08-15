@@ -110,13 +110,28 @@ impl McpManager {
 
     /// 优雅关闭所有 server（README2 §9：terminate child，不留孤儿）。
     /// drop RunningServer 同时注销其全部工具（RAII）。
+    /// ISSUE-032：并行关闭 + 整体超时——逐个串行时 N 个挂死 server 会让退出
+    /// 路径最长 N×30s（client shutdown 内 request 默认 30s 超时）。并行把
+    /// 总等待压到单个 server 的上界；shutdown 内部还有 Supervisor 30s 兜底
+    ///（ISSUE-006），这里再包一层防止极端累积。
     pub async fn shutdown_all(&mut self) {
         let servers = std::mem::take(&mut self.servers);
+        let mut tasks = Vec::with_capacity(servers.len());
         for (_name, running) in servers {
-            let mut guard = running.client.lock().await;
-            guard.shutdown().await;
-            // running drop → _registrations 自动注销。
+            // 提取 client Arc 后 running 立即 drop → 工具 RAII 注销先行
+            //（关闭期间模型无法调用 MCP 工具，比关闭完成后再注销更安全）。
+            let client = running.client.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut guard = client.lock().await;
+                guard.shutdown().await;
+            }));
         }
+        // join_all 全部并发执行；外层超时兜底（总预算 45s）防止退出路径被拖死。
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            futures_util::future::join_all(tasks),
+        )
+        .await;
     }
 
     /// 重启单个 server（Phase 3 /mcp restart）：先启动新 server（private

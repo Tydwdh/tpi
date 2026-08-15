@@ -283,15 +283,18 @@ pub fn glob(args: GlobArgs, ctx: &ToolContext) -> ToolOutcome {
         if !meta.is_file() {
             continue;
         }
-        let rel = relative(&root, entry.path());
-        if !matcher.is_match(rel.as_str()) {
-            continue;
-        }
+        // ISSUE-041：scanned_files 统计**遍历到的全部**文件（与 list 的
+        // 语义一致），而不是只统计命中——否则巨大仓库匹配 0 个时 scan_limit
+        // 永不触发，scanned_files 与真实遍历量无关。字节同理。
         scanned_files = scanned_files.saturating_add(1);
         scanned_bytes = scanned_bytes.saturating_add(meta.len());
         if scanned_files >= MAX_SCAN_FILES || scanned_bytes >= MAX_SCAN_BYTES {
             stop_reason = StopReason::ScanLimit;
             break 'scan;
+        }
+        let rel = relative(&root, entry.path());
+        if !matcher.is_match(rel.as_str()) {
+            continue;
         }
         let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
         items.push((rel, mtime));

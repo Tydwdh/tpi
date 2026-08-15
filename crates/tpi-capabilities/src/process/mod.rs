@@ -173,14 +173,25 @@ pub async fn run_in_host(request: HostRunRequest<'_>) -> Result<HostRunOutput, S
         .ok_or_else(|| "process-host stdout unavailable".to_string())?;
 
     // host 自身的诊断输出（非 target 的 stderr）转发到 tracing 日志，不写终端。
+    // ISSUE-025：不遗留 detached spawn（ADR-006）——Drop 守卫在任何提前返回
+    // 路径（Err/取消）都 abort 该任务；正常路径 host 死亡后管道 EOF 自然结束，
+    // abort 只是兜底（最多丢几条 host 诊断，无副作用）。
     if let Some(host_stderr) = host.stderr.take() {
-        tokio::spawn(async move {
+        struct StderrForwarder(Option<tokio::task::JoinHandle<()>>);
+        impl Drop for StderrForwarder {
+            fn drop(&mut self) {
+                if let Some(handle) = self.0.take() {
+                    handle.abort();
+                }
+            }
+        }
+        let _stderr_guard = StderrForwarder(Some(tokio::spawn(async move {
             use tokio::io::AsyncBufReadExt;
             let mut lines = tokio::io::BufReader::new(host_stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::warn!(line = %line, "process-host stderr");
             }
-        });
+        })));
     }
 
     // 归组期间可能已取消或耗尽 timeout；发送 Start 前再检查，避免目标进程

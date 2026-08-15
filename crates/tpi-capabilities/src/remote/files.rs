@@ -365,7 +365,7 @@ fn resolve_remote_path(ctx: &ToolContext, path: &str) -> Result<String, String> 
 }
 
 fn is_no_such_file(e: &crate::remote::ssh::SshError) -> bool {
-    matches!(e, crate::remote::ssh::SshError::Sftp(_))
+    matches!(e, crate::remote::ssh::SshError::SftpNoSuchFile(_))
 }
 
 fn path_rejected(tool: &str, detail: String) -> ToolOutcome {

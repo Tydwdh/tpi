@@ -346,6 +346,19 @@ impl Provider for OpenAiCompatClient {
                     if error == "cancelled" {
                         return Err(ProviderError::Cancelled);
                     }
+                    // ISSUE-009：确定性错误不得重试——重试必然再次失败，
+                    // 只会浪费配额/请求并让用户误以为是瞬时故障：
+                    // - auth（401/403）：认证问题，改凭据前重试无意义；
+                    // - http 4xx（非 429，429 走 Retryable 分支）：请求格式/
+                    //   内容策略被 provider 拒绝，重发同样内容结果相同。
+                    // 此前这些被当传输错误指数退避重试，叠加 agent 层 turn
+                    // 级重启最多产生 ~100 次无效请求。
+                    if error.starts_with("auth") {
+                        return Err(ProviderError::Auth(error));
+                    }
+                    if error.starts_with("http ") && !error.starts_with("http 429") {
+                        return Err(ProviderError::Protocol(error));
+                    }
                     // 传输层失败（连接被拒/中断）：未收到任何事件，可安全重试。
                     if attempt + 1 >= MAX_ATTEMPTS || retry_wait >= MAX_RETRY_WAIT {
                         return Err(classify_error(error, attempt));
@@ -570,6 +583,11 @@ fn classify_error(message: String, attempt: u32) -> ProviderError {
     }
     if message.starts_with("http 429") {
         return ProviderError::RateLimited(format!("attempt {attempt}: {message}"));
+    }
+    // ISSUE-009：确定性 4xx（请求格式/内容策略）归为协议错误，agent 层
+    // 不把它当瞬时错误做 turn 级重启。
+    if message.starts_with("http 4") {
+        return ProviderError::Protocol(message);
     }
     ProviderError::Connection(format!("attempt {attempt}: {message}"))
 }

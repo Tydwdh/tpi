@@ -382,10 +382,19 @@ impl Editor {
         self.draft = None;
     }
 
-    /// 提交当前输入：trim 后返回，清空编辑区并入历史（去重）。
+    /// 提交当前输入：清空编辑区并入历史（去重）。
+    ///
+    /// ISSUE-017：多行内容**不得**整体 trim——首行前导缩进是代码块/续行命令的
+    /// 有效内容（此前 `trim()` 把粘贴代码块的首行缩进整段剥掉）。单行输入保持
+    /// 原有 trim（首尾空白对单行命令无意义）；多行只去尾部换行与末行尾随空白。
     pub fn submit(&mut self) -> String {
         self.break_undo_run();
-        let text = self.text.trim().to_string();
+        let raw = self.text.clone();
+        let text = if raw.contains('\n') {
+            raw.trim_end_matches([' ', '\t', '\n', '\r']).to_string()
+        } else {
+            raw.trim().to_string()
+        };
         self.clear();
         self.history_pos = None;
         self.draft = None;
@@ -543,6 +552,23 @@ mod tests {
         editor.insert_str("再来一条");
         editor.submit();
         assert_eq!(editor.history.len(), 2);
+    }
+
+    /// ISSUE-017：多行提交不得剥掉首行前导缩进（缩进代码块/续行命令是有效内容）；
+    /// 只去尾部换行与末行尾随空白。
+    #[test]
+    fn submit_keeps_leading_indent_in_multiline() {
+        let mut editor = Editor::new();
+        editor.insert_str("    foo() {\n        bar();\n    }\n");
+        assert_eq!(editor.submit(), "    foo() {\n        bar();\n    }");
+        // 首行缩进必须保留。
+        let mut editor2 = Editor::new();
+        editor2.insert_str("  git commit -m \"x\"\n  git push\n");
+        assert_eq!(
+            editor2.submit(),
+            "  git commit -m \"x\"\n  git push",
+            "首行前导空格不得被剥掉"
+        );
     }
 
     #[test]

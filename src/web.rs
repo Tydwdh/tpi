@@ -113,7 +113,7 @@ pub async fn serve(config: Arc<Config>, port: u16, token: Option<String>) -> Res
         sessions_root,
         workspace_root,
         log_path: std::sync::Mutex::new(log_path),
-        next_run: AtomicU64::new(0),
+        next_run: AtomicU64::new(1),
         registry: std::sync::Arc::new(std::sync::Mutex::new(
             crate::tool::registry::builtin_registry(),
         )),
@@ -548,6 +548,8 @@ impl Drop for RunGuard<'_> {
                 .last
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
+            // ISSUE-035：run_id 从 1 开始（next_run 初值 1），错误占位用 0——
+            // 两者不再冲突，轮询端不会把 panic 错误误认成自己那条消息的结果。
             *last = Some((
                 0,
                 RunResult {

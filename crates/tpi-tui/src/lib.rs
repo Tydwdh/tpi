@@ -3057,7 +3057,24 @@ fn draw_question(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme
                 }),
             ));
         }
-        QuestionMode::Done => {}
+        // ISSUE-029：提交/拒绝后模态保持一帧（直到 app 异步清除），此前渲染
+        // 空内容导致闪烁空框——改为明确反馈，用户看到"已提交"而非空白。
+        QuestionMode::Done => {
+            content.push(Line::styled(
+                if question.rejected {
+                    "已拒绝该问题（可继续输入其他指令）"
+                } else {
+                    "已提交回答，继续执行…"
+                },
+                Style::default()
+                    .fg(if question.rejected {
+                        theme.warning
+                    } else {
+                        theme.success
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
     }
 
     let wrapped = wrap_lines(content, inner_w);

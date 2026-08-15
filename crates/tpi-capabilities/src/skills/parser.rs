@@ -108,9 +108,12 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
 }
 
 /// frontmatter 字段（`key: value`，value 取第一个冒号后 trim）。
+/// ISSUE-037：用 `splitn(2, ':')` 只切第一个冒号——`description: "foo: bar"`
+/// 此前被截断成 "foo"（URL 等含冒号的值丢失）。
 fn frontmatter_field(frontmatter: &str, key: &str) -> Option<String> {
     frontmatter.lines().find_map(|line| {
-        let (k, v) = line.split_once(':')?;
+        let mut parts = line.splitn(2, ':');
+        let (k, v) = (parts.next()?, parts.next()?);
         if k.trim() == key {
             Some(v.trim().to_string())
         } else {

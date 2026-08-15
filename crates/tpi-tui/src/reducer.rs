@@ -83,6 +83,15 @@ fn handle_question_key(state: &mut UiState, key: KeyEvent, effects: &mut Vec<UiE
     if q.mode == QuestionMode::EditingCustom {
         match key.code {
             KeyCode::Char(c) => {
+                // ISSUE-018：Ctrl/Alt/Super 组合键不得当字面字符插入自定义回答
+                //（Ctrl+C/Ctrl+Z/Ctrl+A 此前变成字母）。模态拦截优先于 keymap，
+                // 这里必须过滤修饰位。
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                {
+                    return true;
+                }
                 q.custom_input.push(c);
                 return true;
             }
@@ -335,6 +344,14 @@ fn handle_search_key(
             }
             if c == 'f' && key.modifiers.contains(KeyModifiers::CONTROL) {
                 // Ctrl+F 已打开：无操作。
+            } else if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            {
+                // ISSUE-016：其余 Ctrl/Alt/Super 组合键在搜索打开期间被当普通
+                // 字符插入搜索词（Ctrl+C/Ctrl+Z/Ctrl+D/Ctrl+A/Ctrl+W…全变成
+                // 字母）。搜索路由在 keymap 之前拦截，这里必须过滤修饰位——
+                // 组合键要么另有语义要么应忽略，绝不能进搜索词。
             } else {
                 let mut query = state
                     .view

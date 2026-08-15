@@ -180,6 +180,112 @@ async fn p1_2_max_tool_calls_has_own_reason() {
     );
 }
 
+/// ISSUE-001：工具预算在**同一批**中途耗尽时，本批已 prepared（参数合法、
+/// 已计数）但未执行的调用必须合成 Rejected 终态并持久化——否则
+/// assistant.tool_calls 悬空，resume/继续对话重建出的 provider 消息序列非法。
+#[tokio::test]
+async fn issue_001_budget_exceeded_persists_all_unexecuted_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let mut config = test_config(&workspace);
+    config.limits.max_tool_calls = 2;
+
+    // 单 turn 一次发出 3 个工具调用：read/write 计入预算（index 0,1），
+    // 第 3 个 list 触发超限。read/write 已 prepared 但永远不该执行。
+    let mut provider = FakeProvider::scripted_loop(Box::new(|_request| {
+        FakeResponse::with_tool_calls(vec![
+            tool_call("read", serde_json::json!({"path": "sample.txt"})),
+            tool_call(
+                "write",
+                serde_json::json!({"path": "out.txt", "content": "x"}),
+            ),
+            tool_call("list", serde_json::json!({"path": "."})),
+        ])
+    }));
+    std::fs::write(workspace.join("sample.txt"), "x\n").unwrap();
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, mut rx) = mpsc::channel(16);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "go".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+            workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
+        },
+    )
+    .await
+    .expect("run 正常结束");
+
+    drain.abort();
+    assert_eq!(outcome.reason, CompletionReason::MaxToolCalls);
+
+    // 1) 每个 tool_call_id 都必须有 ToolCompleted（含已 prepared 但未执行的）。
+    let events = tpi::session::read_events(session.path()).unwrap();
+    let requested: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::ToolRequested { call } => Some(call.call_id.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(requested.len(), 3, "3 个调用都必须有 ToolRequested");
+    let completed: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::ToolCompleted { call_id, .. } => Some(call_id.to_string()),
+            _ => None,
+        })
+        .collect();
+    for call_id in &requested {
+        assert!(
+            completed.contains(call_id),
+            "tool_call {call_id} 必须有终态（ISSUE-001 悬空 tool_calls）"
+        );
+    }
+
+    // 2) 投影：assistant 的每个 tool_call 都有对应 Tool 消息（消息单元原子性）。
+    let projected = tpi::session::replay_messages(session.path()).unwrap();
+    let assistant = projected
+        .iter()
+        .find(|m| matches!(m, ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty()))
+        .expect("assistant 消息必须存在");
+    let ChatMessage::Assistant { tool_calls, .. } = assistant else {
+        unreachable!()
+    };
+    for call in tool_calls {
+        assert!(
+            projected.iter().any(|m| matches!(
+                m,
+                ChatMessage::Tool { tool_call_id, .. } if tool_call_id == &call.provider_id
+            )),
+            "assistant tool_call {} 必须有对应 Tool 结果消息",
+            call.provider_id
+        );
+    }
+
+    // 3) 已 prepared 但未执行的 write 不得产生副作用（out.txt 不应被创建）。
+    assert!(
+        !workspace.join("out.txt").exists(),
+        "预算超限时已 prepared 的工具不得执行"
+    );
+}
+
 /// P1-4：压缩与 prune 后上下文仍超窗口时，run 必须明确结束（ContextOverflow），
 /// 而不是继续发起必然 length error 的请求。
 #[tokio::test]

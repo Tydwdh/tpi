@@ -281,11 +281,44 @@ pub fn action_key(tool: BuiltinTool, args_json: &str) -> String {
 /// ActionKey（外部工具版，README2 Phase 5）。
 pub fn action_key_from_name(name: &str, args_json: &str) -> String {
     // serde_json 的 Map 默认有序（BTreeMap），canonical 序列化可复现。
+    // ISSUE-042：数值字面量归一——`1000`（int）与 `1000.0`/`1e3`（float）
+    // 在 Value::to_string 中产生不同文本，会把同一动作判成不同 action；
+    // 统一为「整数值按 u64、浮点按 u64 精确表示时」的形式后再哈希。
     let canonical = serde_json::from_str::<serde_json::Value>(args_json)
-        .map(|value| value.to_string())
+        .map(|value| normalize_numbers(value).to_string())
         .unwrap_or_else(|_| args_json.to_string());
     let digest = blake3::hash(format!("{name}|{canonical}").as_bytes());
     digest.to_hex()[..16].to_string()
+}
+
+/// 递归把数值统一：整数保持 u64；浮点若精确等于某整数（`1000.0`、`1e3`）
+/// 归一为该整数，否则保留原文。数组/对象递归。
+fn normalize_numbers(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_u64() {
+                serde_json::Value::Number(serde_json::Number::from(i))
+            } else if let Some(f) = n.as_f64()
+                && f.fract() == 0.0
+                && f.is_finite()
+                && f >= 0.0
+                && f <= u64::MAX as f64
+            {
+                serde_json::Value::Number(serde_json::Number::from(f as u64))
+            } else {
+                serde_json::Value::Number(n)
+            }
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(normalize_numbers).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, normalize_numbers(v)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// ObservationKey（§12.3）：hash(status + bounded_model_payload)，排除易变字段。
