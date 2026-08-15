@@ -95,6 +95,26 @@ pub struct ModelRequest {
     pub context_window: Option<u64>,
 }
 
+/// P5-01：normalized model stream handle。
+///
+/// Provider 的流式输出统一为 [`ProviderEvent`] 序列（迭代句柄），调用方
+/// **不传 UI channel**——UI 是 agent 的 LiveEvent（P1-03 解耦）；provider 只
+/// 产生语义事件。OpenAI adapter（openai_compat）与 fake 都产出本句柄。
+pub struct ProviderStream {
+    rx: tokio::sync::mpsc::Receiver<ProviderEvent>,
+}
+
+impl ProviderStream {
+    pub fn new(rx: tokio::sync::mpsc::Receiver<ProviderEvent>) -> Self {
+        Self { rx }
+    }
+
+    /// 取下一个事件（None = 流结束）。
+    pub async fn next(&mut self) -> Option<ProviderEvent> {
+        self.rx.recv().await
+    }
+}
+
 /// 一次请求的完整响应（流事件经 `mpsc::Sender<ProviderEvent>` 发送）。
 #[derive(Debug, Clone)]
 pub struct ProviderResponse {
