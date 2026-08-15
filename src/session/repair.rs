@@ -431,7 +431,7 @@ mod tests {
             session_id,
         )
         .unwrap();
-        let call = crate::provider::ToolCall {
+        let call = crate::message::ToolCall {
             call_id: crate::ids::ToolCallId::new_v7(),
             provider_id: "provider-call".into(),
             name: "read".into(),
@@ -464,7 +464,7 @@ mod tests {
             events.iter().any(|e| matches!(
                 e,
                 SessionEvent::ToolCompleted { outcome, .. }
-                    if outcome.status == crate::tool::outcome::ToolStatus::Interrupted
+                    if outcome.status == crate::outcome::ToolStatus::Interrupted
             )),
             "必须包含合成的 Interrupted ToolCompleted: {events:?}"
         );

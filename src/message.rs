@@ -1,4 +1,4 @@
-//! Domain message / content（P1-02）。
+//! Domain message / content（P1-02 + P7 边界下沉）。
 //!
 //! 目标词汇（`02-target-architecture.md` §2.1）：domain model 表达用户/模型/
 //! 工具交互的稳定语义，**不再把 OpenAI-compatible `ChatMessage` 当全系统消息
@@ -6,6 +6,8 @@
 //!
 //! - [`DomainRole`] / [`DomainContentBlock`] / [`DomainMessage`]：UI-agnostic、
 //!   provider-agnostic 的语义消息；
+//! - [`ChatMessage`] / [`ToolCall`]：provider wire 消息类型（P7 下沉：纯数据，
+//!   定义在 domain 层；`crate::provider` re-export 保持对外契约）；
 //! - 双向 adapter：`ChatMessage -> DomainMessage`（provider wire → domain）与
 //!   `DomainMessage -> ChatMessage`（domain → provider wire）。
 //!
@@ -17,7 +19,47 @@
 //! [`crate::session::replay_domain_messages`]），provider converter 再生成旧
 //! `ChatMessage`。对外 `ChatMessage` 契约不变（golden parity 由测试保证）。
 
-use crate::provider::{ChatMessage, ToolCall};
+use crate::ids::ToolCallId;
+
+/// 模型发出的工具调用请求（tool argument 增量已在 adapter 内拼接完成）。
+/// （P7 下沉：定义在 domain 层；provider 层 re-export。）
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolCall {
+    /// TPI 内部分配的 call id（§14.2 恢复关联用）。
+    pub call_id: ToolCallId,
+    /// provider 原始 tool call id（回填 tool result 时必须原样返回）。
+    pub provider_id: String,
+    pub name: String,
+    /// 完整 JSON 参数字符串；schema 校验发生在调度前（§8.2 `PreparedToolCall`）。
+    pub arguments: String,
+}
+
+/// 工具定义（schema 由参数类型生成，§5.2 schemars）。
+/// （P7 下沉：定义在 domain 层；provider 层 re-export。）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// 发给模型的消息（OpenAI-compatible 最小形态；provider 差异在 adapter 内吸收）。
+/// （P7 下沉：定义在 domain 层；provider 层 re-export。）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatMessage {
+    System(String),
+    User(String),
+    Assistant {
+        content: String,
+        tool_calls: Vec<ToolCall>,
+    },
+    /// 工具结果回填。
+    Tool {
+        tool_call_id: String,
+        name: String,
+        content: String,
+    },
+}
 
 /// 消息角色（domain 语义；不携带 provider 特定字段）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -140,7 +140,7 @@ fn json_events_are_versioned_and_bounded() {
     let tool = tpi::agent::LiveEvent::ToolCompleted {
         call_id: tpi::ids::ToolCallId::from_u128(1),
         name: "bash".into(),
-        status: tpi::tool::outcome::ToolStatus::Succeeded,
+        status: tpi::outcome::ToolStatus::Succeeded,
         duration_ms: 5,
         exit_code: Some(0),
         output: "bounded-summary".into(),

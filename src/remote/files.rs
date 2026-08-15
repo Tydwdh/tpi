@@ -10,10 +10,10 @@
 
 use camino::Utf8PathBuf;
 
+use crate::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::remote::ssh::SshClient;
 use crate::tool::ToolContext;
 use crate::tool::edit::{self, FileSnapshot};
-use crate::tool::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 
 /// 远端 read 窗口参数。
 #[derive(Debug, Clone)]

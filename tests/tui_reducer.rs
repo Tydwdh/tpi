@@ -5,7 +5,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tpi::agent::{DeltaKind, RuntimeEvent};
-use tpi::tool::outcome::ToolStatus;
+use tpi::outcome::ToolStatus;
 use tpi::tui::effect::UiEffect;
 use tpi::tui::event::UiEvent;
 use tpi::tui::model::{LineKind, StatusLine, ViewModel};

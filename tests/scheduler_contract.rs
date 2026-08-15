@@ -249,8 +249,8 @@ async fn edit_and_edit_same_file_are_serialized() {
         })
         .collect();
     assert_eq!(completed.len(), 2);
-    assert_eq!(completed[0], tpi::tool::outcome::ToolStatus::Succeeded);
-    assert_eq!(completed[1], tpi::tool::outcome::ToolStatus::Succeeded);
+    assert_eq!(completed[0], tpi::outcome::ToolStatus::Succeeded);
+    assert_eq!(completed[1], tpi::outcome::ToolStatus::Succeeded);
     assert_eq!(
         std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
         "line ONE\nline TWO\n"
@@ -460,7 +460,7 @@ async fn cancellation_during_parallel_bash_cancels_all() {
     assert!(
         cancelled
             .iter()
-            .all(|s| *s == tpi::tool::outcome::ToolStatus::Cancelled),
+            .all(|s| *s == tpi::outcome::ToolStatus::Cancelled),
         "并行中取消必须让所有 in-flight call 全部 Cancelled: {cancelled:?}"
     );
 }

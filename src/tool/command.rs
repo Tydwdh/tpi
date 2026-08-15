@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::tool::ToolContext;
-use crate::tool::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -348,7 +348,7 @@ error: process_execution_failed
         stderr_bytes: &result.stderr,
     });
     let artifact_ref = match artifact_result {
-        Ok(record) => Some(crate::tool::outcome::ArtifactRef {
+        Ok(record) => Some(crate::outcome::ArtifactRef {
             session: ctx.session_id.clone(),
             id: record.id,
         }),
@@ -774,7 +774,7 @@ fn outcome_for(input: OutcomeInput<'_>) -> ToolOutcome {
         evidence: Vec::new(),
         observed_resources: Vec::new(),
         artifacts: Vec::new(),
-        timing: crate::tool::outcome::ToolTiming { duration_ms },
+        timing: crate::outcome::ToolTiming { duration_ms },
     }
 }
 

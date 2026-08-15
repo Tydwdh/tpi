@@ -43,7 +43,7 @@ impl ArtifactWriter {
         tool: &str,
         mime: &str,
     ) -> std::io::Result<Self> {
-        if !crate::tool::validate_artifact_component(session_id) {
+        if !crate::util::validate_artifact_component(session_id) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "invalid artifact session id",
@@ -155,8 +155,8 @@ pub fn find(
     session_id: &str,
     id: &str,
 ) -> Option<ArtifactRecord> {
-    if !crate::tool::validate_artifact_component(session_id)
-        || !crate::tool::validate_artifact_component(id)
+    if !crate::util::validate_artifact_component(session_id)
+        || !crate::util::validate_artifact_component(id)
     {
         return None;
     }

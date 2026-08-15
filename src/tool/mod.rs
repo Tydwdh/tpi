@@ -11,9 +11,9 @@ pub mod edit;
 pub mod files;
 pub mod inspect;
 pub mod invariants;
-pub mod outcome;
+pub use crate::outcome::{Effect, ModelPayload, ToolOutcome, ToolStatus};
 pub mod pipeline;
-pub mod plan;
+pub mod plan_exec;
 pub mod policy;
 pub mod process;
 pub mod registry;
@@ -24,10 +24,9 @@ pub mod selector;
 pub mod web;
 
 use camino::Utf8PathBuf;
-use outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use tokio_util::sync::CancellationToken;
 
-use crate::provider::ToolDef;
+use crate::message::ToolDef;
 
 /// 工具 schema 的 JSON 序列化（schemars 生成，理论上不会失败）。
 /// 失败时记录日志并返回 null（模型将看到无参数 schema，但进程不崩溃）。
@@ -193,30 +192,9 @@ pub(crate) enum ToolExecutionClass {
     WorkspaceUnknown,
 }
 
-/// session 中断后如何解释“缺少 ToolCompleted”的调用。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolRecoveryPolicy {
-    /// 工具不会改变需要恢复的外部状态。
-    NoEffect,
-    /// edit/write 使用 commit metadata 判定已提交、未提交或未知。
-    FileCommit,
-    /// bash 等任意副作用工具无法可靠推断执行结果。
-    Unknown,
-}
-
 impl ToolExecutionClass {
     pub(crate) fn requires_write_ahead(self) -> bool {
         matches!(self, Self::FileWriteExact | Self::WorkspaceUnknown)
-    }
-
-    pub(crate) fn recovery_policy(self) -> ToolRecoveryPolicy {
-        match self {
-            Self::Pure | Self::FileReadExact | Self::FileReadRecursive => {
-                ToolRecoveryPolicy::NoEffect
-            }
-            Self::FileWriteExact => ToolRecoveryPolicy::FileCommit,
-            Self::WorkspaceUnknown => ToolRecoveryPolicy::Unknown,
-        }
     }
 }
 
@@ -282,10 +260,6 @@ impl BuiltinTool {
 
     pub(crate) fn requires_write_ahead(self) -> bool {
         self.execution_class().requires_write_ahead()
-    }
-
-    pub(crate) fn recovery_policy(self) -> ToolRecoveryPolicy {
-        self.execution_class().recovery_policy()
     }
 
     pub fn description(&self) -> &'static str {
@@ -448,7 +422,7 @@ Example: activate_skill name=\"rust-review\""
                 schema_value::<request_input::RequestInputArgs>("request_input")
             }
             BuiltinTool::RuntimeInspect => schema_value::<inspect::InspectArgs>("runtime_inspect"),
-            BuiltinTool::UpdatePlan => schema_value::<plan::UpdatePlanArgs>("update_plan"),
+            BuiltinTool::UpdatePlan => schema_value::<crate::plan::UpdatePlanArgs>("update_plan"),
             BuiltinTool::WebSearch => schema_value::<web::WebSearchArgs>("web_search"),
             BuiltinTool::WebFetch => schema_value::<web::WebFetchArgs>("web_fetch"),
             BuiltinTool::ActivateSkill => {
@@ -508,7 +482,7 @@ pub enum ValidatedArgs {
     Process(process::ProcessArgs),
     RequestInput(request_input::RequestInputArgs),
     RuntimeInspect(inspect::InspectArgs),
-    UpdatePlan(plan::UpdatePlanArgs),
+    UpdatePlan(crate::plan::UpdatePlanArgs),
     WebSearch(web::WebSearchArgs),
     WebFetch(web::WebFetchArgs),
     ActivateSkill(crate::skills::activate::ActivateSkillArgs),
@@ -596,7 +570,7 @@ pub struct ToolContext {
     /// session-local bounded SnapshotStore（§10.1）。
     pub snapshot_store: std::sync::Arc<std::sync::Mutex<crate::tool::edit::SnapshotStore>>,
     /// 当前原子短计划（§13；agent loop 持有，update_plan 原子替换）。
-    pub current_plan: std::sync::Arc<std::sync::Mutex<Option<crate::tool::plan::Plan>>>,
+    pub current_plan: std::sync::Arc<std::sync::Mutex<Option<crate::plan::Plan>>>,
     /// Logical Shell Session（任务书 §S1：属于 Workspace；bash 工具读写）。
     /// 与 `workspace` 内的 shell 是同一状态源（构造时共享 Arc）。
     pub shell: std::sync::Arc<std::sync::Mutex<crate::shell::ShellSessionState>>,
@@ -820,24 +794,16 @@ fn canonical_ancestor(path: &std::path::Path) -> Option<std::path::PathBuf> {
     }
 }
 
-/// artifact 引用组件校验（禁止路径分隔符与 `..`）。
-pub fn validate_artifact_component(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && !value.contains('/')
-        && !value.contains('\\')
-        && !value.contains("..")
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
+/// P7 下沉：`validate_artifact_component` 移入 core（`crate::util`），此处
+/// re-export 保持 `tool::validate_artifact_component` 兼容。
+pub use crate::util::validate_artifact_component;
 
 /// 路径被拒绝时的标准 tool outcome。
 pub fn path_rejected_outcome(tool: &str, error: PathResolveError) -> ToolOutcome {
     ToolOutcome::failed(
         tool,
-        outcome::ModelPayload {
-            status: outcome::ToolStatus::Rejected,
+        crate::outcome::ModelPayload {
+            status: crate::outcome::ToolStatus::Rejected,
             program: None,
             exit_code: None,
             duration_ms: 0,
@@ -892,7 +858,7 @@ pub async fn execute(
                 (BuiltinTool::Edit, ValidatedArgs::Edit(args)) => files::edit(args, &ctx, plan.as_ref()),
                 (BuiltinTool::Write, ValidatedArgs::Write(args)) => files::write(args, &ctx, plan.as_ref()),
                 // §13：update_plan 是原生同步控制操作。
-                (BuiltinTool::UpdatePlan, ValidatedArgs::UpdatePlan(args)) => plan::update_plan(args, &ctx),
+                (BuiltinTool::UpdatePlan, ValidatedArgs::UpdatePlan(args)) => plan_exec::update_plan(args, &ctx),
                 (tool, args) => {
                     // 内部不变量：ValidatedArgs 由同工具解析产生；异常组合按失败上报。
                     tracing::error!(
@@ -987,7 +953,8 @@ mod tests {
                     ToolExecutionClass::FileWriteExact | ToolExecutionClass::WorkspaceUnknown
                 )
             );
-            assert_eq!(tool.recovery_policy(), class.recovery_policy());
+            // recovery 策略已下沉 core（crate::outcome::tool_recovery_policy），
+            // 一致性由 outcome::recovery_policy_tests 保证。
         }
     }
 
@@ -1107,7 +1074,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(outcome.status, outcome::ToolStatus::Succeeded);
+        assert_eq!(outcome.status, crate::outcome::ToolStatus::Succeeded);
         assert!(outcome.model_text().contains("hello 世界"));
     }
 

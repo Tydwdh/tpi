@@ -18,7 +18,7 @@
 //! [`Conversation`]（conversation.rs）是 facade：持有 `SessionLog` 与本
 //! 投影器；恢复/刷新经 `events_with_seq()`（P2-02 port）喂给 `rebuild`。
 
-use crate::provider::ChatMessage;
+use crate::message::ChatMessage;
 use crate::session::protocol::{Plan, SessionEvent};
 use crate::session::store::compacted_range;
 

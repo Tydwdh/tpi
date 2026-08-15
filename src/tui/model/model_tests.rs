@@ -648,7 +648,7 @@ mod p2_card_nav_tests {
         view.push_line(LineKind::User, "旧会话问题");
         view.push_line(LineKind::Assistant, "旧会话回答");
         view.push_stream_delta(LineKind::Assistant, "流式中");
-        view.plan = Some(crate::tool::plan::Plan {
+        view.plan = Some(crate::plan::Plan {
             explanation: Some("旧计划".into()),
             items: Vec::new(),
         });

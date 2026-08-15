@@ -15,8 +15,8 @@ use reqwest::Url;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::outcome::{ArtifactRef, ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::tool::ToolContext;
-use crate::tool::outcome::{ArtifactRef, ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 
 /// 把抓取正文按 `FETCH_BODY_BUDGET` 有界化。
 ///

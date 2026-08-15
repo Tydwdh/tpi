@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Mutex;
 
+use crate::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use crate::tool::ToolContext;
-use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use crate::tool::registry::{Tool, ToolOrigin};
 
 use super::client::McpClient;
@@ -98,7 +98,7 @@ impl Tool for McpToolAdapter {
             Ok(value) => {
                 let output = format_mcp_result(&value);
                 let mut outcome = ToolOutcome::succeeded(&self.internal_name, output);
-                outcome.session_metadata = crate::tool::outcome::ToolMetadata {
+                outcome.session_metadata = crate::outcome::ToolMetadata {
                     tool: self.internal_name.clone(),
                     ..Default::default()
                 };

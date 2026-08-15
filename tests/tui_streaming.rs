@@ -12,7 +12,7 @@ use std::time::Duration;
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 
-use tpi::tool::outcome::ToolStatus;
+use tpi::outcome::ToolStatus;
 use tpi::tui::model::{LineKind, ViewModel};
 use tpi::tui::{FRAME_INTERVAL, draw_captured_bytes, draw_to_test_backend};
 
@@ -329,7 +329,7 @@ fn command_menu_pops_up_with_matches() {
 /// Todo 只在侧边栏显示，主区底部不再重复渲染计划条。
 #[test]
 fn plan_renders_only_in_sidebar() {
-    use tpi::tool::plan::{Plan, PlanItem, PlanStatus};
+    use tpi::plan::{Plan, PlanItem, PlanStatus};
     let mut view = ViewModel::default();
     view.push_line(LineKind::User, "请实现功能");
     view.plan = Some(Plan {

@@ -114,7 +114,7 @@ mod tests {
                 &self,
                 _args: &str,
                 _ctx: &crate::tool::ToolContext,
-            ) -> crate::tool::outcome::ToolOutcome {
+            ) -> crate::outcome::ToolOutcome {
                 unreachable!()
             }
         }

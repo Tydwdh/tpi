@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use camino::Utf8PathBuf;
 use tokio_util::sync::CancellationToken;
+use tpi::outcome::ToolStatus;
 use tpi::remote::RemoteWorkspace;
 use tpi::remote::ssh::{HostKeyDecision, RemoteHost};
 use tpi::tool::command::{BashArgs, bash};
-use tpi::tool::outcome::ToolStatus;
 use tpi::workspace::ActiveWorkspace;
 
 /// 启动 server + 确认 host key + 构造 Remote ToolContext。
@@ -67,7 +67,7 @@ async fn run_bash(
     ctx: &tpi::tool::ToolContext,
     command: &str,
     cancel: CancellationToken,
-) -> tpi::tool::outcome::ToolOutcome {
+) -> tpi::outcome::ToolOutcome {
     let mut ctx = ctx.clone();
     ctx.cancel = cancel;
     bash(

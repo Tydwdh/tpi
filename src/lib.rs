@@ -14,6 +14,8 @@ pub mod eval;
 pub mod ids;
 pub mod mcp;
 pub mod message;
+pub mod outcome;
+pub mod plan;
 pub mod process;
 pub mod provider;
 pub mod remote;

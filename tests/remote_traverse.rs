@@ -85,7 +85,7 @@ async fn remote_list_format_matches_local() {
         &ctx,
     )
     .await;
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Succeeded);
     let out = &outcome.model_payload.output;
     assert!(out.contains("status: succeeded"), "{out}");
     // tempdir 里还有 server 的 known_hosts 文件，scanned_files 含它；只断言 >= 2。
@@ -121,7 +121,7 @@ async fn remote_search_finds_matches() {
         &ctx,
     )
     .await;
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Succeeded);
     let out = &outcome.model_payload.output;
     assert!(out.contains("log.txt"), "匹配行含路径：{out}");
     assert!(out.contains("error: bad thing"), "{out}");
@@ -152,7 +152,7 @@ async fn remote_glob_matches_pattern() {
         &ctx,
     )
     .await;
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Succeeded);
     let out = &outcome.model_payload.output;
     assert!(out.contains("main.rs"), "{out}");
     assert!(out.contains("lib.rs"), "{out}");

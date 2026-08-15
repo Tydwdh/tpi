@@ -35,6 +35,19 @@ pub fn lock_mutex<'a, T>(mutex: &'a Mutex<T>, what: &'static str) -> MutexGuard<
     }
 }
 
+/// P7 下沉：artifact 路径组件校验（原 `crate::tool::validate_artifact_component`）。
+/// 纯函数，core 层提供；tool（files）与 session（artifact）共用。
+pub fn validate_artifact_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains("..")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// UTF-8 安全截断：把 `String` 截断到不超过 `max_bytes` 的最大字符边界。
 ///
 /// `String::truncate` 在非 char boundary 处直接 panic；所有按字节预算截断

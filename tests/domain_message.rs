@@ -146,18 +146,18 @@ fn corpus_replay_parity() {
     assert!(!direct.is_empty());
 }
 
-fn tool_outcome(text: &str) -> tpi::tool::outcome::StoredToolOutcome {
-    tpi::tool::outcome::StoredToolOutcome {
-        status: tpi::tool::outcome::ToolStatus::Succeeded,
-        session_metadata: tpi::tool::outcome::ToolMetadata {
+fn tool_outcome(text: &str) -> tpi::outcome::StoredToolOutcome {
+    tpi::outcome::StoredToolOutcome {
+        status: tpi::outcome::ToolStatus::Succeeded,
+        session_metadata: tpi::outcome::ToolMetadata {
             tool: "bash".into(),
             target: None,
             program: None,
             timeout_ms: None,
             diff: None,
         },
-        model_payload: tpi::tool::outcome::ModelPayload {
-            status: tpi::tool::outcome::ToolStatus::Succeeded,
+        model_payload: tpi::outcome::ModelPayload {
+            status: tpi::outcome::ToolStatus::Succeeded,
             program: Some("bash".into()),
             exit_code: Some(0),
             duration_ms: 0,

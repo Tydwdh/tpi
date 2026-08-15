@@ -9,7 +9,7 @@
 //! - scroll lock 期间新输出不强制拉回底部。
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tpi::tool::outcome::ToolStatus;
+use tpi::outcome::ToolStatus;
 use tpi::tui::event::UiEvent;
 use tpi::tui::model::{Entry, LineKind, MAX_CARD_OUTPUT, ToolCard, ToolCardState, ViewModel};
 use tpi::tui::{HitTarget, draw_to_test_backend};

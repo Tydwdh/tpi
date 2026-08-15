@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use crate::agent;
 use crate::config::Config;
 use crate::ids::RunId;
+use crate::outcome::ToolStatus;
 use crate::session::{SessionEvent, SessionLog};
-use crate::tool::outcome::ToolStatus;
 
 /// Eval 根目录名（相对 workspace）。
 pub const EVALS_DIR: &str = "evals";
@@ -978,12 +978,12 @@ mod tests {
     #[test]
     fn stats_count_events() {
         use crate::ids::ToolCallId;
+        use crate::outcome::{ModelPayload, StoredToolOutcome};
         use crate::provider::ToolCall;
         use crate::session::{
             AssistantMessage, CompactSummary, CompletionReason, EventRange, ModelRef, RunLimits,
             Usage,
         };
-        use crate::tool::outcome::{ModelPayload, StoredToolOutcome};
 
         let mut events: Vec<(i128, SessionEvent)> = Vec::new();
         let mut ts = 1_000_000i128;

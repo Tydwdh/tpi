@@ -4,8 +4,8 @@
 //! 和正文（§10.2）。正文统一 LF，因此模型复制出的 `old_text` 与匹配空间一致；
 //! 每行带 `{n}: ` 行号前缀（§read 精度：模型可精确引用单行）。
 
+use crate::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::tool::edit::{self, EditError};
-use crate::tool::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::tool::{
     ToolContext, path_rejected_outcome, resolve_tool_path, validate_artifact_component,
 };
@@ -323,7 +323,7 @@ pub fn edit(
             let mut outcome = ToolOutcome::succeeded("edit", output);
             outcome
                 .observed_resources
-                .push(crate::tool::outcome::ResourceVersion {
+                .push(crate::outcome::ResourceVersion {
                     path: display_path(&ctx.workspace_root, &path),
                     revision: result.current_revision,
                 });
@@ -444,7 +444,7 @@ pub fn write(
             }
             outcome
                 .observed_resources
-                .push(crate::tool::outcome::ResourceVersion {
+                .push(crate::outcome::ResourceVersion {
                     path: display_path(&ctx.workspace_root, &path),
                     revision: revision.clone(),
                 });
@@ -523,7 +523,7 @@ fn rewrite_with_revision(
             }
             outcome
                 .observed_resources
-                .push(crate::tool::outcome::ResourceVersion {
+                .push(crate::outcome::ResourceVersion {
                     path: display_path.to_string(),
                     revision: result.current_revision.clone(),
                 });
@@ -614,7 +614,7 @@ pub fn display_path(workspace_root: &Utf8PathBuf, path: &Utf8PathBuf) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::outcome::ToolStatus;
+    use crate::outcome::ToolStatus;
     use tokio_util::sync::CancellationToken;
 
     /// BUG-001 回归：读取超过 32 KiB 且截断点落在多字节字符中间的中文文件

@@ -735,10 +735,7 @@ async fn invalid_tool_args_produce_observation_without_breaking_session() {
         "第一次的 observation 必须说明校验失败: {}",
         completed[0].model_payload.output
     );
-    assert_eq!(
-        completed[1].status,
-        tpi::tool::outcome::ToolStatus::Succeeded
-    );
+    assert_eq!(completed[1].status, tpi::outcome::ToolStatus::Succeeded);
     // P0-3：rejected observation 持久化后，restart 重建必须与 runtime 一致。
     let resumed = tpi::session::replay_messages(session.path()).unwrap();
     assert_eq!(

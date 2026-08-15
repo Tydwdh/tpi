@@ -6,7 +6,6 @@
 //! 第一版只有 OpenAI-compatible 一个实现 + 测试用 fake provider；
 //! 第二个真实 adapter 出现时再从已稳定的输入/事件类型提取边界（§7.1）。
 
-use crate::ids::ToolCallId;
 use crate::session::Usage;
 use tokio_util::sync::CancellationToken;
 
@@ -47,42 +46,10 @@ pub enum FinishReason {
     Error,
 }
 
-/// 模型发出的工具调用请求（tool argument 增量已在 adapter 内拼接完成）。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ToolCall {
-    /// TPI 内部分配的 call id（§14.2 恢复关联用）。
-    pub call_id: ToolCallId,
-    /// provider 原始 tool call id（回填 tool result 时必须原样返回）。
-    pub provider_id: String,
-    pub name: String,
-    /// 完整 JSON 参数字符串；schema 校验发生在调度前（§8.2 `PreparedToolCall`）。
-    pub arguments: String,
-}
-
-/// 发给模型的消息（OpenAI-compatible 最小形态；provider 差异在 adapter 内吸收）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChatMessage {
-    System(String),
-    User(String),
-    Assistant {
-        content: String,
-        tool_calls: Vec<ToolCall>,
-    },
-    /// 工具结果回填。
-    Tool {
-        tool_call_id: String,
-        name: String,
-        content: String,
-    },
-}
-
-/// 工具定义（schema 由参数类型生成，§5.2 schemars）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolDef {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
-}
+/// P7 下沉：`ChatMessage` / `ToolCall` / `ToolDef` 是纯数据，定义在 domain 层
+/// （`crate::message`）；此处 re-export 保持对外契约不变（`provider::ChatMessage`
+/// 等仍可用，golden parity 由测试保证）。
+pub use crate::message::{ChatMessage, ToolCall, ToolDef};
 
 /// 一次模型请求。
 #[derive(Debug, Clone)]

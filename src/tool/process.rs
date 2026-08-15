@@ -16,9 +16,9 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use crate::process::managed::{ManagedProcessState, ProcessId, wait_process};
 use crate::tool::ToolContext;
-use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 
 /// 默认 wait 上限（§20：建议 5 秒窗口）。
 pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 5_000;

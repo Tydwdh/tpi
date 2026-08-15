@@ -8,10 +8,10 @@
 
 use std::path::Path;
 
+use crate::outcome::Effect;
+use crate::outcome::{ModelPayload, StoredToolOutcome, ToolMetadata, ToolStatus};
+use crate::outcome::{ToolRecoveryPolicy, tool_recovery_policy};
 use crate::session::{RecoveryMetadata, SessionEvent, read_events};
-use crate::tool::edit::Effect;
-use crate::tool::outcome::{ModelPayload, StoredToolOutcome, ToolMetadata, ToolStatus};
-use crate::tool::{BuiltinTool, ToolRecoveryPolicy};
 
 /// 恢复结果。
 pub struct RecoveryOutcome {
@@ -90,11 +90,11 @@ pub fn recover(path: &Path) -> std::io::Result<RecoveryOutcome> {
 /// 纯读工具无副作用，记为 not_applied。
 /// `pub(crate)`：session repair 在重建 interrupted tool outcome 时复用。
 pub(crate) fn classify_effect(tool_name: &str, recovery: Option<&RecoveryMetadata>) -> Effect {
-    let policy = BuiltinTool::from_name(tool_name).map(BuiltinTool::recovery_policy);
+    let policy = tool_recovery_policy(tool_name);
     match policy {
-        Some(ToolRecoveryPolicy::NoEffect) => Effect::NotApplied,
-        Some(ToolRecoveryPolicy::Unknown) | None => Effect::Unknown,
-        Some(ToolRecoveryPolicy::FileCommit) => {
+        ToolRecoveryPolicy::NoEffect => Effect::NotApplied,
+        ToolRecoveryPolicy::Unknown => Effect::Unknown,
+        ToolRecoveryPolicy::FileCommit => {
             let Some(metadata) = recovery else {
                 return Effect::Unknown;
             };

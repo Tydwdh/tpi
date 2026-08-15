@@ -1,4 +1,4 @@
-﻿//! M3 竞态与恢复契约测试（§10.4/§10.7、§20.2 场景 18/19）。
+//! M3 竞态与恢复契约测试（§10.4/§10.7、§20.2 场景 18/19）。
 //!
 //! - §20.2 场景 18：写工具在副作用前已持久化 recovery metadata；分别在 replace 前、
 //!   replace 后、ToolCompleted 前崩溃都能恢复/诊断；
@@ -8,12 +8,12 @@
 mod fixtures;
 
 use camino::Utf8PathBuf;
+use tpi::outcome::Effect;
 use tpi::session::{RecoveryMetadata, SessionEvent, SessionLog};
 use tpi::tool::edit::CommitPlan;
 use tpi::tool::edit::{
     Replacement, apply_edit, commit_edit, prepare_commit, revision_of, verify_after_replace,
 };
-use tpi::tool::outcome::Effect;
 
 /// 构造一个带 recovery metadata 的 ToolStarted + 缺 ToolCompleted 的崩溃 session。
 fn crashed_session(

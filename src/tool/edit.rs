@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use camino::Utf8PathBuf;
 use serde::Deserialize;
 
-pub use crate::tool::outcome::Effect;
+pub use crate::outcome::Effect;
 
 /// edit 工具参数（§10.3）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]

@@ -7,8 +7,8 @@ mod fixtures;
 
 use camino::Utf8PathBuf;
 use tokio_util::sync::CancellationToken;
+use tpi::outcome::ToolStatus;
 use tpi::tool::command::{BashArgs, bash};
-use tpi::tool::outcome::ToolStatus;
 
 /// Windows 路径比较：盘符大小写不敏感 + 分隔符归一化（session cwd 来自
 /// cygpath -w 是反斜杠，workspace.join() 是正斜杠）。
@@ -22,7 +22,7 @@ async fn run_bash(
     command: &str,
     timeout_ms: u64,
     cancel: CancellationToken,
-) -> tpi::tool::outcome::ToolOutcome {
+) -> tpi::outcome::ToolOutcome {
     let mut ctx = ctx.clone();
     ctx.cancel = cancel;
     bash(

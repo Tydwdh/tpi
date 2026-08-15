@@ -41,7 +41,7 @@ pub use store::{
 mod tests {
     use super::*;
     use crate::ids::{EventId, RequestId, RunId, SessionId, ToolCallId};
-    use crate::provider::{ChatMessage, ToolCall};
+    use crate::message::{ChatMessage, ToolCall};
     use crate::session::store::read_envelopes_state_with_limits;
     use camino::Utf8PathBuf;
     use std::path::PathBuf;
@@ -175,8 +175,7 @@ mod tests {
         let mut log =
             SessionLog::create(&sessions_root, workspace.as_std_path(), RunId::new_v7()).unwrap();
         let call_id = ToolCallId::new_v7();
-        let outcome =
-            crate::tool::outcome::ToolOutcome::succeeded("read", "ok".into()).into_stored();
+        let outcome = crate::outcome::ToolOutcome::succeeded("read", "ok".into()).into_stored();
 
         assert!(
             log.append_event(&SessionEvent::ToolCompleted { call_id, outcome })

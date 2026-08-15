@@ -7,9 +7,9 @@
 mod fixtures;
 
 use serial_test::serial;
+use tpi::outcome::{ToolOutcome, ToolStatus};
 use tpi::process::managed::{ManagedProcessState, ProcessId, wait_process};
 use tpi::tool::command::{BashArgs, bash};
-use tpi::tool::outcome::{ToolOutcome, ToolStatus};
 
 #[test]
 fn exit_status_is_visible_in_model_payload() {
@@ -921,7 +921,7 @@ async fn foreground_and_background_cancel_both_cancelled() {
     .await;
     assert_eq!(
         fg.status,
-        tpi::tool::outcome::ToolStatus::Cancelled,
+        tpi::outcome::ToolStatus::Cancelled,
         "foreground cancel 对齐"
     );
 
@@ -938,7 +938,7 @@ async fn foreground_and_background_cancel_both_cancelled() {
     .await;
     assert_eq!(
         bg.status,
-        tpi::tool::outcome::ToolStatus::Cancelled,
+        tpi::outcome::ToolStatus::Cancelled,
         "background cancel 对齐"
     );
     // 无残留进程（registry 空）。

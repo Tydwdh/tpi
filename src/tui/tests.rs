@@ -182,7 +182,7 @@ fn tool_card_only_header_clickable() {
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::tool::outcome::ToolStatus::Failed,
+        crate::outcome::ToolStatus::Failed,
         10,
         Some(1),
         "第一行\n第二行\n第三行\n第四行",
@@ -214,7 +214,7 @@ fn tool_card_only_header_clickable() {
 /// 侧边栏 Todo 显示全部项目，活跃项优先、完成历史沉底。
 #[test]
 fn sidebar_plan_shows_all_active_items_before_history() {
-    use crate::tool::plan::{Plan, PlanItem, PlanStatus};
+    use crate::plan::{Plan, PlanItem, PlanStatus};
     let plan = Plan {
         explanation: None,
         items: vec![
@@ -697,7 +697,7 @@ fn tool_card_shows_diff_without_expanding() {
             target: Some("src/lib.rs".into()),
             command: None,
             state: ToolCardState::Done {
-                status: crate::tool::outcome::ToolStatus::Succeeded,
+                status: crate::outcome::ToolStatus::Succeeded,
                 duration_ms: 10,
                 exit_code: Some(0),
             },
@@ -759,7 +759,7 @@ fn tool_card_diff_limits_length_when_collapsed() {
         target: None,
         command: None,
         state: ToolCardState::Done {
-            status: crate::tool::outcome::ToolStatus::Succeeded,
+            status: crate::outcome::ToolStatus::Succeeded,
             duration_ms: 10,
             exit_code: Some(0),
         },
@@ -853,7 +853,7 @@ fn tool_card_running_shows_spinner_and_done_shows_status() {
         target: Some("bash: cargo test".into()),
         command: None,
         state: ToolCardState::Done {
-            status: crate::tool::outcome::ToolStatus::Failed,
+            status: crate::outcome::ToolStatus::Failed,
             duration_ms: 1234,
             exit_code: Some(2),
         },
@@ -1018,7 +1018,7 @@ fn expanded_card_shows_full_output() {
         target: None,
         command: None,
         state: ToolCardState::Done {
-            status: crate::tool::outcome::ToolStatus::Succeeded,
+            status: crate::outcome::ToolStatus::Succeeded,
             duration_ms: 10,
             exit_code: Some(0),
         },
@@ -1053,7 +1053,7 @@ fn read_card_shows_real_line_numbers() {
         target: Some("src/lib.rs".into()),
         command: None,
         state: ToolCardState::Done {
-            status: crate::tool::outcome::ToolStatus::Succeeded,
+            status: crate::outcome::ToolStatus::Succeeded,
             duration_ms: 5,
             exit_code: Some(0),
         },
@@ -1151,7 +1151,7 @@ fn overlay_clears_background_before_rendering() {
     view.begin_tool("c", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c", "bash"),
-        crate::tool::outcome::ToolStatus::Failed,
+        crate::outcome::ToolStatus::Failed,
         1,
         Some(1),
         "err",
@@ -1211,16 +1211,16 @@ fn sidebar_renders_todo_outline_and_shrinks_main() {
     view.push_line(LineKind::Assistant, "回复一");
     view.push_line(LineKind::User, "第二条用户消息更长一些用于测试截断");
     // 计划项（todo 段）。
-    view.plan = Some(crate::tool::plan::Plan {
+    view.plan = Some(crate::plan::Plan {
         explanation: None,
         items: vec![
-            crate::tool::plan::PlanItem {
+            crate::plan::PlanItem {
                 text: "实现侧边栏".into(),
-                status: crate::tool::plan::PlanStatus::InProgress,
+                status: crate::plan::PlanStatus::InProgress,
             },
-            crate::tool::plan::PlanItem {
+            crate::plan::PlanItem {
                 text: "写测试".into(),
-                status: crate::tool::plan::PlanStatus::Pending,
+                status: crate::plan::PlanStatus::Pending,
             },
         ],
     });
@@ -1325,11 +1325,11 @@ fn session_modal_and_menu_stay_within_main_area_when_sidebar_open() {
 #[test]
 fn sidebar_todo_wraps_long_text_by_cell_width() {
     let mut view = ViewModel {
-        plan: Some(crate::tool::plan::Plan {
+        plan: Some(crate::plan::Plan {
             explanation: None,
-            items: vec![crate::tool::plan::PlanItem {
+            items: vec![crate::plan::PlanItem {
                 text: "第一项：重构侧边栏布局与渲染管线使其支持长文本折行显示".into(),
-                status: crate::tool::plan::PlanStatus::InProgress,
+                status: crate::plan::PlanStatus::InProgress,
             }],
         }),
         sidebar: crate::tui::model::SidebarState {
@@ -1390,16 +1390,16 @@ fn sidebar_todo_wraps_long_text_by_cell_width() {
 #[test]
 fn sidebar_clears_todo_when_plan_fully_terminal() {
     let mut view = ViewModel {
-        plan: Some(crate::tool::plan::Plan {
+        plan: Some(crate::plan::Plan {
             explanation: None,
             items: vec![
-                crate::tool::plan::PlanItem {
+                crate::plan::PlanItem {
                     text: "完成的任务甲".into(),
-                    status: crate::tool::plan::PlanStatus::Completed,
+                    status: crate::plan::PlanStatus::Completed,
                 },
-                crate::tool::plan::PlanItem {
+                crate::plan::PlanItem {
                     text: "取消的任务乙".into(),
-                    status: crate::tool::plan::PlanStatus::Cancelled,
+                    status: crate::plan::PlanStatus::Cancelled,
                 },
             ],
         }),
@@ -1433,16 +1433,16 @@ fn sidebar_clears_todo_when_plan_fully_terminal() {
 #[test]
 fn sidebar_keeps_terminal_history_when_open_items_exist() {
     let mut view = ViewModel {
-        plan: Some(crate::tool::plan::Plan {
+        plan: Some(crate::plan::Plan {
             explanation: None,
             items: vec![
-                crate::tool::plan::PlanItem {
+                crate::plan::PlanItem {
                     text: "已完成的任务".into(),
-                    status: crate::tool::plan::PlanStatus::Completed,
+                    status: crate::plan::PlanStatus::Completed,
                 },
-                crate::tool::plan::PlanItem {
+                crate::plan::PlanItem {
                     text: "进行中的任务".into(),
-                    status: crate::tool::plan::PlanStatus::InProgress,
+                    status: crate::plan::PlanStatus::InProgress,
                 },
             ],
         }),
@@ -2236,7 +2236,7 @@ fn read_tool_card_highlights_source_without_polluting_semantics() {
         target: Some("read src/main.rs".into()),
         command: None,
         state: ToolCardState::Done {
-            status: crate::tool::outcome::ToolStatus::Succeeded,
+            status: crate::outcome::ToolStatus::Succeeded,
             duration_ms: 1,
             exit_code: None,
         },
@@ -2374,7 +2374,7 @@ fn diff_line_padding_keeps_panel_background() {
     view.begin_tool("c1", "edit", Some("src/main.rs".into()), None);
     view.finish_tool(
         ("c1", "edit"),
-        crate::tool::outcome::ToolStatus::Succeeded,
+        crate::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "",
@@ -2427,7 +2427,7 @@ fn tool_card_body_bg_matches_panel() {
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::tool::outcome::ToolStatus::Succeeded,
+        crate::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "第一行输出\n第二行输出",
@@ -2666,7 +2666,7 @@ fn selecting_part_of_tool_card_highlights_only_that_row() {
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::tool::outcome::ToolStatus::Succeeded,
+        crate::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "第一行输出\n第二行输出\n第三行输出",
@@ -2744,7 +2744,7 @@ fn failed_tool_card_tail_window_selection_aligns_with_visible_rows() {
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::tool::outcome::ToolStatus::Failed,
+        crate::outcome::ToolStatus::Failed,
         10,
         Some(1),
         output.clone(),
@@ -2808,7 +2808,7 @@ fn tool_card_default_zero_collapses_to_main_row_only() {
         target: None,
         command: None,
         state: ToolCardState::Done {
-            status: crate::tool::outcome::ToolStatus::Succeeded,
+            status: crate::outcome::ToolStatus::Succeeded,
             duration_ms: 10,
             exit_code: Some(0),
         },
@@ -2844,7 +2844,7 @@ fn zero_collapsed_tool_cards_have_no_gap_between() {
     view.begin_tool("c1", "bash", Some("cmd1".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::tool::outcome::ToolStatus::Succeeded,
+        crate::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "out1",
@@ -2853,7 +2853,7 @@ fn zero_collapsed_tool_cards_have_no_gap_between() {
     view.begin_tool("c2", "read", Some("file.rs".into()), None);
     view.finish_tool(
         ("c2", "read"),
-        crate::tool::outcome::ToolStatus::Succeeded,
+        crate::outcome::ToolStatus::Succeeded,
         5,
         Some(0),
         "out2",
@@ -2954,7 +2954,7 @@ fn compact_tool_card_keeps_gap_before_thinking() {
     view.begin_tool("c1", "bash", Some("cmd1".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::tool::outcome::ToolStatus::Succeeded,
+        crate::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "out1",
@@ -2992,7 +2992,7 @@ fn compact_tool_card_keeps_gap_before_assistant() {
     view.begin_tool("c1", "bash", Some("cmd1".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::tool::outcome::ToolStatus::Succeeded,
+        crate::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "out1",
@@ -3157,7 +3157,7 @@ fn history_tail_compact_tool_keeps_gap_before_live_reasoning() {
     view.begin_tool("c1", "bash", Some("cmd1".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::tool::outcome::ToolStatus::Succeeded,
+        crate::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "out1",
@@ -3187,7 +3187,7 @@ fn live_thinking_keeps_gap_across_wrap_cache() {
     view.begin_tool("c1", "bash", Some("cmd1".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::tool::outcome::ToolStatus::Succeeded,
+        crate::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "out1",

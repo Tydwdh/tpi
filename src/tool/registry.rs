@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::outcome::ToolOutcome;
 use crate::tool::ToolContext;
-use crate::tool::outcome::ToolOutcome;
 
 /// 工具来源（README2 §2.1：只能作为 metadata，Agent Loop 不据此分支执行）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,10 +324,10 @@ impl Tool for BuiltinToolAdapter {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
         match self.tool.parse_args(args) {
             Ok(validated) => crate::tool::execute(self.tool, validated, ctx, None).await,
-            Err(error) => crate::tool::outcome::ToolOutcome::failed(
+            Err(error) => crate::outcome::ToolOutcome::failed(
                 self.tool.name(),
-                crate::tool::outcome::ModelPayload {
-                    status: crate::tool::outcome::ToolStatus::Rejected,
+                crate::outcome::ModelPayload {
+                    status: crate::outcome::ToolStatus::Rejected,
                     program: None,
                     exit_code: None,
                     duration_ms: 0,
@@ -458,7 +458,7 @@ mod tests {
         };
         // 非法参数 → rejected（不 panic）。
         let outcome = adapter.execute("{", &ctx).await;
-        assert_eq!(outcome.status, crate::tool::outcome::ToolStatus::Rejected);
+        assert_eq!(outcome.status, crate::outcome::ToolStatus::Rejected);
         assert!(outcome.model_payload.output.contains("invalid_arguments"));
     }
 }

@@ -7,8 +7,8 @@ mod fixtures;
 
 use camino::Utf8PathBuf;
 use tokio_util::sync::CancellationToken;
+use tpi::outcome::ToolStatus;
 use tpi::tool::command::{BashArgs, bash};
-use tpi::tool::outcome::ToolStatus;
 
 /// 取消 token 触发后，长时间运行的命令以 Cancelled 结束（§11.5：取消是独立状态）。
 #[tokio::test]

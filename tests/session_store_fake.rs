@@ -10,10 +10,10 @@ mod fixtures;
 use std::path::Path;
 
 use tpi::ids::{RunId, SessionId, ToolCallId};
+use tpi::outcome::StoredToolOutcome;
 use tpi::provider::ToolCall;
 use tpi::session::protocol::{RecoveryMetadata, SessionEvent};
 use tpi::session::store::{SessionLog, SessionStore};
-use tpi::tool::outcome::StoredToolOutcome;
 
 /// in-memory SessionStore：事件存 Vec，seq 单调；无文件/锁。
 /// 单写者由 `&mut self` 借用保证。
@@ -102,16 +102,16 @@ fn tool_call(id: u128) -> ToolCall {
 
 fn fake_outcome() -> StoredToolOutcome {
     StoredToolOutcome {
-        status: tpi::tool::outcome::ToolStatus::Succeeded,
-        session_metadata: tpi::tool::outcome::ToolMetadata {
+        status: tpi::outcome::ToolStatus::Succeeded,
+        session_metadata: tpi::outcome::ToolMetadata {
             tool: "bash".into(),
             target: None,
             program: None,
             timeout_ms: None,
             diff: None,
         },
-        model_payload: tpi::tool::outcome::ModelPayload {
-            status: tpi::tool::outcome::ToolStatus::Succeeded,
+        model_payload: tpi::outcome::ModelPayload {
+            status: tpi::outcome::ToolStatus::Succeeded,
             program: Some("bash".into()),
             exit_code: Some(0),
             duration_ms: 5,

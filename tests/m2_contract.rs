@@ -10,8 +10,8 @@ mod fixtures;
 use camino::Utf8PathBuf;
 use fixtures::{point_host_at_real_tpi, test_config, test_tool_context};
 use tokio_util::sync::CancellationToken;
+use tpi::outcome::ToolStatus;
 use tpi::tool::command::{BashArgs, bash};
-use tpi::tool::outcome::ToolStatus;
 use tpi::tool::search::{ListArgs, SearchArgs, list, search};
 use tpi::tool::{ToolContext, files};
 

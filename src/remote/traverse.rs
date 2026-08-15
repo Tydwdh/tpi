@@ -9,9 +9,9 @@
 
 use std::time::Instant;
 
+use crate::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use crate::remote::ssh::SshClient;
 use crate::tool::ToolContext;
-use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 
 /// 与本地一致的扫描上限（§8.4）。
 pub const MAX_SCAN_FILES: u64 = 100_000;
@@ -295,7 +295,7 @@ fn build_scan_outcome(
         output.push_str("\n\n结果达上限。可加 exclude 排除目录或收窄 path 后重新搜索。");
     }
     let mut outcome = ToolOutcome::succeeded(tool, output);
-    outcome.session_metadata = crate::tool::outcome::ToolMetadata {
+    outcome.session_metadata = crate::outcome::ToolMetadata {
         tool: tool.to_string(),
         ..Default::default()
     };

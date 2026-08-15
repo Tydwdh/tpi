@@ -10,7 +10,7 @@ mod fixtures;
 
 use camino::Utf8PathBuf;
 use fixtures::test_tool_context;
-use tpi::tool::outcome::ToolStatus;
+use tpi::outcome::ToolStatus;
 use tpi::tool::web::{
     WebFetchArgs, WebSearchArgs, parse_ddg_results, web_fetch, web_fetch_allowing_private_for_test,
 };

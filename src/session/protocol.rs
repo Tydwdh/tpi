@@ -6,8 +6,8 @@
 //! 长期兼容面：**P2-01 拆分不改任何字段/序列化**（golden hash 证明）。
 
 use crate::ids::{EventId, RequestId, RunId, SessionId, ToolCallId};
-use crate::provider::ToolCall;
-use crate::tool::outcome::StoredToolOutcome;
+use crate::message::ToolCall;
+use crate::outcome::StoredToolOutcome;
 use serde::{Deserialize, Serialize};
 
 /// 模型引用（§7.2 模型角色；M1 只有 primary）。
@@ -37,7 +37,7 @@ pub struct AssistantMessage {
 }
 
 /// 原子短计划（§13）。
-pub use crate::tool::plan::Plan;
+pub use crate::plan::Plan;
 
 /// 事件区间，用于 compaction 覆盖范围（§15.4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

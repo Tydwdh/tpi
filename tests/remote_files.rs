@@ -83,7 +83,7 @@ async fn remote_read_returns_local_style_output() {
         &ctx,
     )
     .await;
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Succeeded);
     let out = &outcome.model_payload.output;
     assert!(out.contains("[revision="), "必须带 revision header：{out}");
     assert!(out.contains("lines: 1-3 of 3"), "行区间：{out}");
@@ -109,7 +109,7 @@ async fn remote_write_then_read_roundtrip() {
         &ctx,
     )
     .await;
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Succeeded);
     let out = &outcome.model_payload.output;
     assert!(out.contains("[revision="), "{out}");
 
@@ -150,7 +150,7 @@ async fn remote_stale_edit_is_rejected() {
         &ctx,
     )
     .await;
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Failed);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Failed);
     assert!(
         outcome.model_payload.output.contains("stale_revision"),
         "必须 stale：{}",
@@ -191,7 +191,7 @@ async fn remote_edit_applies_and_returns_diff() {
         &ctx,
     )
     .await;
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Succeeded);
     assert!(
         outcome.model_payload.output.contains("applied: 2"),
         "{}",
@@ -249,7 +249,7 @@ async fn remote_edit_atomic_batch_rejects_partial() {
         &ctx,
     )
     .await;
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Failed);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Failed);
     assert!(
         outcome.model_payload.output.contains("no_match"),
         "{}",

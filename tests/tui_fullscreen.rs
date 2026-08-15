@@ -268,7 +268,7 @@ fn tool_card_stays_single_line_on_narrow_terminal() {
     view.begin_tool("c", "bash", Some(long.clone()), Some(long));
     view.finish_tool(
         ("c", "bash"),
-        tpi::tool::outcome::ToolStatus::Failed,
+        tpi::outcome::ToolStatus::Failed,
         123_456,
         Some(101),
         "error[E0308]",
@@ -298,7 +298,7 @@ fn success_card_hides_exit_zero_failure_keeps_it() {
     view.begin_tool("c", "bash", Some("cargo test".into()), None);
     view.finish_tool(
         ("c", "bash"),
-        tpi::tool::outcome::ToolStatus::Succeeded,
+        tpi::outcome::ToolStatus::Succeeded,
         100,
         Some(0),
         "",
@@ -312,7 +312,7 @@ fn success_card_hides_exit_zero_failure_keeps_it() {
     view2.begin_tool("c", "bash", Some("cargo test".into()), None);
     view2.finish_tool(
         ("c", "bash"),
-        tpi::tool::outcome::ToolStatus::Failed,
+        tpi::outcome::ToolStatus::Failed,
         100,
         Some(101),
         "boom",

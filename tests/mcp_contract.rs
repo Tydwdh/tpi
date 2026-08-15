@@ -150,7 +150,7 @@ async fn server_crash_marks_unavailable() {
         .unwrap();
     let ctx = fixtures::test_tool_context(&camino::Utf8PathBuf::from("."));
     let outcome = echo_tool.execute(r#"{"text":"x"}"#, &ctx).await;
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Succeeded);
     assert!(outcome.model_payload.output.contains("echo: x"));
 
     // kill server 进程（直接杀 child：通过 manager 无法直接访问，
@@ -161,7 +161,7 @@ async fn server_crash_marks_unavailable() {
 
     // 已 shutdown 的 server 再调用：stdout 关闭 → Unavailable（adapter 标记）。
     let outcome2 = echo_tool.execute(r#"{"text":"y"}"#, &ctx).await;
-    assert_eq!(outcome2.status, tpi::tool::outcome::ToolStatus::Failed);
+    assert_eq!(outcome2.status, tpi::outcome::ToolStatus::Failed);
     assert!(
         outcome2.model_payload.output.contains("mcp_"),
         "错误码：{}",
@@ -354,6 +354,6 @@ async fn restart_failure_keeps_old_active() {
         .unwrap();
     let ctx = fixtures::test_tool_context(&camino::Utf8PathBuf::from("."));
     let outcome = echo_tool.execute(r#"{"text":"x"}"#, &ctx).await;
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Succeeded);
     manager.shutdown_all().await;
 }

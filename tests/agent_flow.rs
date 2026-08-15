@@ -132,7 +132,7 @@ async fn tool_call_loop_terminates_and_reports_completion() {
         })
         .collect();
     assert_eq!(completed.len(), 1);
-    assert_eq!(completed[0].status, tpi::tool::outcome::ToolStatus::Failed);
+    assert_eq!(completed[0].status, tpi::outcome::ToolStatus::Failed);
     assert!(completed[0].model_payload.output.contains("not_found"));
 }
 

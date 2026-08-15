@@ -6,8 +6,8 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use crate::tool::ToolContext;
-use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 
 /// activate_skill 参数。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -41,7 +41,7 @@ pub fn activate_skill(args: ActivateSkillArgs, ctx: &ToolContext) -> ToolOutcome
                     output.push_str(&format!("\n\nscripts:\n  {}", skill.scripts.join("\n  ")));
                 }
                 let mut outcome = ToolOutcome::succeeded("activate_skill", output);
-                outcome.session_metadata = crate::tool::outcome::ToolMetadata {
+                outcome.session_metadata = crate::outcome::ToolMetadata {
                     tool: "activate_skill".into(),
                     target: Some(skill.name.clone()),
                     ..Default::default()

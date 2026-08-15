@@ -16,8 +16,8 @@ use tpi::agent;
 use tpi::agent::limits;
 use tpi::agent::scheduler::{PreparedCall, ProgressTracker, ToolAccess, build_waves};
 use tpi::ids::RunId;
+use tpi::outcome::ToolStatus;
 use tpi::session::{CompletionReason, SessionEvent, SessionLog, read_events};
-use tpi::tool::outcome::ToolStatus;
 
 /// §12.2：同 wave 无冲突 read 并行；冲突 write 独立 wave（不重叠）。
 #[test]
@@ -203,9 +203,7 @@ async fn watchdog_cancels_at_wall_deadline() {
 /// §13：update_plan 不变量（≤7 项、显式状态、完整替换、拒绝无效）。
 #[test]
 fn plan_invariants_enforced() {
-    use tpi::tool::plan::{
-        PlanItemArg, PlanStatus, UpdatePlanArgs, build_plan, validate_invariants,
-    };
+    use tpi::plan::{PlanItemArg, PlanStatus, UpdatePlanArgs, build_plan, validate_invariants};
     let item = |text: &str, status| PlanItemArg {
         text: text.into(),
         status,

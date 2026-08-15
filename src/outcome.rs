@@ -226,3 +226,74 @@ impl ToolOutcome {
         self.model_payload.output.clone()
     }
 }
+
+/// session 中断后如何解释“缺少 ToolCompleted”的调用。
+/// （P7 下沉：core 层恢复契约；tool 与 session 共用。）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRecoveryPolicy {
+    /// 工具不会改变需要恢复的外部状态。
+    NoEffect,
+    /// edit/write 使用 commit metadata 判定已提交、未提交或未知。
+    FileCommit,
+    /// bash 等任意副作用工具无法可靠推断执行结果。
+    Unknown,
+}
+
+/// 工具名 → 恢复策略（core 层单一事实源；与 BuiltinTool 解耦）。
+/// 一致性由测试保证（tool 的 BuiltinTool::recovery_policy == 本函数）。
+pub fn tool_recovery_policy(tool_name: &str) -> ToolRecoveryPolicy {
+    match tool_name {
+        "edit" | "write" => ToolRecoveryPolicy::FileCommit,
+        // bash 任意副作用（WorkspaceUnknown）；其余工具无文件副作用。
+        "bash" => ToolRecoveryPolicy::Unknown,
+        _ => ToolRecoveryPolicy::NoEffect,
+    }
+}
+
+#[cfg(test)]
+mod recovery_policy_tests {
+    use super::*;
+
+    #[test]
+    fn policy_matches_builtin_tool_categories() {
+        assert_eq!(tool_recovery_policy("read"), ToolRecoveryPolicy::NoEffect);
+        assert_eq!(tool_recovery_policy("search"), ToolRecoveryPolicy::NoEffect);
+        assert_eq!(
+            tool_recovery_policy("process"),
+            ToolRecoveryPolicy::NoEffect
+        );
+        assert_eq!(
+            tool_recovery_policy("write"),
+            ToolRecoveryPolicy::FileCommit
+        );
+        assert_eq!(tool_recovery_policy("edit"), ToolRecoveryPolicy::FileCommit);
+        assert_eq!(tool_recovery_policy("bash"), ToolRecoveryPolicy::Unknown);
+        assert_eq!(
+            tool_recovery_policy("request_input"),
+            ToolRecoveryPolicy::NoEffect
+        );
+        assert_eq!(
+            tool_recovery_policy("unknown_tool"),
+            ToolRecoveryPolicy::NoEffect
+        );
+    }
+
+    /// 与 BuiltinTool 的 execution_class 映射一致（单一事实源防漂移）。
+    #[test]
+    fn consistent_with_builtin_tool() {
+        use crate::tool::ToolExecutionClass as C;
+        for tool in crate::tool::implemented_tools() {
+            let expected = match tool.execution_class() {
+                C::Pure | C::FileReadExact | C::FileReadRecursive => ToolRecoveryPolicy::NoEffect,
+                C::FileWriteExact => ToolRecoveryPolicy::FileCommit,
+                C::WorkspaceUnknown => ToolRecoveryPolicy::Unknown,
+            };
+            assert_eq!(
+                tool_recovery_policy(tool.name()),
+                expected,
+                "core 策略与 BuiltinTool 执行分类一致: {}",
+                tool.name()
+            );
+        }
+    }
+}

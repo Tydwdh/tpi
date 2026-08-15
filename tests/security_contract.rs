@@ -4,8 +4,8 @@ mod fixtures;
 
 use camino::Utf8PathBuf;
 use fixtures::test_tool_context;
+use tpi::outcome::ToolStatus;
 use tpi::tool::files::{ReadArgs, WriteArgs, read, write};
-use tpi::tool::outcome::ToolStatus;
 use tpi::tool::web::{
     WebFetchArgs, validate_fetch_url, web_fetch, web_fetch_allowing_private_for_test,
 };

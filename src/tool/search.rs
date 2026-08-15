@@ -12,7 +12,7 @@ use camino::Utf8PathBuf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::tool::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
+use crate::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::tool::{ToolContext, path_rejected_outcome, resolve_tool_path};
 
 /// 路径不存在或非目录的统一诊断（§P0：区分「不存在」与「存在但非目录」，

@@ -240,7 +240,7 @@ fn tool_overlay_does_not_change_transcript_anchor() {
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        tpi::tool::outcome::ToolStatus::Failed,
+        tpi::outcome::ToolStatus::Failed,
         1,
         Some(1),
         "err",

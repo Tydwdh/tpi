@@ -29,7 +29,7 @@ fn gen_event(seq: u64, call_id: ToolCallId) -> SessionEvent {
             },
         },
         2 => SessionEvent::PlanReplaced {
-            plan: tpi::tool::plan::Plan {
+            plan: tpi::plan::Plan {
                 explanation: Some(format!("plan-{seq}")),
                 items: vec![],
             },

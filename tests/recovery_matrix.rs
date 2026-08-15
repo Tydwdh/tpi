@@ -76,7 +76,7 @@ fn crash_after_tool_requested_recovers_with_clear_effect() {
     assert_eq!(recovery.interrupted.len(), 1, "必须合成 1 条 Interrupted");
     let (_, provider_id, outcome) = &recovery.interrupted[0];
     assert_eq!(provider_id, "call_read_1");
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Interrupted);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Interrupted);
     assert_eq!(outcome.model_payload.effect, Some(Effect::NotApplied));
     assert!(
         outcome.model_payload.output.contains("未自动重跑"),

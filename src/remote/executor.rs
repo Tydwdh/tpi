@@ -19,10 +19,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use crate::remote::ssh::{ConnectionState, SshClient, SshError};
 use crate::tool::ToolContext;
 use crate::tool::command::BashArgs;
-use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 
 /// Remote bash 入口（§35：SshShellExecutor）。
 pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {

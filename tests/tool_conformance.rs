@@ -7,8 +7,8 @@ mod fixtures;
 
 use std::sync::Arc;
 
+use tpi::outcome::ToolStatus;
 use tpi::tool::BuiltinTool;
-use tpi::tool::outcome::ToolStatus;
 use tpi::tool::registry::{BuiltinToolAdapter, Tool, ToolOrigin};
 
 fn tool_context() -> tpi::tool::ToolContext {
@@ -37,17 +37,13 @@ impl Tool for FakeMcpTool {
             server: "fake".into(),
         }
     }
-    async fn execute(
-        &self,
-        args: &str,
-        ctx: &tpi::tool::ToolContext,
-    ) -> tpi::tool::outcome::ToolOutcome {
+    async fn execute(&self, args: &str, ctx: &tpi::tool::ToolContext) -> tpi::outcome::ToolOutcome {
         let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
         let text = v["text"].as_str().unwrap_or("").to_string();
         if ctx.cancel.is_cancelled() {
-            return tpi::tool::outcome::ToolOutcome::failed(
+            return tpi::outcome::ToolOutcome::failed(
                 &self.name,
-                tpi::tool::outcome::ModelPayload {
+                tpi::outcome::ModelPayload {
                     status: ToolStatus::Cancelled,
                     program: Some("fake".into()),
                     exit_code: None,
@@ -58,9 +54,9 @@ impl Tool for FakeMcpTool {
                 },
             );
         }
-        tpi::tool::outcome::ToolOutcome::failed(
+        tpi::outcome::ToolOutcome::failed(
             &self.name,
-            tpi::tool::outcome::ModelPayload {
+            tpi::outcome::ModelPayload {
                 status: ToolStatus::Succeeded,
                 program: Some("fake".into()),
                 exit_code: Some(0),
@@ -148,9 +144,9 @@ async fn pipeline_and_canonical_conformance() {
     assert_eq!(stage.tool_name(), "read");
 
     // canonical output：有界。
-    let outcome = tpi::tool::outcome::ToolOutcome::failed(
+    let outcome = tpi::outcome::ToolOutcome::failed(
         "read",
-        tpi::tool::outcome::ModelPayload {
+        tpi::outcome::ModelPayload {
             status: ToolStatus::Succeeded,
             program: Some("read".into()),
             exit_code: Some(0),

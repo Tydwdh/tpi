@@ -8,8 +8,8 @@
 //! Stage 序列：`parse → (plan/approval) → execute → output`。
 //! 每次迁移后跑 existing scheduler/recovery suites（验收）。
 
+use crate::outcome::{StoredToolOutcome, ToolOutcome};
 use crate::tool::ToolContext;
-use crate::tool::outcome::{StoredToolOutcome, ToolOutcome};
 use crate::tool::registry::Tool;
 
 /// 显式 stage 结果（每个阶段有明确产出，供 inspector/审计消费）。
@@ -71,7 +71,7 @@ pub async fn run_canonical_pure_pipeline(
 ) -> Result<StageResult, String> {
     let tool_name = tool.name().to_string();
     let outcome = tool.execute(args_json, ctx).await;
-    if outcome.status == crate::tool::outcome::ToolStatus::Failed {
+    if outcome.status == crate::outcome::ToolStatus::Failed {
         return Ok(StageResult::Executed {
             tool: tool_name,
             outcome,
@@ -100,7 +100,7 @@ pub async fn run_pure_pipeline(
     // Stage 2: plan（Pure 无副作用，无 write-ahead）。
     // Stage 3: execute。
     let outcome = tool.execute(args_json, ctx).await;
-    if outcome.status == crate::tool::outcome::ToolStatus::Failed {
+    if outcome.status == crate::outcome::ToolStatus::Failed {
         return Ok(StageResult::Executed {
             tool: tool_name,
             outcome,
@@ -189,7 +189,7 @@ mod tests {
 /// P4-06：canonical output 截断有界（不伪装完整）。
 #[test]
 fn canonical_output_truncates_and_marks() {
-    use crate::tool::outcome::{ModelPayload, ToolStatus};
+    use crate::outcome::{ModelPayload, ToolStatus};
     let big = "x".repeat(100);
     let mut outcome = ToolOutcome::failed(
         "echo",
@@ -219,7 +219,7 @@ fn canonical_output_truncates_and_marks() {
 /// P4-06：小输出不截断（投影等价）。
 #[test]
 fn canonical_output_keeps_small_unchanged() {
-    use crate::tool::outcome::{ModelPayload, ToolStatus};
+    use crate::outcome::{ModelPayload, ToolStatus};
     let outcome = ToolOutcome::failed(
         "echo",
         ModelPayload {

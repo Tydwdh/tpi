@@ -9,7 +9,7 @@ use std::path::Path;
 use camino::Utf8PathBuf;
 
 use crate::ids::{RunId, SessionId, ToolCallId};
-use crate::provider::ChatMessage;
+use crate::message::ChatMessage;
 
 use super::projector::ConversationProjector;
 use super::protocol::Plan;
@@ -160,9 +160,9 @@ impl Conversation {
 mod tests {
     use super::*;
     use crate::ids::ToolCallId;
-    use crate::provider::ToolCall;
+    use crate::message::ToolCall;
+    use crate::plan::{Plan, PlanItem, PlanStatus};
     use crate::session::{AssistantMessage, SessionEvent};
-    use crate::tool::plan::{Plan, PlanItem, PlanStatus};
 
     fn workspace() -> (tempfile::TempDir, Utf8PathBuf) {
         let dir = tempfile::tempdir().unwrap();

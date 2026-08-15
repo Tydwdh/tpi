@@ -9,8 +9,8 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::outcome::ToolOutcome;
 use crate::tool::ToolContext;
-use crate::tool::outcome::ToolOutcome;
 
 /// `runtime_inspect` 参数（无）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]

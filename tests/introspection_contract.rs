@@ -16,7 +16,7 @@ async fn runtime_inspect_reports_capabilities() {
     let args = tpi::tool::ValidatedArgs::RuntimeInspect(tpi::tool::inspect::InspectArgs {});
     let outcome =
         tpi::tool::execute(tpi::tool::BuiltinTool::RuntimeInspect, args, &ctx, None).await;
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Succeeded);
 
     let out = &outcome.model_payload.output;
     // 工具目录（builtin 至少包含 bash；origin 标注 builtin）。

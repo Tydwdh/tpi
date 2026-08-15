@@ -79,7 +79,7 @@ impl SessionStore for FaultyStore {
     fn complete_tool(
         &mut self,
         call_id: ToolCallId,
-        outcome: &tpi::tool::outcome::StoredToolOutcome,
+        outcome: &tpi::outcome::StoredToolOutcome,
     ) -> std::io::Result<()> {
         self.append_event(&SessionEvent::ToolCompleted {
             call_id,

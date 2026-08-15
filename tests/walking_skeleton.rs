@@ -1,4 +1,4 @@
-﻿//! M1 Walking Skeleton 端到端验收（§21 M1）。
+//! M1 Walking Skeleton 端到端验收（§21 M1）。
 //!
 //! fake provider 驱动 TPI 读取 fixture、修改一处代码、运行一次失败检查、
 //! 再次修正并通过；验证 finish=stop 只有一次请求、session 持久化完整、
@@ -13,9 +13,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tpi::agent;
 use tpi::ids::RunId;
+use tpi::outcome::ToolStatus;
 use tpi::session::{CompletionReason, SessionEvent, SessionLog, read_events};
 use tpi::tool::edit::revision_of;
-use tpi::tool::outcome::ToolStatus;
 
 fn current_revision(workspace: &Utf8PathBuf, relative: &str) -> String {
     let path = workspace.join(relative);
@@ -253,7 +253,7 @@ async fn recovery_never_replays_write_tools() {
     assert_eq!(outcome.status, ToolStatus::Interrupted);
     assert_eq!(
         outcome.model_payload.effect,
-        Some(tpi::tool::outcome::Effect::Unknown)
+        Some(tpi::outcome::Effect::Unknown)
     );
     assert!(
         outcome.model_payload.output.contains("未自动重跑"),

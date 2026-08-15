@@ -120,7 +120,7 @@ async fn activate_skill_tool_executes_via_tool() {
         None,
     )
     .await;
-    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
+    assert_eq!(outcome.status, tpi::outcome::ToolStatus::Succeeded);
     let out = &outcome.model_payload.output;
     assert!(out.contains("Bevy Debug"), "{out}");
     assert!(out.contains("query.py"), "scripts 清单：{out}");

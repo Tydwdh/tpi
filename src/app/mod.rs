@@ -2260,7 +2260,7 @@ fn last_edit_diff(log: &SessionLog) -> String {
         .filter_map(|event| match event {
             SessionEvent::ToolCompleted { outcome, .. }
                 if matches!(outcome.session_metadata.tool.as_str(), "edit" | "write")
-                    && outcome.status == crate::tool::outcome::ToolStatus::Succeeded =>
+                    && outcome.status == crate::outcome::ToolStatus::Succeeded =>
             {
                 outcome.session_metadata.diff.clone()
             }
@@ -2723,9 +2723,9 @@ mod tests {
     fn project_live_event_covers_all_variants() {
         use crate::agent::{DeltaKind, LiveEvent};
         use crate::ids::{RequestId, ToolCallId};
-        use crate::tool::outcome::ToolStatus;
+        use crate::outcome::ToolStatus;
         let call_id = ToolCallId::new_v7();
-        let plan = crate::tool::plan::Plan {
+        let plan = crate::plan::Plan {
             explanation: Some("p".into()),
             items: vec![],
         };
@@ -2916,7 +2916,7 @@ mod tests {
     /// P2：/diff 聚合本 run 内所有成功的 edit（此前只返回最近一次）。
     #[test]
     fn last_edit_diff_aggregates_all_successful_edits() {
-        use crate::tool::outcome::{ModelPayload, StoredToolOutcome, ToolMetadata, ToolStatus};
+        use crate::outcome::{ModelPayload, StoredToolOutcome, ToolMetadata, ToolStatus};
         let dir = tempfile::tempdir().unwrap();
         let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
         let mut log = crate::session::SessionLog::create(

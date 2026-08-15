@@ -11,12 +11,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::ids::{RunId, SessionId, ToolCallId};
-use crate::provider::{ChatMessage, ToolCall};
+use crate::message::{ChatMessage, ToolCall};
+use crate::outcome::StoredToolOutcome;
+use crate::plan::Plan;
 use crate::session::protocol::{
     self, Envelope, EventBody, RecoveryMetadata, SCHEMA_VERSION, SessionEvent,
 };
-use crate::tool::outcome::StoredToolOutcome;
-use crate::tool::plan::Plan;
 
 pub(crate) use protocol::MAX_SESSION_EVENTS;
 

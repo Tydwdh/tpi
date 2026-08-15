@@ -9,9 +9,9 @@
 
 use std::collections::HashMap;
 
+use crate::outcome::ToolStatus;
+use crate::plan::Plan;
 use crate::session::Usage;
-use crate::tool::outcome::ToolStatus;
-use crate::tool::plan::Plan;
 use crate::tui::interaction::TextPosition;
 use crate::tui::scroll::{EntryId, ScrollAnchor, ScrollMode};
 
@@ -767,7 +767,7 @@ impl ViewModel {
                         target: None,
                         command: None,
                         state: ToolCardState::Done {
-                            status: crate::tool::outcome::ToolStatus::Succeeded,
+                            status: crate::outcome::ToolStatus::Succeeded,
                             duration_ms: 0,
                             exit_code: None,
                         },

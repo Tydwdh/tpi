@@ -23,11 +23,11 @@ pub use crate::tool::scheduler;
 mod tool_runtime;
 use self::tool_runtime::{BatchEnd, ToolBatchExecutor, ToolRuntime};
 use crate::ids::{EventId, RequestId, ToolCallId};
+use crate::outcome::{StoredToolOutcome, ToolStatus};
 use crate::provider::{ChatMessage, ModelRequest, Provider, ProviderEvent, ToolCall};
 use crate::session::{
     self, AssistantMessage, CompletionReason, ModelRef, RunLimits, SessionEvent, Usage,
 };
-use crate::tool::outcome::{StoredToolOutcome, ToolStatus};
 
 /// 内建 system prompt（§23 草案）。
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
@@ -206,7 +206,7 @@ pub enum LiveEvent {
     /// 接近 wall-time 预算。
     BudgetWarning,
     /// `update_plan` 提交后的独立状态。
-    PlanUpdated { plan: crate::tool::plan::Plan },
+    PlanUpdated { plan: crate::plan::Plan },
     /// 流中断后正在自动续写（text-only attempt 恢复）。
     StreamRecovering { attempt: u32 },
     /// partial tool-call 后整个 model step 重新生成。
@@ -264,7 +264,7 @@ pub enum RuntimeEvent {
     /// 接近 wall-time 预算（P1-3：TUI 状态栏/系统行提示，此前只写日志）。
     BudgetWarning,
     /// `update_plan` 提交后的独立 UI 状态；不作为聊天流水的一部分。
-    PlanUpdated { plan: crate::tool::plan::Plan },
+    PlanUpdated { plan: crate::plan::Plan },
     /// 流中断后正在自动续写（第二阶段 §4.3：text-only attempt 恢复）。
     StreamRecovering { attempt: u32 },
     /// partial tool-call 后整个 model turn 重新生成（第三阶段 §4.3）。
@@ -1494,7 +1494,7 @@ fn build_context(
     config: &Config,
     messages: &[ChatMessage],
     ephemeral_system: Option<&str>,
-    plan: Option<&crate::tool::plan::Plan>,
+    plan: Option<&crate::plan::Plan>,
     workspace: Option<&crate::workspace::ActiveWorkspace>,
     process_snapshot: Option<&str>,
 ) -> Vec<ChatMessage> {
@@ -1524,7 +1524,7 @@ fn build_context(
     // §注入可靠性（用户反馈）：历史里 update_plan 的 tool result 不再带快照，
     // 但**必须**让模型区分“当前权威快照”与任何历史计划文本——用专属标记
     // 前缀 + 明确“以此为准，忽略历史中的任何旧计划”，防止模型引用过期快照。
-    let snapshot = crate::tool::plan::plan_snapshot(plan);
+    let snapshot = crate::plan::plan_snapshot(plan);
     if !snapshot.is_empty() {
         out.push(ChatMessage::System(format!(
             "[当前计划·唯一权威·完整快照·以此为准]（每次 update_plan 都提交完整显式计划；每完成一项立即单独标记 completed，未完成项保持 pending/in_progress，不要一次性把全部项标记 completed。需要用户决定或外部条件时，先标记 blocked，再提问；忽略对话历史中出现的任何旧计划）：\n{snapshot}"
@@ -1549,10 +1549,7 @@ fn tool_result_succeeded(content: &str) -> bool {
 
 /// 确保当前 runtime history 至少包含一次成功计划结果。只在恢复/压缩边界调用，
 /// 补入的消息随后随真实 assistant/tool 事实向后增长，不会每轮重新占据尾部。
-fn ensure_plan_state_messages(
-    messages: &mut Vec<ChatMessage>,
-    plan: Option<&crate::tool::plan::Plan>,
-) {
+fn ensure_plan_state_messages(messages: &mut Vec<ChatMessage>, plan: Option<&crate::plan::Plan>) {
     let already_present = messages.iter().any(|message| {
         matches!(
             message,
@@ -1571,8 +1568,8 @@ fn ensure_plan_state_messages(
 
 /// Compaction 可能只留下 summary 与独立持久化的 PlanReplaced。此时用合法的
 /// assistant/tool 配对恢复运行时计划，避免重新伪造一条 User 指令。
-fn append_restored_plan_round(messages: &mut Vec<ChatMessage>, plan: &crate::tool::plan::Plan) {
-    let snapshot = crate::tool::plan::plan_snapshot(Some(plan));
+fn append_restored_plan_round(messages: &mut Vec<ChatMessage>, plan: &crate::plan::Plan) {
+    let snapshot = crate::plan::plan_snapshot(Some(plan));
     if snapshot.is_empty() {
         return;
     }
@@ -1632,8 +1629,8 @@ mod tests {
         build_context, ensure_plan_state_messages, recoverable_stream_interrupt,
         recovery_overlap_bytes,
     };
+    use crate::plan::{Plan, PlanItem, PlanStatus};
     use crate::provider::ChatMessage;
-    use crate::tool::plan::{Plan, PlanItem, PlanStatus};
 
     /// 最小可用 Config（build_context 只读 system_prompt_extra 等字段）。
     /// P1 Exit gate：经 config::test_config 构造（tui 依赖收敛在 config），

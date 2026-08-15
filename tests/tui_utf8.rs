@@ -5,7 +5,7 @@
 //! 回归点：push_stream_delta（message cap）、append_tool_output（card cap
 //! 中段丢弃）、finish_tool tail（bound_output 尾部窗口）、command 渲染截断。
 
-use tpi::tool::outcome::ToolStatus;
+use tpi::outcome::ToolStatus;
 use tpi::tui::model::{Entry, LineKind, MAX_CARD_OUTPUT, MAX_MESSAGE_CHARS, ViewModel};
 
 /// 混入多字节字符的流：中文、日文、emoji、ZWJ、combining、全角。

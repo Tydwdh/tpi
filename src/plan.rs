@@ -1,7 +1,10 @@
-//! `update_plan` 工具：Plan 是短期状态，不是调度器。
+//! Plan 领域类型（P7 下沉：core 层纯数据契约）。
 //!
-//! 每次调用都是一个完整、显式的快照。这样模型不必猜测省略某项究竟代表完成、
-//! 取消还是遗忘；也避免把历史中不完整的计划带入下一轮。
+//! 由 `update_plan` 工具维护；每次调用都是一个完整、显式的快照。这样模型不必
+//! 猜测省略某项究竟代表完成、取消还是遗忘；也避免把历史中不完整的计划带入
+//! 下一轮。`update_plan` 工具执行（依赖 ToolContext）留在 tool 层
+//! （`crate::tool::plan_exec`），本模块只定义数据与纯逻辑（build/validate/
+//! snapshot）。
 
 use serde::{Deserialize, Serialize};
 
@@ -170,43 +173,6 @@ pub fn validate_invariants(plan: &Plan) -> Result<(), PlanError> {
         });
     }
     Ok(())
-}
-
-/// 执行 update_plan（同步控制操作，返回标准 tool result）。
-pub fn update_plan(
-    args: UpdatePlanArgs,
-    ctx: &crate::tool::ToolContext,
-) -> crate::tool::outcome::ToolOutcome {
-    use crate::tool::outcome::{ModelPayload, ToolOutcome, ToolStatus};
-    let mut current = crate::util::lock_mutex(&ctx.current_plan, "current_plan");
-    match build_plan(&args, current.as_ref()) {
-        Ok(plan) => {
-            let output = if plan.items.is_empty() {
-                "status: succeeded\ntool: update_plan\nplan: cleared".to_string()
-            } else {
-                format!(
-                    "status: succeeded\ntool: update_plan\nitems: {}\nplan: updated",
-                    plan.items.len()
-                )
-            };
-            *current = Some(plan);
-            ToolOutcome::succeeded("update_plan", output)
-        }
-        Err(error) => ToolOutcome::failed(
-            "update_plan",
-            ModelPayload {
-                status: ToolStatus::Rejected,
-                program: None,
-                exit_code: None,
-                duration_ms: 0,
-                output: format!(
-                    "status: rejected\ntool: update_plan\nerror: invalid_plan\n\n{error}"
-                ),
-                effect: None,
-                artifact: None,
-            },
-        ),
-    }
 }
 
 /// 完整的模型可见计划快照。历史状态也必须可见，才能安全提交下一个完整快照。

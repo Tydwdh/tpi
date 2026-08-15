@@ -2166,8 +2166,8 @@ fn cached_markdown(
 }
 
 /// 侧边栏 Todo 项：当前项优先，其余开放项随后，终态项沉底。侧边栏自身可滚动。
-fn sidebar_plan_items(plan: &crate::tool::plan::Plan) -> Vec<&crate::tool::plan::PlanItem> {
-    use crate::tool::plan::PlanStatus;
+fn sidebar_plan_items(plan: &crate::plan::Plan) -> Vec<&crate::plan::PlanItem> {
+    use crate::plan::PlanStatus;
     let rank = |status| match status {
         PlanStatus::InProgress => 0,
         PlanStatus::Pending => 1,
@@ -2220,23 +2220,23 @@ fn draw_sidebar(
         Some(plan) if !plan.items.is_empty() && has_open => {
             for item in sidebar_plan_items(plan) {
                 let (marker, style) = match item.status {
-                    crate::tool::plan::PlanStatus::Completed => (
+                    crate::plan::PlanStatus::Completed => (
                         "[x]",
                         Style::default()
                             .fg(theme.muted)
                             .bg(theme.surface)
                             .add_modifier(Modifier::DIM),
                     ),
-                    crate::tool::plan::PlanStatus::InProgress => {
+                    crate::plan::PlanStatus::InProgress => {
                         ("[>]", Style::default().fg(theme.warning).bg(theme.surface))
                     }
-                    crate::tool::plan::PlanStatus::Pending => {
+                    crate::plan::PlanStatus::Pending => {
                         ("[ ]", Style::default().fg(theme.muted).bg(theme.surface))
                     }
-                    crate::tool::plan::PlanStatus::Blocked => {
+                    crate::plan::PlanStatus::Blocked => {
                         ("[!]", Style::default().fg(theme.error).bg(theme.surface))
                     }
-                    crate::tool::plan::PlanStatus::Cancelled => (
+                    crate::plan::PlanStatus::Cancelled => (
                         "[-]",
                         Style::default()
                             .fg(theme.muted)

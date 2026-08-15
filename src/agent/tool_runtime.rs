@@ -13,11 +13,11 @@ use tokio_util::sync::CancellationToken;
 use super::{LiveEvent, RunFailure};
 use crate::config::Config;
 use crate::ids::ToolCallId;
+use crate::outcome::{StoredToolOutcome, ToolOutcome, ToolStatus};
+use crate::plan::Plan;
 use crate::provider::{ChatMessage, FinishReason, ModelRequest, Provider, ProviderEvent, ToolCall};
 use crate::session::{RecoveryMetadata, SessionEvent, Usage};
 use crate::tool::edit::SnapshotStore;
-use crate::tool::outcome::{StoredToolOutcome, ToolOutcome, ToolStatus};
-use crate::tool::plan::Plan;
 use crate::tool::search::ScanSnapshot;
 use crate::tool::{self, BuiltinTool, ToolContext, ToolStreamEvent};
 use camino::Utf8PathBuf;
@@ -305,7 +305,7 @@ async fn execute_batch<P: Provider, S: crate::session::store::SessionStore>(
                     .unwrap_or(name.clone());
                 let outcome = ToolOutcome::failed(
                     &tool_label,
-                    crate::tool::outcome::ModelPayload {
+                    crate::outcome::ModelPayload {
                         status: ToolStatus::Rejected,
                         program: None,
                         exit_code: None,
@@ -382,7 +382,7 @@ async fn execute_batch<P: Provider, S: crate::session::store::SessionStore>(
             Err(message) => {
                 let outcome = ToolOutcome::failed(
                     tool.name(),
-                    crate::tool::outcome::ModelPayload {
+                    crate::outcome::ModelPayload {
                         status: ToolStatus::Rejected,
                         program: None,
                         exit_code: None,
@@ -841,7 +841,7 @@ fn extract_external_content(output: &str) -> Option<&str> {
 fn repeated_outcome(tool: &str, action_key: &str) -> ToolOutcome {
     ToolOutcome::failed(
         tool,
-        crate::tool::outcome::ModelPayload {
+        crate::outcome::ModelPayload {
             status: ToolStatus::Rejected,
             program: None,
             exit_code: None,
@@ -884,7 +884,7 @@ fn tool_result_message(call: &ToolCall, outcome: &StoredToolOutcome) -> ChatMess
 fn unknown_tool_outcome(name: &str) -> StoredToolOutcome {
     ToolOutcome::failed(
         name,
-        crate::tool::outcome::ModelPayload {
+        crate::outcome::ModelPayload {
             status: ToolStatus::Rejected,
             program: None,
             exit_code: None,
@@ -1024,7 +1024,7 @@ mod tests {
     /// 无法证明恢复完成）必须保留恢复现场。
     #[test]
     fn backup_cleanup_policy_keeps_recovery_on_failure() {
-        use crate::tool::outcome::ToolStatus;
+        use crate::outcome::ToolStatus;
         assert!(backup_cleanup_allowed(ToolStatus::Succeeded));
         assert!(!backup_cleanup_allowed(ToolStatus::Failed));
         assert!(!backup_cleanup_allowed(ToolStatus::Rejected));
@@ -1071,9 +1071,9 @@ mod tests {
         let config = crate::config::test_config(&camino::Utf8PathBuf::from("fake"));
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut usage = Usage::default();
-        let outcome = crate::tool::outcome::ToolOutcome::failed(
+        let outcome = crate::outcome::ToolOutcome::failed(
             "web_fetch",
-            crate::tool::outcome::ModelPayload {
+            crate::outcome::ModelPayload {
                 status: ToolStatus::Failed,
                 program: None,
                 exit_code: None,
@@ -1145,7 +1145,7 @@ mod tests {
         let config = crate::config::test_config(&camino::Utf8PathBuf::from("fake"));
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut usage = Usage::default();
-        let mut outcome = crate::tool::outcome::ToolOutcome::succeeded(
+        let mut outcome = crate::outcome::ToolOutcome::succeeded(
             "web_fetch",
             "status: succeeded\ntool: web_fetch\nurl: https://example.com\nhttp: 200\n\n<external_content source=\"https://example.com\">\n页面正文……\n</external_content>\nartifact: @artifact/s/id\n".into(),
         )

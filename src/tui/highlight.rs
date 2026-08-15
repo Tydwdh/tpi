@@ -318,7 +318,7 @@ mod tests {
             target: Some("edit src/main.rs".into()),
             command: None,
             state: crate::tui::model::ToolCardState::Done {
-                status: crate::tool::outcome::ToolStatus::Succeeded,
+                status: crate::outcome::ToolStatus::Succeeded,
                 duration_ms: 0,
                 exit_code: Some(0),
             },

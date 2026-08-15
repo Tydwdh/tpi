@@ -8,8 +8,8 @@ mod fixtures;
 
 use camino::Utf8PathBuf;
 use fixtures::test_tool_context;
+use tpi::outcome::ToolStatus;
 use tpi::tool::files::{WriteArgs, write};
-use tpi::tool::outcome::ToolStatus;
 
 /// P2：write 支持 revision-bound 整体重写（此前只能新建文件）。
 /// - 已存在文件不带 revision → 明确拒绝（给出下一步）；
