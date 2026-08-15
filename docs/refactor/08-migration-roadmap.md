@@ -814,11 +814,11 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 ### Exit gate
 
-- `global_registry` 删除；
-- runtime 特殊工具名 match 清零；
-- builtin/external scheduler 来源分支清零或只存在 adapter 内；
-- write recovery crash matrix、MCP tests、tool contracts 全绿。
-- invariant companion 能定位故意注入的 registry/pipeline 违规，terminal 后无 effect orphan。
+- `global_registry` 删除；✓（2026-08-14：定义与全部调用点移除，arch_gate R3 删除）
+- runtime 特殊工具名 match 清零；✓（P4-07）
+- builtin/external scheduler 来源分支清零或只存在 adapter 内；✓（P4-03/04）
+- write recovery crash matrix、MCP tests、tool contracts 全绿。✓（全量 56 target）
+- invariant companion 能定位故意注入的 registry/pipeline 违规，terminal 后无 effect orphan。✓（P4-11）
 
 ## 8. Phase 5：Provider、Context 与 Workspace adapters
 
