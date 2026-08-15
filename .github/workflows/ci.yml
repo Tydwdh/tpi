@@ -38,7 +38,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
-      - run: cargo audit
+      # P10-04：与 deny.toml 的 ignore 列表对齐（rsa 无修复版 + syntect 的
+      # unmaintained 传递依赖；理由见 deny.toml）。
+      - run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2024-0320
       # P10-04：deny（advisories/licenses/bans/sources）+ 未用依赖检查。
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked --version 0.20.2
