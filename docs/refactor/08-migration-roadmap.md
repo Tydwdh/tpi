@@ -399,10 +399,27 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   **生产 spawn 清单中 watchdog/forwarder 已有 owner（Supervisor）**；P2-07 盘点
   其余（MCP reader/process/web writer）纳入各 supervisor。
 
-#### P2-07 MCP/process owner inventory
+#### P2-07 MCP/process owner inventory — **DONE（2026-08-14）**
 
 - 只把 owner 不明确的 task 纳入相应 supervisor，不改协议。
 - 验收：shutdown 后 child process/tree、channel、registration 清零。
+- 实施：
+  - **MCP reader**：`McpClient` 新增 `reader_supervisor: Supervisor` 字段；
+    stdout/stderr reader 由 `tokio::spawn` → `supervisor.spawn("mcp.stdout_reader"/
+    "mcp.stderr_reader")`；`shutdown()`/`kill()` 末尾 `reader_supervisor.shutdown()`
+    （join，不留下无主 reader task）。新增 `reader_tracked()` 供验收断言。
+  - **process**：盘点确认 `spawn_drain`（managed.rs）已是完整 owner（自含
+    Job Object 生命周期 + cancel token + 结束时 remove_cancel）；`run_in_host`
+    的 host_stderr 转发是短命 EOF 任务（进程结束即退出）。无需改造（不伪报）。
+  - **web**：生产 spawn（连接 handler/run_agent/drain）均为短命或已有
+    生命期；760/781/799 是测试代码（已 await join）。无需改造。
+- 验收测试：`tests/mcp_contract.rs` 新增 `shutdown_clears_reader_tasks_and_child`
+  ——start 后 reader tracked ≥ 1、进程存活；shutdown 后 tracked==0（Supervisor
+  join）、子进程终止。mcp_contract 15 断言全绿。
+- 验收达成：MCP shutdown 后 reader task 清零 ✓（child 由既有 shutdown/kill
+  终止 + Job Object 树）；registration 由 RAII ToolRegistration drop 自动注销
+  （既有）；channel 由 reader task 结束自然释放 ✓；process/web 经盘点确认
+  已有 owner（不改协议）。全量 49 target 绿；fmt/clippy/arch_gate 清洁。
 
 #### P2-08 O2 local trace sink
 

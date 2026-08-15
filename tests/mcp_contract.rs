@@ -296,3 +296,26 @@ fn tool_registration_drop_unregisters() {
         "drop ToolRegistration 后工具必须消失"
     );
 }
+
+/// P2-07：MCP server shutdown 后 reader task 清零（owner 验收）。
+/// start 时 stdout/stderr reader 被 Supervisor 跟踪；shutdown join 后 tracked=0，
+/// 且子进程已终止（不留孤儿进程）。
+#[tokio::test]
+async fn shutdown_clears_reader_tasks_and_child() {
+    let mut client = McpClient::start(test_server_config("p2-07-test"))
+        .await
+        .unwrap();
+    // start 后至少 1 个 reader（stdout reader；stderr 取决于 python 是否输出）。
+    let before = client.reader_tracked();
+    assert!(before >= 1, "start 后应有 reader 被跟踪: {before}");
+    // 进程存活。
+    assert!(client.pid().is_some(), "server 进程应存在");
+
+    client.shutdown().await;
+
+    assert_eq!(
+        client.reader_tracked(),
+        0,
+        "shutdown 后 reader task 必须清零（Supervisor join）"
+    );
+}

@@ -46,6 +46,9 @@ pub struct McpClient {
     reader_rx: UnboundedReceiver<String>,
     init: Option<InitializeResult>,
     tools: Vec<McpToolInfo>,
+    /// P2-07：stderr/stdout reader 任务的 owner（shutdown/kill 时 join，
+    /// 不留下无主的 reader task）。
+    reader_supervisor: crate::process::supervisor::Supervisor,
 }
 
 impl McpClient {
@@ -78,9 +81,11 @@ impl McpClient {
         let stderr = child.stderr.take();
 
         // stderr → tracing（完整错误进 debug log，README2 §11）。
+        // P2-07：reader 由 Supervisor 跟踪（shutdown 时 join）。
+        let mut reader_supervisor = crate::process::supervisor::Supervisor::new();
         if let Some(stderr) = stderr {
             let name = config.name.clone();
-            tokio::spawn(async move {
+            reader_supervisor.spawn("mcp.stderr_reader", move |_| async move {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
                     tracing::debug!(server = %name, line = %line, "MCP server stderr");
@@ -91,13 +96,14 @@ impl McpClient {
         // stdout 后台读取循环 → 逐行发到 channel。
         let (tx, rx): (UnboundedSender<String>, UnboundedReceiver<String>) =
             tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        let stdout_tx = tx.clone();
+        reader_supervisor.spawn("mcp.stdout_reader", move |_| async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.trim().is_empty() {
                     continue;
                 }
-                if tx.send(line).is_err() {
+                if stdout_tx.send(line).is_err() {
                     break;
                 }
             }
@@ -111,6 +117,7 @@ impl McpClient {
             reader_rx: rx,
             init: None,
             tools: Vec::new(),
+            reader_supervisor,
         };
         client.initialize().await?;
         client.notify_initialized().await?;
@@ -275,17 +282,25 @@ impl McpClient {
         &self.config.name
     }
 
-    /// 优雅关闭：shutdown 请求 + 终止进程（README2 §9：不留孤儿进程）。
+    /// 优雅关闭：shutdown 请求 + 终止进程 + join reader（README2 §9：
+    /// 不留孤儿进程；P2-07：不留无主 reader task）。
     pub async fn shutdown(&mut self) {
         let _ = self.request("shutdown", None).await;
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+        let _ = self.reader_supervisor.shutdown().await;
     }
 
-    /// 强制终止（server 卡死/异常时）。
+    /// 强制终止（server 卡死/异常时）+ join reader。
     pub async fn kill(&mut self) {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+        let _ = self.reader_supervisor.shutdown().await;
+    }
+
+    /// P2-07 验收：当前被跟踪的 reader task 数（shutdown 后应为 0）。
+    pub fn reader_tracked(&self) -> usize {
+        self.reader_supervisor.tracked()
     }
 
     /// 写一行 JSON 到 stdin（newline-delimited：每消息一行）。
