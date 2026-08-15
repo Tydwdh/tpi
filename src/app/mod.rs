@@ -13,6 +13,7 @@
 
 pub mod controller;
 pub mod effects;
+pub mod headless;
 pub mod slash;
 pub use slash::command_from_slash;
 pub mod intent;

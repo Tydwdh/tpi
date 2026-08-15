@@ -571,11 +571,24 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   回 controller（不 let _ = 静默）✓；Windows/Linux fake 通过 ✓；全量 53 target 绿；
   fmt/clippy/arch_gate 清洁。
 
-#### P3-05 Headless JSON surface
+#### P3-05 Headless JSON surface — **DONE（2026-08-14）**
 
 - 直接订阅 semantic runtime/durable terminal，不创建 TUI channel/drain task。
 - 定义 versioned JSON output；取消/await input 明确退出码/事件。
 - 验收：与 TUI 对同一 fake provider 得到等价业务终态。
+- 实施：`src/app/headless.rs`：
+  - `run_headless<P,S: SessionStore>`：直接跑 agent::run，**消费** LiveEvent（collector
+    task 收集为 JSON 事件后 join 取回，**无 drain 丢弃 workaround**）；
+  - `JsonEvent`（v1 versioned）：step_started/assistant_delta/tool_started/
+    tool_completed/tool_output_delta/notice；tool output 只含有界摘要（无正文泄露）；
+  - `final_json(outcome)`：run_completed（reason/assistant_text）；
+  - `exit_code_for(reason)`：Stop 0、Cancelled/WallTime 130、Error 1。
+- 验收测试 `tests/headless_surface.rs`（4 断言 + fixtures）：与 TUI（agent_flow 同一
+  EchoProvider）等价业务终态（assistant_text/reason）；session 事件完整落盘 + cancel
+  槽清空（无 drain task）；JSON versioned + 有界摘要；退出码显式。
+- 验收达成：headless 直接订阅 semantic runtime（无 TUI channel/drain task）✓；
+  versioned JSON + 明确退出码 ✓；与 TUI 同一 fake provider 等价业务终态 ✓；
+  全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
 #### P3-06 Terminal input adapter ownership
 
