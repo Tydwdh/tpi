@@ -11,6 +11,7 @@
 //! 命令补全菜单（Tab）、输入历史（↑/↓）、多行输入（Alt+Enter）、
 //! 思考折叠（Alt+T）、动画时钟（spinner）。
 
+pub mod controller;
 pub mod intent;
 
 use std::sync::{Arc, Mutex};

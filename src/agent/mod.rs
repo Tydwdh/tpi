@@ -294,8 +294,6 @@ pub async fn run<P: Provider, S: crate::session::store::SessionStore>(
         workspace,
     } = input;
     let run_id = session.begin_run();
-    // P1-05：agent 只读窄视图 AgentConfig（owner 不直接消费全 Config）。
-    let agent_cfg = config.agent_config();
     // O1（P1-07）：一次 public Agent Run = 一个 TraceId；span 用 SpanId。
     // 只在真实边界注入（这里是 agent 的入口边界），后续 follow-up 新 run
     // 生成新 TraceId，跨 run 因果用显式 link（O8/P8 子代理时落地）。
@@ -581,7 +579,8 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                         ensure_plan_state_messages(&mut messages, plan.as_ref());
                         // P1-4：compaction 成功后若仍无法容纳（窗口过小），
                         // 不再发起普通请求（必然 length error），明确结束并提示用户。
-                        let system_prompt = system_prompt_text(agent_cfg.system_prompt_extra.as_deref(), None);
+                        let system_prompt =
+                            system_prompt_text(agent_cfg.system_prompt_extra.as_deref(), None);
                         let after =
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
@@ -606,7 +605,8 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                         let plan = tool_runtime.plan_snapshot();
                         ensure_plan_state_messages(&mut messages, plan.as_ref());
                         // P1-4：prune 后仍超窗口（如 user 消息本身巨大）→ 明确结束。
-                        let system_prompt = system_prompt_text(agent_cfg.system_prompt_extra.as_deref(), None);
+                        let system_prompt =
+                            system_prompt_text(agent_cfg.system_prompt_extra.as_deref(), None);
                         let after =
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
@@ -684,7 +684,10 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
                     agent_cfg.model.max_output_tokens.unwrap_or(0) as u64,
                     agent_cfg.safety_reserve_tokens,
                 );
-                let system_prompt = system_prompt_text(agent_cfg.system_prompt_extra.as_deref(), ephemeral_system.as_deref());
+                let system_prompt = system_prompt_text(
+                    agent_cfg.system_prompt_extra.as_deref(),
+                    ephemeral_system.as_deref(),
+                );
                 let projected =
                     crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                 let _ = ui.send(LiveEvent::ContextUsage { projected, usable }).await;

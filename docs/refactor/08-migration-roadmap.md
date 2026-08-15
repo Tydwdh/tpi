@@ -513,12 +513,29 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收达成：command sequence 固定 ✓；key/mouse/slash action 按语义入 enum ✓。
   全量 52 target 绿；fmt/clippy/arch_gate 清洁。P3-02 基于本意图模型。
 
-#### P3-02 建 `AppController`
+#### P3-02 建 `AppController` — **DONE（2026-08-14）**
 
 - 先迁 `start/cancel run` 一个 use case。
 - controller 接收 ports、返回 events/effects；不引用 Crossterm/Ratatui。
 - 逐个迁 resume/session/input answer/config commands。
 - 验收：fake runtime/session/platform 的 integration tests。
+- 实施：`src/app/controller.rs` 新增 `AppController<P: Provider>`：
+  - `new(services)` 持有 `AppServices`（ports）；`handle(&mut self, UiIntent) ->
+    Result<Vec<AppEffect>, String>` 同步决策（无 IO/await），副作用经 AppEffect
+    返回由 surface adapter 执行；不引用 Crossterm/Ratatui。
+  - 已迁 use cases：CancelRun（取消 current_cancel token + Notify）、
+    StartNewSession（conversation.reset）、Quit（请求 Draw）、ToggleSidebar/
+    ToggleReasoning/OpenModal/OpenSearch/OpenLastTool/OpenFailedTool（视图意图→
+    Draw/Notify）、CompactNow/RetryLast（交还 run 路径）、输入类（SubmitInput/
+    OpenSession/RequestInputAnswer/Paste→Draw 由 adapter 进 run 路径）。
+  - `take_cancel()` 供 surface adapter 挂载 run。
+- 验收测试 `tests/app_controller.rs`（5 断言）：cancel run 取消 token + Notify；
+  idle cancel 幂等；start new session 重置会话（parts_for_run 报未启动）；Quit
+  请求渲染；ToggleSidebar 是视图意图（Draw，无业务副作用）。fake EchoProvider
+  构造最小 controller。
+- 验收达成：fake runtime/session/platform integration tests ✓；controller 不
+  引用 Crossterm/Ratatui ✓；全量 53 target 绿；fmt/clippy/arch_gate 清洁。
+  P3-03（slash registry）/P3-05（headless）基于 controller。
 
 #### P3-03 Slash command registry
 
