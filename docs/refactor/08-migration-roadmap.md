@@ -1122,9 +1122,18 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   + evidence 提取）；parent cancel 传播（cancel 后 child 立即失败）；只读
   registry 排除写工具（bash/edit/write/web_fetch 不可用）。
 
-#### P8-05 bounded parallel children
+#### P8-05 bounded parallel children — **DONE（2026-08-14）**
 
 - global/per-parent semaphore、source order、rate fairness、output cap。
+- 实施：`src/subagent/parallel.rs`——`BoundedChildRunner<F>`（make_child 工厂，
+  每个 child 独立 provider 实例——`SubagentProvider` 是 `&mut self` 调用不可
+  共享）：
+  - semaphore：`max_concurrent` 限流（acquire_owned 等待；tokio Semaphore
+    FIFO 公平 = rate fairness）；
+  - source order：结果按请求顺序 await 返回；
+  - output cap：`cap_report` 截断 summary（UTF-8 边界安全）。
+- 验收测试（3 断言）：max_concurrent=2 时 4 请求峰值并发 <= 2 + source order
+  保持；max_concurrent=1 严格串行；output cap 截断。subagent 共 8 断言全绿。
 
 #### P8-06 child TUI
 
