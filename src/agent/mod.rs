@@ -28,16 +28,6 @@ use crate::session::{
 };
 use crate::tool::outcome::{StoredToolOutcome, ToolStatus};
 
-/// Tokio 的 JoinHandle 在 drop 时会脱离而不是取消；run 的 watchdog 必须随
-/// 任意返回路径终止，避免失败后仍发送警告或取消已结束的 token。
-struct AbortTaskOnDrop<T>(tokio::task::JoinHandle<T>);
-
-impl<T> Drop for AbortTaskOnDrop<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 /// 内建 system prompt（§23 草案）。
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
 
@@ -380,35 +370,48 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
         .map_err(|e| RunFailure::Session(e.to_string()))?;
 
     // watchdog 必须覆盖手动 compaction 在内的整个模型工作阶段，并通过
-    // AbortTaskOnDrop 保证所有 `?`/early return 路径都停止后台任务。
+    // Supervisor 保证所有 `?`/early return 路径都停止后台任务（P2-06：
+    // 删除 AbortTaskOnDrop 直接 abort；正常路径 shutdown() join，Drop 兜底 cancel）。
     let cancel_cause = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
         crate::agent::limits::CANCEL_CAUSE_USER,
     ));
     // §用户诉求：max_wall_time_minutes=0（默认）不启动 watchdog——不限制。
-    // 占位任务立即结束，AbortTaskOnDrop 包装类型一致、drop 无副作用。
-    let watchdog = if config.limits.max_wall_time_minutes > 0 {
+    // P2-06：watchdog 逻辑由 Supervisor 直接承载（不再嵌套 spawn_watchdog 的
+    // 内部 spawn；保留 limits::spawn_watchdog 供测试与诊断）。
+    let mut watchdog_supervisor = crate::process::supervisor::Supervisor::new();
+    if config.limits.max_wall_time_minutes > 0 {
         let warn_ui = ui.clone();
         let cause_for_watchdog = cancel_cause.clone();
-        let (watchdog, _wall) = crate::agent::limits::spawn_watchdog(
-            &config.limits,
-            cancel.clone(),
-            move || {
-                cause_for_watchdog.store(
-                    crate::agent::limits::CANCEL_CAUSE_WALL_TIME,
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-            },
-            move || {
-                tracing::info!("run approaching wall-time budget");
-                let _ = warn_ui.try_send(LiveEvent::BudgetWarning);
-            },
-        );
-        AbortTaskOnDrop(watchdog)
-    } else {
-        AbortTaskOnDrop(tokio::spawn(async {
-            crate::agent::limits::BudgetEnd::None
-        }))
-    };
+        let run_cancel = cancel.clone();
+        let wall_secs = config.limits.max_wall_time_minutes.saturating_mul(60);
+        watchdog_supervisor.spawn("agent.watchdog", move |sup_cancel| async move {
+            let wall = std::time::Duration::from_secs(wall_secs.max(1));
+            let deadline = tokio::time::Instant::now() + wall;
+            let warn_at =
+                deadline - std::time::Duration::from_secs((wall.as_secs() as f64 * 0.1) as u64);
+            // 接近预算提示（剩余 10%）。
+            tokio::select! {
+                _ = tokio::time::sleep_until(warn_at) => {
+                    tracing::info!("run approaching wall-time budget");
+                    let _ = warn_ui.try_send(LiveEvent::BudgetWarning);
+                }
+                _ = sup_cancel.cancelled() => return,
+                _ = run_cancel.cancelled() => return,
+            }
+            // 硬限制：先写取消来源，再取消 run token（§16 区分用户/超时）。
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    cause_for_watchdog.store(
+                        crate::agent::limits::CANCEL_CAUSE_WALL_TIME,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    run_cancel.cancel();
+                }
+                _ = sup_cancel.cancelled() => {}
+                _ = run_cancel.cancelled() => {}
+            }
+        });
+    }
 
     let mut usage_total = Usage::default();
     let mut messages: Vec<ChatMessage> = history.to_vec();
@@ -1037,7 +1040,8 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
         break reason;
     };
 
-    watchdog.0.abort();
+    // P2-06：watchdog 由 Supervisor join（而非 abort）；Drop 兜底 cancel。
+    let _ = watchdog_supervisor.shutdown().await;
     // §27/§44：run 级汇总（turn/tool 计数、总 token、总耗时）——性能基线的最小记录。
     tracing::info!(
         run_id = %run_id,
@@ -1594,8 +1598,16 @@ pub fn session_path(
 
 #[cfg(test)]
 mod tests {
+    /// 遗留测试辅助（P2-06 前 watchdog 的直接 abort 语义；现仅测试验证 Drop 行为）。
+    struct AbortTaskOnDrop<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortTaskOnDrop<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     use super::{
-        AbortTaskOnDrop, build_context, ensure_plan_state_messages, recoverable_stream_interrupt,
+        build_context, ensure_plan_state_messages, recoverable_stream_interrupt,
         recovery_overlap_bytes,
     };
     use crate::provider::ChatMessage;

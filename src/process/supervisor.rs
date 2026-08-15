@@ -53,6 +53,14 @@ impl Default for Supervisor {
     }
 }
 
+impl Drop for Supervisor {
+    /// 兜底：未显式 shutdown 时 abort 未完成任务（与旧 AbortTaskOnDrop 等价）。
+    /// 正常路径应显式 `shutdown().await`（join），Drop 只是防提前返回泄漏。
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
+}
+
 impl Supervisor {
     pub fn new() -> Self {
         Self {

@@ -436,11 +436,19 @@ error: invalid_arguments
         // 实时输出通道：工具执行中 bash 增量 → 本 task 转发 → ui_tx。
         // BUG-012：有界通道（§12/§13）——UI 消费慢时工具侧 try_send 丢弃新帧，
         // 不阻塞进程读循环、不无限堆积。
-        let (output_tx, mut output_rx) =
+        let (output_tx, output_rx) =
             tokio::sync::mpsc::channel::<tool::ToolStreamEvent>(tool::TOOL_STREAM_CAPACITY);
         let ui_for_stream = ui.clone();
-        let stream_forwarder = tokio::spawn(async move {
-            while let Some(event) = output_rx.recv().await {
+        // P2-06：stream forwarder 由 Supervisor 跟踪（join 而非 abort）。
+        // channel 关闭（所有 output_tx sender drop）时 recv 返回 None，任务自然
+        // 结束；wave 结束时 drop(output_tx) 后 join。
+        let mut stream_supervisor = crate::process::supervisor::Supervisor::new();
+        let mut stream_output_rx = Some(output_rx);
+        stream_supervisor.spawn("tool.stream_forwarder", move |_| async move {
+            let Some(mut rx) = stream_output_rx.take() else {
+                return;
+            };
+            while let Some(event) = rx.recv().await {
                 let _ = ui_for_stream
                     .send(LiveEvent::ToolOutputDelta {
                         call_id: event.call_id,
@@ -611,7 +619,9 @@ error: invalid_arguments
             }
             results.insert(index, outcome);
         }
-        stream_forwarder.abort();
+        // P2-06：drop 最后的 sender → channel 关闭 → forwarder 自然结束 → join。
+        drop(output_tx);
+        let _ = stream_supervisor.shutdown().await;
 
         // §13（AGENTS.md）：本 wave 含 `request_input` 且成功 → run 挂起。
         // 该 wave 的工具结果已全部持久化（ToolRequested/ToolCompleted），

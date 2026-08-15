@@ -378,10 +378,26 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   成立 ✓；全量 49 target 绿；fmt/clippy/arch_gate 清洁。
   P2-06（迁 watchdog/tool forwarder）基于本 Supervisor。
 
-#### P2-06 迁 Agent watchdog/tool forwarder
+#### P2-06 迁 Agent watchdog/tool forwarder — **DONE（2026-08-14）**
 
 - 一次迁一个 spawn；删除直接 abort 或在 bounded hard-stop 后 await。
 - 验收：cancel at every await；terminal event ordering。
+- 实施：
+  - **watchdog**：`AbortTaskOnDrop(tokio::spawn)` → `Supervisor::spawn("agent.watchdog")`。
+    watchdog 逻辑内联进 Supervisor 任务（select warn/deadline/cancel，两处 await
+    都有 cancel 分支 = cancel at every await）；run 结束时 `shutdown().await`（join
+    而非 abort）；Drop 兜底 cancel。`limits::spawn_watchdog` 保留（测试/诊断用）。
+  - **tool stream forwarder**：`tokio::spawn + abort()` → `Supervisor::spawn(
+    "tool.stream_forwarder")`。channel 关闭（drop 最后 sender）时 recv 返回 None
+    任务自然结束；wave 后 `drop(output_tx) + shutdown().await`（join）。
+    ToolOutputDelta 经有界 channel 在 ToolCompleted 前送达（ordering 保持）。
+  - `AbortTaskOnDrop` 生产代码删除（移入测试模块，仅验证 Drop 行为）。
+- 验收达成：cancel at every await（watchdog/forwarder 的 select/recv 均有 cancel
+  分支）✓；terminal event ordering（ToolRequested→Started→Delta→Completed 顺序
+  由 channel + join 保证，agent_flow/recovery_matrix 全过）✓；全量 49 target 绿；
+  fmt/clippy/arch_gate 清洁。
+  **生产 spawn 清单中 watchdog/forwarder 已有 owner（Supervisor）**；P2-07 盘点
+  其余（MCP reader/process/web writer）纳入各 supervisor。
 
 #### P2-07 MCP/process owner inventory
 
