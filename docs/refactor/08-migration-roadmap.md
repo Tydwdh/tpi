@@ -1258,13 +1258,41 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 - 用户选择的副本 corpus；dry run、migrate、rollback、old binary read behavior。
 
-#### P10-03 performance/resource comparison
+#### P10-03 performance/resource comparison — **DONE（2026-08-14）**
 
 - 对 P0 fixtures 逐项 before/after；解释任何退化并批准预算。
+- 实施：git worktree 检出拆包前提交 d29ff37（单 crate），与拆包后 HEAD 各跑
+  一次 `perf_baseline`（release），逐项对比存 `docs/perf/
+  p10-03-crate-split-comparison.json`。
+- 结论：**无性能退化**。replay_10k_append -5.9%、context_1k_estimate -5.8%
+  等改善；两项 >5% 波动（context_1k_prune +133%、tool_cards +5.0%）经 3 次
+  重跑确认为亚微秒级测量噪声（0.005-0.007ms / 0.020-0.028ms 波动区间），
+  非真实退化。量级指标（replay 10k / hf_append 10k / estimate 10k）±6% 内。
 
-#### P10-04 security/dependency review
+#### P10-04 security/dependency review — **DONE（2026-08-14）**
 
 - deny/advisory/license/source、secret scrub、path/SSRF/process/subagent threat tests。
+- 实施：
+  - `deny.toml` 新建：advisories/licenses/bans/sources 全绿。rsa
+    RUSTSEC-2023-0071（russh 0.62.6 传递依赖，SSH RSA 主机密钥验证；RustSec
+    标注 No fixed upgrade available）ignore 并记录理由（个人终端 agent、
+    自有服务器、攻击面=连接受恶意服务器非默认场景；追踪 russh 升级）；
+    bincode/yaml-rust unmaintained ignore（syntect 本地语法高亮，非安全敏感）。
+  - 8 个 Cargo.toml 补 `license = "MIT"`（此前全缺失，deny licenses 失败）。
+  - **拆包遗留未用依赖清理（cargo machete 从 ~30 项 → 全绿）**：主 crate 删
+    eventsource-stream/futures-util/globset/grep/ignore/html2text/
+    pulldown-cmark/similar/syntect/keyring/regex/russh-config/schemars/
+    thiserror/two-face/tpi-ui-types；agent 删 blake3/ratatui/schemars/uuid/
+    tpi-ui-types；capabilities 删 eventsource-stream/pulldown-cmark/ratatui/
+    regex/unicode-segmentation/unicode-width；config 删 serde_json/uuid；
+    tui 删 blake3/camino/html2text/serde/toml/tokio/tokio-util/
+    tpi-capabilities/tpi-config。全量 56 target 验证编译+测试通过。
+  - secret scrub：源码无疑似密钥（sk-/AKIA/ghp_/api_key 等模式）。
+  - threat tests 盘点：path（junction/escape/traversal，security_contract）、
+    SSRF（localhost/private target，web_fetch）、process（spawn/cancel/100
+    次无泄漏）、subagent（read_only_registry 白名单，写工具不存在）。
+  - ci.yml audit job 补 `cargo deny check` + `cargo machete`（P10-04 后
+    CI 持续执行）。
 
 #### P10-05 UX release candidate
 
