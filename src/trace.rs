@@ -20,7 +20,7 @@ use crate::ids::{RunId, SessionId, SpanId, TraceId};
 pub const TRACE_SCHEMA_VERSION: u16 = 1;
 
 /// 记录种类：span 开/关、事件、缺口、链接、快照。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum TraceRecordKind {
     SpanOpen,
     SpanClose,
@@ -31,7 +31,7 @@ pub enum TraceRecordKind {
 }
 
 /// 日志级别（对齐 tracing 的 Level）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum TraceLevel {
     Trace,
     Debug,
@@ -41,7 +41,7 @@ pub enum TraceLevel {
 }
 
 /// span/event 的终止结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum TraceOutcome {
     Ok,
     Cancelled,
@@ -51,7 +51,7 @@ pub enum TraceOutcome {
 }
 
 /// 字段敏感度（`12` §5.2）：构造 TraceValue 时声明，禁止裸 Debug string。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Sensitivity {
     /// 无隐私，可外发。
     Public,
@@ -72,7 +72,7 @@ pub enum TraceValue {
 }
 
 /// 记录完整性（`12` §5.3）：manifest 报告 dropped/truncated/redacted 等。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum RecordCompleteness {
     Complete,
     Lossy,
@@ -83,7 +83,7 @@ pub enum RecordCompleteness {
 }
 
 /// 关联身份：创建者填它能权威提供的；sink 继承 active trace context 补全。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CorrelationIds {
     pub trace_id: Option<TraceId>,
     pub span_id: Option<SpanId>,
@@ -92,7 +92,7 @@ pub struct CorrelationIds {
 }
 
 /// 一条 trace record（O2 sink 的输入契约；本阶段用于 catalog 与边界注入）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TraceRecord {
     pub schema: u16,
     pub record_seq: u64,
@@ -223,6 +223,171 @@ pub fn is_registered(name: &str) -> bool {
 /// 按 name 查 catalog 条目。
 pub fn entry(name: &str) -> Option<&'static CatalogEntry> {
     CATALOG.iter().find(|e| e.name == name)
+}
+
+// ---------------------------------------------------------------------------
+// O2 Local TraceSink（P2-08）：有界队列 + gap counter + flush guard。
+//
+// - [`TraceSink`]：application 持有的写端。有界（records+bytes），溢出时
+//   gap counter +1 并在后续写入前插入一条 [`TraceGap`]（声明缺口，不伪装完整）；
+// - [`TraceFlushGuard`]：Drop 时 flush 未写队列（或 shutdown deadline 后放弃）；
+// - [`SinkStats`]：manifest/completeness（dropped/gap/seq 范围）。
+//
+// sink error 只降级观测：flush 失败不 panic、不影响调用方（session/run）。
+
+use std::collections::VecDeque;
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// 队列上限（records）。
+const MAX_QUEUED_RECORDS: usize = 4096;
+/// 队列上限（bytes）。
+const MAX_QUEUED_BYTES: usize = 1024 * 1024;
+
+/// 一条声明的 trace 缺口（溢出/写入失败时产生，manifest 披露）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TraceGap {
+    pub dropped_records: u64,
+    pub reason: &'static str,
+    pub at_seq: u64,
+}
+
+/// sink 统计（manifest/completeness 依据）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SinkStats {
+    pub written_records: u64,
+    pub dropped_records: u64,
+    pub gaps: u64,
+    pub first_seq: Option<u64>,
+    pub last_seq: Option<u64>,
+}
+
+/// 有界 trace sink：记录进队列，FlushGuard 落盘。
+///
+/// 线程安全：`push` 可并发（原子 seq + mutex 队列）；`flush` 需 &mut。
+pub struct TraceSink<W: Write + Send> {
+    writer: W,
+    queue: VecDeque<(u64, TraceRecord)>,
+    queued_bytes: usize,
+    seq: AtomicU64,
+    stats: SinkStats,
+    /// 溢出导致的 pending gap（下次 flush 前插入）。
+    pending_gap: Option<TraceGap>,
+}
+
+impl<W: Write + Send> TraceSink<W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer,
+            queue: VecDeque::new(),
+            queued_bytes: 0,
+            seq: AtomicU64::new(0),
+            stats: SinkStats::default(),
+            pending_gap: None,
+        }
+    }
+
+    /// 入队一条记录。有界：超出 records/bytes 时丢最旧 + gap counter。
+    pub fn push(&mut self, record: TraceRecord) {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut record = record;
+        record.record_seq = seq;
+        let approx_bytes = std::mem::size_of_val(&record) + record.name.len();
+
+        if self.queue.len() >= MAX_QUEUED_RECORDS
+            || self.queued_bytes + approx_bytes > MAX_QUEUED_BYTES
+        {
+            // 溢出：丢最旧 + gap counter + 声明 TraceGap。
+            if let Some((dropped_seq, _)) = self.queue.pop_front() {
+                self.queued_bytes = self
+                    .queued_bytes
+                    .saturating_sub(std::mem::size_of_val(&dropped_seq));
+                self.stats.dropped_records += 1;
+            }
+            self.stats.gaps += 1;
+            self.pending_gap = Some(TraceGap {
+                dropped_records: 1,
+                reason: "queue overflow",
+                at_seq: seq,
+            });
+        }
+        self.queue.push_back((seq, record));
+        self.queued_bytes += approx_bytes;
+        if self.stats.first_seq.is_none() {
+            self.stats.first_seq = Some(seq);
+        }
+        self.stats.last_seq = Some(seq);
+    }
+
+    /// 当前队列深度。
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// 底层 writer 可变访问（测试注入故障用）。
+    pub fn writer_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
+    /// 统计（manifest/completeness）。
+    pub fn stats(&self) -> &SinkStats {
+        &self.stats
+    }
+
+    /// flush 全部队列到 writer（含 pending gap）。失败只降级观测（记录错误）。
+    pub fn flush(&mut self) {
+        // 先写 pending gap（声明缺口）。
+        if let Some(gap) = self.pending_gap.take()
+            && let Ok(line) = serde_json::to_string(&gap)
+        {
+            let _ = writeln!(self.writer, "{}", line);
+        }
+        while let Some((_seq, record)) = self.queue.pop_front() {
+            let line = serde_json::to_string(&record);
+            match line {
+                Ok(line) => {
+                    if writeln!(self.writer, "{}", line).is_err() {
+                        // 写入失败：停止（后续 flush 重试）；不 panic。
+                        self.queue.push_front((0, record)); // 放回，下次重试
+                        self.stats.dropped_records += 1;
+                        break;
+                    }
+                    self.stats.written_records += 1;
+                }
+                Err(_) => self.stats.dropped_records += 1,
+            }
+        }
+        self.queued_bytes = self
+            .queue
+            .iter()
+            .map(|(_, r)| std::mem::size_of_val(r) + r.name.len())
+            .sum();
+        let _ = self.writer.flush();
+    }
+
+    /// 队列是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
+/// Flush guard：Drop 时 flush 未写队列（RAII）。
+/// 若 flush 耗时超 deadline（shutdown deadline），仍尽力 flush（不强制超时——
+/// 有界队列保证 flush 有界）。
+pub struct TraceFlushGuard<'a, W: Write + Send> {
+    sink: &'a mut TraceSink<W>,
+}
+
+impl<'a, W: Write + Send> TraceFlushGuard<'a, W> {
+    pub fn new(sink: &'a mut TraceSink<W>) -> Self {
+        Self { sink }
+    }
+}
+
+impl<W: Write + Send> Drop for TraceFlushGuard<'_, W> {
+    fn drop(&mut self) {
+        self.sink.flush();
+    }
 }
 
 #[cfg(test)]

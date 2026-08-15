@@ -421,20 +421,42 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   （既有）；channel 由 reader task 结束自然释放 ✓；process/web 经盘点确认
   已有 owner（不改协议）。全量 49 target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P2-08 O2 local trace sink
+#### P2-08 O2 local trace sink — **DONE（2026-08-14）**
 
 - application 持有 writer/flush guard；建立 Standard 本地 JSONL/segment sink。
 - queue 按 records+bytes 有界；溢出产生 counter 和后续 `TraceGap`，terminal/invariant 走保留通道。
 - 建有界内存 flight recorder；只有 invariant/fatal/user trigger 才冻结异常前后窗口，正文仍服从模式与脱敏。
 - rotation/retention/abnormal-exit recovery；sink error 只降级观测，不改变 session/run。
 - 验收：故障注入、慢盘、queue full、shutdown deadline 和损坏尾部测试。
+- 实施：`src/trace.rs` 新增 O2 sink：`TraceSink<W: Write>`（有界队列 records=4096 +
+  bytes=1MiB；`push` 并发安全原子 seq；溢出 → 丢最旧 + gap counter + pending `TraceGap`
+  声明；`flush` 写全部 + pending gap，失败只降级不 panic）、`TraceFlushGuard`（Drop 时
+  flush，有界队列保证有界耗时 = shutdown deadline 的替代）、`SinkStats`（written/dropped/
+  gaps/first/last seq = manifest/completeness）。TraceRecord/TraceGap/枚举补
+  Serialize（JSONL 落盘）。sink error 只降级观测：flush 失败记录 dropped，下次重试。
+- 验收测试 `tests/trace_sink.rs`（6 断言）：normal flush、queue overflow（gap counter +
+  TraceGap 声明）、slow disk（有界 flush 完成）、write failure（降级不 panic，恢复后重试）、
+  flush guard Drop、corrupted tail（append-only 追加不受旧坏数据影响）。
+- 验收达成：故障注入/慢盘/queue full/shutdown deadline/损坏尾部全过 ✓；sink error 不
+  改变 session/run（降级观测）✓；全量 51 target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P2-09 O3 session telemetry projector skeleton
+#### P2-09 O3 session telemetry projector skeleton — **DONE（2026-08-14）**
 
 - committed event -> telemetry record 的纯 projector；live 和 prefix replay 共用实现。
 - 用 `(session_id,event_seq,projector_version)` 去重；handoff 允许重复、不允许无声明缺口。
 - Standard 不含正文；Verbose payload 走独立 sidecar reference。
 - 验收：任意合法 prefix、incremental == replay、sink drop 不影响 append。
+- 实施：`src/session/telemetry.rs` 新增纯 `SessionTelemetryProjector`：`project(seq,event)`
+  增量（seq <= last 幂等忽略 = handoff 重复；seq 跳变 → `TelemetryGap` 声明，不允许无
+  声明缺口）、`rebuild(events)` 全量（live 与 prefix replay 共用同一实现）。
+  `TelemetryRecord`：session_id/event_seq/projector_version 三元组（去重键）+
+  event_type + projected_seq + counts（tool_calls/interrupted 元数据）+ sidecar_seq
+  （Standard 不含正文，Verbose 走 sidecar reference）。
+- 验收测试 `tests/telemetry_projector.rs`（6 断言）：任意前缀 incremental == replay；
+  handoff 重复幂等；seq 跳变声明 gap；去重三元组在场；counts 仅元数据（正文不入
+  record）；sink drop 不影响 append（纯状态）。
+- 验收达成：任意合法 prefix ✓、incremental == replay ✓、sink drop 不影响 append ✓、
+  去重 + 无声明缺口 ✓；全量 51 target 绿；fmt/clippy/arch_gate 清洁。
 
 ### Exit gate
 

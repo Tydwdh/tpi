@@ -13,6 +13,7 @@ pub mod protocol;
 pub mod recovery;
 pub mod repair;
 pub mod store;
+pub mod telemetry;
 
 // P2-01：store 层 re-export（原 mod.rs 的 public API 保持不变；迁移完成后
 // 调用方可改 `session::store::` 直引，re-export 留待 P10 清理）。
@@ -24,6 +25,9 @@ pub use protocol::{
 };
 pub use store::read_envelopes;
 pub(crate) use store::{SessionProtocolState, open_and_lock_session};
+pub use telemetry::{
+    PROJECTOR_VERSION, SessionTelemetryProjector, TelemetryCounts, TelemetryGap, TelemetryRecord,
+};
 
 pub use store::{
     SessionLog, compacted_range, latest_plan, latest_plan_from_events, project_domain_messages,
