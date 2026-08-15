@@ -474,11 +474,22 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 ### 任务
 
-#### P3-01 定义 `UiIntent/AppCommand/AppEffect`
+#### P3-01 定义 `UiIntent/AppCommand/AppEffect` — **DONE（2026-08-14）**
 
 - 收集所有 key/mouse/slash action；按语义建 enum。
 - 旧 event pump adapter 把新 command 转回旧函数，保持行为。
 - 验收：recorded input trace 的 command sequence 固定。
+- 实施：`src/app.rs` 拆为 `src/app/mod.rs`（逻辑不变）+ `src/app/intent.rs`：
+  `AppCommand`（SubmitInput/Quit/CancelRun/StartNewSession/CompactNow/RetryLast/
+  ToggleSidebar/ToggleReasoning/OpenModal/OpenLastTool/OpenFailedTool/OpenSearch/
+  OpenSession/RequestInputAnswer/Paste，平台无关）、`UiIntent`（AppCommand +
+  IntentSource：Keyboard/Mouse/SlashCommand/Headless/Paste）、`AppEffect`
+  （Draw/CopyToClipboard/OpenUrl/SetTerminalTitle/OpenFilePicker/Notify）。
+  adapter：`command_from_slash` + key 事件映射（Ctrl+D/Ctrl+B/Ctrl+F/Enter/Paste）。
+- 验收测试 `tests/app_intent.rs`（4 断言）：recorded input trace command sequence
+  固定（确定性）；Ctrl+D/Enter 语义等价；scroll 是视图意图；slash 映射与旧 pump 一致。
+- 验收达成：command sequence 固定 ✓；key/mouse/slash action 按语义入 enum ✓。
+  全量 52 target 绿；fmt/clippy/arch_gate 清洁。P3-02 基于本意图模型。
 
 #### P3-02 建 `AppController`
 
