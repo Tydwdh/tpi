@@ -1012,13 +1012,22 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   session→agent、capabilities→agent、agent→tui（后续拆分前需消除，如把
   ChatMessage adapter 移出 domain 核心、agent 不引用 tui）。脚本可作为拆 crate
   的回归检查。
-- 验收达成：crate edges 模拟脚本 ✓；cycles 定位 ✓；P7-02 拆 crate 的启动条件
-  （连续两阶段无反向 import）由后续迭代逐项消除。
+- 验收达成：crate edges 模拟脚本 ✓；cycles 定位 ✓；**全部 6 处反向引用已消除
+  （2026-08-14，P7-02 前置）**——脚本改进（只统计真实 use，排除 doc 链接误报）
+  后剩 4 处真实：ChatMessage/ToolCall/ToolDef 下沉 message.rs（core→provider、
+  session→provider、tool→provider 消除）；outcome.rs（StoredToolOutcome/Effect/
+  ToolRecoveryPolicy/tool_recovery_policy 名字表）与 plan.rs 下沉 core
+  （session→tool 消除；update_plan 执行留 tool/plan_exec.rs）；
+  validate_artifact_component 下沉 util.rs。DAG dry run 现为 **OK（0 反向引用）**，
+  连续两阶段无反向 import 的条件已满足，可开始拆 crate。
 
-#### P7-02 依次拆 crate
+#### P7-02 依次拆 crate — **前置已达成（2026-08-14）**
 
 - 顺序：core -> session -> capabilities -> agent -> TUI -> adapters/CLI。
 - 每个 PR 只拆一个 crate；零行为变化；必要 re-export 有删除阶段。
+- 前置：DAG 0 反向引用 ✓；global_registry 移除（P4 gate）✓；共享纯数据
+  （message/outcome/plan）已在 core 层，拆包时直接搬目录。拆包本身（crates/ 下
+  建 workspace、Cargo.toml 依赖、逐 crate 编译验证）是连续迭代工程，后续轮实施。
 
 #### P7-03 feature audit
 
