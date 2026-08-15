@@ -753,3 +753,62 @@ mod zero_width_tests {
         assert_eq!(editor.col_to_offset(0, editor.text.len(), 1), 3);
     }
 }
+
+/// P6-05：grapheme 边界函数（emoji ZWJ / 组合字符按用户感知字符处理）。
+/// 返回 text 的 grapheme 簇边界字节偏移（0..len）。
+pub fn grapheme_boundaries(text: &str) -> Vec<usize> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut boundaries = vec![0usize];
+    for g in text.graphemes(true) {
+        let next = boundaries.last().unwrap() + g.len();
+        boundaries.push(next);
+    }
+    boundaries
+}
+
+/// P6-05：光标前的 grapheme 数（用户感知字符数；与字节 offset 区分）。
+pub fn grapheme_count_before(text: &str, byte_offset: usize) -> usize {
+    let bounds = grapheme_boundaries(text);
+    // 完整越过的 grapheme 数 = 边界 b（b <= offset）数 - 起始边界 0；
+    // 光标在 grapheme 内部（offset 非边界）时不加一。
+    bounds
+        .iter()
+        .filter(|&&b| b <= byte_offset)
+        .count()
+        .saturating_sub(1)
+}
+
+#[cfg(test)]
+mod grapheme_tests {
+    use super::*;
+
+    /// emoji ZWJ 序列是一个 grapheme（多字节多 char）。
+    #[test]
+    fn zwj_emoji_is_one_grapheme() {
+        let text = "👨‍👩‍👧‍👦"; // 家庭 emoji：4 个 char，1 个 grapheme
+        let bounds = grapheme_boundaries(text);
+        assert_eq!(bounds.len(), 2, "一个 grapheme = 2 个边界（0 与 len）");
+        assert_eq!(bounds[1], text.len());
+    }
+
+    /// 组合字符（é = e + combining accent）是一个 grapheme。
+    #[test]
+    fn combining_sequence_is_one_grapheme() {
+        let text = "e\u{301}"; // e + combining acute
+        let bounds = grapheme_boundaries(text);
+        assert_eq!(bounds.len(), 2, "组合序列 = 1 grapheme");
+        assert_eq!(
+            grapheme_count_before(text, 1),
+            0,
+            "第一个字节处仍是 0 个 grapheme"
+        );
+    }
+
+    /// ASCII 与 grapheme 一一对应。
+    #[test]
+    fn ascii_graphemes_equal_chars() {
+        let text = "hello";
+        assert_eq!(grapheme_boundaries(text).len(), text.len() + 1);
+        assert_eq!(grapheme_count_before(text, 3), 3);
+    }
+}

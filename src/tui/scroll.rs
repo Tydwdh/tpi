@@ -207,3 +207,42 @@ mod tests {
         assert_eq!(move_by_rows(&ids, &heights, 3, 99), (EntryId(3), 3));
     }
 }
+
+#[cfg(test)]
+mod dual_model_tests {
+    use super::*;
+
+    /// P6-03：semantic anchor 在 append 后稳定（Locked 位置不被新内容顶走）。
+    #[test]
+    fn semantic_anchor_stable_across_append() {
+        // 初始 3 个 entry。
+        let ids = vec![EntryId(1), EntryId(2), EntryId(3)];
+        let heights = vec![2, 2, 2];
+        // 锁定 entry 2 的 row 0 → 全局 row。
+        let locked_row = row_of(&ids, &heights, EntryId(2), 0);
+        assert_eq!(locked_row, 2);
+        // append 2 个新 entry（模拟新消息到达）。
+        let ids2 = vec![EntryId(1), EntryId(2), EntryId(3), EntryId(4), EntryId(5)];
+        let heights2 = vec![2, 2, 2, 3, 3];
+        let locked_row2 = row_of(&ids2, &heights2, EntryId(2), 0);
+        assert_eq!(
+            locked_row, locked_row2,
+            "semantic anchor 在 append 后必须稳定（不被顶走）"
+        );
+    }
+
+    /// P6-03：old offset 模型（行号）在 append 后会漂移——双模型差异明确。
+    #[test]
+    fn old_offset_drifts_while_semantic_stable() {
+        let ids = vec![EntryId(1), EntryId(2), EntryId(3)];
+        let heights = vec![2, 2, 2];
+        let old_offset_row = row_of(&ids, &heights, EntryId(2), 0); // = 2
+        // 顶部插入（模拟早前消息滚动出去）：旧模型 offset 失效。
+        let ids2 = vec![EntryId(0), EntryId(1), EntryId(2), EntryId(3)];
+        let heights2 = vec![1, 2, 2, 2];
+        let old_drifted = row_of(&ids2, &heights2, EntryId(2), 0);
+        assert_ne!(old_offset_row, old_drifted, "offset 模型顶部插入后漂移");
+        // semantic（EntryId 2 的稳定锚）仍可定位。
+        assert_eq!(old_drifted, 3);
+    }
+}

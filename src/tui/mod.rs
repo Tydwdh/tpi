@@ -18,13 +18,16 @@
 pub mod editor;
 pub mod effect;
 pub mod event;
+pub mod focus;
 pub mod highlight;
 pub mod interaction;
 pub mod keymap;
+pub mod layout;
 mod markdown;
 pub mod model;
 pub mod paste;
 pub mod reducer;
+pub mod render_cache;
 pub mod scroll;
 pub mod state;
 pub mod terminal;

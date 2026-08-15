@@ -390,9 +390,71 @@ impl<W: Write + Send> Drop for TraceFlushGuard<'_, W> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// P6-09：O5 trace inspector——只读视图（timeline/gap/completeness）。
+//
+// inspector 读取冻结 snapshot/segment；**禁止通过 debug UI 触发 tool/session
+// mutation**（本模块只读 SinkStats/TraceRecord）。
+
+/// inspector 视图（只读；由 sink stats 投影）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InspectorView {
+    pub written: u64,
+    pub dropped: u64,
+    pub gaps: u64,
+    pub first_seq: Option<u64>,
+    pub last_seq: Option<u64>,
+    /// 完整性 = 写入 / 总记录（gap 可见，不伪装完整）。
+    pub completeness_ratio: f64,
+}
+
+/// 从 sink stats 构建只读 inspector 视图（不修改 sink）。
+pub fn inspect(stats: &SinkStats) -> InspectorView {
+    let total = stats.written_records + stats.dropped_records;
+    InspectorView {
+        written: stats.written_records,
+        dropped: stats.dropped_records,
+        gaps: stats.gaps,
+        first_seq: stats.first_seq,
+        last_seq: stats.last_seq,
+        completeness_ratio: if total == 0 {
+            1.0
+        } else {
+            stats.written_records as f64 / total as f64
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// inspector 对 incomplete/dropped 数据不伪装完整。
+    #[test]
+    fn inspector_reports_incompleteness() {
+        let stats = SinkStats {
+            written_records: 8,
+            dropped_records: 2,
+            gaps: 1,
+            first_seq: Some(1),
+            last_seq: Some(10),
+        };
+        let view = inspect(&stats);
+        assert_eq!(view.gaps, 1, "gap 可见");
+        assert!((view.completeness_ratio - 0.8).abs() < 1e-9, "完整性如实");
+        assert!(
+            (view.completeness_ratio - 1.0).abs() >= 1e-9,
+            "不伪装完整"
+        );
+    }
+
+    /// 空 sink：完整（无记录）。
+    #[test]
+    fn empty_sink_is_complete() {
+        let view = inspect(&SinkStats::default());
+        assert_eq!(view.completeness_ratio, 1.0);
+        assert_eq!(view.written, 0);
+    }
 
     #[test]
     fn catalog_has_no_duplicate_names() {

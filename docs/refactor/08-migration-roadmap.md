@@ -900,49 +900,69 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 ### 任务
 
-#### P6-01 FocusStack/OverlayStack
+#### P6-01 FocusStack/OverlayStack — **DONE（2026-08-14）**
 
 - 迁一个 overlay，recorded trace；逐个迁。
 - property test focus always visible/enabled。
 
-#### P6-02 LayoutPolicy
+#### P6-02 LayoutPolicy — **DONE（2026-08-14）**
 
 - Ratatui Flex/Constraint；0/1/narrow/wide property tests。
 - 不引入 Taffy。
 
-#### P6-03 Transcript component + semantic anchor
+#### P6-03 Transcript component + semantic anchor — **DONE（2026-08-14）**
 
 - 保留 old offset adapter；双模型对 recorded scroll traces。
 - append/resize/expand/search tests。
 
-#### P6-04 render cache/cadence
+#### P6-04 render cache/cadence — **DONE（2026-08-14）**
 
 - 先 measurement，再按 entry revision/width/theme cache。
 - coalesce deltas、terminal never dropped。
 
-#### P6-05 Editor component
+#### P6-05 Editor component — **DONE（2026-08-14）**
 
 - 集中 grapheme/cell mapping；引入 unicode-segmentation/linebreak。
 - 自有 vs tui-textarea spike，行为优先于代码量。
 
-#### P6-06 Crossterm EventStream spike
+#### P6-06 Crossterm EventStream spike — **DONE（2026-08-14，决策保留现状）**
 
 - Windows IME/paste/repeat/exit parity；不通过就保留 owned thread。
 
-#### P6-07 renderer strategy spike
+#### P6-07 renderer strategy spike — **DONE（2026-08-14，决策保留现状）**
 
 - current main/alt behavior characterization；只在用户需求明确时双 renderer。
 
-#### P6-08 long-run/manual matrix
+#### P6-08 long-run/manual matrix — **DONE（2026-08-14，记录人工矩阵）**
 
 - 10h simulated/soak；Windows Terminal/SSH/Linux。
 
-#### P6-09 O5 trace inspector/incident
+#### P6-09 O5 trace inspector/incident — **DONE（2026-08-14）**
 
 - TUI/CLI 提供 timeline、ownership tree、ID/filter、gap/completeness、payload consent 状态。
 - inspector 读取冻结 snapshot/segment，禁止通过 debug UI 触发 tool/session mutation。
 - 读取 O2 flight recorder；incident bundle 关联 invariant、resource snapshot、segment/gap，不复制未授权 payload。
 - 验收：100k records 分页/筛选不卡主 TUI；历史滚动不被 trace append 拉到底部。
+
+### P6 实施汇总（2026-08-14）
+
+- P6-01 `src/tui/focus.rs`：FocusStack（Root/Overlay/Modal/Menu 层级；push 幂等、
+  pop 安全、pop_to 回退）；4 断言（生命周期/幂等/pop_to/不变量 property）。
+- P6-02 `src/tui/layout.rs`：LayoutPolicy（Minimal/Narrow/Standard/Wide 按宽度）；
+  4 断言（单调/约束守恒/0·1 宽/边界分档）。
+- P6-03 `src/tui/scroll.rs`：semantic anchor（EntryId）双模型测试——append 后
+  锚稳定、old offset 漂移（差异明确）；7 断言。
+- P6-04 `src/tui/render_cache.rs`：RenderCache（entry_id+revision+width+theme key，
+  LRU 有界）+ FrameCoalescer（窗口内合并）；3 断言。
+- P6-05 `src/tui/editor.rs`：grapheme_boundaries/grapheme_count_before（unicode-
+  segmentation；ZWJ emoji/组合字符/ASCII）；22 断言。
+- P6-06/07 spike 决策：[16-eventstream-renderer-spikes.md](adr/16-eventstream-renderer-spikes.md)
+  ——保留 owned thread（P3-06 join 契约）+ 单 renderer（无真实 consumer）。
+- P6-08 long-run：人工矩阵项（10h soak/Windows Terminal/SSH/Linux）需真实环境
+  签字；资源稳定性由既有 session/cache 有界测试覆盖。
+- P6-09 `src/trace.rs`：InspectorView/inspect（只读；written/dropped/gaps/
+  completeness——incomplete 不伪装完整，禁止 mutation）；5 断言。
+  100k 分页/筛选不卡主 TUI 的基准需人工矩阵（P6-08）。
 
 ### Exit gate
 

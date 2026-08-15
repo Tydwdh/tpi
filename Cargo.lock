@@ -5103,6 +5103,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "two-face",
+ "unicode-segmentation",
  "unicode-width",
  "uuid",
  "windows-sys 0.61.2",
