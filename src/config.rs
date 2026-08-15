@@ -184,9 +184,9 @@ pub struct Config {
     /// §16.3 [ui] theme：omp / dark / light（P2：主题可选，默认 omp）。
     pub ui_theme: String,
     /// §1 [ui] mode：fullscreen（默认）/ inline（兼容模式）。
-    pub ui_mode: crate::tui::terminal::ViewMode,
+    pub ui_mode: tpi_ui_types::ViewMode,
     /// §成熟化 [ui] keymap：动作 → 按键覆盖（未配置动作保持内建默认）。
-    pub ui_keymap: crate::tui::keymap::Keymap,
+    pub ui_keymap: tpi_ui_types::Keymap,
     /// §用户诉求 [ui] collapsed_lines：卡片折叠时显示的正文行数（thinking/工具
     /// 卡片统一）；默认 10；0 = 折叠态只显示主行摘要。
     pub ui_collapsed_lines: usize,
@@ -272,8 +272,8 @@ pub struct ToolPolicy {
 #[derive(Debug, Clone)]
 pub struct UiConfig {
     pub theme: String,
-    pub mode: crate::tui::terminal::ViewMode,
-    pub keymap: crate::tui::keymap::Keymap,
+    pub mode: tpi_ui_types::ViewMode,
+    pub keymap: tpi_ui_types::Keymap,
     pub collapsed_lines: usize,
 }
 
@@ -354,8 +354,8 @@ pub(crate) fn test_config(workspace_root: &Utf8PathBuf) -> Config {
         artifacts_root: std::path::PathBuf::from(".tpi-test-artifacts"),
         shell_path: None,
         safety_reserve_tokens: 8192,
-        ui_mode: crate::tui::terminal::ViewMode::default(),
-        ui_keymap: crate::tui::keymap::Keymap::builtin(),
+        ui_mode: tpi_ui_types::ViewMode::default(),
+        ui_keymap: tpi_ui_types::Keymap::builtin(),
         ui_collapsed_lines: 10,
         auto_open_browser: false,
         web_summary_model: "none".into(),
@@ -560,9 +560,9 @@ pub(crate) fn load_from_home(
             .ui
             .mode
             .as_deref()
-            .map(crate::tui::terminal::ViewMode::parse)
+            .map(tpi_ui_types::ViewMode::parse)
             .unwrap_or_default(),
-        ui_keymap: crate::tui::keymap::Keymap::from_config(&merged.ui.keymap.unwrap_or_default()),
+        ui_keymap: tpi_ui_types::Keymap::from_config(&merged.ui.keymap.unwrap_or_default()),
         allow_outside_workspace: merged.agent.allow_outside_workspace.unwrap_or(true),
     })
 }

@@ -5136,6 +5136,7 @@ dependencies = [
  "tpi-capabilities",
  "tpi-core",
  "tpi-session",
+ "tpi-ui-types",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -5211,6 +5212,16 @@ dependencies = [
  "tpi-core",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "tpi-ui-types"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "serde",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

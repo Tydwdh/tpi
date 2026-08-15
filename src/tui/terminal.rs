@@ -13,23 +13,9 @@ use ratatui::crossterm::execute;
 
 const MOUSE_CAPTURE_SEQUENCE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 
-/// 视口模式（§1：默认 fullscreen；inline 仅为兼容模式）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ViewMode {
-    #[default]
-    Fullscreen,
-    Inline,
-}
-
-impl ViewMode {
-    /// 从配置字符串解析（`[ui] mode`）；未知值回退 fullscreen。
-    pub fn parse(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "inline" => ViewMode::Inline,
-            _ => ViewMode::Fullscreen,
-        }
-    }
-}
+/// 视口模式（P7-02 拆 crate：定义在 tpi-ui-types，此处 re-export 保持
+/// `tui::terminal::ViewMode` 路径兼容）。
+pub use tpi_ui_types::ViewMode;
 
 /// inline 模式的活动区高度（约 2/5 屏，随终端行数自适应；§16.1 保留）。
 fn inline_activity_height(rows: u16) -> u16 {
