@@ -1384,17 +1384,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fancy-regex"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "998b056554fbe42e03ae0e152895cd1a7e1002aec800fdc6635d20270260c46f"
-dependencies = [
- "bit-set 0.8.0",
- "regex-automata",
- "regex-syntax",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1694,20 +1683,7 @@ checksum = "308ae749734e28d749a86f33212c7b756748568ce332f970ac1d9cd8531f32e6"
 dependencies = [
  "grep-cli",
  "grep-matcher",
- "grep-printer 0.2.2",
- "grep-regex",
- "grep-searcher",
-]
-
-[[package]]
-name = "grep"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "309217bc53e2c691c314389c7fa91f9cd1a998cda19e25544ea47d94103880c3"
-dependencies = [
- "grep-cli",
- "grep-matcher",
- "grep-printer 0.3.1",
+ "grep-printer",
  "grep-regex",
  "grep-searcher",
 ]
@@ -1740,21 +1716,6 @@ name = "grep-printer"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c112110ae4a891aa4d83ab82ecf734b307497d066f437686175e83fbd4e013fe"
-dependencies = [
- "bstr",
- "grep-matcher",
- "grep-searcher",
- "log",
- "serde",
- "serde_json",
- "termcolor",
-]
-
-[[package]]
-name = "grep-printer"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd76035e87871f51c1ee5b793e32122b3ccf9c692662d9622ef1686ff5321acb"
 dependencies = [
  "bstr",
  "grep-matcher",
@@ -4466,15 +4427,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
-name = "similar"
-version = "3.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85ee016af5d736b69fc89e19254540fa4b5f5492853fb5503920f084011c78b6"
-dependencies = [
- "bstr",
-]
-
-[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4712,7 +4664,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "656b45c05d95a5704399aeef6bd0ddec7b2b3531b7c9e900abbf7c4d2190c925"
 dependencies = [
  "bincode",
- "fancy-regex 0.16.2",
  "flate2",
  "fnv",
  "once_cell",
@@ -4832,7 +4783,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bitflags 2.13.1",
- "fancy-regex 0.11.0",
+ "fancy-regex",
  "filedescriptor",
  "finl_unicode",
  "fixedbitset",
@@ -5127,31 +5078,17 @@ dependencies = [
  "blake3",
  "camino",
  "clap",
- "eventsource-stream",
- "futures-util",
- "globset",
- "grep 0.4.1",
- "html2text",
- "ignore",
- "keyring",
  "proptest",
- "pulldown-cmark",
  "rand 0.10.2",
  "ratatui",
- "regex",
  "reqwest",
  "russh",
- "russh-config",
  "russh-sftp",
- "schemars",
  "serde",
  "serde_json",
  "serial_test",
- "similar 3.1.2",
  "socket2",
- "syntect",
  "tempfile",
- "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
@@ -5162,12 +5099,9 @@ dependencies = [
  "tpi-core",
  "tpi-session",
  "tpi-tui",
- "tpi-ui-types",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "two-face",
- "unicode-segmentation",
  "unicode-width",
  "uuid",
  "windows-sys 0.61.2",
@@ -5178,14 +5112,11 @@ name = "tpi-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "blake3",
  "camino",
  "eventsource-stream",
  "futures-util",
  "proptest",
- "ratatui",
  "reqwest",
- "schemars",
  "serde",
  "serde_json",
  "tempfile",
@@ -5196,9 +5127,7 @@ dependencies = [
  "tpi-config",
  "tpi-core",
  "tpi-session",
- "tpi-ui-types",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -5208,16 +5137,12 @@ dependencies = [
  "async-trait",
  "blake3",
  "camino",
- "eventsource-stream",
  "futures-util",
  "globset",
- "grep 0.3.2",
+ "grep",
  "html2text",
  "ignore",
  "proptest",
- "pulldown-cmark",
- "ratatui",
- "regex",
  "reqwest",
  "russh",
  "russh-config",
@@ -5225,7 +5150,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "similar 2.7.0",
+ "similar",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -5234,8 +5159,6 @@ dependencies = [
  "tpi-core",
  "tpi-session",
  "tracing",
- "unicode-segmentation",
- "unicode-width",
  "uuid",
  "windows-sys 0.61.2",
 ]
@@ -5248,12 +5171,10 @@ dependencies = [
  "keyring",
  "reqwest",
  "serde",
- "serde_json",
  "tempfile",
  "toml",
  "tpi-core",
  "tpi-ui-types",
- "uuid",
 ]
 
 [[package]]
@@ -5288,24 +5209,15 @@ dependencies = [
 name = "tpi-tui"
 version = "0.1.0"
 dependencies = [
- "blake3",
- "camino",
- "html2text",
  "proptest",
  "pulldown-cmark",
  "ratatui",
  "regex",
- "serde",
  "serde_json",
  "syntect",
  "tempfile",
  "time",
- "tokio",
- "tokio-util",
- "toml",
  "tpi-agent",
- "tpi-capabilities",
- "tpi-config",
  "tpi-core",
  "tpi-session",
  "tpi-ui-types",
@@ -5320,7 +5232,6 @@ name = "tpi-ui-types"
 version = "0.1.0"
 dependencies = [
  "crossterm",
- "serde",
  "toml",
  "tracing",
 ]

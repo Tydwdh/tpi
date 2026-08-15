@@ -2,6 +2,7 @@
 name = "tpi-core"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 description = "TPI core layer: pure data types and utilities (ids/message/plan/outcome/util)"
 
 [dependencies]

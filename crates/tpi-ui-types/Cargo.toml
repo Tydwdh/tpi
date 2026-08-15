@@ -2,10 +2,10 @@
 name = "tpi-ui-types"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 description = "TPI UI data types shared by config and TUI (ViewMode, Keymap, KeyAction)"
 
 [dependencies]
 crossterm = "0.29"
 toml = "1"
-serde = { version = "1", features = ["derive"] }
 tracing = "0.1"

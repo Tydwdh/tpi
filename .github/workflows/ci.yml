@@ -39,3 +39,10 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
       - run: cargo audit
+      # P10-04：deny（advisories/licenses/bans/sources）+ 未用依赖检查。
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
+      - run: cargo deny check
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked --version 0.9.2
+      - run: cargo machete

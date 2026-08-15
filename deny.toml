@@ -1,0 +1,49 @@
+# cargo-deny 配置（P10-04 security/dependency review）。
+# 用法：cargo deny check（advisories/licenses/bans/sources）
+[advisories]
+# 已知无修复的生态级漏洞：rsa 0.10.0-rc.18（russh 0.62.6 传递依赖，SSH
+# RSA 主机密钥验证；RUSTSEC-2023-0071 Marvin Attack，RustSec 标注
+# "No fixed upgrade available"——rsa 0.10 全系列受影响，russh 上游未升级）。
+# 风险缓解：TPI 是个人终端 agent，SSH 目标为自有服务器；攻击面 = 连接受
+# 恶意服务器（非默认场景）。追踪：russh 升级到使用稳定 rsa 的版本后移除。
+ignore = [
+  # 已知无修复的生态级漏洞：rsa 0.10.0-rc.18（russh 0.62.6 传递依赖，SSH
+  # RSA 主机密钥验证；RUSTSEC-2023-0071 Marvin Attack，RustSec 标注
+  # "No fixed upgrade available"——rsa 0.10 全系列受影响，russh 上游未升级）。
+  # 风险缓解：TPI 是个人终端 agent，SSH 目标为自有服务器；攻击面 = 连接受
+  # 恶意服务器（非默认场景）。追踪：russh 升级到使用稳定 rsa 的版本后移除。
+  "RUSTSEC-2023-0071",
+  # unmaintained：bincode（RUSTSEC-2025-0141）经 syntect 用于本地语法高亮，
+  # 非安全敏感路径；无官方维护替代（syntect 上游依赖）。
+  "RUSTSEC-2025-0141",
+  # unmaintained：yaml-rust（RUSTSEC-2024-0320）同 bincode，经 syntect 本地
+  # 语法高亮；yaml-rust2 fork 需 syntect 上游升级支持，追踪中。
+  "RUSTSEC-2024-0320",
+]
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "ISC",
+  "0BSD",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CC0-1.0",
+  "Zlib",
+  "MPL-2.0",
+  "BSD-2-Clause",
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# 允许重复版本（syntect 等传递依赖常有），但显式列出不允许的重复。
+multiple-versions = "warn"
+# skip：已知且无害的重复（rustls 等）。留空，按 warn 提示后决定。
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

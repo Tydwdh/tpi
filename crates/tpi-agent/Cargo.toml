@@ -2,6 +2,7 @@
 name = "tpi-agent"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 description = "TPI agent layer: agent loop, provider adapters, context projection, subagents, trace"
 
 [dependencies]
@@ -9,22 +10,17 @@ tpi-core = { path = "../tpi-core" }
 tpi-session = { path = "../tpi-session" }
 tpi-capabilities = { path = "../tpi-capabilities" }
 tpi-config = { path = "../tpi-config" }
-tpi-ui-types = { path = "../tpi-ui-types" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "signal", "sync", "time", "fs", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
-blake3 = "1"
 camino = { version = "1", features = ["serde1"] }
-uuid = { version = "1", features = ["v7"] }
 thiserror = "2"
 async-trait = "0.1.92"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "system-proxy", "charset", "http2", "json", "stream"] }
 eventsource-stream = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-schemars = { version = "1.2", features = ["derive"] }
-ratatui = { version = "0.30", features = ["scrolling-regions"] }
 
 [dev-dependencies]
 tempfile = "3"

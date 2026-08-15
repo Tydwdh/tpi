@@ -15,6 +15,7 @@ resolver = "2"
 name = "tpi"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 rust-version = "1.97"
 description = "A personal terminal coding agent for Windows"
 
@@ -22,7 +23,6 @@ description = "A personal terminal coding agent for Windows"
 tpi-core = { path = "crates/tpi-core" }
 tpi-session = { path = "crates/tpi-session" }
 tpi-capabilities = { path = "crates/tpi-capabilities" }
-tpi-ui-types = { path = "crates/tpi-ui-types" }
 tpi-config = { path = "crates/tpi-config" }
 tpi-agent = { path = "crates/tpi-agent" }
 tpi-tui = { path = "crates/tpi-tui" }
@@ -34,45 +34,20 @@ tokio-util = { version = "0.7", features = ["rt"] }
 reqwest = { version = "0.13", default-features = false, features = [
   "rustls", "system-proxy", "charset", "http2", "json", "stream"
 ] }
-eventsource-stream = "0.2"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
 clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 uuid = { version = "1", features = ["v7"] }
 time = { version = "0.3", features = ["formatting"] }
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 blake3 = "1"
-schemars = { version = "1.2", features = ["derive"] }
 ratatui = { version = "0.30", features = ["scrolling-regions"] }
 unicode-width = "0.2"
-unicode-segmentation = "1"
-pulldown-cmark = "0.13"
-html2text = "0.17"
-keyring = { version = "4.1", features = ["windows-native-keyring-store"] }
 camino = { version = "1", features = ["serde1"] }
-ignore = "0.4"
-regex = "1"
-# search 内核（ripgrep 同源：grep-searcher 逐行搜索、自带 binary/行号处理）。
-grep = "0.4"
-# glob 工具与 search include 过滤（文件名模式匹配；ripgrep 生态）。
-globset = "0.4"
-similar = "3"
-# 代码块语法高亮（纯 Rust：regex-fancy，无 oniguruma C 依赖；default-fancy
-# 含默认语法集与主题集）。
-syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
-# bat 同源扩展语法包：补齐 TSX、TOML、Go、Kotlin、Terraform、Vue、Svelte 等。
-# 使用 fancy-regex 后端，避免引入 oniguruma C 依赖。
-two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 russh = "0.62.6"
-# russh-keys 0.49.2 曾为直接依赖但 src/tests 零直接引用（cargo machete 确认），
-# russh 自带 keys 模块（ssh-key =0.7.0-rc.11），删除以避免重复加密栈
-# （aead 0.5.2 / ssh-key 0.6.7 / ed25519 3.0.0，见 P0-06）。
-russh-config = "0.58.0"
 russh-sftp = "2.4.0"
 async-trait = "0.1.92"
 
