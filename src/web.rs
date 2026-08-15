@@ -41,6 +41,9 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const MAX_LINE_BYTES: usize = 8 * 1024;
 /// 全部 header 总大小上限。
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+/// 并发连接上限（防局域网恶意/失控客户端用大量连接耗尽内存；每个连接
+/// 最多持有一个解析缓冲 + 15s READ_TIMEOUT 窗口）。
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
 /// 一次 run 的结果（供 /api/status 轮询）。
 #[derive(Debug, Clone)]
@@ -123,13 +126,33 @@ pub async fn serve(config: Arc<Config>, port: u16, token: Option<String>) -> Res
     println!("手机与本机在同一局域网时访问 http://<本机局域网IP>:{port}");
     println!("（ipconfig 查看本机局域网 IP；Ctrl-C 停止）");
 
+    // K-1：并发连接上限——accept 无限 spawn + 每连接最大 15s 解析窗口，
+    // 局域网内大量连接可各自吃数百 MiB（read_line 先整行读入再检查）。
+    let connection_permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
-        let (stream, _peer) = listener
-            .accept()
-            .await
-            .map_err(|e| format!("accept 失败: {e}"))?;
+        let (mut stream, _peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            // K-5：瞬时 accept 错误（如 EMFILE 句柄耗尽）不应终止整个服务。
+            Err(e) => {
+                tracing::warn!(error = %e, "web accept 失败（继续监听）");
+                continue;
+            }
+        };
+        // 超过并发上限：立即拒绝（不排队），保持服务可用。
+        let Ok(permit) = connection_permits.clone().try_acquire_owned() else {
+            tracing::warn!("web 并发连接超限（{MAX_CONCURRENT_CONNECTIONS}），拒绝连接");
+            let _ = write_response(
+                &mut stream,
+                "503 Service Unavailable",
+                "text/plain; charset=utf-8",
+                "server busy".into(),
+            )
+            .await;
+            continue;
+        };
         let state = state.clone();
         tokio::spawn(async move {
+            let _permit = permit; // 连接处理完（含 15s 超时）后自动释放
             if let Err(e) = handle_connection(stream, state).await {
                 tracing::warn!(error = %e, "web connection error");
             }
@@ -206,17 +229,54 @@ async fn write_response(
     Ok(())
 }
 
+/// 有界逐行读取（K-1）：先整行读入再检查长度会让内存无上限——
+/// `read_line` 会先把任意长的行读进 String。这里用 `fill_buf` 增量检查：
+/// 累积超过 `max` 字节立即拒绝，绝不为超长行分配无限内存。
+/// 返回 `Ok(None)` = EOF（无任何内容）。行内容含换行符（与 `read_line` 一致）。
+async fn read_line_bounded(
+    reader: &mut BufReader<&mut tokio::net::TcpStream>,
+    max: usize,
+) -> Result<Option<String>, String> {
+    let mut line = String::new();
+    loop {
+        let buf = reader
+            .fill_buf()
+            .await
+            .map_err(|e| format!("读行失败: {e}"))?;
+        if buf.is_empty() {
+            // EOF：无内容 → None；有部分内容 → 返回（未换行的最后一段）。
+            return Ok(if line.is_empty() { None } else { Some(line) });
+        }
+        match buf.iter().position(|b| *b == b'\n') {
+            Some(index) => {
+                let take = index + 1;
+                if line.len() + take > max {
+                    return Err("行过长".into());
+                }
+                line.push_str(&String::from_utf8_lossy(&buf[..take]));
+                let consumed = take;
+                reader.consume(consumed);
+                return Ok(Some(line));
+            }
+            None => {
+                if line.len() + buf.len() > max {
+                    return Err("行过长".into());
+                }
+                line.push_str(&String::from_utf8_lossy(buf));
+                let consumed = buf.len();
+                reader.consume(consumed);
+            }
+        }
+    }
+}
+
 /// 逐行读取请求：请求行 + headers + Content-Length body（上限 MAX_BODY_BYTES）。
 async fn read_request(stream: &mut tokio::net::TcpStream) -> Result<Request, String> {
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
+    let line = read_line_bounded(&mut reader, MAX_LINE_BYTES)
         .await
-        .map_err(|e| format!("读请求行失败: {e}"))?;
-    if line.len() > MAX_LINE_BYTES {
-        return Err("请求行过长".into());
-    }
+        .map_err(|_| "请求行过长".to_string())?
+        .ok_or_else(|| "空请求".to_string())?;
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("/").to_string();
@@ -232,17 +292,12 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Result<Request, Str
     let mut content_length: usize = 0;
     let mut header_bytes = 0usize;
     loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
+        let Some(line) = read_line_bounded(&mut reader, MAX_LINE_BYTES)
             .await
-            .map_err(|e| format!("读 header 失败: {e}"))?;
-        if n == 0 {
+            .map_err(|_| "header 行过长".to_string())?
+        else {
             break;
-        }
-        if line.len() > MAX_LINE_BYTES {
-            return Err("header 行过长".into());
-        }
+        };
         header_bytes += line.len();
         if header_bytes > MAX_HEADER_BYTES {
             return Err("header 总大小超限".into());

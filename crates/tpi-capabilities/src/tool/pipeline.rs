@@ -48,7 +48,10 @@ pub fn canonicalize_output(outcome: ToolOutcome, max_output_bytes: usize) -> Sto
     let mut outcome = outcome;
     let payload = &mut outcome.model_payload;
     if payload.output.len() > max_output_bytes {
-        let mut truncated = payload.output[..max_output_bytes].to_string();
+        let mut truncated = payload.output.clone();
+        // 按字节切片会切在多字节字符中间 → String::index panic（中文/emoji
+        // 输出在 16 KiB 边界必然触发）；先推进到字符边界再截断。
+        tpi_core::util::truncate_to_char_boundary(&mut truncated, max_output_bytes);
         truncated.push_str(&format!(
             "
 [truncated: {} bytes]",

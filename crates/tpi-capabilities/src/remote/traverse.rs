@@ -141,13 +141,19 @@ pub async fn remote_search(
     };
 
     // 2. 构造搜索命令。
+    // glob 必须 shell_quote：include/exclude 来自模型参数，原样拼接会经
+    // 远端 shell 展开（`;`/`$()`/反引号 = 任意命令执行，I3）。
     let max_results = args.max_results.clamp(1, MAX_SEARCH_RESULTS);
     let mut cmd = String::new();
-    let include_globs: Vec<String> = args.include.iter().map(|g| format!("--glob={g}")).collect();
+    let include_globs: Vec<String> = args
+        .include
+        .iter()
+        .map(|g| format!("--glob={}", shell_quote(g)))
+        .collect();
     let exclude_globs: Vec<String> = args
         .exclude
         .iter()
-        .map(|g| format!("--glob=!{g}"))
+        .map(|g| format!("--glob=!{}", shell_quote(g)))
         .collect();
     if has_rg {
         // rg --no-heading --line-number -m N --glob=include --glob=!exclude pattern path
@@ -159,12 +165,13 @@ pub async fn remote_search(
             shell_quote(&root),
         ));
     } else {
-        // fallback grep -rn（POSIX 基础能力）。
-        let include_extra = if include_globs.is_empty() {
-            String::new()
-        } else {
-            format!(" --include='{}'", include_globs.join(" --include='"))
-        };
+        // fallback grep -rn（POSIX 基础能力）：grep 用 --include=PATTERN（
+        // 逐个 glob），不能传 rg 的 --glob= 语法。
+        let include_extra: String = args
+            .include
+            .iter()
+            .map(|g| format!(" --include={}", shell_quote(g)))
+            .collect();
         cmd.push_str(&format!(
             "grep -rn --color never -m 1{} -- {} {} 2>/dev/null | head -{max_results}",
             include_extra,

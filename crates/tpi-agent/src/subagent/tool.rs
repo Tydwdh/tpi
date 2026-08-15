@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tokio_util::sync::CancellationToken;
 
 use tpi_capabilities::tool::ToolContext;
 use tpi_capabilities::tool::registry::{Tool, ToolOrigin};
@@ -135,7 +134,7 @@ where
         ToolOrigin::Builtin
     }
 
-    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolOutcome {
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
         let parsed: SubagentArgs = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => {
@@ -219,7 +218,10 @@ where
         )
         .with_report_tx(self.report_tx.clone());
 
-        let cancel = CancellationToken::new();
+        // 取消传播（C5 修复）：必须用 ctx.cancel（= 当前 run 的 cancel token），
+        // 不能用新 token——否则用户 Esc / Ctrl-C / watchdog 超时无法中止 child
+        // 调查，join_all 会一直等它完成，run 卡住无法取消。
+        let cancel = ctx.cancel.clone();
         match child_provider.run_investigation(request, cancel).await {
             Ok(report) => {
                 let mut output = format!(
@@ -322,7 +324,7 @@ mod tool_tests {
         Arc::new(config)
     }
 
-    /// 最小 ToolContext（subagent 工具 execute 不读 ctx 字段，构造占位）。
+    /// 最小 ToolContext（subagent 工具 execute 只读 ctx.cancel 做取消传播）。
     fn minimal_ctx() -> ToolContext {
         ToolContext {
             workspace_root: camino::Utf8PathBuf::from("C:/proj"),

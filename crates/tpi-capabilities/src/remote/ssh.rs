@@ -403,12 +403,14 @@ impl SshClient {
             .await
             .map_err(|e| SshError::Exec(e.to_string()))?;
         // cwd 通过 cd 前缀；env 通过 export 前缀（远端 shell 每次 fresh）。
+        // 注意：`shell_quote` 已产出 `'value'`，不能再套 `{:?}`（Debug 引号会
+        // 变成字面量进入值，且 `"..."` 内 `$` 会被远端 shell 展开）。
         let mut prefix = String::new();
         for (k, v) in env {
-            prefix.push_str(&format!("export {k}={:?}; ", shell_quote(v)));
+            prefix.push_str(&format!("export {k}={}; ", shell_quote(v)));
         }
         if let Some(dir) = cwd {
-            prefix.push_str(&format!("cd {:?}; ", shell_quote(dir)));
+            prefix.push_str(&format!("cd {}; ", shell_quote(dir)));
         }
         let full = format!("{prefix}{command}");
         channel

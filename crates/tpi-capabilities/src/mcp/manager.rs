@@ -119,8 +119,10 @@ impl McpManager {
         }
     }
 
-    /// 重启单个 server（Phase 3 /mcp restart）：drop 旧 RunningServer
-    /// （工具自动注销 + client 终止），再按配置重新启动。
+    /// 重启单个 server（Phase 3 /mcp restart）：先启动新 server（private
+    /// setup），成功后由 `start_server` 的 insert 覆盖旧条目（旧 RunningServer
+    /// drop → 旧工具 RAII 注销 + 旧 client 经 Drop 杀进程）；启动失败时
+    /// servers 表未动，旧 active 原样保留（P4-09 原子发布）。
     pub async fn restart_server(
         &mut self,
         server_id: &str,
@@ -129,18 +131,10 @@ impl McpManager {
         let Some(config) = configs.iter().find(|c| c.name == server_id).cloned() else {
             return Err(McpError::Protocol(format!("server {server_id} 未配置")));
         };
-        // P4-09：atomic publish——先暂存旧（不 kill），启动新（private setup）；
-        // 新成功后才 drain 旧（kill + drop 旧 registrations 按旧 id 注销）。
-        // 新 setup 失败：旧 active 原样保留（servers 表项未动）。
-        let old = self.servers.remove(server_id);
-        let started = self.start_server(config).await?;
-        if let Some(running) = old {
-            let client = running.client.clone();
-            let mut guard = client.lock().await;
-            guard.kill().await;
-            // running drop → 旧 _registrations 自动注销（精确 dispose，不影响新）。
-        }
-        Ok(started)
+        // 先启新、后弃旧：`start_server` 内部 insert 覆盖同名条目时，旧
+        // RunningServer 被 drop（工具注销 + McpClient::Drop 杀旧进程）。
+        // 启动失败则 `?` 在 insert 前返回，旧 server 完整保留。
+        self.start_server(config).await
     }
 
     /// 各 server 状态（Phase 3 /mcp 页面）。

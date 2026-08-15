@@ -51,6 +51,20 @@ pub struct McpClient {
     reader_supervisor: crate::process::supervisor::Supervisor,
 }
 
+impl Drop for McpClient {
+    /// 兜底：任何未走 `shutdown()`/`kill()` 的退出路径（start 握手失败、
+    /// restart 原子发布、TPI 崩溃/panic）都必须杀掉子进程，否则 tokio
+    /// `Child`（kill_on_drop=false）会把 MCP server 变成孤儿进程，且
+    /// stdout/stderr reader task 因管道未 EOF 永久阻塞（F1/F3）。
+    ///
+    /// `start_kill` 是同步的（Tokio 支持），Drop 中可安全调用；子进程死
+    /// 后管道 EOF，reader task 自然退出。已 kill/wait 的进程再次 start_kill
+    /// 返回错误，忽略即可。
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
 impl McpClient {
     /// 启动进程并完成 initialize + initialized 通知。
     pub async fn start(config: McpServerConfig) -> Result<Self, McpError> {

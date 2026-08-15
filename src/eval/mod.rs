@@ -472,6 +472,10 @@ pub async fn run_task(
     eval_config.workspace_root = repo_root.clone();
     eval_config.sessions_root = sessions_root.clone();
     eval_config.artifacts_root = artifacts_root.clone();
+    // L-2：评测 agent 必须被沙箱到 repo 内——否则 bash/edit/write 可访问并
+    // 修改 repo 之外的用户真实文件（评测结果被外部上下文污染、破坏用户数据），
+    // 与"可重置 repo、独立现场"的隔离目标相悖。强制严格模式。
+    eval_config.allow_outside_workspace = false;
 
     // 4. 创建 session 并运行 agent。
     let mut session = SessionLog::create(&sessions_root, repo_root.as_std_path(), RunId::new_v7())
@@ -489,10 +493,15 @@ pub async fn run_task(
     let (ui_tx, mut ui_rx) = tokio::sync::mpsc::channel(128);
     tokio::spawn(async move { while ui_rx.recv().await.is_some() {} });
 
-    let cancel_run = cancel.clone();
-    let run_result = tokio::time::timeout(
-        std::time::Duration::from_secs(task.expected.timeout_sec),
-        agent::run(
+    // L-1：超时必须**真实 join** run future（而不是 timeout 后 drop + 假 sleep）。
+    // timeout 直接包裹 agent::run 时，超时触发会 drop future——其内部的 Job Object
+    // 句柄关闭是异步的，残留 bash 子进程可能仍在终止/读写 repo，随后立即跑
+    // verify 断言会产生竞态抖动。这里 select：超时 → cancel token → 等 run
+    // future 响应取消并结束（agent 的 Cancelled 分支正常返回），5s 兜底。
+    // 块作用域：run_fut 借用 &mut session/provider，块结束即 drop 释放借用。
+    let (success, reason, error) = {
+        let cancel_run = cancel.clone();
+        let run_fut = agent::run(
             &mut provider,
             &mut session,
             &eval_config,
@@ -508,28 +517,30 @@ pub async fn run_task(
                     crate::tool::registry::builtin_registry(),
                 )),
             },
-        ),
-    )
-    .await;
+        );
+        tokio::pin!(run_fut);
+        let run_result = tokio::select! {
+            result = &mut run_fut => Ok(result),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(task.expected.timeout_sec)) => Err(()),
+        };
 
-    // §PointerHit 5：超时时显式 cancel token，再等 grace period——
-    // 否则 agent 内部 watchdog/provider task 未被明确取消（可能泄漏/残留）。
-    let (success, reason, error) = match run_result {
-        Err(_) => {
-            cancel_run.cancel();
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                std::future::pending::<()>(),
-            )
-            .await;
-            (false, "timeout".to_string(), Some("评测超时".to_string()))
+        // §PointerHit 5：超时时显式 cancel token，并真正等待 run 结束（含
+        // Job Object 进程树终止），再进入 verify——否则残留子进程与断言并发。
+        match run_result {
+            Err(_) => {
+                cancel_run.cancel();
+                // 等 run future 响应取消并结束（Cancelled 是正常终态）；5s 兜底防
+                // 极端情况（provider 卡在不可取消的 IO）阻塞整个 eval。
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut run_fut).await;
+                (false, "timeout".to_string(), Some("评测超时".to_string()))
+            }
+            Ok(Err(failure)) => (false, format!("error:{failure}"), Some(failure.to_string())),
+            Ok(Ok(outcome)) => (
+                outcome.reason == crate::session::CompletionReason::Stop,
+                format!("{:?}", outcome.reason),
+                None,
+            ),
         }
-        Ok(Err(failure)) => (false, format!("error:{failure}"), Some(failure.to_string())),
-        Ok(Ok(outcome)) => (
-            outcome.reason == crate::session::CompletionReason::Stop,
-            format!("{:?}", outcome.reason),
-            None,
-        ),
     };
 
     // 5. 事件统计（读取 session 文件）。
