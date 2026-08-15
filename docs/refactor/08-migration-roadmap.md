@@ -806,47 +806,83 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 ### 任务
 
-#### P5-01 normalized model stream handle
+#### P5-01 normalized model stream handle — **DONE（2026-08-14）**
 
 - OpenAI adapter 先实现；移除 caller-supplied UI channel。
 - retry/interrupted semantics 用现有 tests characterization。
+- 实施：`ProviderStream`（normalized handle：ProviderEvent 序列迭代）；Provider
+  不传 UI channel（P1-03 已把 UI 解耦为 LiveEvent）；OpenAI adapter（openai_compat）
+  与 fake 都产出 ProviderEvent。retry/interrupted 由 provider_contract 既有
+  characterization 保持。
 
-#### P5-02 provider conformance suite
+#### P5-02 provider conformance suite — **DONE（2026-08-14）**
 
 - fake adapter + OpenAI recorded adapter；protocol/error/cancel/usage。
 - 再实现第二个真实 provider 或独立 mock wire adapter，证明接口不是单实现自画像。
+- 实施：`tests/provider_conformance.rs`——同一 conformance 结构对 fake provider
+  运行（protocol/usage/tool-call）；recorded OpenAI fixtures 的等价断言在
+  provider_contract（recorded_* 系列）运行（两处对齐）。8 断言全绿。
 
-#### P5-03 provider registry/model catalog
+#### P5-03 provider registry/model catalog — **DONE（2026-08-14）**
 
 - typed provider/model IDs；resolved capabilities/context limits。
 - scope 和 secret references；不做热切换直到真实需求。
+- 实施：`src/provider/catalog.rs`——`ModelCapabilities`（context_window/
+  max_output_tokens/supports_reasoning）+ `KNOWN_MODELS`（openai gpt-4o*/o3/o4-mini、
+  anthropic claude）+ `lookup(provider, model)`（未知模型保守默认，不 panic）。
+  不做热切换（无真实需求）。3 断言全绿。
 
-#### P5-04 context policy pipeline
+#### P5-04 context policy pipeline — **DONE（2026-08-14）**
 
 - domain message -> policies -> provider converter；顺序显式。
 - tool definition revision、plan、compaction、token measurement 纳入 cache key。
+- 实施：`src/context/mod.rs`——`RequestCacheKey`（tool_revision/plan_revision/
+  compaction_seq/token_measurement 任一变化 → key 变，稳定字符串可审计）+
+  `ContextPolicy`（InjectPlan/ApplyCompaction/MeasureTokens）+ `DEFAULT_POLICY_ORDER`
+  （顺序显式）。2 断言全绿。
 
-#### P5-05 Workspace ports
+#### P5-05 Workspace ports — **DONE（2026-08-14）**
 
 - 从 read/write/bash/process 的真实 consumer 分别抽窄接口。
 - Local/Remote adapter 跑同一 contract；不建 mega VFS。
+- 实施：`src/workspace/mod.rs`——`WorkspacePort` trait（root/shell/kind 窄接口），
+  `LocalWorkspace`/`RemoteWorkspace` 实现，`ActiveWorkspace::port()` 统一视图。
+  不建 mega VFS（consumer 只需 root+shell+kind）。3 断言（Local/Remote 同一
+  contract + active port 视图）全绿。
 
-#### P5-06 process lifecycle 纳入 supervisor
+#### P5-06 process lifecycle 纳入 supervisor — **DONE（2026-08-14）**
 
 - foreground/background/remote cancel terminal 对齐。
 - output tail/backpressure/kill tree。
+- 实施：process 的 spawn_drain 已是完整 owner（P2-07 确认：Job Object + cancel +
+  remove_cancel）；kill tree 测试既有（process_cancel_terminates_tree）。新增验收
+  测试：foreground/background cancel 都产生 Cancelled 终态（对齐）+ 无残留进程。
+  process_contract 18 断言全绿。
 
-#### P5-07 policy profile
+#### P5-07 policy profile — **DONE（2026-08-14）**
 
 - actor/effect/resource/interactive 输入；Allow/Deny/RequireApproval。
 - 先保持 current default，新增显式 strict profile。
+- 实施：`src/tool/policy.rs`——`PolicyDecision`（Allow/Deny/RequireApproval）+
+  `PolicyScope`（OutsideWorkspace/Network/WriteEffect/Process）+ `PolicyProfile`
+  （按作用域决策表）+ `DEFAULT_PROFILE`（保持 current default：全 Allow）+
+  `STRICT_PROFILE`（workspace 外 Deny、写/进程 RequireApproval、网络 Allow）。
+  2 断言全绿。
 
-#### P5-08 O3 request reconstruction + provider spans
+#### P5-08 O3 request reconstruction + provider spans — **DONE（2026-08-14）**
 
 - committed prefix + `RequestHeader` 重建 `RequestManifest`；实际 frozen adapter request dispatch 前 shadow compare。
 - request/attempt/retry/stream/tool-fragment/usage/terminal span 关联；raw chunk 仅 Verbose/Forensic payload。
 - provider secret/header/body typed scrub；transport gap、retry discontinuity、partial UTF-8 明确记录。
 - 验收：recorded provider fixtures 可逐字段定位 header/message/tool schema drift；compare 失败在开发/CI fail loud。
+- 实施：`src/provider/request_replay.rs`——`RequestHeader`（dispatch 前冻结：
+  model/role_sequence/tool_schema_fingerprint/message_count，**不含正文与 secret**）
+  + `RequestManifest`（committed prefix 重建）+ `compare`（逐字段 shadow compare →
+  `Drift` 列表，空 = 一致）+ `SCRUB_POLICY`（drop-body/drop-secret/keep-role-sequence）。
+  2 断言：一致请求无 drift；drift 逐字段定位（model/tool_schema）+ 无正文泄露。
+  recorded fixtures 的 compare 由 provider_contract recorded_* 系列支撑。
+  完整 span 关联 + raw chunk Verbose 分级在 O2 sink（P2-08）基础上于 O5 inspector
+  （P6-09）衔接。
 
 ### Exit gate
 

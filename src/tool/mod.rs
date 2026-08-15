@@ -14,6 +14,7 @@ pub mod invariants;
 pub mod outcome;
 pub mod pipeline;
 pub mod plan;
+pub mod policy;
 pub mod process;
 pub mod registry;
 pub mod request_input;

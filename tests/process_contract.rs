@@ -893,3 +893,54 @@ async fn multiple_processes_are_isolated() {
         .await;
     }
 }
+
+/// P5-06：foreground/background cancel terminal 对齐——都产生 Cancelled 终态。
+#[tokio::test]
+async fn foreground_and_background_cancel_both_cancelled() {
+    use tpi::tool::command::{BashArgs, bash};
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let mut ctx = fixtures::test_tool_context(&workspace);
+    if tpi::tool::command::locate_git_bash(&ctx).is_none() {
+        eprintln!("本机未安装 Git Bash，跳过（§11.2 环境依赖）");
+        return;
+    }
+
+    // foreground：先取消再执行 → 立即 Cancelled（不启动进程）。
+    ctx.cancel = tokio_util::sync::CancellationToken::new();
+    ctx.cancel.cancel();
+    let fg = bash(
+        BashArgs {
+            command: "echo hi".into(),
+            cwd: None,
+            timeout_ms: 10_000,
+            background: false,
+        },
+        &ctx,
+    )
+    .await;
+    assert_eq!(
+        fg.status,
+        tpi::tool::outcome::ToolStatus::Cancelled,
+        "foreground cancel 对齐"
+    );
+
+    // background：取消后启动 → 也是 Cancelled（cancel terminal 对齐）。
+    let bg = bash(
+        BashArgs {
+            command: "sleep 5".into(),
+            cwd: None,
+            timeout_ms: 10_000,
+            background: true,
+        },
+        &ctx,
+    )
+    .await;
+    assert_eq!(
+        bg.status,
+        tpi::tool::outcome::ToolStatus::Cancelled,
+        "background cancel 对齐"
+    );
+    // 无残留进程（registry 空）。
+    assert_eq!(ctx.processes.lock().unwrap().active_count(), 0);
+}

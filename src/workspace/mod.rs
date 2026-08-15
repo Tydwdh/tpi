@@ -144,3 +144,103 @@ mod tests {
         assert_eq!(b_cwd.as_str(), "C:/b", "workspace B 不得被 A 污染（§9）");
     }
 }
+
+// ---------------------------------------------------------------------------
+// P5-05：Workspace ports——窄接口（Local/Remote 同一 contract，不建 mega VFS）。
+//
+// read/write/bash/process 的真实 consumer 只需要：root + shell + kind。
+// [`WorkspacePort`] 是它们的窄依赖；Local/Remote 实现并跑同一 contract。
+
+/// 工具消费的窄 workspace 接口（P5-05）。
+pub trait WorkspacePort {
+    /// workspace root（路径解析边界）。
+    fn root(&self) -> &camino::Utf8PathBuf;
+    /// logical shell（cwd/env；各 workspace 独立）。
+    fn shell(&self) -> &Arc<std::sync::Mutex<crate::shell::ShellSessionState>>;
+    /// workspace 种类（Local/Remote；metadata，不分支执行）。
+    fn kind(&self) -> WorkspaceKind;
+}
+
+impl WorkspacePort for LocalWorkspace {
+    fn root(&self) -> &camino::Utf8PathBuf {
+        &self.root
+    }
+    fn shell(&self) -> &Arc<std::sync::Mutex<crate::shell::ShellSessionState>> {
+        &self.shell
+    }
+    fn kind(&self) -> WorkspaceKind {
+        WorkspaceKind::Local
+    }
+}
+
+impl WorkspacePort for crate::remote::RemoteWorkspace {
+    fn root(&self) -> &camino::Utf8PathBuf {
+        &self.root
+    }
+    fn shell(&self) -> &Arc<std::sync::Mutex<crate::shell::ShellSessionState>> {
+        &self.shell
+    }
+    fn kind(&self) -> WorkspaceKind {
+        WorkspaceKind::Remote
+    }
+}
+
+/// ActiveWorkspace 上的 port 视图（consumer 用，不感知变体分发）。
+impl ActiveWorkspace {
+    pub fn port(&self) -> &dyn WorkspacePort {
+        match &self.workspace {
+            Workspace::Local(local) => local,
+            Workspace::Remote(remote) => remote,
+        }
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+
+    /// 同一 contract 对 Local 与 Remote 运行（P5-05：接口非单实现）。
+    fn assert_workspace_port(ws: &dyn WorkspacePort, expected_kind: WorkspaceKind) {
+        assert!(!ws.root().as_str().is_empty(), "root 必须存在");
+        assert_eq!(ws.kind(), expected_kind);
+        assert!(
+            !ws.shell().lock().unwrap().cwd.as_str().is_empty(),
+            "shell cwd 必须存在"
+        );
+    }
+
+    #[test]
+    fn local_port_contract() {
+        let ws = LocalWorkspace::new(Utf8PathBuf::from("C:/proj"), true);
+        assert_workspace_port(&ws, WorkspaceKind::Local);
+        assert_eq!(ws.root().as_str(), "C:/proj");
+    }
+
+    #[test]
+    fn remote_port_contract() {
+        // RemoteWorkspace 需要 ssh host/client；用 minimal 构造验证 port 视图
+        // （root/shell/kind 不依赖传输就绪）。
+        let ws = crate::remote::RemoteWorkspace::new(
+            crate::remote::ssh::RemoteHost {
+                alias: "test".into(),
+                hostname: "localhost".into(),
+                port: 22,
+                user: "u".into(),
+                identity_file: None,
+                known_hosts_path: std::path::PathBuf::from("~/.ssh/known_hosts"),
+                strict_host_key_checking: true,
+                password: None,
+            },
+            Utf8PathBuf::from("/remote/proj"),
+        );
+        assert_workspace_port(&ws, WorkspaceKind::Remote);
+        assert_eq!(ws.root().as_str(), "/remote/proj");
+    }
+
+    /// ActiveWorkspace::port() 统一视图。
+    #[test]
+    fn active_workspace_port_view() {
+        let active = ActiveWorkspace::local(LocalWorkspace::new(Utf8PathBuf::from("C:/p"), true));
+        assert_workspace_port(active.port(), WorkspaceKind::Local);
+    }
+}

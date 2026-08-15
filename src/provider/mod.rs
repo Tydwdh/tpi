@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 pub mod catalog;
 pub mod openai_compat;
+pub mod request_replay;
 pub mod trace;
 
 /// Provider 流归一化后的事件（ephemeral，不逐 token 写盘，见 §4.3/§7.1）。
