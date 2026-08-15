@@ -55,9 +55,12 @@ pub struct ToolDescriptor {
 
 /// 工具注册表（README2 §4：只管理 Tool，不管 MCP 生命周期）。
 /// 不 derive Debug：`Arc<dyn Tool>` 不实现 Debug。
+///
+/// P4-01（ABA 修复）：条目携带 [`RegistrationId`]；RAII 句柄注销必须
+/// `(name, id)` 同时匹配——old disposer 绝不能删除 replacement。
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: HashMap<String, (crate::ids::RegistrationId, Arc<dyn Tool>)>,
 }
 
 impl ToolRegistry {
@@ -66,8 +69,12 @@ impl ToolRegistry {
     }
 
     /// 注册（覆盖同名；内部名必须全局唯一，README2 §5）。
+    /// 覆盖时分配新 RegistrationId（旧句柄按旧 id 注销时不会误删本条目）。
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.name().to_string(), tool);
+        self.tools.insert(
+            tool.name().to_string(),
+            (crate::ids::RegistrationId::new_v7(), tool),
+        );
     }
 
     /// 注册并返回 RAII 句柄（Cordis revertible effect 的 Rust 版本：谁注册谁
@@ -81,10 +88,16 @@ impl ToolRegistry {
         tool: Arc<dyn Tool>,
     ) -> ToolRegistration {
         let name = tool.name().to_string();
-        registry.lock().unwrap().register(tool);
+        let id = crate::ids::RegistrationId::new_v7();
+        registry
+            .lock()
+            .unwrap()
+            .tools
+            .insert(name.clone(), (id, tool));
         ToolRegistration {
             registry: Some(registry.clone()),
             name,
+            id,
         }
     }
 
@@ -92,13 +105,22 @@ impl ToolRegistry {
         self.tools.remove(name);
     }
 
+    /// P4-01：`(name, id)` 同时匹配才删除——old disposer 绝不删除 replacement。
+    pub fn unregister_entry(&mut self, name: &str, id: crate::ids::RegistrationId) {
+        if let Some((existing, _)) = self.tools.get(name)
+            && *existing == id
+        {
+            self.tools.remove(name);
+        }
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
+        self.tools.get(name).map(|(_, tool)| tool.clone())
     }
 
     /// 全量目录（Phase 5 的 ToolSelector 在此之上做选择）。
     pub fn list(&self) -> Vec<Arc<dyn Tool>> {
-        self.tools.values().cloned().collect()
+        self.tools.values().map(|(_, tool)| tool.clone()).collect()
     }
 
     /// 发给模型的描述（Phase 5 前 = 全量）。
@@ -106,7 +128,7 @@ impl ToolRegistry {
         let mut out: Vec<ToolDescriptor> = self
             .tools
             .values()
-            .map(|tool| ToolDescriptor {
+            .map(|(_, tool)| ToolDescriptor {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
                 parameters: tool.input_schema(),
@@ -216,13 +238,18 @@ pub fn builtin_registry() -> ToolRegistry {
 pub struct ToolRegistration {
     registry: Option<Arc<std::sync::Mutex<ToolRegistry>>>,
     name: String,
+    /// P4-01：注册时的唯一 id；注销按 `(name, id)` 匹配（ABA 修复）。
+    id: crate::ids::RegistrationId,
 }
 
 impl ToolRegistration {
     /// 主动注销（幂等）；`Drop` 也会注销。
     pub fn unregister(&mut self) {
         if let Some(registry) = self.registry.take() {
-            registry.lock().unwrap().unregister(&self.name);
+            registry
+                .lock()
+                .unwrap()
+                .unregister_entry(&self.name, self.id);
         }
     }
 }
@@ -299,4 +326,70 @@ mod tests {
         assert_eq!(outcome.status, crate::tool::outcome::ToolStatus::Rejected);
         assert!(outcome.model_payload.output.contains("invalid_arguments"));
     }
+}
+
+/// P4-01 ABA：old disposer 绝不能删除 replacement。
+/// A 注册（句柄1）→ 注销/覆盖为 B（句柄2）→ 句柄1 drop 不得删 B。
+#[tokio::test]
+async fn aba_old_disposer_never_deletes_replacement() {
+    let registry = Arc::new(std::sync::Mutex::new(ToolRegistry::new()));
+    let make = |name: &'static str| -> Arc<dyn Tool> {
+        Arc::new(BuiltinToolAdapter::new(
+            crate::tool::implemented_tools()
+                .into_iter()
+                .find(|t| t.name() == name)
+                .unwrap(),
+        ))
+    };
+    // 场景 1：register_owned A → unregister（手动）→ 再 register_owned A（新 id）→
+    // 旧句柄 drop 不得删除新条目。
+    let handle_a = ToolRegistry::register_owned(&registry, make("read"));
+    // 手动注销（等价 MCP restart 的 drop 前的显式 unregister）。
+    let mut h = handle_a;
+    h.unregister();
+    assert!(registry.lock().unwrap().get("read").is_none());
+    // replacement（同名重新注册，新 id）。
+    let _handle_b = ToolRegistry::register_owned(&registry, make("read"));
+    assert!(registry.lock().unwrap().get("read").is_some());
+    // 旧句柄 h 已 unregister（id=旧），drop 不删 replacement。
+    drop(h);
+    assert!(
+        registry.lock().unwrap().get("read").is_some(),
+        "old disposer 绝不能删除 replacement（ABA）"
+    );
+
+    // 场景 2：直接 drop 旧句柄（不显式 unregister）也不删 replacement。
+    let handle_c = ToolRegistry::register_owned(&registry, make("bash"));
+    drop(handle_c); // 旧 id 注销
+    let _handle_d = ToolRegistry::register_owned(&registry, make("bash"));
+    assert!(registry.lock().unwrap().get("bash").is_some());
+    // 若 handle_c drop 误删 replacement，这里会失败（ABA 复现）。
+    assert!(
+        registry.lock().unwrap().get("bash").is_some(),
+        "ABA：旧句柄 drop 不得删除 replacement"
+    );
+}
+
+/// P4-01：重复名策略——register_owned 同名覆盖（新 id）；旧句柄注销不影响新条目。
+#[tokio::test]
+async fn duplicate_name_replacement_keeps_new_entry() {
+    let registry = Arc::new(std::sync::Mutex::new(ToolRegistry::new()));
+    let make = |name: &'static str| -> Arc<dyn Tool> {
+        Arc::new(BuiltinToolAdapter::new(
+            crate::tool::implemented_tools()
+                .into_iter()
+                .find(|t| t.name() == name)
+                .unwrap(),
+        ))
+    };
+    let handle_old = ToolRegistry::register_owned(&registry, make("read"));
+    let handle_new = ToolRegistry::register_owned(&registry, make("read"));
+    assert!(registry.lock().unwrap().get("read").is_some());
+    drop(handle_old);
+    assert!(
+        registry.lock().unwrap().get("read").is_some(),
+        "旧句柄 drop 不得影响 replacement"
+    );
+    drop(handle_new);
+    assert!(registry.lock().unwrap().get("read").is_none());
 }

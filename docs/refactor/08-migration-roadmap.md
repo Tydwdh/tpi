@@ -620,13 +620,24 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 ### 任务
 
-#### P4-01 RegistrationId 最小修复
+#### P4-01 RegistrationId 最小修复 — **DONE（2026-08-14）**
 
 - 先写 ABA red test；entry/id 精确删除；重复名规则显式。
 - 不同 PR 再加 override API。
 - duplicate-name policy（用户决策 2026-08-14）：**默认拒绝重复注册**；覆盖必须经
   显式 scope/override API；**old disposer 绝不能删除 replacement**（`(name,id)`
   同时匹配才删除）。ABA 是独立正确性问题，不依赖真实冲突事故即可开工（高优先级）。
+- 实施：`src/ids.rs` 新增 `RegistrationId`（UUIDv7）；`ToolRegistry` 存储从
+  `HashMap<String, Arc<dyn Tool>>` → `HashMap<String, (RegistrationId, Arc<dyn Tool>)>`；
+  `register_owned` 分配唯一 id；`ToolRegistration` 携带 id，注销经
+  `unregister_entry(name, id)`——**(name,id) 同时匹配才删除**（old disposer 绝不
+  删除 replacement）。`register`（进程级内置）覆盖时更新 id；`get/list/descriptors`
+  适配元组存储。override API（显式 scope）留后续 PR（P4-08 scoped overlays）。
+- 验收测试（registry 2 断言）：ABA（unregister 后 replacement 不被旧句柄删；
+  drop 旧句柄不删 replacement）；duplicate-name replacement 保持新条目、旧句柄
+  drop 不影响、新句柄 drop 才移除。
+- 验收达成：ABA red test 先写并通过修复 ✓；entry/id 精确删除 ✓；重复名规则显式
+  （覆盖=新 id，旧 disposer 无效）✓；全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
 #### P4-02 composition root 注入 registry
 

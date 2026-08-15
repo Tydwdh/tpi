@@ -46,6 +46,7 @@ id_type!(ToolCallId);
 id_type!(EventId);
 id_type!(SessionId);
 id_type!(RunId);
+id_type!(RegistrationId);
 // O1（P1-07）：trace 因果链身份——只在真实边界注入（一次 public Agent Run =
 // 一个 TraceId；span 用 SpanId；跨 run 因果用显式 link，不嵌套到永不关闭的树）。
 id_type!(TraceId);
