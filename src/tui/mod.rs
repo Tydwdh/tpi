@@ -77,7 +77,7 @@ pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("help", "显示帮助与快捷键"),
     ("settings", "查看生效配置及来源"),
-    ("model", "查看当前模型"),
+    ("model", "查看/切换模型（primary + profiles）"),
     ("session", "查看会话与成本"),
     ("sessions", "浏览并恢复历史会话"),
     ("theme", "切换主题（UI + 代码高亮）"),

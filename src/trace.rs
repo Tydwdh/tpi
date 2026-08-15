@@ -159,6 +159,21 @@ pub const CATALOG: &[CatalogEntry] = &[
         sensitivity: Sensitivity::Internal,
         owner: "agent::run_inner",
     },
+    // O8（P8-09）：子代理 link--parent span 与 child trace 双向引用。
+    CatalogEntry {
+        name: "subagent.link",
+        kind: "event",
+        sensitivity: Sensitivity::Internal,
+        owner: "subagent::child",
+    },
+    // O8（P8-09）：子代理 report commit（因果链终点：parent cancel ->
+    // child terminal -> report commit）。
+    CatalogEntry {
+        name: "subagent.report_committed",
+        kind: "event",
+        sensitivity: Sensitivity::Internal,
+        owner: "subagent::child",
+    },
     CatalogEntry {
         name: "run approaching wall-time budget",
         kind: "event",

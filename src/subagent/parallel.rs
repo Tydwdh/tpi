@@ -131,6 +131,8 @@ mod tests {
                 child_session: request.child_session,
                 summary: format!("调查 {}", request.instruction),
                 evidence: Vec::new(),
+                trace_id: None,
+                cancelled: false,
             })
         }
     }
@@ -140,6 +142,7 @@ mod tests {
             instruction: instruction.into(),
             child_session: SessionId::new_v7(),
             capabilities: vec![ReadOnlyCapability::Read],
+            parent: None,
         }
     }
 
@@ -210,6 +213,8 @@ mod tests {
             child_session: SessionId::new_v7(),
             summary: "x".repeat(1000),
             evidence: Vec::new(),
+            trace_id: None,
+            cancelled: false,
         };
         let capped = cap_report(report, 100);
         assert!(capped.summary.len() <= 100 + "…[truncated]".len());

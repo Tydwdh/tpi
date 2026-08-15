@@ -114,15 +114,45 @@ impl<P: Provider + Send, F: FnMut() -> P + Send> SubagentProvider for InProcessC
         drain.abort();
 
         let outcome = outcome.map_err(|e| format!("child run 失败: {e}"))?;
+
+        // O8（P8-09）：child trace 与 parent 的双向引用（link 事件）。child run
+        // 总是新 TraceId（depth 1 语义：不继承 parent trace）；parent 侧上下文
+        // 存在时记录双向 id，否则记 remote_boundary（无 parent 上下文，如独立
+        // 测试/诊断路径）。
+        if let Some(parent) = &request.parent {
+            tracing::info!(
+                parent_trace_id = %parent.trace_id,
+                parent_span_id = %parent.span_id,
+                child_trace_id = %outcome.trace_id,
+                child_session_id = %request.child_session,
+                "subagent.link"
+            );
+        } else {
+            tracing::info!(
+                parent_trace_id = "(remote_boundary)",
+                child_trace_id = %outcome.trace_id,
+                child_session_id = %request.child_session,
+                "subagent.link"
+            );
+        }
+
         // parent cancel 传播：child run 以 Cancelled 正常结束（§11.5 取消是正常
         // 终态，非错误）——此时 parent 不需要 report，按契约返回 Err。
         if outcome.reason == crate::session::CompletionReason::Cancelled {
             return Err("child run cancelled（parent cancel 传播）".into());
         }
+        // O8：report commit（因果链终点：parent 发起 -> child run -> report）。
+        tracing::info!(
+            child_trace_id = %outcome.trace_id,
+            child_session_id = %request.child_session,
+            "subagent.report_committed"
+        );
         Ok(SubagentReport {
             child_session: request.child_session,
             summary: outcome.assistant_text.clone(),
             evidence: evidence_from(&outcome.assistant_text),
+            trace_id: Some(outcome.trace_id),
+            cancelled: false,
         })
     }
 }
@@ -136,7 +166,7 @@ mod tests {
     use crate::workspace::LocalWorkspace;
 
     /// 脚本化 fake provider（实现 Provider；测试专用）。
-    struct ChildFake;
+    pub(crate) struct ChildFake;
     impl Provider for ChildFake {
         fn model_name(&self) -> &str {
             "child-fake"
@@ -164,7 +194,7 @@ mod tests {
         }
     }
 
-    fn test_config() -> Arc<Config> {
+    pub(crate) fn test_config() -> Arc<Config> {
         let dir = tempfile::tempdir().unwrap();
         let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
         let mut config = crate::config::test_config(&root);
@@ -196,6 +226,7 @@ mod tests {
                         ReadOnlyCapability::List,
                         ReadOnlyCapability::Search,
                     ],
+                    parent: None,
                 },
                 CancellationToken::new(),
             )
@@ -233,6 +264,7 @@ mod tests {
                     instruction: "调查".into(),
                     child_session: crate::ids::SessionId::new_v7(),
                     capabilities: vec![ReadOnlyCapability::Read],
+                    parent: None,
                 },
                 cancel,
             )
@@ -254,5 +286,87 @@ mod tests {
         assert!(registry.get("edit").is_none(), "edit 不可用");
         assert!(registry.get("write").is_none(), "write 不可用");
         assert!(registry.get("web_fetch").is_none(), "网络工具不可用");
+    }
+}
+
+/// O8（P8-09）trace link 验收（追加在 child.rs 内联测试之后）。
+#[cfg(test)]
+mod o8_tests {
+    use super::tests::{ChildFake, test_config};
+    use super::*;
+    use crate::subagent::{ParentTraceContext, ReadOnlyCapability};
+    use crate::workspace::LocalWorkspace;
+
+    /// child run 总是新 TraceId；report 携带（parent 可查询）。
+    #[tokio::test]
+    async fn child_report_carries_its_own_trace_id() {
+        let mut provider = InProcessChildProvider::new(
+            || ChildFake,
+            test_config(),
+            ActiveWorkspace::local(LocalWorkspace::new(
+                camino::Utf8PathBuf::from("C:/proj"),
+                false,
+            )),
+        );
+        let report = provider
+            .run_investigation(
+                SubagentRequest {
+                    instruction: "调查".into(),
+                    child_session: crate::ids::SessionId::new_v7(),
+                    capabilities: vec![ReadOnlyCapability::Read],
+                    parent: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("child 执行成功");
+        assert!(report.trace_id.is_some(), "report 携带 child trace id");
+        assert!(!report.cancelled, "正常完成非 cancelled");
+    }
+
+    /// link 事件字段（parent/child 双向 id）--用 tracing capture 验证不可行
+    ///（无全局 subscriber 注入点）；改为验证 ParentTraceContext 可构造并
+    /// 传递（类型层面链路完整；事件输出由 trace.rs catalog 测试保证 name 合法）。
+    #[test]
+    fn parent_trace_context_constructs_and_links_in_catalog() {
+        let ctx = ParentTraceContext {
+            trace_id: crate::ids::TraceId::new_v7(),
+            span_id: crate::ids::SpanId::new_v7(),
+        };
+        // link 事件名已在 trace catalog 登记（无孤儿 name）。
+        assert!(crate::trace::is_registered("subagent.link"));
+        assert!(crate::trace::is_registered("subagent.report_committed"));
+        let _ = ctx; // 类型可构造（parent 侧上下文完整）
+    }
+
+    /// cancel 因果链：parent cancel -> child Cancelled 终态 -> Err（report 不
+    /// commit；child trace 仍可从 link 事件查询）。
+    #[tokio::test]
+    async fn cancel_causal_chain_returns_err_without_report() {
+        let mut provider = InProcessChildProvider::new(
+            || ChildFake,
+            test_config(),
+            ActiveWorkspace::local(LocalWorkspace::new(
+                camino::Utf8PathBuf::from("C:/proj"),
+                false,
+            )),
+        );
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = provider
+            .run_investigation(
+                SubagentRequest {
+                    instruction: "调查".into(),
+                    child_session: crate::ids::SessionId::new_v7(),
+                    capabilities: vec![ReadOnlyCapability::Read],
+                    parent: Some(ParentTraceContext {
+                        trace_id: crate::ids::TraceId::new_v7(),
+                        span_id: crate::ids::SpanId::new_v7(),
+                    }),
+                },
+                cancel,
+            )
+            .await;
+        assert!(result.is_err(), "cancel -> Err（无 report commit）");
     }
 }

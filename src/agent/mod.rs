@@ -83,6 +83,8 @@ pub struct AgentOutcome {
     /// §13（AGENTS.md）：run 因 `request_input` 挂起时的完整信息
     /// （TUI 显示问题并等待用户回答；非挂起为 None）。
     pub awaiting_input: Option<AwaitingInput>,
+    /// O8（P8-09）：本次 run 的 trace id（子代理 link/lineage 溯源用）。
+    pub trace_id: crate::ids::TraceId,
 }
 
 /// §13：`request_input` 挂起的结构化信息。
@@ -315,6 +317,7 @@ pub async fn run<P: Provider, S: crate::session::store::SessionStore>(
         session,
         config,
         run_id,
+        trace_id,
         RunInput {
             history,
             user_message,
@@ -336,6 +339,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
     session: &mut S,
     config: &Config,
     run_id: crate::ids::RunId,
+    trace_id: crate::ids::TraceId,
     input: RunInput<'_>,
 ) -> Result<AgentOutcome, RunFailure> {
     let RunInput {
@@ -1076,6 +1080,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
         messages,
         assistant_text,
         awaiting_input,
+        trace_id,
     })
 }
 

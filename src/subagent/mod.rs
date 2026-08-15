@@ -9,7 +9,7 @@
 pub mod child;
 pub mod parallel;
 
-use crate::ids::SessionId;
+use crate::ids::{SessionId, SpanId, TraceId};
 
 /// 子代理只读能力白名单（P8 初始规格：只读调查）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +18,13 @@ pub enum ReadOnlyCapability {
     List,
     Search,
     Glob,
+}
+
+/// O8（P8-09）：发起子代理的 parent trace 上下文（link 双向引用的 parent 侧）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentTraceContext {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
 }
 
 /// 子代理请求（depth=1、concurrency=1、只读）。
@@ -29,6 +36,9 @@ pub struct SubagentRequest {
     pub child_session: SessionId,
     /// 只读能力白名单。
     pub capabilities: Vec<ReadOnlyCapability>,
+    /// O8（P8-09）：发起方（parent）trace 上下文；None = remote_boundary
+    /// （独立测试/诊断路径，无 parent 可链）。
+    pub parent: Option<ParentTraceContext>,
 }
 
 /// 子代理 structured report（parent 只接收此）。
@@ -38,6 +48,12 @@ pub struct SubagentReport {
     pub summary: String,
     /// 引用的文件/证据（只读调查产出）。
     pub evidence: Vec<String>,
+    /// O8（P8-09）：child run 的 trace id（parent 可据它查询完整 child trace；
+    /// 与 parent 侧 link 记录双向引用）。
+    pub trace_id: Option<TraceId>,
+    /// O8（P8-09）：parent cancel 是否传播到了 child（Cancelled 终态转 Err 前
+    /// 记录因果链）。
+    pub cancelled: bool,
 }
 
 /// SubagentProvider 契约。
@@ -65,6 +81,8 @@ impl SubagentProvider for FakeSubagentProvider {
             child_session: request.child_session,
             summary: format!("调查完成: {}", request.instruction),
             evidence: vec!["fake-evidence".into()],
+            trace_id: None,
+            cancelled: false,
         })
     }
 }
@@ -84,6 +102,7 @@ mod tests {
                     instruction: "检查 src/main.rs".into(),
                     child_session: child,
                     capabilities: vec![ReadOnlyCapability::Read, ReadOnlyCapability::Search],
+                    parent: None,
                 },
                 tokio_util::sync::CancellationToken::new(),
             )
@@ -101,6 +120,7 @@ mod tests {
             instruction: "调查".into(),
             child_session: SessionId::new_v7(),
             capabilities: vec![ReadOnlyCapability::Read],
+            parent: None,
         };
         assert_eq!(req.capabilities, vec![ReadOnlyCapability::Read]);
         // 类型层面保证只读：ReadOnlyCapability 没有写能力变体（读/列表/搜索/glob
