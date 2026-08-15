@@ -21,6 +21,7 @@ pub mod session;
 pub mod shell;
 pub mod skills;
 pub mod tool;
+pub mod trace;
 pub mod tui;
 pub mod util;
 pub mod web;

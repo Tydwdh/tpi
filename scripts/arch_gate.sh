@@ -45,13 +45,9 @@ check() {
 #     移入 src/tui/model.rs），allowlist 为空：任何 `crate::app` 引用都违规。
 check "R1:tui->app" "src/tui" "(use crate::app|crate::app::)"
 
-# R2: agent 不得引用 TUI（现状：测试构造的 ViewMode/Keymap 默认值，
-#     P1 Exit gate 要求清零后删除全部 allowlist 行）。
-check "R2:agent->tui" "src/agent" "(use crate::tui|crate::tui::)" \
-    "src/agent/tool_runtime.rs|crate::tui::terminal::ViewMode" \
-    "src/agent/tool_runtime.rs|crate::tui::keymap::Keymap" \
-    "src/agent/mod.rs|crate::tui::terminal::ViewMode" \
-    "src/agent/mod.rs|crate::tui::keymap::Keymap"
+# R2: agent 不得引用 TUI。已清零（P1 Exit gate：测试 fake config 构造收敛到
+#     config::test_config，tui 依赖集中在 config 模块），allowlist 为空。
+check "R2:agent->tui" "src/agent" "(use crate::tui|crate::tui::)"
 
 # R3: 禁止新增 global_registry() 调用（定义处与既有调用点登记；
 #     P4-02 逐 consumer 迁移后逐行删除，直至 global_registry 整体移除）。

@@ -19,7 +19,7 @@
 //! `?token=T` 查询参数；`GET /` 页面本身无敏感信息不校验。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use camino::Utf8PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -31,9 +31,16 @@ use crate::config::Config;
 use crate::provider::ChatMessage;
 use crate::provider::openai_compat::OpenAiCompatClient;
 use crate::session::conversation::Conversation;
+use crate::session::replay_messages;
 
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+/// 读请求的整体超时（防慢客户端/半开连接挂住连接与 task）。
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// 请求行 / 单个 header 行上限。
+const MAX_LINE_BYTES: usize = 8 * 1024;
+/// 全部 header 总大小上限。
+const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// 一次 run 的结果（供 /api/status 轮询）。
 #[derive(Debug, Clone)]
@@ -48,10 +55,16 @@ struct ServerState {
     conversation: Mutex<Conversation>,
     provider: Mutex<OpenAiCompatClient>,
     busy: AtomicBool,
-    last: std::sync::Mutex<Option<RunResult>>,
+    /// 最近一次完成的结果，关联其 run_id（供轮询方区分“是不是我的消息”）。
+    last: std::sync::Mutex<Option<(u64, RunResult)>>,
     token: Option<String>,
     sessions_root: std::path::PathBuf,
     workspace_root: Utf8PathBuf,
+    /// 当前会话的 durable log 文件路径；run 期间由 `history_json` 直接
+    /// replay 文件，避免被 run 持有的 conversation 锁阻塞。
+    log_path: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// 单调递增的 run 序号（/api/send 响应带出，轮询按它认领结果）。
+    next_run: AtomicU64,
 }
 
 /// 启动局域网网页服务（阻塞直到监听失败或 Ctrl-C）。
@@ -82,6 +95,9 @@ pub async fn serve(config: Arc<Config>, port: u16, token: Option<String>) -> Res
         config.model.context_window,
     );
 
+    // 恢复的会话已有 log 时，history 可直接 replay 该文件（无需等锁）。
+    let log_path = conversation.log().map(|log| log.path().to_path_buf());
+
     let state = Arc::new(ServerState {
         config,
         conversation: Mutex::new(conversation),
@@ -91,6 +107,8 @@ pub async fn serve(config: Arc<Config>, port: u16, token: Option<String>) -> Res
         token,
         sessions_root,
         workspace_root,
+        log_path: std::sync::Mutex::new(log_path),
+        next_run: AtomicU64::new(0),
     });
 
     let listener = TcpListener::bind(("0.0.0.0", port))
@@ -118,6 +136,7 @@ pub async fn serve(config: Arc<Config>, port: u16, token: Option<String>) -> Res
 // 请求解析与路由
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct Request {
     method: String,
     path: String,
@@ -130,12 +149,44 @@ async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     state: Arc<ServerState>,
 ) -> Result<(), String> {
-    let request = read_request(&mut stream).await?;
+    let request = match tokio::time::timeout(READ_TIMEOUT, read_request(&mut stream)).await {
+        Ok(Ok(request)) => request,
+        Ok(Err(e)) => {
+            // 解析失败也要给客户端一个 HTTP 响应，而不是直接断连
+            // （否则 fetch 只能报“网络错误”，无法区分原因）。
+            write_response(
+                &mut stream,
+                "400 Bad Request",
+                "text/plain; charset=utf-8",
+                format!("bad request: {e}"),
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(_) => {
+            write_response(
+                &mut stream,
+                "408 Request Timeout",
+                "text/plain; charset=utf-8",
+                "request timeout".to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let (status, content_type, body) = route(request, &state).await;
+    write_response(&mut stream, &status, &content_type, body).await
+}
 
+async fn write_response(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    content_type: &str,
+    body: String,
+) -> Result<(), String> {
     let body_bytes = body.into_bytes();
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body_bytes.len()
     );
     stream
@@ -158,6 +209,9 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Result<Request, Str
         .read_line(&mut line)
         .await
         .map_err(|e| format!("读请求行失败: {e}"))?;
+    if line.len() > MAX_LINE_BYTES {
+        return Err("请求行过长".into());
+    }
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("/").to_string();
@@ -171,6 +225,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Result<Request, Str
 
     let mut headers = std::collections::HashMap::new();
     let mut content_length: usize = 0;
+    let mut header_bytes = 0usize;
     loop {
         line.clear();
         let n = reader
@@ -179,6 +234,13 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Result<Request, Str
             .map_err(|e| format!("读 header 失败: {e}"))?;
         if n == 0 {
             break;
+        }
+        if line.len() > MAX_LINE_BYTES {
+            return Err("header 行过长".into());
+        }
+        header_bytes += line.len();
+        if header_bytes > MAX_HEADER_BYTES {
+            return Err("header 总大小超限".into());
         }
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
@@ -287,9 +349,20 @@ fn json_error(message: &str) -> String {
 }
 
 async fn history_json(state: &Arc<ServerState>) -> Result<String, String> {
-    let conversation = state.conversation.lock().await;
-    let messages: Vec<serde_json::Value> = conversation
-        .history()
+    // 直接从 durable log 文件 replay，不经过 conversation 锁：run 期间
+    // conversation 锁被 agent::run 持有（&mut SessionLog 借用），若这里等锁
+    // 手机端在 agent 处理中刷新页面会挂起数分钟。replay 与 run 结束后的
+    // refresh_from_log 同一语义；并发写入的未完成尾行会被 read_envelopes 丢弃。
+    let path = state
+        .log_path
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let messages: Vec<ChatMessage> = match &path {
+        Some(path) => replay_messages(path).map_err(|e| format!("重建历史失败: {e}"))?,
+        None => Vec::new(),
+    };
+    let messages: Vec<serde_json::Value> = messages
         .iter()
         .map(|message| {
             let (role, text) = match message {
@@ -306,13 +379,26 @@ async fn history_json(state: &Arc<ServerState>) -> Result<String, String> {
 
 fn status_json(state: &Arc<ServerState>) -> (String, String, String) {
     let busy = state.busy.load(Ordering::SeqCst);
-    let result = state.last.lock().unwrap().as_ref().map(
-        |r| serde_json::json!({ "text": r.text, "error": r.error, "finished_ms": r.finished_ms }),
-    );
+    let last = state
+        .last
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let (run_id, result) = match last {
+        Some((run_id, result)) => (
+            Some(run_id),
+            Some(serde_json::json!({
+                "text": result.text,
+                "error": result.error,
+                "finished_ms": result.finished_ms,
+            })),
+        ),
+        None => (None, None),
+    };
     (
         "200 OK".to_string(),
         "application/json; charset=utf-8".to_string(),
-        serde_json::json!({ "busy": busy, "result": result }).to_string(),
+        serde_json::json!({ "busy": busy, "run_id": run_id, "result": result }).to_string(),
     )
 }
 
@@ -353,17 +439,66 @@ async fn send_message(
         ));
     }
 
+    let run_id = state.next_run.fetch_add(1, Ordering::SeqCst);
     let state = state.clone();
     tokio::spawn(async move {
+        // RunGuard 保证任何路径（含 panic/取消）都复位 busy 并写入结果，
+        // 否则一次异常会让服务永久 409、所有后续轮询看到旧结果。
+        let mut guard = RunGuard::new(&state.busy, &state.last);
         let result = run_agent(&state, content).await;
-        *state.last.lock().unwrap() = Some(result);
-        state.busy.store(false, Ordering::SeqCst);
+        *state
+            .last
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some((run_id, result));
+        guard.finish();
     });
 
     Ok((
         "200 OK".to_string(),
-        serde_json::json!({ "ok": true }).to_string(),
+        serde_json::json!({ "ok": true, "run_id": run_id }).to_string(),
     ))
+}
+
+/// busy 生命周期守卫：drop（含 unwind）时必复位 busy；若 run 意外中断
+/// （panic）则写入错误结果，避免 status 把上一次成功结果当成这次完成。
+struct RunGuard<'a> {
+    busy: &'a AtomicBool,
+    last: &'a std::sync::Mutex<Option<(u64, RunResult)>>,
+    finished: bool,
+}
+
+impl<'a> RunGuard<'a> {
+    fn new(busy: &'a AtomicBool, last: &'a std::sync::Mutex<Option<(u64, RunResult)>>) -> Self {
+        Self {
+            busy,
+            last,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut last = self
+                .last
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            *last = Some((
+                0,
+                RunResult {
+                    text: String::new(),
+                    error: Some("内部错误：处理意外中断（服务端）".to_string()),
+                    finished_ms: 0,
+                },
+            ));
+        }
+        self.busy.store(false, Ordering::SeqCst);
+    }
 }
 
 /// 执行一次完整 agent run（串行；borrow 全部在函数内释放后更新状态）。
@@ -371,6 +506,13 @@ async fn run_agent(state: &Arc<ServerState>, content: String) -> RunResult {
     let started = std::time::Instant::now();
     let mut conversation = state.conversation.lock().await;
     let ensure = conversation.ensure_started(&state.sessions_root, &state.workspace_root);
+    // 记录 durable log 路径：run 期间 history 从文件 replay，不依赖这把锁。
+    if let Some(log) = conversation.log() {
+        *state
+            .log_path
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(log.path().to_path_buf());
+    }
     let run = async {
         let (session, history) = conversation
             .parts_for_run()
@@ -518,23 +660,29 @@ async function send() {
   input.value = '';
   setStatus('已发送，处理中… ⏳');
   try {
-    await api('/api/send', { method: 'POST', body: JSON.stringify({ content: text }) });
-    poll();
+    const d = await api('/api/send', { method: 'POST', body: JSON.stringify({ content: text }) });
+    poll(d.run_id);
   } catch (e) {
+    input.value = text; // 失败（409 忙/网络错误）时恢复输入，避免用户丢字重打
     setStatus('发送失败: ' + e.message);
     loadHistory();
   }
 }
 let polling = false;
-async function poll() {
+async function poll(myRunId) {
   if (polling) return;
   polling = true;
   try {
     while (true) {
       const d = await api('/api/status');
       if (!d.busy) {
-        setStatus(d.result && d.result.error ? ('失败: ' + d.result.error) : '完成 ✓');
-        if (d.result && d.result.text) { setStatus('完成 ✓'); }
+        if (d.run_id === myRunId) {
+          setStatus(d.result && d.result.error ? ('失败: ' + d.result.error) : '完成 ✓');
+        } else {
+          // 串行执行下多手机并发：自己的结果可能已被后续消息覆盖，
+          // 不把别人的结果当成自己的，直接看对话确认。
+          setStatus('该消息已完成（结果已被后续消息覆盖），见下方对话');
+        }
         await loadHistory();
         return;
       }
@@ -553,3 +701,110 @@ loadHistory();
 </script>
 </body>
 </html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn parse_query_decodes_plus_and_space() {
+        let q = parse_query("token=a+b%20c&x=1");
+        assert_eq!(q.get("token").map(String::as_str), Some("a b c"));
+        assert_eq!(q.get("x").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn run_guard_unwound_path_resets_busy_and_writes_error() {
+        let busy = AtomicBool::new(true);
+        let last = std::sync::Mutex::new(None);
+        {
+            // 模拟 panic：不调用 finish() 直接 drop（unwind 时 guard drop 等价路径）。
+            let _guard = RunGuard::new(&busy, &last);
+        }
+        assert!(!busy.load(Ordering::SeqCst), "busy 必须被复位");
+        let last = last.lock().unwrap();
+        let (run_id, result) = last.as_ref().expect("unwind 路径应写入错误结果");
+        assert_eq!(*run_id, 0);
+        assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn run_guard_finished_path_keeps_last() {
+        let busy = AtomicBool::new(true);
+        let last = std::sync::Mutex::new(None);
+        {
+            let mut guard = RunGuard::new(&busy, &last);
+            *last.lock().unwrap() = Some((
+                7,
+                RunResult {
+                    text: "ok".into(),
+                    error: None,
+                    finished_ms: 1,
+                },
+            ));
+            guard.finish();
+        }
+        assert!(!busy.load(Ordering::SeqCst));
+        let last = last.lock().unwrap();
+        let (run_id, result) = last.as_ref().unwrap();
+        assert_eq!(*run_id, 7, "正常完成的结果不应被 guard 覆盖");
+        assert_eq!(result.text, "ok");
+    }
+
+    #[tokio::test]
+    async fn read_request_parses_headers_and_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(
+                b"POST /api/send HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\n{\"a\":1}",
+            )
+            .await
+            .unwrap();
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let req = read_request(&mut stream).await.unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/api/send");
+        assert_eq!(req.headers.get("host").map(String::as_str), Some("x"));
+        assert_eq!(req.body, b"{\"a\":1}");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_request_rejects_oversized_header_line() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            let req = format!(
+                "POST / HTTP/1.1\r\nX-Pad: {}\r\n\r\n",
+                "a".repeat(MAX_LINE_BYTES)
+            );
+            s.write_all(req.as_bytes()).await.unwrap();
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let err = read_request(&mut stream).await.unwrap_err();
+        assert!(err.contains("header 行过长"), "实际错误: {err}");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_request_rejects_oversized_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(b"POST /api/send HTTP/1.1\r\nContent-Length: 99999999\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let err = read_request(&mut stream).await.unwrap_err();
+        assert!(err.contains("请求体过大"), "实际错误: {err}");
+        writer.await.unwrap();
+    }
+}

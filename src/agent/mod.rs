@@ -304,7 +304,12 @@ pub async fn run<P: Provider>(
         workspace,
     } = input;
     let run_id = session.begin_run();
-    let span = tracing::info_span!("agent.run", %run_id);
+    // O1（P1-07）：一次 public Agent Run = 一个 TraceId；span 用 SpanId。
+    // 只在真实边界注入（这里是 agent 的入口边界），后续 follow-up 新 run
+    // 生成新 TraceId，跨 run 因果用显式 link（O8/P8 子代理时落地）。
+    let trace_id = crate::ids::TraceId::new_v7();
+    let span_id = crate::ids::SpanId::new_v7();
+    let span = tracing::info_span!("agent.run", %run_id, %trace_id, %span_id);
     // O0（Medium-7）：async 函数体不能用同步 enter guard 跨 await 持有——
     // thread-local scope 在 future yield 后仍持锁，同线程其他任务会被错误
     // 归入当前 span，造成并发 run 的 parent/child 关系交叉（tests/
@@ -1617,35 +1622,10 @@ mod tests {
     use crate::tool::plan::{Plan, PlanItem, PlanStatus};
 
     /// 最小可用 Config（build_context 只读 system_prompt_extra 等字段）。
+    /// P1 Exit gate：经 config::test_config 构造（tui 依赖收敛在 config），
+    /// agent 测试不再直接引用 crate::tui。
     fn unit_config() -> crate::config::Config {
-        crate::config::Config {
-            model: crate::config::ModelConfig {
-                provider: "test".into(),
-                name: "fake-model".into(),
-                base_url: "https://example.invalid/v1".into(),
-                reasoning: None,
-                max_output_tokens: None,
-                context_window: None,
-                api_key_env: "TPI_TEST_API_KEY".into(),
-                price_input: None,
-                price_output: None,
-            },
-            limits: crate::config::LimitsConfig::default(),
-            workspace_root: camino::Utf8PathBuf::from("fake"),
-            sessions_root: std::path::PathBuf::from(".tpi-test-sessions"),
-            artifacts_root: std::path::PathBuf::from(".tpi-test-artifacts"),
-            shell_path: None,
-            safety_reserve_tokens: 8192,
-            ui_mode: crate::tui::terminal::ViewMode::default(),
-            ui_keymap: crate::tui::keymap::Keymap::builtin(),
-            ui_collapsed_lines: 10,
-            auto_open_browser: false,
-            web_summary_model: "none".into(),
-            system_prompt_extra: None,
-            source: "test".into(),
-            ui_theme: "omp".into(),
-            allow_outside_workspace: true,
-        }
+        crate::config::test_config(&camino::Utf8PathBuf::from("fake"))
     }
 
     struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);

@@ -325,6 +325,41 @@ impl Config {
     }
 }
 
+/// lib 内测试辅助：最小可用 Config（不读真实配置；agent 测试构造 fake config
+/// 用）。P1 Exit gate：避免 agent 测试直接引用 `crate::tui`（tui 依赖收敛在
+/// config 模块，config -> tui 是允许的依赖方向）。
+#[cfg(test)]
+pub(crate) fn test_config(workspace_root: &Utf8PathBuf) -> Config {
+    Config {
+        model: ModelConfig {
+            provider: "test".into(),
+            name: "fake-model".into(),
+            base_url: "https://example.invalid/v1".into(),
+            reasoning: None,
+            max_output_tokens: None,
+            context_window: None,
+            api_key_env: "TPI_TEST_API_KEY".into(),
+            price_input: None,
+            price_output: None,
+        },
+        limits: LimitsConfig::default(),
+        workspace_root: workspace_root.clone(),
+        sessions_root: std::path::PathBuf::from(".tpi-test-sessions"),
+        artifacts_root: std::path::PathBuf::from(".tpi-test-artifacts"),
+        shell_path: None,
+        safety_reserve_tokens: 8192,
+        ui_mode: crate::tui::terminal::ViewMode::default(),
+        ui_keymap: crate::tui::keymap::Keymap::builtin(),
+        ui_collapsed_lines: 10,
+        auto_open_browser: false,
+        web_summary_model: "none".into(),
+        system_prompt_extra: None,
+        source: "test".into(),
+        ui_theme: "omp".into(),
+        allow_outside_workspace: true,
+    }
+}
+
 /// 加载配置：合并 ~/.tpi/config.toml 与 workspace .tpi/config.toml。
 ///
 /// 模型配置缺失时返回明确错误（§18.1：不允许看不见的默认模型）。

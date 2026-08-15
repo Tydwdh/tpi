@@ -101,67 +101,123 @@ enum TerminalInput {
 }
 
 /// 应用入口。
-pub async fn run(
-    config: Config,
-    session_target: SessionTarget,
+/// P1-06：app 依赖的显式打包（composition inventory）。
+///
+/// object construction（provider/conversation/cancel/mcp）集中在
+/// [`AppServices::from_config`]；use case（`-p` / 交互）由 [`run_with_services`]
+/// 消费这些字段。依赖经构造参数注入，**禁止 service locator**（进程级全局
+/// 可变注册表；该全局注册表属待删除项，见 P4-02）。
+///
+/// `P: Provider` 泛型：测试可用 fake provider 构造最小 controller（验收：
+/// fake ports）。真实路径为 `AppServices<OpenAiCompatClient>`。
+pub struct AppServices<P: Provider> {
+    pub config: Config,
+    pub workspace_root: Utf8PathBuf,
+    pub sessions_root: std::path::PathBuf,
+    pub provider: P,
+    pub conversation: Conversation,
+    pub current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    pub mcp_manager: crate::mcp::manager::McpManager,
+}
+
+impl AppServices<OpenAiCompatClient> {
+    /// object construction：真实 provider + 会话恢复 + cancel 全部集中于此。
+    ///
+    /// 副作用：创建临时 session/artifacts 目录（`no_session`）、spawn Ctrl-C
+    /// handler（生命周期与进程一致）。
+    pub fn from_config(
+        mut config: Config,
+        session_target: SessionTarget,
+        no_session: bool,
+    ) -> Result<Self, String> {
+        // README2 Phase 4：启动时发现 skills（metadata-only）。
+        crate::skills::manager::refresh_global(&config.workspace_root);
+        let _ephemeral_root = if no_session {
+            let root = std::env::temp_dir()
+                .join(format!("tpi-ephemeral-{}", crate::ids::EventId::new_v7()));
+            std::fs::create_dir_all(&root)
+                .map_err(|e| format!("创建临时 session 目录失败: {e}"))?;
+            config.sessions_root = root.join("sessions");
+            config.artifacts_root = root.join("artifacts");
+            std::fs::create_dir_all(&config.sessions_root)
+                .map_err(|e| format!("创建临时 sessions 目录失败: {e}"))?;
+            std::fs::create_dir_all(&config.artifacts_root)
+                .map_err(|e| format!("创建临时 artifacts 目录失败: {e}"))?;
+            Some(root)
+        } else {
+            None
+        };
+
+        if no_session {
+            match session_target {
+                SessionTarget::Continue | SessionTarget::Resume(_) => {
+                    return Err("--no-session 不能与 --continue/--resume 同时使用".into());
+                }
+                SessionTarget::New => {}
+            }
+        }
+        let workspace_root = config.workspace_root.clone();
+        let sessions_root = config.sessions_root.clone();
+        let api_key = crate::config::read_api_key(&config)?;
+        let provider = OpenAiCompatClient::new(
+            config.model.base_url.clone(),
+            config.model.name.clone(),
+            api_key,
+            config.model.reasoning.clone(),
+            config.model.max_output_tokens,
+            config.model.context_window,
+        );
+
+        // 共享的当前取消 token（Ctrl-C 第一次取消 run，空闲时退出）。
+        let current_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+        spawn_ctrl_c_handler(current_cancel.clone());
+
+        let conversation = match session_target {
+            SessionTarget::New => Conversation::new(),
+            SessionTarget::Continue => {
+                let session_id = latest_session_id(&sessions_root, &workspace_root)?;
+                Conversation::resume(&sessions_root, &workspace_root, session_id)?
+            }
+            SessionTarget::Resume(id) => {
+                let session_id = parse_session_id(&id)?;
+                Conversation::resume(&sessions_root, &workspace_root, session_id)?
+            }
+        };
+
+        Ok(Self {
+            config,
+            workspace_root,
+            sessions_root,
+            provider,
+            conversation,
+            current_cancel,
+            mcp_manager: crate::mcp::manager::McpManager::new(),
+        })
+    }
+}
+
+/// use case：消费 [`AppServices`] 执行一次会话。
+///
+/// - `-p` 非交互：执行一次 run，返回最终答案文本（`Some`）；wall-time/中断
+///   提示写 stderr（与 `-p` 语义一致）。
+/// - 交互：进入 `interactive_loop`，返回 `None`。
+///
+/// 返回最终答案由调用方（`run` facade）打印 stdout——use case 不直接写
+/// stdout，便于 fake ports 测试断言返回值。
+pub async fn run_with_services<P: Provider>(
+    services: AppServices<P>,
     prompt: &str,
     non_interactive: bool,
-    no_session: bool,
-) -> Result<(), String> {
-    let mut config = config;
-    // README2 Phase 4：启动时发现 skills（metadata-only；~/.tpi/skills +
-    // <workspace>/.agent/skills）。
-    crate::skills::manager::refresh_global(&config.workspace_root);
-    let _ephemeral_root = if no_session {
-        let root =
-            std::env::temp_dir().join(format!("tpi-ephemeral-{}", crate::ids::EventId::new_v7()));
-        std::fs::create_dir_all(&root).map_err(|e| format!("创建临时 session 目录失败: {e}"))?;
-        config.sessions_root = root.join("sessions");
-        config.artifacts_root = root.join("artifacts");
-        std::fs::create_dir_all(&config.sessions_root)
-            .map_err(|e| format!("创建临时 sessions 目录失败: {e}"))?;
-        std::fs::create_dir_all(&config.artifacts_root)
-            .map_err(|e| format!("创建临时 artifacts 目录失败: {e}"))?;
-        Some(root)
-    } else {
-        None
-    };
-
-    if no_session {
-        match session_target {
-            SessionTarget::Continue | SessionTarget::Resume(_) => {
-                return Err("--no-session 不能与 --continue/--resume 同时使用".into());
-            }
-            SessionTarget::New => {}
-        }
-    }
-    let workspace_root = config.workspace_root.clone();
-    let sessions_root = config.sessions_root.clone();
-    let api_key = crate::config::read_api_key(&config)?;
-    let mut provider = OpenAiCompatClient::new(
-        config.model.base_url.clone(),
-        config.model.name.clone(),
-        api_key,
-        config.model.reasoning.clone(),
-        config.model.max_output_tokens,
-        config.model.context_window,
-    );
-
-    // 共享的当前取消 token（Ctrl-C 第一次取消 run，空闲时退出）。
-    let current_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
-    spawn_ctrl_c_handler(current_cancel.clone());
-
-    let mut conversation = match session_target {
-        SessionTarget::New => Conversation::new(),
-        SessionTarget::Continue => {
-            let session_id = latest_session_id(&sessions_root, &workspace_root)?;
-            Conversation::resume(&sessions_root, &workspace_root, session_id)?
-        }
-        SessionTarget::Resume(id) => {
-            let session_id = parse_session_id(&id)?;
-            Conversation::resume(&sessions_root, &workspace_root, session_id)?
-        }
-    };
+) -> Result<Option<String>, String> {
+    let AppServices {
+        config,
+        workspace_root,
+        sessions_root,
+        mut provider,
+        mut conversation,
+        current_cancel,
+        mut mcp_manager,
+    } = services;
 
     if non_interactive {
         if prompt.is_empty() {
@@ -188,26 +244,21 @@ pub async fn run(
             .await?
         };
         // P0-3：Cancel/ProviderInterrupted 后 runtime history 必须与 session
-        // 事实源一致——统一从 durable log 重建（outcome.messages 在部分提交
-        // 路径可能与 log 投影分叉）。
+        // 事实源一致——统一从 durable log 重建。
         conversation.refresh_from_log()?;
         // §16：wall-time 自动取消不是用户取消，-p 也要明确提示（stderr）。
         if outcome.reason == crate::session::CompletionReason::WallTimeExceeded {
             eprintln!("警告：run 达到 wall-time 预算被自动取消（非用户取消）");
         }
-        // §4.3：流中断且已有 partial——输出 partial 但明确提示不完整（stderr）。
+        // §4.3：流中断且已有 partial——提示不完整（stderr）。
         if outcome.reason == crate::session::CompletionReason::ProviderInterrupted {
             eprintln!("警告：模型连接中断，以下为不完整的部分输出；session 已保留。");
         }
-        // §18.3：`-p` 模式 stdout 只输出最终答案。
-        if !outcome.assistant_text.is_empty() {
-            println!("{}", outcome.assistant_text);
-        }
-        return Ok(());
+        // §18.3：`-p` 模式 stdout 只输出最终答案（由 run facade 打印）。
+        return Ok((!outcome.assistant_text.is_empty()).then_some(outcome.assistant_text));
     }
 
     // README2 Phase 3：MCP server 生命周期由 interactive_loop 管理。
-    let mut mcp_manager = crate::mcp::manager::McpManager::new();
     interactive_loop(
         &mut provider,
         &mut conversation,
@@ -216,7 +267,26 @@ pub async fn run(
         current_cancel.clone(),
         &mut mcp_manager,
     )
-    .await
+    .await?;
+    Ok(None)
+}
+
+/// composition root 入口（facade）：object construction 与 use case 分离。
+///
+/// 仅做：`AppServices::from_config`（construction）+ `run_with_services`
+/// （use case）+ stdout 打印最终答案。
+pub async fn run(
+    config: Config,
+    session_target: SessionTarget,
+    prompt: &str,
+    non_interactive: bool,
+    no_session: bool,
+) -> Result<(), String> {
+    let services = AppServices::from_config(config, session_target, no_session)?;
+    if let Some(text) = run_with_services(services, prompt, non_interactive).await? {
+        println!("{text}");
+    }
+    Ok(())
 }
 
 /// 非交互单次 run（输出经 stdout，仅最终答案）。

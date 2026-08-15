@@ -1021,34 +1021,8 @@ mod tests {
             }
         }
         let mut provider = NoopProvider;
-        let config = crate::config::Config {
-            model: crate::config::ModelConfig {
-                provider: "test".into(),
-                name: "fake-model".into(),
-                base_url: "https://example.invalid/v1".into(),
-                reasoning: None,
-                max_output_tokens: None,
-                context_window: None,
-                api_key_env: "TPI_TEST_API_KEY".into(),
-                price_input: None,
-                price_output: None,
-            },
-            limits: crate::config::LimitsConfig::default(),
-            workspace_root: camino::Utf8PathBuf::from("fake"),
-            sessions_root: std::path::PathBuf::from(".tpi-test-sessions"),
-            artifacts_root: std::path::PathBuf::from(".tpi-test-artifacts"),
-            shell_path: None,
-            safety_reserve_tokens: 8192,
-            ui_mode: crate::tui::terminal::ViewMode::default(),
-            ui_keymap: crate::tui::keymap::Keymap::builtin(),
-            ui_collapsed_lines: 10,
-            auto_open_browser: false,
-            web_summary_model: "none".into(),
-            system_prompt_extra: None,
-            source: "test".into(),
-            ui_theme: "omp".into(),
-            allow_outside_workspace: true,
-        };
+        // P1 Exit gate：tui 依赖收敛在 config 模块（config::test_config）。
+        let config = crate::config::test_config(&camino::Utf8PathBuf::from("fake"));
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut usage = Usage::default();
         let outcome = crate::tool::outcome::ToolOutcome::failed(
@@ -1121,34 +1095,8 @@ mod tests {
             }
         }
         let mut provider = FixedProvider { answered: false };
-        let config = crate::config::Config {
-            model: crate::config::ModelConfig {
-                provider: "test".into(),
-                name: "fake-model".into(),
-                base_url: "https://example.invalid/v1".into(),
-                reasoning: None,
-                max_output_tokens: None,
-                context_window: None,
-                api_key_env: "TPI_TEST_API_KEY".into(),
-                price_input: None,
-                price_output: None,
-            },
-            limits: crate::config::LimitsConfig::default(),
-            workspace_root: camino::Utf8PathBuf::from("fake"),
-            sessions_root: std::path::PathBuf::from(".tpi-test-sessions"),
-            artifacts_root: std::path::PathBuf::from(".tpi-test-artifacts"),
-            shell_path: None,
-            safety_reserve_tokens: 8192,
-            ui_mode: crate::tui::terminal::ViewMode::default(),
-            ui_keymap: crate::tui::keymap::Keymap::builtin(),
-            ui_collapsed_lines: 10,
-            auto_open_browser: false,
-            web_summary_model: "none".into(),
-            system_prompt_extra: None,
-            source: "test".into(),
-            ui_theme: "omp".into(),
-            allow_outside_workspace: true,
-        };
+        // P1 Exit gate：tui 依赖收敛在 config 模块（config::test_config）。
+        let config = crate::config::test_config(&camino::Utf8PathBuf::from("fake"));
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut usage = Usage::default();
         let mut outcome = crate::tool::outcome::ToolOutcome::succeeded(

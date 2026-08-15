@@ -224,18 +224,35 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 每次只让一个 owner 接收窄 config。
 - 验收：字段级 merge/unknown rejection 全部保持；default snapshot 不变。
 
-#### P1-06 main/app composition inventory
+#### P1-06 main/app composition inventory — **DONE（2026-08-14）**
 
 - 把 object construction 与 use case 标注；不立即移动复杂 loop。
 - 建 `AppServices` 显式字段，禁止 service locator。
 - 验收：测试可用 fake ports 构造最小 controller。
+- 实施：`AppServices<P: Provider>`（config/workspace_root/sessions_root/provider/
+  conversation/current_cancel/mcp_manager 显式字段）+ `from_config`（construction：
+  真实 provider + 会话恢复 + Ctrl-C handler + ephemeral 目录，全部集中）+ `run_with_services`
+  （use case：`-p` 返回 `Option<String>` 最终答案、交互进 interactive_loop；不直接写
+  stdout）。`run` 退化为薄 facade（construction + use case + 打印）。测试
+  `tests/app_services.rs`：fake EchoProvider 构造最小 controller 驱动 `-p`
+  use case（不依赖真实 key/网络）、空 prompt 拒绝、类型存在性。
+  `latest_session_id` 改 pub（web serve 复用）。
 
-#### P1-07 O1 typed trace identity/catalog
+#### P1-07 O1 typed trace identity/catalog — **DONE（2026-08-14）**
 
 - 定义 `TraceId/SpanId/SessionId/RunId/TurnId/StepId/AttemptId/RequestId/ToolCallId/RegistrationId/ChildId`，只在真实边界注入。
 - 建 schema/versioned `TraceRecord` 和 span/event/sensitivity/completeness catalog；生成 producer/consumer 文档。
 - 先用 adapter 映射旧 tracing fields，禁止业务模块直接依赖 exporter DTO。
 - 验收：catalog 无孤儿 name、每个 payload 有 sensitivity/default mode/owner。
+- 实施：`src/ids.rs` 新增 `TraceId/SpanId`（UUIDv7）；`src/trace.rs` 建 TraceRecord
+  （schema/kind/level/outcome/CorrelationIds/sensitivity/completeness）+ TraceValue
+  （Plain/Hashed/Redacted）+ `CATALOG`（span/event 注册表：agent.run + 11 个已登记
+  event，每项 sensitivity/owner；测试强制无重复、非空、可解析）。`agent.run` span
+  注入 `trace_id/span_id`（真实边界，一次 Run = 一个 Trace）。文档
+  [14-trace-catalog.md](14-trace-catalog.md)：身份模型 + span/event 目录 +
+  sensitivity 规则（Secret 永不 Plain）+ completeness。未登记的运维日志（~30 处
+  remote/MCP/process error 转发）O2 落地时随 sink 逐条补登；catalog 测试届时改
+  强制全量。业务模块仍用 tracing 宏（O2 前不迁移），不依赖 exporter DTO。
 
 ### Exit gate
 
