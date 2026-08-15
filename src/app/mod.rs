@@ -57,6 +57,8 @@ fn push_system_line(
 struct PendingInput {
     /// 单问题时的选项列表（数字编号 → 选项文本映射；多问题/无选项为空）。
     options: Vec<String>,
+    /// `request_input` 模态已提交的答案（Some = 自动 resume，不等待输入框）。
+    answer: Option<String>,
 }
 
 /// §13（内联）：挂起时用户提交的回答——单问题带选项时，纯数字（1..=N）
@@ -1023,8 +1025,29 @@ where
                             let effects = crate::tui::reducer::update(&mut ui_state, UiEvent::Key(key));
                             let mut quit = false;
                             for effect in effects {
-                                if execute_ui_effect(effect, &mut ui_state, &mut renderer, current_cancel.clone()) {
-                                    quit = true;
+                                match execute_ui_effect(
+                                    effect,
+                                    &mut ui_state,
+                                    &mut renderer,
+                                    current_cancel.clone(),
+                                ) {
+                                    EffectResult::Quit => quit = true,
+                                    EffectResult::QuestionAnswer(answer) => {
+                                        // `request_input` 模态提交：把答案存入
+                                        // pending_question（含 answer），主循环
+                                        // 检测到后自动 resume（复用 §13 路径）。
+                                        pending_question = Some(PendingInput {
+                                            options: Vec::new(),
+                                            answer: Some(answer),
+                                        });
+                                    }
+                                    EffectResult::QuestionRejected => {
+                                        pending_question = Some(PendingInput {
+                                            options: Vec::new(),
+                                            answer: Some("（用户拒绝了该问题）".into()),
+                                        });
+                                    }
+                                    EffectResult::Continue => {}
                                 }
                             }
                             if quit {
@@ -1301,6 +1324,92 @@ where
                 SlashAction::Consumed => continue,
                 SlashAction::NotCommand => {}
             }
+            // `request_input` 模态已提交答案（QuestionSubmitted/Rejected）：
+            // 自动 resume——不 push User 行、不依赖输入框输入。
+            if let Some(pending) = pending_question.take()
+                && let Some(answer) = pending.answer
+            {
+                // 记录 UserInputReceived（durable 事实）并继续 run。
+                let run_result = {
+                    let (session_log, history) = conversation.parts_for_run()?;
+                    session_log
+                        .commit(&SessionEvent::UserInputReceived {
+                            content: answer.clone(),
+                        })
+                        .map_err(|e| e.to_string())?;
+                    run_interactive(
+                        provider,
+                        session_log,
+                        config,
+                        history,
+                        answer.clone(),
+                        false,
+                        InteractiveIo {
+                            ui_state: &mut ui_state,
+                            renderer: &mut renderer,
+                            key_rx: &mut key_rx,
+                            current_cancel: current_cancel.clone(),
+                            registry: registry.clone(),
+                        },
+                    )
+                    .await
+                };
+                let outcome = match run_result {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        conversation.refresh_from_log()?;
+                        ui_state.view.status = crate::tui::model::StatusLine::Idle;
+                        ui_state.view.step = 0;
+                        ui_state.view.push_line(
+                            LineKind::System,
+                            format!(
+                                "run 失败，session 已保留：{}",
+                                friendly_provider_failure(&error)
+                            ),
+                        );
+                        renderer
+                            .draw(&mut ui_state.view)
+                            .map_err(|e| e.to_string())?;
+                        last_failed = Some(RetryTarget {
+                            message: answer,
+                            reason: crate::session::CompletionReason::Error,
+                        });
+                        continue;
+                    }
+                };
+                conversation.refresh_from_log()?;
+                if outcome.reason == crate::session::CompletionReason::AwaitingUserInput {
+                    pending_question =
+                        outcome
+                            .awaiting_input
+                            .as_ref()
+                            .map(|awaiting| PendingInput {
+                                options: if awaiting.questions.len() == 1 {
+                                    awaiting.questions[0]
+                                        .options
+                                        .iter()
+                                        .map(|o| o.label().to_string())
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                },
+                                answer: None,
+                            });
+                }
+                match outcome.reason {
+                    crate::session::CompletionReason::ProviderInterrupted
+                    | crate::session::CompletionReason::ProviderUnavailable
+                    | crate::session::CompletionReason::Error => {
+                        last_failed = Some(RetryTarget {
+                            message: answer.clone(),
+                            reason: outcome.reason,
+                        });
+                    }
+                    _ => last_failed = None,
+                }
+                ui_state.view.push_line(LineKind::System, "─".repeat(40));
+                continue;
+            }
             ui_state.view.push_line(LineKind::User, message.clone());
             renderer
                 .draw(&mut ui_state.view)
@@ -1380,10 +1489,15 @@ where
                     PendingInput {
                         // 单问题带选项才启用编号映射；多问题按行回答不做歧义映射。
                         options: if awaiting.questions.len() == 1 {
-                            awaiting.questions[0].options.clone()
+                            awaiting.questions[0]
+                                .options
+                                .iter()
+                                .map(|o| o.label().to_string())
+                                .collect()
                         } else {
                             Vec::new()
                         },
+                        answer: None,
                     }
                 });
             }
@@ -1967,14 +2081,28 @@ fn pointer_target(
     }
     PointerHit::none()
 }
+/// reducer 跨边界效果的执行结果（app 主循环据此决定下一步）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EffectResult {
+    /// 继续主循环。
+    Continue,
+    /// 请求退出主循环（BUG-004：空闲 Ctrl-C）。
+    Quit,
+    /// `request_input` 模态提交：答案是模型收到的回答（app 记录
+    /// UserInputReceived 并 resume）。
+    QuestionAnswer(String),
+    /// `request_input` 模态拒绝（Esc）：模型收到 dismissed 语义。
+    QuestionRejected,
+}
+
 /// 执行 reducer 返回的跨边界效果（§27：app 层执行 effect）。
-/// 返回 true 表示请求退出主循环（BUG-004：空闲 Ctrl-C）。
+/// 返回 [`EffectResult`]（主循环据此 break 或 resume）。
 fn execute_ui_effect(
     effect: UiEffect,
     ui_state: &mut UiState,
     _renderer: &mut Renderer,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
-) -> bool {
+) -> EffectResult {
     match effect {
         UiEffect::CancelRun => {
             if let Some(cancel) = crate::util::lock_mutex(&current_cancel, "current_cancel").clone()
@@ -1983,12 +2111,12 @@ fn execute_ui_effect(
             }
             // §PointerHit：瞬时反馈用 footer hint，不污染 transcript。
             ui_state.view.transient_hint = Some("已发送取消（Esc）；保留 session".into());
-            false
+            EffectResult::Continue
         }
         // BUG-004：空闲 Ctrl-C 产生 Quit → app 层 break 主循环走正常退出（含终端 restore）。
-        UiEffect::Quit => true,
+        UiEffect::Quit => EffectResult::Quit,
         // ResumeSession 由交互主循环处理（/sessions 菜单）。
-        UiEffect::ResumeSession(_) => false,
+        UiEffect::ResumeSession(_) => EffectResult::Continue,
         // §成熟化：Link Overlay Enter → 打开 URL。仅允许 http/https scheme
         //（防 file:// 等危险协议）；显式用户动作，不违反"绝不自动打开浏览器"。
         UiEffect::OpenUrl(url) => {
@@ -2002,7 +2130,7 @@ fn execute_ui_effect(
                     crate::tui::text::truncate_middle_utf8(&url, 40, "…")
                 ));
             }
-            false
+            EffectResult::Continue
         }
         // §成熟化：Link Overlay `c` → 复制 URL 到剪贴板。
         UiEffect::CopyText(url) => {
@@ -2012,7 +2140,7 @@ fn execute_ui_effect(
                 ui_state.view.transient_hint =
                     Some("复制失败：剪贴板不可用（可能被占用或平台不支持）".into());
             }
-            false
+            EffectResult::Continue
         }
         // §PointerHit：复制选中文本到剪贴板。copy 从 ViewModel 语义文本提取
         //（不依赖当前 viewport 快照；Renderer 只负责几何映射）。
@@ -2032,8 +2160,11 @@ fn execute_ui_effect(
                         Some("复制失败：剪贴板不可用，可再按一次 Ctrl+C 重试".into());
                 }
             }
-            false
+            EffectResult::Continue
         }
+        // `request_input` 模态提交（答案）/拒绝——主循环据此 resume。
+        UiEffect::QuestionSubmitted(answer) => EffectResult::QuestionAnswer(answer),
+        UiEffect::QuestionRejected => EffectResult::QuestionRejected,
     }
 }
 
@@ -2181,7 +2312,9 @@ async fn run_interactive<P: Provider>(
                                 UiEffect::Quit
                                 | UiEffect::ResumeSession(_)
                                 | UiEffect::OpenUrl(_)
-                                | UiEffect::CopyText(_) => {
+                                | UiEffect::CopyText(_)
+                                | UiEffect::QuestionSubmitted(_)
+                                | UiEffect::QuestionRejected => {
                                     // run 中不会产生（reducer 仅空闲时产生）。
                                 }
                             }
@@ -2327,17 +2460,39 @@ async fn run_interactive<P: Provider>(
             let question = awaiting
                 .map(|a| a.text.as_str())
                 .unwrap_or("请提供你的输入");
-            let mut block: Vec<String> = Vec::with_capacity(question.lines().count() + 2);
-            block.push("⏸ run 挂起，等待你的输入：".to_string());
-            block.extend(question.lines().map(String::from));
-            block.push("（输入回答后继续；可直接输入选项编号 1-N 选择）".to_string());
-            // 刷屏防护（跨回答）：askuser 的典型流程是“挂起 → 用户回答 →
-            // resume → 再挂起”，中间必然插入 User 消息，连续去重永远失效。
-            // 相同问题（同一块）在整个 transcript 中只完整展示一次；用户已
-            // 回答过该问题后又挂起时补一行轻提示（全局去重，循环也不累积），
-            // 不同问题每次完整展示（用户需要看到新提问）。
+            // 打开 `request_input` 交互模态（opencode 形态：选项选择器/多问题
+            // tab/自定义回答/拒绝）。投影：capabilities 的 RequestInputQuestion
+            // → tui 的 QuestionView。
+            if let Some(awaiting) = outcome.awaiting_input.as_ref() {
+                let views = awaiting
+                    .questions
+                    .iter()
+                    .map(|q| crate::tui::model::QuestionView {
+                        question: q.question.clone(),
+                        header: q.header.clone(),
+                        options: q
+                            .options
+                            .iter()
+                            .map(|o| crate::tui::model::QuestionOptionView {
+                                label: o.label().to_string(),
+                                description: o.description().to_string(),
+                            })
+                            .collect(),
+                        multiple: q.multiple,
+                        custom: q.custom,
+                    })
+                    .collect::<Vec<_>>();
+                if !views.is_empty() {
+                    ui_state.view.question =
+                        Some(crate::tui::model::QuestionModalState::new(views));
+                }
+            }
+            // 轻量系统行（不刷屏：只一行，完整展示在模态里）。
+            let mut block: Vec<String> = Vec::with_capacity(2);
+            block.push("⏸ run 挂起，等待你的输入（Esc 拒绝）".to_string());
+            block.extend(question.lines().take(1).map(String::from));
             if ui_state.view.has_system_block(&block) {
-                let hint = "⏸ run 再次挂起（问题同上，等待你的输入）".to_string();
+                let hint = "⏸ run 再次挂起（等待你的输入）".to_string();
                 if !ui_state.view.has_system_block(std::slice::from_ref(&hint)) {
                     ui_state.view.push_line(LineKind::System, hint);
                 }
@@ -2934,6 +3089,7 @@ mod tests {
     fn map_pending_answer_maps_digit_to_option_otherwise_passthrough() {
         let pending = PendingInput {
             options: vec!["生产".into(), "staging".into()],
+            answer: None,
         };
         assert_eq!(map_pending_answer(&pending, "1"), "生产");
         assert_eq!(
@@ -2947,6 +3103,7 @@ mod tests {
         // 无选项（多问题/自由回答）：任何输入原样。
         let free = PendingInput {
             options: Vec::new(),
+            answer: None,
         };
         assert_eq!(map_pending_answer(&free, "1"), "1", "无选项时数字原样");
     }

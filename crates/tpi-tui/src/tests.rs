@@ -3353,3 +3353,214 @@ fn subagent_reported_projects_to_system_line() {
         "系统行含 evidence: {texts:?}"
     );
 }
+
+/// P13（opencode 形态）request_input 交互模态：单选/多选/多问题/自定义/拒绝。
+mod question_modal_tests {
+    use crate::effect::UiEffect;
+    use crate::event::UiEvent;
+    use crate::model::{
+        QuestionModalState, QuestionMode, QuestionOptionView, QuestionView, ViewModel,
+    };
+    use crate::reducer;
+    use crate::state::UiState;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn single_q() -> Vec<QuestionView> {
+        vec![QuestionView {
+            question: "发布到哪个环境？".into(),
+            header: Some("部署".into()),
+            options: vec![
+                QuestionOptionView {
+                    label: "生产".into(),
+                    description: "线上环境".into(),
+                },
+                QuestionOptionView {
+                    label: "staging".into(),
+                    description: "预发".into(),
+                },
+            ],
+            multiple: false,
+            custom: true,
+        }]
+    }
+
+    fn state_with(q: Vec<QuestionView>) -> UiState {
+        let mut state = UiState::new(ViewModel::default());
+        state.view.question = Some(QuestionModalState::new(q));
+        state
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn single_select_submits_label() {
+        let mut state = state_with(single_q());
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down)));
+        assert!(effects.is_empty(), "移动不产生 effect");
+        assert_eq!(state.view.question.as_ref().unwrap().selected, 1);
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        assert_eq!(effects.len(), 1, "Enter 提交");
+        match &effects[0] {
+            UiEffect::QuestionSubmitted(text) => {
+                assert!(text.contains("staging"), "选中第 2 项提交: {text}")
+            }
+            other => panic!("期望 QuestionSubmitted，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn digit_select_submits() {
+        let mut state = state_with(single_q());
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Char('1'))));
+        match &effects[0] {
+            UiEffect::QuestionSubmitted(text) => assert!(text.contains("生产"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn escape_rejects() {
+        let mut state = state_with(single_q());
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Esc)));
+        assert_eq!(effects, vec![UiEffect::QuestionRejected]);
+        assert!(state.view.question.as_ref().unwrap().rejected);
+    }
+
+    #[test]
+    fn multiple_toggles() {
+        let mut state = state_with(vec![QuestionView {
+            question: "选框架？".into(),
+            header: None,
+            options: vec![
+                QuestionOptionView {
+                    label: "react".into(),
+                    description: String::new(),
+                },
+                QuestionOptionView {
+                    label: "vue".into(),
+                    description: String::new(),
+                },
+            ],
+            multiple: true,
+            custom: false,
+        }]);
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down)));
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        assert_eq!(
+            state.view.question.as_ref().unwrap().answers[0],
+            vec!["react", "vue"],
+            "多选两个"
+        );
+        // 再 Enter 取消第一个。
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Up)));
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        assert_eq!(
+            state.view.question.as_ref().unwrap().answers[0],
+            vec!["vue"],
+            "取消 react"
+        );
+    }
+
+    #[test]
+    fn multi_question_tabs_and_review() {
+        let mut state = state_with(vec![
+            QuestionView {
+                question: "Q1".into(),
+                header: Some("一".into()),
+                options: vec![QuestionOptionView {
+                    label: "a".into(),
+                    description: String::new(),
+                }],
+                multiple: false,
+                custom: false,
+            },
+            QuestionView {
+                question: "Q2".into(),
+                header: Some("二".into()),
+                options: vec![QuestionOptionView {
+                    label: "b".into(),
+                    description: String::new(),
+                }],
+                multiple: false,
+                custom: false,
+            },
+        ]);
+        // Q1 选 a → 自动进 Q2 tab。
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        assert_eq!(state.view.question.as_ref().unwrap().tab, 1, "进 Q2");
+        // Q2 选 b → Review。
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        assert_eq!(
+            state.view.question.as_ref().unwrap().mode,
+            QuestionMode::Review,
+            "全答完进 Review"
+        );
+        // Review Enter → 提交（含两个问题答案）。
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        match &effects[0] {
+            UiEffect::QuestionSubmitted(text) => {
+                assert!(text.contains("Q1: a") && text.contains("Q2: b"), "{text}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_edit_submits_text() {
+        let mut state = state_with(single_q());
+        // 选中自定义项（最后一项）。
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down)));
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down)));
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        assert_eq!(
+            state.view.question.as_ref().unwrap().mode,
+            QuestionMode::EditingCustom,
+            "自定义项进入编辑"
+        );
+        for c in "我的环境".chars() {
+            reducer::update(&mut state, UiEvent::Key(key(KeyCode::Char(c))));
+        }
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        match &effects[0] {
+            UiEffect::QuestionSubmitted(text) => assert!(text.contains("我的环境"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_single_question_done_item_submits() {
+        // multiple + custom=false：选两个后到“完成”项 Enter 提交。
+        let mut state = state_with(vec![QuestionView {
+            question: "选框架？".into(),
+            header: None,
+            options: vec![
+                QuestionOptionView {
+                    label: "react".into(),
+                    description: String::new(),
+                },
+                QuestionOptionView {
+                    label: "vue".into(),
+                    description: String::new(),
+                },
+            ],
+            multiple: true,
+            custom: false,
+        }]);
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // 选 react
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down)));
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // 选 vue
+        // 到“完成”项（第 3 项）。
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down)));
+        assert!(state.view.question.as_ref().unwrap().on_done(), "在完成项");
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        match &effects[0] {
+            UiEffect::QuestionSubmitted(text) => {
+                assert!(text.contains("react") && text.contains("vue"), "{text}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}

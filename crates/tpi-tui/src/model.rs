@@ -283,6 +283,118 @@ pub enum OverlayKind {
     Link,
 }
 
+/// Question 选项的 view 层表示（app 从 `RequestInputQuestion` 投影；
+/// tui 不依赖 capabilities，保持解耦）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionOptionView {
+    /// 选项显示文本/选择结果。
+    pub label: String,
+    /// 选项说明（副行；可为空）。
+    pub description: String,
+}
+
+/// 单个问题的 view 层表示。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionView {
+    /// 问题正文。
+    pub question: String,
+    /// 分组标题（tab 标签；可为空）。
+    pub header: Option<String>,
+    /// 建议选项。
+    pub options: Vec<QuestionOptionView>,
+    /// 允许多选。
+    pub multiple: bool,
+    /// 允许自定义回答。
+    pub custom: bool,
+}
+
+/// QuestionModal 模式（opencode 形态的交互状态机）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionMode {
+    /// 浏览/选择当前问题的选项（↑↓/数字选，Enter 确认）。
+    Selecting,
+    /// 正在编辑自定义回答（textarea）。
+    EditingCustom,
+    /// 多问题：Review 汇总页（Enter 提交全部）。
+    Review,
+    /// 已确认（提交完成后关闭）。
+    Done,
+}
+
+/// `request_input` 挂起的交互模态（对标 opencode question UI）。
+///
+/// 与展示型 [`ModalState`] 不同：这是**交互型**组件（选项导航/多问题
+/// tab/自定义编辑/拒绝）。渲染由 [`crate::draw_question`] 完成。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct QuestionModalState {
+    /// 问题列表（多问题时 tab 导航）。
+    pub questions: Vec<QuestionView>,
+    /// 当前问题 index（tab 位置）。
+    pub tab: usize,
+    /// 当前高亮选项 index（含自定义项，长度 = options.len() + custom）。
+    pub selected: usize,
+    /// 每问题的已选答案（multiple 可多个；单选用第一个）。
+    pub answers: Vec<Vec<String>>,
+    /// 交互模式。
+    pub mode: QuestionMode,
+    /// 自定义回答输入缓冲区（EditingCustom 时）。
+    pub custom_input: String,
+    /// 该问题是否被用户显式拒绝（Esc）。
+    pub rejected: bool,
+}
+
+impl QuestionModalState {
+    pub fn new(questions: Vec<QuestionView>) -> Self {
+        let n = questions.len();
+        Self {
+            questions,
+            tab: 0,
+            selected: 0,
+            answers: vec![Vec::new(); n],
+            mode: QuestionMode::Selecting,
+            custom_input: String::new(),
+            rejected: false,
+        }
+    }
+
+    /// 当前问题的选项总数（含自定义项；multiple 且无 custom 时含“完成”项）。
+    pub fn option_count(&self) -> usize {
+        let q = &self.questions[self.tab];
+        q.options.len() + usize::from(q.custom) + usize::from(q.multiple && !q.custom)
+    }
+
+    /// 当前是否选中自定义项（最后一项且 custom）。
+    pub fn on_custom(&self) -> bool {
+        let q = &self.questions[self.tab];
+        q.custom && self.selected >= q.options.len()
+    }
+
+    /// 当前是否选中“完成”项（multiple 且无 custom 的最后一个伪项）。
+    pub fn on_done(&self) -> bool {
+        let q = &self.questions[self.tab];
+        q.multiple && !q.custom && self.selected >= q.options.len()
+    }
+
+    /// 所有问题都已回答（Review 可提交）。
+    pub fn all_answered(&self) -> bool {
+        self.questions
+            .iter()
+            .enumerate()
+            .all(|(i, _)| self.answers.get(i).is_some_and(|a| !a.is_empty()))
+    }
+
+    /// 序列化为模型可见的答案文本（每问题 `Q: A` 一行）。
+    pub fn answers_text(&self) -> String {
+        self.questions
+            .iter()
+            .zip(&self.answers)
+            .map(|(q, a)| format!("{}: {}", q.question, a.join(", ")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 /// 详情 Overlay 状态（整改 B：历史/工具详情不重写 scrollback，覆盖显示）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayState {
@@ -628,6 +740,8 @@ pub struct ViewModel {
     pub overlay: Option<OverlayState>,
     /// 操作型 Modal（None = 关闭；§42：/help /settings /doctor 等不污染 transcript）。
     pub modal: Option<ModalState>,
+    /// `request_input` 交互模态（None = 关闭；opencode 形态的选项选择器）。
+    pub question: Option<QuestionModalState>,
     /// 转录搜索（None = 关闭；§14 Ctrl+F）。
     pub search: Option<SearchState>,
     /// 右侧边栏（§用户诉求）：todo + 用户消息大纲；关闭时主区占满全宽。
@@ -677,6 +791,7 @@ impl Default for ViewModel {
             file_index: Vec::new(),
             overlay: None,
             modal: None,
+            question: None,
             search: None,
             sidebar: SidebarState::default(),
             next_version: 1,

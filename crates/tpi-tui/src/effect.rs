@@ -16,4 +16,9 @@ pub enum UiEffect {
     OpenUrl(String),
     /// 复制 URL 到剪贴板（§成熟化：Link Overlay 内 `c`）。
     CopyText(String),
+    /// `request_input` 模态：用户提交答案（多问题逐行 `Q: A`；app 记录
+    /// UserInputReceived 并 resume）。
+    QuestionSubmitted(String),
+    /// `request_input` 模态：用户拒绝（Esc；app 记录 dismissed 语义）。
+    QuestionRejected,
 }

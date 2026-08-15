@@ -638,6 +638,15 @@ fn render_frame(
         draw_overlay(frame, Rect::new(x, y, w, h), view, theme);
     }
 
+    // `request_input` 交互模态（opencode 形态；最顶层，最后画）。
+    if view.question.is_some() {
+        let w = (main_area.width.saturating_mul(3) / 4).clamp(60, 120);
+        let h = modal_height(trans_area.height);
+        let x = main_area.x + (main_area.width.saturating_sub(w)) / 2;
+        let y = trans_area.y + trans_area.height.saturating_sub(h) / 2;
+        draw_question(frame, Rect::new(x, y, w, h), view, theme);
+    }
+
     draw_input(frame, input_area, view, theme);
 
     // §用户诉求：右侧边栏（todo + 用户消息大纲）。贯穿整个主区高度。
@@ -2771,6 +2780,240 @@ fn draw_modal(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: t
         ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(theme.info)),
+        rect,
+    );
+    let inner = Rect::new(
+        rect.x + 1,
+        rect.y + 1,
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2),
+    );
+    frame.render_widget(Paragraph::new(window).scroll((0, 0)), inner);
+}
+
+/// `request_input` 交互模态渲染（opencode 形态）：tab 栏（多问题）+
+/// 问题正文 + 选项列表（label + description 副行；multiple 勾选；custom 项）
+/// + Review 页 + footer 快捷键提示。
+fn draw_question(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: theme::Theme) {
+    use crate::model::QuestionMode;
+    let Some(question) = &view.question else {
+        return;
+    };
+    let inner_w = rect.width.saturating_sub(2).max(1) as usize;
+    let inner_h = rect.height.saturating_sub(2).max(1) as usize;
+    let multi = question.questions.len() > 1;
+    let cur = &question.questions[question.tab.min(question.questions.len().saturating_sub(1))];
+    let mut content: Vec<Line<'static>> = Vec::new();
+
+    // 标题行：⏸ 请求输入（Esc 拒绝 · Enter 确认）。
+    content.push(Line::from(vec![
+        Span::styled(
+            "⏸ 请求输入",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  （Esc 拒绝 · ↑↓ 选择 · Enter 确认）",
+            Style::default().fg(theme.muted),
+        ),
+    ]));
+    content.push(Line::default());
+
+    // 多问题 tab 栏（opencode 形态：header 标签 + 已答标记）。
+    if multi && question.mode != QuestionMode::Review {
+        let mut tab_line = Vec::<Span<'static>>::new();
+        for (i, q) in question.questions.iter().enumerate() {
+            let answered = question.answers.get(i).is_some_and(|a| !a.is_empty());
+            let active = i == question.tab;
+            let label = q
+                .header
+                .clone()
+                .unwrap_or_else(|| format!("问题 {}", i + 1));
+            let span = if active {
+                Span::styled(
+                    format!("▌{}{} ▌", label, if answered { " ✓" } else { "" }),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    format!(" {}{} ", label, if answered { " ✓" } else { "" }),
+                    Style::default().fg(if answered { theme.text } else { theme.muted }),
+                )
+            };
+            tab_line.push(span);
+        }
+        content.push(Line::from(tab_line));
+        content.push(Line::default());
+    }
+
+    match question.mode {
+        QuestionMode::Selecting | QuestionMode::EditingCustom => {
+            // 问题正文。
+            content.push(Line::styled(
+                format!(
+                    "{}{}",
+                    cur.question,
+                    if cur.multiple { " （可多选）" } else { "" }
+                ),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ));
+            content.push(Line::default());
+            // 选项列表。
+            for (i, option) in cur.options.iter().enumerate() {
+                let active = question.selected == i;
+                let picked = question
+                    .answers
+                    .get(question.tab)
+                    .is_some_and(|a| a.contains(&option.label));
+                let marker = if cur.multiple {
+                    format!("[{}] ", if picked { "✓" } else { " " })
+                } else {
+                    format!("{}. ", i + 1)
+                };
+                let num_style = if active {
+                    Style::default().fg(theme.accent)
+                } else {
+                    Style::default().fg(theme.muted)
+                };
+                let label_style = if active {
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
+                } else if picked {
+                    Style::default().fg(theme.success)
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                content.push(Line::from(vec![
+                    Span::styled(marker, num_style),
+                    Span::styled(option.label.clone(), label_style),
+                    Span::styled(
+                        " ✓",
+                        if picked && !cur.multiple {
+                            theme.success
+                        } else {
+                            theme.muted
+                        },
+                    ),
+                ]));
+                if !option.description.is_empty() {
+                    content.push(Line::from(vec![
+                        Span::styled("    ", Style::default()),
+                        Span::styled(option.description.clone(), Style::default().fg(theme.muted)),
+                    ]));
+                }
+            }
+            // 自定义项。
+            if cur.custom {
+                let i = cur.options.len();
+                let active = question.selected == i;
+                let custom_val = question.answers.get(question.tab).and_then(|a| {
+                    a.iter()
+                        .find(|v| !cur.options.iter().any(|o| &o.label == *v))
+                        .cloned()
+                });
+                let marker = format!("{}. ", i + 1);
+                content.push(Line::from(vec![
+                    Span::styled(marker, if active { theme.accent } else { theme.muted }),
+                    Span::styled(
+                        "✎ 自定义回答",
+                        if active {
+                            Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.text)
+                        },
+                    ),
+                ]));
+                if let Some(val) = &custom_val {
+                    content.push(Line::from(vec![
+                        Span::styled("    ", Style::default()),
+                        Span::styled(val.clone(), Style::default().fg(theme.success)),
+                    ]));
+                }
+            }
+            // multiple 且无 custom 时：完成项（提交当前多选）。
+            if cur.multiple && !cur.custom {
+                let i = cur.options.len();
+                let active = question.selected == i;
+                content.push(Line::from(vec![
+                    Span::styled(
+                        format!("{}. ", i + 1),
+                        if active { theme.accent } else { theme.muted },
+                    ),
+                    Span::styled(
+                        "✓ 完成选择",
+                        if active {
+                            Style::default()
+                                .fg(theme.success)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.success)
+                        },
+                    ),
+                ]));
+            }
+            // 自定义编辑中的输入。
+            if question.mode == QuestionMode::EditingCustom {
+                content.push(Line::default());
+                content.push(Line::from(vec![
+                    Span::styled("✎ ", Style::default().fg(theme.primary)),
+                    Span::styled(
+                        if question.custom_input.is_empty() {
+                            "输入你的回答…（Enter 确认）".to_string()
+                        } else {
+                            question.custom_input.clone()
+                        },
+                        Style::default().fg(theme.text),
+                    ),
+                ]));
+            }
+        }
+        QuestionMode::Review => {
+            content.push(Line::styled(
+                "确认回答",
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            content.push(Line::default());
+            for (i, q) in question.questions.iter().enumerate() {
+                let answered = question.answers.get(i).is_some_and(|a| !a.is_empty());
+                content.push(Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "{}: ",
+                            q.header
+                                .clone()
+                                .unwrap_or_else(|| format!("问题 {}", i + 1))
+                        ),
+                        Style::default().fg(theme.muted),
+                    ),
+                    Span::styled(
+                        if answered {
+                            question.answers[i].join(", ")
+                        } else {
+                            "（未回答）".to_string()
+                        },
+                        Style::default().fg(if answered { theme.text } else { theme.error }),
+                    ),
+                ]));
+            }
+        }
+        QuestionMode::Done => {}
+    }
+
+    let wrapped = wrap_lines(content, inner_w);
+    let total = wrapped.len();
+    let scroll = 0usize;
+    let start = scroll;
+    let window = wrapped[start..start + inner_h.min(total)].to_vec();
+
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    frame.render_widget(
+        ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(theme.accent)),
         rect,
     );
     let inner = Rect::new(

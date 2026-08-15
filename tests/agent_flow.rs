@@ -723,11 +723,22 @@ async fn request_input_multi_question_suspends_with_rendered_prompt() {
     // 结构化 questions 供 TUI 选择器使用：全部问题 + 选项保留。
     assert_eq!(awaiting.questions.len(), 2, "结构化问题数");
     assert_eq!(
-        awaiting.questions[0].options,
+        awaiting.questions[0]
+            .options
+            .iter()
+            .map(|o| o.label())
+            .collect::<Vec<_>>(),
         vec!["是，运行全部", "只跑单元测试", "跳过"]
     );
     assert_eq!(awaiting.questions[1].header.as_deref(), Some("部署"));
-    assert_eq!(awaiting.questions[1].options, vec!["生产", "staging"]);
+    assert_eq!(
+        awaiting.questions[1]
+            .options
+            .iter()
+            .map(|o| o.label())
+            .collect::<Vec<_>>(),
+        vec!["生产", "staging"]
+    );
 
     // session 事实：user_input_requested 记录渲染后的完整问题文本。
     let events = read_events(session.path()).expect("read session");
@@ -797,5 +808,12 @@ async fn request_input_legacy_single_question_still_works() {
     );
     // 兼容格式同样产出结构化问题（供选择器）。
     assert_eq!(awaiting.questions.len(), 1);
-    assert_eq!(awaiting.questions[0].options, vec!["是", "否"]);
+    assert_eq!(
+        awaiting.questions[0]
+            .options
+            .iter()
+            .map(|o| o.label())
+            .collect::<Vec<_>>(),
+        vec!["是", "否"]
+    );
 }

@@ -49,7 +49,49 @@ pub struct RequestInputQuestion {
     pub header: Option<String>,
     /// 建议选项：用户可直接选择（可按编号引用）或输入自定义内容。
     #[serde(default)]
-    pub options: Vec<String>,
+    pub options: Vec<QuestionOption>,
+    /// 允许多选（checkbox 式；默认 false）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multiple: bool,
+    /// 允许自定义回答（默认 true；false 时只能选选项）。
+    #[serde(default = "default_true", skip_serializing_if = "std::ops::Not::not")]
+    pub custom: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 单个建议选项（label + description；label 是选择结果，description 是说明）。
+///
+/// 兼容旧调用：反序列化接受 `"字符串"`（→ label）或 `{label, description}`。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum QuestionOption {
+    /// 纯字符串（旧格式）：label = 字符串，description 为空。
+    Plain(String),
+    /// 结构化：label + description。
+    Structured {
+        label: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        description: String,
+    },
+}
+
+impl QuestionOption {
+    pub fn label(&self) -> &str {
+        match self {
+            QuestionOption::Plain(s) => s,
+            QuestionOption::Structured { label, .. } => label,
+        }
+    }
+
+    pub fn description(&self) -> &str {
+        match self {
+            QuestionOption::Plain(_) => "",
+            QuestionOption::Structured { description, .. } => description,
+        }
+    }
 }
 
 impl RequestInputArgs {
@@ -64,7 +106,14 @@ impl RequestInputArgs {
             vec![RequestInputQuestion {
                 question: question.clone(),
                 header: None,
-                options: self.options.clone(),
+                options: self
+                    .options
+                    .iter()
+                    .cloned()
+                    .map(QuestionOption::Plain)
+                    .collect(),
+                multiple: false,
+                custom: true,
             }]
         })
     }
@@ -87,15 +136,22 @@ impl RequestInputArgs {
                 line.push_str("] ");
             }
             line.push_str(question.question.trim());
+            if question.multiple {
+                line.push_str("（可多选）");
+            }
             lines.push(line);
             if !question.options.is_empty() {
-                let options: Vec<String> = question
-                    .options
-                    .iter()
-                    .enumerate()
-                    .map(|(option_index, option)| format!("{}. {}", option_index + 1, option))
-                    .collect();
-                lines.push(format!("   选项: {}", options.join(" / ")));
+                for (option_index, option) in question.options.iter().enumerate() {
+                    let mut opt_line =
+                        format!("   {}. {}", option_index + 1, option.label().trim());
+                    if !option.description().trim().is_empty() {
+                        opt_line.push_str(&format!(" — {}", option.description().trim()));
+                    }
+                    lines.push(opt_line);
+                }
+                if question.custom {
+                    lines.push(format!("   {}. （自定义回答）", question.options.len() + 1));
+                }
             }
         }
         lines.join("\n")

@@ -11,7 +11,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::effect::UiEffect;
 use crate::event::UiEvent;
 use crate::keymap::KeyAction;
-use crate::model::{LineKind, MenuKind, StatusLine};
+use crate::model::{LineKind, MenuKind, QuestionMode, StatusLine};
 use crate::state::UiState;
 use tpi_agent::agent::{DeltaKind, RuntimeEvent};
 use tpi_session::Usage;
@@ -61,6 +61,201 @@ fn refresh_menus(state: &mut UiState) {
         state.view.refresh_at_menu();
     } else {
         state.view.refresh_command_menu();
+    }
+}
+
+/// `request_input` 交互模态的按键路由（opencode 形态）。
+/// 优先级最高：打开时拦截所有按键（不落 composer）。
+///
+/// - Selecting：↑↓/k/j 移动、1-9 快选、Enter 确认（单问题提交；多问题
+///   下一 tab 或 Review）、Tab/←→/h/l 切 tab、Esc 拒绝
+/// - EditingCustom：字符输入、Enter 确认、Esc 取消编辑
+/// - Review：Enter 提交全部、Esc 拒绝
+fn handle_question_key(state: &mut UiState, key: KeyEvent, effects: &mut Vec<UiEffect>) -> bool {
+    let Some(q) = state.view.question.as_mut() else {
+        return false;
+    };
+    if q.mode == QuestionMode::Done {
+        // 已提交/拒绝：关闭模态（effect 已发出，app 处理）。
+        state.view.question = None;
+        return true;
+    }
+    if q.mode == QuestionMode::EditingCustom {
+        match key.code {
+            KeyCode::Char(c) => {
+                q.custom_input.push(c);
+                return true;
+            }
+            KeyCode::Backspace => {
+                q.custom_input.pop();
+                return true;
+            }
+            KeyCode::Enter => {
+                let val = std::mem::take(&mut q.custom_input);
+                if !val.trim().is_empty() {
+                    let i = q.tab;
+                    if q.questions[i].multiple {
+                        q.answers[i].push(val.trim().to_string());
+                        q.mode = QuestionMode::Selecting;
+                    } else {
+                        q.answers[i] = vec![val.trim().to_string()];
+                        // 单选自定义回答：单问题直接提交；多问题进下一 tab/Review。
+                        if q.questions.len() == 1 {
+                            submit_single(q, effects);
+                        } else {
+                            advance_tab(q);
+                        }
+                    }
+                } else {
+                    q.mode = QuestionMode::Selecting;
+                }
+                return true;
+            }
+            KeyCode::Esc => {
+                q.custom_input.clear();
+                q.mode = QuestionMode::Selecting;
+                return true;
+            }
+            _ => return true, // 编辑中拦截所有其他键。
+        }
+    }
+    if q.mode == QuestionMode::Review {
+        match key.code {
+            KeyCode::Enter => {
+                q.mode = QuestionMode::Done;
+                let text = q.answers_text();
+                effects.push(UiEffect::QuestionSubmitted(text));
+                return true;
+            }
+            KeyCode::Esc => {
+                q.mode = QuestionMode::Done;
+                q.rejected = true;
+                effects.push(UiEffect::QuestionRejected);
+                return true;
+            }
+            _ => return true,
+        }
+    }
+    // Selecting 模式。
+    let multi_q = q.questions.len() > 1;
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            let total = q.option_count();
+            q.selected = if total == 0 {
+                0
+            } else {
+                (q.selected + total - 1) % total
+            };
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let total = q.option_count();
+            q.selected = if total == 0 {
+                0
+            } else {
+                (q.selected + 1) % total
+            };
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            let n = (c as usize) - ('0' as usize);
+            if n <= q.option_count() {
+                q.selected = n - 1;
+                select_current_option(q);
+                // multiple：toggle 后停留（用户可继续多选）；
+                // 单选：单问题提交；多问题进下一 tab/Review。
+                if !q.questions[q.tab].multiple {
+                    if !multi_q {
+                        submit_single(q, effects);
+                    } else {
+                        advance_tab(q);
+                    }
+                }
+            }
+        }
+        KeyCode::Enter => {
+            select_current_option(q);
+            // multiple 的“完成”项/Review：直接提交（不再走单选提交逻辑）。
+            if q.mode == QuestionMode::Done && !multi_q {
+                effects.push(UiEffect::QuestionSubmitted(q.answers_text()));
+            } else if q.mode == QuestionMode::Review {
+                // 多问题 multiple 完成项 → Review（用户 Enter 提交）。
+            } else if !q.questions[q.tab].multiple {
+                if !multi_q {
+                    submit_single(q, effects);
+                } else {
+                    advance_tab(q);
+                }
+            }
+        }
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+            if multi_q {
+                advance_tab(q);
+            }
+        }
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+            if multi_q {
+                q.tab = (q.tab + q.questions.len() - 1) % q.questions.len();
+                q.selected = 0;
+            }
+        }
+        KeyCode::Esc => {
+            q.mode = QuestionMode::Done;
+            q.rejected = true;
+            effects.push(UiEffect::QuestionRejected);
+        }
+        _ => {}
+    }
+    true
+}
+
+/// 选中当前高亮项（选项/自定义项/完成项）。
+fn select_current_option(q: &mut crate::model::QuestionModalState) {
+    let cur = &q.questions[q.tab];
+    if q.on_done() {
+        // multiple 且无 custom：完成项 → 提交（单问题）或 Review（多问题）。
+        q.mode = if q.questions.len() == 1 {
+            QuestionMode::Done
+        } else {
+            QuestionMode::Review
+        };
+        return;
+    }
+    if q.on_custom() {
+        // 自定义项：进入编辑（multiple 直接编辑追加；单选编辑后提交）。
+        q.mode = QuestionMode::EditingCustom;
+        return;
+    }
+    let Some(option) = cur.options.get(q.selected) else {
+        return;
+    };
+    let label = option.label.clone();
+    if cur.multiple {
+        let i = q.tab;
+        if let Some(pos) = q.answers[i].iter().position(|a| a == &label) {
+            q.answers[i].remove(pos);
+        } else {
+            q.answers[i].push(label);
+        }
+    } else {
+        q.answers[q.tab] = vec![label];
+    }
+}
+
+/// 单问题提交（发出 QuestionSubmitted）。
+fn submit_single(q: &mut crate::model::QuestionModalState, effects: &mut Vec<UiEffect>) {
+    if q.answers[0].is_empty() {
+        return; // 未选不提交。
+    }
+    q.mode = QuestionMode::Done;
+    effects.push(UiEffect::QuestionSubmitted(q.answers_text()));
+}
+
+/// 多问题：前进到下一 tab 或 Review。
+fn advance_tab(q: &mut crate::model::QuestionModalState) {
+    if q.tab + 1 < q.questions.len() {
+        q.tab += 1;
+        q.selected = 0;
+    } else {
+        q.mode = QuestionMode::Review;
     }
 }
 
@@ -138,6 +333,12 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
     let mut effects = Vec::new();
     // 过渡提示下一次键盘操作清除（同一个键可重新设置）。
     state.view.transient_hint = None;
+
+    // `request_input` 模态优先（opencode 形态：拦截所有按键，不落 composer）。
+    if state.view.question.is_some() {
+        handle_question_key(state, key, &mut effects);
+        return effects;
+    }
 
     // Ctrl+C 语义（§用户诉求）：只用于复制——Windows Terminal 选中文本后
     // Ctrl+C 由终端优先复制（不传给应用）；未选中时到达应用的 Ctrl+C 静默忽略，
