@@ -1033,10 +1033,16 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   主 crate `pub use tpi_core::{...}` re-export 保持 `crate::ids` 等路径零改动；
   `PlanStatus::is_open` pub（跨 crate）；跨层一致性测试移回 tool 模块；
   tpi-core 独立 12 断言绿；全量 56 target 绿；DAG/arch_gate 保持清洁。
-- **剩余**：session（3432 行）-> capabilities（tool 10768/shell/workspace/
-  process/mcp）-> agent（3257）-> TUI（17524）-> adapters/CLI（约 1.1 万行）。
-  后续每步：目标模块移入新 crate + 全局 `crate::X` 引用改 `tpi_session::X` 等
-  + 主 crate re-export 兼容 + 零行为验证。
+- **第 2 步（2026-08-14，提交 7a628cf）**：拆出 `tpi-session` crate
+  （crates/tpi-session）——durable 存储层 10 文件 git mv；3 个纯函数
+  （REVISION_PREFIX/revision_of/estimate_tokens + 完整版 prune_messages）先下沉
+  tpi-core/revision.rs（tool::edit 与 context re-export 保持路径）；session 内部
+  引用改 tpi_core::；主 crate `pub use tpi_session as session` 保持 `crate::session`
+  路径零改动；tpi-session 独立 26 断言绿；全量 56 target 绿。
+- **剩余**：capabilities（tool 10768/shell/workspace/process/mcp）-> agent（3257）
+  -> TUI（17524）-> adapters/CLI（约 1.1 万行）。后续每步：目标模块移入新
+  crate + 全局 `crate::X` 引用改 `tpi_xxx::X` + 主 crate re-export 兼容 +
+  零行为验证。
 
 #### P7-03 feature audit
 
