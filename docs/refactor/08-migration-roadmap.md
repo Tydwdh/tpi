@@ -1021,13 +1021,22 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   validate_artifact_component 下沉 util.rs。DAG dry run 现为 **OK（0 反向引用）**，
   连续两阶段无反向 import 的条件已满足，可开始拆 crate。
 
-#### P7-02 依次拆 crate — **前置已达成（2026-08-14）**
+#### P7-02 依次拆 crate — **进行中（第 1 步完成：tpi-core 已拆出）**
 
 - 顺序：core -> session -> capabilities -> agent -> TUI -> adapters/CLI。
 - 每个 PR 只拆一个 crate；零行为变化；必要 re-export 有删除阶段。
 - 前置：DAG 0 反向引用 ✓；global_registry 移除（P4 gate）✓；共享纯数据
-  （message/outcome/plan）已在 core 层，拆包时直接搬目录。拆包本身（crates/ 下
-  建 workspace、Cargo.toml 依赖、逐 crate 编译验证）是连续迭代工程，后续轮实施。
+  （message/outcome/plan）已在 core 层，拆包时直接搬目录。
+- **第 1 步（2026-08-14，提交 3889a55）**：拆出 `tpi-core` crate
+  （crates/tpi-core）——ids/message/plan/outcome/util 5 个纯数据模块
+  git mv + workspace 化（根 Cargo.toml [workspace] members: . + crates/tpi-core）；
+  主 crate `pub use tpi_core::{...}` re-export 保持 `crate::ids` 等路径零改动；
+  `PlanStatus::is_open` pub（跨 crate）；跨层一致性测试移回 tool 模块；
+  tpi-core 独立 12 断言绿；全量 56 target 绿；DAG/arch_gate 保持清洁。
+- **剩余**：session（3432 行）-> capabilities（tool 10768/shell/workspace/
+  process/mcp）-> agent（3257）-> TUI（17524）-> adapters/CLI（约 1.1 万行）。
+  后续每步：目标模块移入新 crate + 全局 `crate::X` 引用改 `tpi_session::X` 等
+  + 主 crate re-export 兼容 + 零行为验证。
 
 #### P7-03 feature audit
 
