@@ -1104,9 +1104,23 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   （summary/evidence structured）、`SubagentProvider` trait + `FakeSubagentProvider`。
   2 断言全绿。P8-04 in-process child 基于本契约。
 
-#### P8-04 in-process read-only child
+#### P8-04 in-process read-only child — **DONE（2026-08-14）**
 
 - concurrency 1、depth 1、default off；parent cancel。
+- 实施：`src/subagent/child.rs`——`InProcessChildProvider<P, F>`（make_provider
+  工厂 + config + workspace）实现 `SubagentProvider`：
+  - 复用进程内 `agent::run` 执行只读调查（depth 1 不递归；concurrency 1）；
+  - 只读 registry：`read_only_registry(caps)` 只注册 read/list/search/glob
+    白名单（写/进程/网络工具不存在于 registry → 不可调用）；
+  - 独立 child session（`config.sessions_root/child` 隔离目录，不与 parent 混）；
+  - parent cancel 传播：同一 CancellationToken 传 child run；child 以 Cancelled
+    终态结束时转 Err（parent 不需要 cancelled 的 report）；
+  - child 用独立 provider 实例（不与 parent 争用 &mut provider）；
+  - structured report：summary = assistant_text；evidence = 提取 `@artifact/...`
+    引用。
+- 验收测试（subagent 5 断言）：structured report（child_session 匹配 + summary
+  + evidence 提取）；parent cancel 传播（cancel 后 child 立即失败）；只读
+  registry 排除写工具（bash/edit/write/web_fetch 不可用）。
 
 #### P8-05 bounded parallel children
 
