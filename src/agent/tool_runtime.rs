@@ -55,6 +55,7 @@ impl ToolRuntime {
         interactive: bool,
         initial_plan: Option<Plan>,
         active_workspace: crate::workspace::ActiveWorkspace,
+        registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
     ) -> Self {
         // §W0/R4：workspace 由调用方注入（默认 Local；测试可传 remote）。
         // ctx.shell 与 workspace 内 shell 共享同一 Arc。
@@ -63,9 +64,6 @@ impl ToolRuntime {
             let ws = workspace.lock().unwrap();
             ws.shell().clone()
         };
-        // §Phase 5：工具目录 = 进程级共享 registry（builtin + McpManager 注册的
-        // MCP 工具）。
-        let registry = crate::tool::registry::global_registry();
         // P1-05：工具执行策略来自窄视图 ToolPolicy（不直接读 Config 的
         // allow_outside_workspace/artifacts_root/shell_path）。
         let policy = config.tool_policy();

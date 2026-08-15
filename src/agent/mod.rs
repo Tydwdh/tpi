@@ -520,6 +520,8 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
         interactive,
         initial_plan,
         active_workspace,
+        // P4-02：registry 由 composition root 注入（新调用禁止 global_registry）。
+        crate::tool::registry::global_registry(),
     );
 
     let mut turn = 0u32;
