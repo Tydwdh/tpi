@@ -61,13 +61,10 @@ fn estimate_message(message: &ChatMessage) -> u64 {
     }
 }
 
-/// 可用输入预算（§15.4）：
-/// `usable_input = context_window - max_output_tokens - safety_reserve`。
-pub fn usable_input(context_window: u64, max_output_tokens: u64, safety_reserve: u64) -> u64 {
-    context_window
-        .saturating_sub(max_output_tokens)
-        .saturating_sub(safety_reserve)
-}
+/// 可用输入预算（§15.4）：`usable_input = context_window - max_output_tokens -
+/// safety_reserve`。P7-02 拆 crate：实现下沉 tpi-core（revision::usable_input），
+/// 此处 re-export 保持 `crate::context::usable_input` 路径兼容。
+pub use crate::revision::usable_input;
 
 /// 是否触发 compaction（§15.4：`projected_input > usable_input`）。
 pub fn should_compact(projected: u64, usable: u64) -> bool {

@@ -21,6 +21,13 @@ pub fn estimate_tokens(text: &str) -> u64 {
     (cjk_count + ascii_scalars.div_ceil(3)).max(1)
 }
 
+/// 可用输入预算（P7-02 拆 crate：从 context 下沉；config 与 agent 共用）。
+pub fn usable_input(context_window: u64, max_output_tokens: u64, safety_reserve: u64) -> u64 {
+    context_window
+        .saturating_sub(max_output_tokens)
+        .saturating_sub(safety_reserve)
+}
+
 /// 剪枝超长工具输出（projection 用；不改变消息数量是不变量）。
 /// 完整版：digest + 结构化关键行（status/program/exit_code/artifact/error）
 /// + 尾部 8 行，模型仍能获得完整输出入口。

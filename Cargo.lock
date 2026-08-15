@@ -5134,6 +5134,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tpi-capabilities",
+ "tpi-config",
  "tpi-core",
  "tpi-session",
  "tpi-ui-types",
@@ -5184,6 +5185,22 @@ dependencies = [
  "unicode-width",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tpi-config"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "keyring",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "tpi-core",
+ "tpi-ui-types",
+ "uuid",
 ]
 
 [[package]]

@@ -48,9 +48,9 @@ pub(crate) fn set_ui_theme_at(
 }
 
 /// 配置根目录（~/.tpi，§14.1）。
-/// P7-02 拆 crate：实现下沉 tpi-core（crate::util::tpi_home）；此处 re-export
+/// P7-02 拆 crate：实现下沉 tpi-core（tpi_core::util::tpi_home）；此处 re-export
 /// 保持 `crate::config::tpi_home` 路径兼容。
-pub use crate::util::tpi_home;
+pub use tpi_core::util::tpi_home;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -329,11 +329,9 @@ impl Config {
     }
 }
 
-/// lib 内测试辅助：最小可用 Config（不读真实配置；agent 测试构造 fake config
-/// 用）。P1 Exit gate：避免 agent 测试直接引用 `crate::tui`（tui 依赖收敛在
-/// config 模块，config -> tui 是允许的依赖方向）。
-#[cfg(test)]
-pub(crate) fn test_config(workspace_root: &Utf8PathBuf) -> Config {
+/// 测试辅助：最小可用 Config（不读真实配置；agent 测试构造 fake config 用）。
+/// P7-02 拆 crate：主 crate 的 agent 测试也需要它，故 pub + 无 cfg(test)。
+pub fn test_config(workspace_root: &Utf8PathBuf) -> Config {
     Config {
         model: ModelConfig {
             provider: "test".into(),
@@ -374,7 +372,8 @@ pub fn load(workspace_root: &Utf8PathBuf, cli_model: Option<&str>) -> Result<Con
     load_from_home(workspace_root, cli_model, &home)
 }
 
-pub(crate) fn load_from_home(
+/// P7-02 拆 crate：doctor（主 crate）调用，改 pub。
+pub fn load_from_home(
     workspace_root: &Utf8PathBuf,
     cli_model: Option<&str>,
     home: &std::path::Path,
@@ -498,7 +497,7 @@ pub(crate) fn load_from_home(
 
     let safety_reserve_tokens = merged.context.safety_reserve_tokens.unwrap_or(8192);
     if let Some(context_window) = selected.context_window
-        && crate::context::usable_input(
+        && tpi_core::revision::usable_input(
             context_window,
             u64::from(selected.max_output_tokens.unwrap_or(0)),
             safety_reserve_tokens,
@@ -571,7 +570,7 @@ fn read_config(path: &std::path::Path) -> Result<ConfigFile, String> {
     if !path.exists() {
         return Ok(ConfigFile::default());
     }
-    let text = crate::util::read_utf8_file_bounded(path, MAX_CONFIG_BYTES)
+    let text = tpi_core::util::read_utf8_file_bounded(path, MAX_CONFIG_BYTES)
         .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
     toml::from_str(&text).map_err(|e| format!("解析 {} 失败: {e}", path.display()))
 }
@@ -712,7 +711,7 @@ fn read_system_md(path: &std::path::Path) -> Result<Option<String>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    let content = crate::util::read_utf8_file_bounded(path, MAX_INSTRUCTION_BYTES)
+    let content = tpi_core::util::read_utf8_file_bounded(path, MAX_INSTRUCTION_BYTES)
         .map_err(|error| format!("读取指令文件 {} 失败: {error}", path.display()))?;
     Ok((!content.trim().is_empty()).then_some(content))
 }
@@ -735,7 +734,7 @@ pub fn read_api_key_for(model: &ModelConfig) -> Result<String, String> {
     {
         return Ok(key.clone());
     }
-    if let Some(key) = crate::auth::auth_get(&model.provider)? {
+    if let Some(key) = crate::auth_get(&model.provider)? {
         return Ok(key);
     }
     Err(format!(
