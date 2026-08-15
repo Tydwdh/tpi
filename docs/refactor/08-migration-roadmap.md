@@ -701,10 +701,18 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收达成：显式 stage result ✓；Pure builtin 包裹 ✓；全量 54 target 绿；
   fmt/clippy/arch_gate 清洁。
 
-#### P4-06 canonical output
+#### P4-06 canonical output — **DONE（2026-08-14）**
 
 - 从无副作用工具开始；投影回现有 ToolOutcome 保持模型/session/UI。
 - bounded diagnostics/artifacts/output schema。
+- 实施：`src/tool/pipeline.rs` 新增 `canonicalize_output(ToolOutcome, max_bytes) ->
+  StoredToolOutcome`（output 截断到上限、截断尾部声明 `[truncated: N bytes]` 不伪装
+  完整、投影回现有 StoredToolOutcome 保持模型/session/UI 消费结构）+ `MAX_MODEL_OUTPUT_BYTES`
+  (16KiB) + `run_canonical_pure_pipeline`（Pure 工具 + canonical）。
+- 验收测试（pipeline 2 断言）：大输出截断有界且声明；小输出不截断投影等价。
+  4 断言全绿。模型/session/UI 消费的 StoredToolOutcome 结构不变（投影保持）。
+- 验收达成：无副作用工具 canonical output ✓；投影回现有 ToolOutcome（模型/session/
+  UI 不变）✓；bounded output ✓；全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
 #### P4-07 替换四个 tool-name protocol
 

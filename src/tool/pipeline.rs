@@ -39,6 +39,51 @@ impl StageResult {
     }
 }
 
+/// P4-06：canonical output——有界输出 + 规范化 diagnostics。
+///
+/// - output 截断到 `max_output_bytes`（防无界正文进模型上下文）；
+/// - 截断时在尾部标注 `[truncated: N bytes]`（不伪装完整）；
+/// - 投影回 [`StoredToolOutcome`]（模型/session/UI 现有消费结构不变）。
+pub fn canonicalize_output(outcome: ToolOutcome, max_output_bytes: usize) -> StoredToolOutcome {
+    let mut outcome = outcome;
+    let payload = &mut outcome.model_payload;
+    if payload.output.len() > max_output_bytes {
+        let mut truncated = payload.output[..max_output_bytes].to_string();
+        truncated.push_str(&format!(
+            "
+[truncated: {} bytes]",
+            payload.output.len()
+        ));
+        payload.output = truncated;
+    }
+    // diagnostics/artifact 有界（effect 保持结构化；无界日志不进 model payload）。
+    outcome.into_stored()
+}
+
+/// canonical 常量：模型可见输出上限（与 tool_runtime 的展示裁剪一致量级）。
+pub const MAX_MODEL_OUTPUT_BYTES: usize = 16 * 1024;
+
+/// 跑 Pure 工具 + canonical output（P4-06 纯工具入口）。
+pub async fn run_canonical_pure_pipeline(
+    tool: &dyn Tool,
+    args_json: &str,
+    ctx: &ToolContext,
+) -> Result<StageResult, String> {
+    let tool_name = tool.name().to_string();
+    let outcome = tool.execute(args_json, ctx).await;
+    if outcome.status == crate::tool::outcome::ToolStatus::Failed {
+        return Ok(StageResult::Executed {
+            tool: tool_name,
+            outcome,
+        });
+    }
+    let stored = canonicalize_output(outcome, MAX_MODEL_OUTPUT_BYTES);
+    Ok(StageResult::Output {
+        tool: tool_name,
+        stored,
+    })
+}
+
 /// 跑一个 Pure 工具的完整 pipeline（parse → execute → output）。
 ///
 /// Pure 无副作用前计划（write-ahead 由 scheduler 在 write 工具路径处理）；
@@ -139,4 +184,55 @@ mod tests {
         };
         assert_eq!(r.tool_name(), "read");
     }
+}
+
+/// P4-06：canonical output 截断有界（不伪装完整）。
+#[test]
+fn canonical_output_truncates_and_marks() {
+    use crate::tool::outcome::{ModelPayload, ToolStatus};
+    let big = "x".repeat(100);
+    let mut outcome = ToolOutcome::failed(
+        "echo",
+        ModelPayload {
+            status: ToolStatus::Succeeded,
+            program: Some("echo".into()),
+            exit_code: Some(0),
+            duration_ms: 1,
+            output: big.clone(),
+            effect: None,
+            artifact: None,
+        },
+    );
+    outcome.status = ToolStatus::Succeeded;
+    let stored = canonicalize_output(outcome, 10);
+    assert!(stored.model_payload.output.len() < 100, "输出必须有界");
+    assert!(
+        stored
+            .model_payload
+            .output
+            .contains("[truncated: 100 bytes]"),
+        "截断必须声明: {}",
+        stored.model_payload.output
+    );
+}
+
+/// P4-06：小输出不截断（投影等价）。
+#[test]
+fn canonical_output_keeps_small_unchanged() {
+    use crate::tool::outcome::{ModelPayload, ToolStatus};
+    let outcome = ToolOutcome::failed(
+        "echo",
+        ModelPayload {
+            status: ToolStatus::Succeeded,
+            program: Some("echo".into()),
+            exit_code: Some(0),
+            duration_ms: 1,
+            output: "ok".into(),
+            effect: None,
+            artifact: None,
+        },
+    );
+    let stored = canonicalize_output(outcome, 100);
+    assert_eq!(stored.model_payload.output, "ok");
+    assert_eq!(stored.status, ToolStatus::Succeeded);
 }
