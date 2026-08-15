@@ -7,6 +7,7 @@
 //! 本模块定义契约 + fake；P8-04 in-process child 在其上实现。
 
 pub mod child;
+pub mod parallel;
 
 use crate::ids::SessionId;
 
