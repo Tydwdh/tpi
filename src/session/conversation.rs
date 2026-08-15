@@ -11,7 +11,8 @@ use camino::Utf8PathBuf;
 use crate::ids::{RunId, SessionId, ToolCallId};
 use crate::provider::ChatMessage;
 
-use super::{Plan, SessionLog, latest_plan, recovery, replay_messages, workspace_id_for};
+use super::protocol::Plan;
+use super::{SessionLog, latest_plan, recovery, replay_messages, workspace_id_for};
 
 /// 一个会话的 durable log 与当前模型上下文投影。
 ///

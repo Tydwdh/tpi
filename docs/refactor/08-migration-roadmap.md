@@ -270,11 +270,29 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 ### 任务
 
-#### P2-01 机械拆 session protocol/codec/store
+#### P2-01 机械拆 session protocol/codec/store — **DONE（2026-08-14）**
 
 - 仅移动代码与 visibility；每次一个 module。
 - 用 golden hash 证明 encode 无变化。
 - 验收：`git diff` 无无关 format；old corpus 全过。
+- 实施：`src/session/mod.rs`（1533 行）按行切割为三块，wire 零改动：
+  - `protocol.rs`（500 行）：SessionEvent/Envelope/EventBody/schema version/serde
+    wire 类型（领域 API + 稳定 wire）；
+  - `store.rs`（772 行）：SessionLog append/read/sync/lock、head cursor、投影
+    （replay/project，含 P1-02 domain 投影）；
+  - `mod.rs`（325 行）：子模块声明 + `pub use` re-export（对外 API 完全不变）+
+    tests。
+  - visibility 调整：SessionProtocolState/read_envelopes/open_and_lock_session/
+    read_envelopes_state_with_limits/EnvelopeRead/MAX_SESSION_EVENTS 转
+    pub(crate)/pub（store 内私有符号对 repair/测试可见）；conversation.rs
+    `super::Plan` 改 `super::protocol::Plan`。
+  - golden hash 验证：确定版 example（固定 session_id/run_id/event_id + 去随机
+    字段求 hash）在 HEAD 与拆分后**完全一致**（`25a9f617...`，1817 字符）——
+    此前 hash 差异源于随机 session_id/event_id/timestamp 与旧文件残留，已排除。
+  - 验收达成：`git diff --check` 无空白错误；session_golden 10 + domain_message 8
+    （corpus）全过；全量 47 target 绿；fmt/clippy/arch_gate 清洁。
+  - re-export 兼容层（`session::X` 直引）留待 P10-01 清理（删除条件：调用方
+    已迁移到 `session::store::X`）。
 
 #### P2-02 `SessionStore` port + JSONL adapter
 
