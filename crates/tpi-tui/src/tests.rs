@@ -3317,3 +3317,39 @@ fn key_event(code: ratatui::crossterm::event::KeyCode) -> ratatui::crossterm::ev
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
     KeyEvent::new(code, KeyModifiers::NONE)
 }
+
+/// P8-06：SubagentReported 投影为系统行（summary + evidence）。
+#[test]
+fn subagent_reported_projects_to_system_line() {
+    let mut state = UiState::new(ViewModel::default());
+    let _ = reducer::update(
+        &mut state,
+        UiEvent::Agent(tpi_agent::agent::RuntimeEvent::SubagentReported {
+            child_session: tpi_core::ids::SessionId::from_u128(1),
+            summary: "发现 3 处可疑调用".to_string(),
+            evidence: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
+        }),
+    );
+    // 投影为系统行（transcript 内 Message 行）。
+    let texts: Vec<String> = state
+        .view
+        .transcript
+        .iter()
+        .filter_map(|e| match e {
+            crate::model::Entry::Message { line, .. } => Some(line.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("子代理调查完成") && t.contains("发现 3 处可疑调用")),
+        "系统行含 summary: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("src/main.rs") && t.contains("src/lib.rs")),
+        "系统行含 evidence: {texts:?}"
+    );
+}

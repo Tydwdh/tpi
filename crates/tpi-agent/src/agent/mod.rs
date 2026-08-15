@@ -215,6 +215,12 @@ pub enum LiveEvent {
     TurnRestarting { attempt: u32 },
     /// 手动 /compact 的结果反馈。
     CompactionNotice { message: String },
+    /// P8-06：子代理调查完成（summary card 投影；parent 可见 structured report）。
+    SubagentReported {
+        child_session: tpi_core::ids::SessionId,
+        summary: String,
+        evidence: Vec<String>,
+    },
 }
 
 /// TUI view event（P1-03：由 app projector 从 [`LiveEvent`] 生成，agent 不再直接发）。
@@ -275,6 +281,12 @@ pub enum RuntimeEvent {
     /// 手动 /compact 的结果反馈（§用户诉求：压缩未生效时用户可见，
     /// 此前只写日志、界面无感知）。
     CompactionNotice { message: String },
+    /// P8-06：子代理调查完成（summary card；可展开 evidence）。
+    SubagentReported {
+        child_session: tpi_core::ids::SessionId,
+        summary: String,
+        evidence: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

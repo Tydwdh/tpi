@@ -411,6 +411,15 @@ pub fn project_live_event(event: crate::agent::LiveEvent) -> Option<crate::agent
         LiveEvent::StreamRecovering { attempt } => Some(RuntimeEvent::StreamRecovering { attempt }),
         LiveEvent::TurnRestarting { attempt } => Some(RuntimeEvent::TurnRestarting { attempt }),
         LiveEvent::CompactionNotice { message } => Some(RuntimeEvent::CompactionNotice { message }),
+        LiveEvent::SubagentReported {
+            child_session,
+            summary,
+            evidence,
+        } => Some(RuntimeEvent::SubagentReported {
+            child_session,
+            summary,
+            evidence,
+        }),
     }
 }
 

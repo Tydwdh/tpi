@@ -591,6 +591,19 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
             // §用户诉求：手动 /compact 结果反馈（成功/未生效）写入系统行。
             view.push_line(LineKind::System, message);
         }
+        RuntimeEvent::SubagentReported {
+            child_session,
+            summary,
+            evidence,
+        } => {
+            // P8-06：子代理调查完成 → summary card（系统行 + 证据列表）。
+            let mut text = format!("🔍 子代理调查完成（session {child_session}）：{summary}");
+            if !evidence.is_empty() {
+                text.push_str("\n  证据: ");
+                text.push_str(&evidence.join(", "));
+            }
+            view.push_line(LineKind::System, text);
+        }
     }
 }
 

@@ -26,6 +26,8 @@ pub struct InProcessChildProvider<P, F> {
     make_provider: F,
     config: Arc<tpi_config::config::Config>,
     workspace: ActiveWorkspace,
+    /// P8-06：child 完成后发出 SubagentReported 的通道（None = 不投影 TUI）。
+    report_tx: Option<tokio::sync::mpsc::Sender<crate::agent::LiveEvent>>,
     _provider: std::marker::PhantomData<P>,
 }
 
@@ -39,8 +41,19 @@ impl<P, F> InProcessChildProvider<P, F> {
             make_provider,
             config,
             workspace,
+            report_tx: None,
             _provider: std::marker::PhantomData,
         }
+    }
+
+    /// P8-06：绑定 report 通道（child 完成时发 SubagentReported；
+    /// None = 不投影）。
+    pub fn with_report_tx(
+        mut self,
+        report_tx: Option<tokio::sync::mpsc::Sender<crate::agent::LiveEvent>>,
+    ) -> Self {
+        self.report_tx = report_tx;
+        self
     }
 }
 
@@ -147,6 +160,16 @@ impl<P: Provider + Send, F: FnMut() -> P + Send> SubagentProvider for InProcessC
             child_session_id = %request.child_session,
             "subagent.report_committed"
         );
+        // P8-06：child 完成 → 发 SubagentReported（parent TUI 投影 summary card）。
+        if let Some(report_tx) = &self.report_tx {
+            let _ = report_tx
+                .send(crate::agent::LiveEvent::SubagentReported {
+                    child_session: request.child_session,
+                    summary: outcome.assistant_text.clone(),
+                    evidence: evidence_from(&outcome.assistant_text),
+                })
+                .await;
+        }
         Ok(SubagentReport {
             child_session: request.child_session,
             summary: outcome.assistant_text.clone(),
@@ -368,5 +391,50 @@ mod o8_tests {
             )
             .await;
         assert!(result.is_err(), "cancel -> Err（无 report commit）");
+    }
+}
+
+/// P8-06：child 完成经 report_tx 发 SubagentReported（TUI summary card 数据源）。
+#[cfg(test)]
+mod p8_06_tests {
+    use super::tests::{ChildFake, test_config};
+    use super::*;
+    use crate::agent::LiveEvent;
+    use crate::subagent::ReadOnlyCapability;
+    use tpi_capabilities::workspace::ActiveWorkspace;
+    use tpi_capabilities::workspace::LocalWorkspace;
+
+    #[tokio::test]
+    async fn child_emits_subagent_reported_event() {
+        let (report_tx, mut report_rx) = tokio::sync::mpsc::channel::<LiveEvent>(8);
+        let mut provider = InProcessChildProvider::new(
+            || ChildFake,
+            test_config(),
+            ActiveWorkspace::local(LocalWorkspace::new(
+                camino::Utf8PathBuf::from("C:/proj"),
+                false,
+            )),
+        )
+        .with_report_tx(Some(report_tx));
+        let report = provider
+            .run_investigation(
+                SubagentRequest {
+                    instruction: "调查".into(),
+                    child_session: tpi_core::ids::SessionId::new_v7(),
+                    capabilities: vec![ReadOnlyCapability::Read],
+                    parent: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("child 执行成功");
+        // report_tx 收到 SubagentReported（summary 与 report 一致）。
+        let event = report_rx.recv().await.expect("收到 SubagentReported");
+        match event {
+            LiveEvent::SubagentReported { summary, .. } => {
+                assert_eq!(summary, report.summary, "事件 summary == report summary");
+            }
+            other => panic!("期望 SubagentReported，实际 {other:?}"),
+        }
     }
 }
