@@ -418,9 +418,103 @@ pub fn is_significant_shrink(original_tokens: u64, summary_tokens: u64) -> bool 
     summary_tokens <= original_tokens.saturating_sub(1) / required_ratio
 }
 
+// ---------------------------------------------------------------------------
+// P5-04：context policy pipeline + request cache key。
+//
+// 顺序显式：domain messages → policies（plan/compaction/token 测量按序应用）→
+// provider request。cache key 纳入 tool definition revision、plan、compaction
+// 与 token measurement（任何变化 → 不同 key → 不复用缓存）。
+
+use std::fmt::Write as _;
+
+/// 请求级 cache key（纳入 tool revision / plan / compaction / token 测量）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestCacheKey {
+    pub tool_revision: u64,
+    pub plan_revision: u64,
+    pub compaction_seq: u64,
+    pub token_measurement: u64,
+}
+
+impl RequestCacheKey {
+    /// 稳定字符串（调试/审计）。
+    pub fn to_key_string(&self) -> String {
+        let mut out = String::new();
+        let _ = write!(
+            out,
+            "tools={};plan={};compact={};tokens={}",
+            self.tool_revision, self.plan_revision, self.compaction_seq, self.token_measurement
+        );
+        out
+    }
+}
+
+/// 显式 context policy（顺序执行；每项有明确输入/输出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextPolicy {
+    /// 注入 plan snapshot（模型看到剩余计划）。
+    InjectPlan,
+    /// 应用 compaction 决策（should_compact → prune）。
+    ApplyCompaction,
+    /// token 测量（estimate_request；纳入 cache key）。
+    MeasureTokens,
+}
+
+/// 默认策略顺序（roadmap：顺序显式）。
+pub const DEFAULT_POLICY_ORDER: &[ContextPolicy] = &[
+    ContextPolicy::InjectPlan,
+    ContextPolicy::ApplyCompaction,
+    ContextPolicy::MeasureTokens,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// cache key：tool revision / plan / compaction / token 任一变化 → key 变。
+    #[test]
+    fn cache_key_changes_with_any_dimension() {
+        let base = RequestCacheKey {
+            tool_revision: 1,
+            plan_revision: 1,
+            compaction_seq: 0,
+            token_measurement: 100,
+        };
+        let tool_bump = RequestCacheKey {
+            tool_revision: 2,
+            ..base.clone()
+        };
+        let plan_bump = RequestCacheKey {
+            plan_revision: 2,
+            ..base.clone()
+        };
+        let compact_bump = RequestCacheKey {
+            compaction_seq: 1,
+            ..base.clone()
+        };
+        let token_bump = RequestCacheKey {
+            token_measurement: 200,
+            ..base.clone()
+        };
+        assert_ne!(base, tool_bump);
+        assert_ne!(base, plan_bump);
+        assert_ne!(base, compact_bump);
+        assert_ne!(base, token_bump);
+        assert_eq!(base.to_key_string(), "tools=1;plan=1;compact=0;tokens=100");
+    }
+
+    /// 策略顺序显式且确定。
+    #[test]
+    fn policy_order_is_explicit() {
+        assert_eq!(
+            DEFAULT_POLICY_ORDER,
+            &[
+                ContextPolicy::InjectPlan,
+                ContextPolicy::ApplyCompaction,
+                ContextPolicy::MeasureTokens,
+            ]
+        );
+    }
+
     use crate::provider::ToolDef;
 
     /// P0-9：请求级估算必须包含 system prompt 与工具 schema。

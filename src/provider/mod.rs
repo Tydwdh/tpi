@@ -10,6 +10,7 @@ use crate::ids::ToolCallId;
 use crate::session::Usage;
 use tokio_util::sync::CancellationToken;
 
+pub mod catalog;
 pub mod openai_compat;
 pub mod trace;
 
