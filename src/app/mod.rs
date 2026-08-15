@@ -12,6 +12,7 @@
 //! 思考折叠（Alt+T）、动画时钟（spinner）。
 
 pub mod controller;
+pub mod effects;
 pub mod slash;
 pub use slash::command_from_slash;
 pub mod intent;

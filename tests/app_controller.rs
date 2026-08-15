@@ -153,3 +153,99 @@ fn toggle_sidebar_is_view_intent() {
         .expect("toggle 不失败");
     assert!(effects.iter().any(|e| matches!(e, AppEffect::Draw)));
 }
+
+// ---- P3-04：Platform effects adapter 验收（fake + 错误反馈）----
+
+use tpi::app::effects::{PlatformEffects, apply_effect};
+
+/// fake platform：可配置失败，记录调用。
+#[derive(Default)]
+struct FakePlatform {
+    clipboard: std::cell::RefCell<Vec<String>>,
+    urls: std::cell::RefCell<Vec<String>>,
+    titles: std::cell::RefCell<Vec<String>>,
+    fail_clipboard: bool,
+    fail_url: bool,
+}
+
+impl PlatformEffects for FakePlatform {
+    fn copy_to_clipboard(&self, text: &str) -> Result<(), String> {
+        if self.fail_clipboard {
+            return Err("injected clipboard failure".into());
+        }
+        self.clipboard.borrow_mut().push(text.to_string());
+        Ok(())
+    }
+    fn open_url(&self, url: &str) -> Result<(), String> {
+        if self.fail_url {
+            return Err("injected url failure".into());
+        }
+        self.urls.borrow_mut().push(url.to_string());
+        Ok(())
+    }
+    fn set_terminal_title(&self, title: &str) -> Result<(), String> {
+        self.titles.borrow_mut().push(title.to_string());
+        Ok(())
+    }
+    fn notify(&self, _message: &str) {}
+}
+
+/// CopyToClipboard 成功：调用 fake，错误不静默。
+#[test]
+fn copy_to_clipboard_success_and_error() {
+    let fake = FakePlatform::default();
+    assert!(apply_effect(&fake, &AppEffect::CopyToClipboard("hi".into())).is_ok());
+    assert_eq!(fake.clipboard.borrow().as_slice(), ["hi"]);
+
+    // 失败：错误反馈（不 let _ = 静默）。
+    let failing = FakePlatform {
+        fail_clipboard: true,
+        ..Default::default()
+    };
+    let err = apply_effect(&failing, &AppEffect::CopyToClipboard("x".into()))
+        .expect_err("clipboard 失败必须反馈");
+    assert!(err.contains("injected"), "{err}");
+}
+
+/// OpenUrl：scheme 校验（非 http/https 拒绝）在 effects 层执行。
+#[test]
+fn open_url_rejects_non_http() {
+    let fake = FakePlatform::default();
+    let err = apply_effect(&fake, &AppEffect::OpenUrl("file:///etc/passwd".into()))
+        .expect_err("非 http/https 必须拒绝");
+    assert!(err.contains("http"), "{err}");
+    assert!(fake.urls.borrow().is_empty(), "拒绝的 URL 不得执行");
+
+    // 合法 URL 执行。
+    assert!(apply_effect(&fake, &AppEffect::OpenUrl("https://example.com".into())).is_ok());
+    assert_eq!(fake.urls.borrow().as_slice(), ["https://example.com"]);
+}
+
+/// OpenUrl 平台失败：错误反馈。
+#[test]
+fn open_url_platform_error_feedback() {
+    let fake = FakePlatform {
+        fail_url: true,
+        ..Default::default()
+    };
+    let err = apply_effect(&fake, &AppEffect::OpenUrl("https://example.com".into()))
+        .expect_err("平台失败必须反馈");
+    assert!(err.contains("injected"), "{err}");
+}
+
+/// SetTerminalTitle：成功与反馈。
+#[test]
+fn terminal_title_sets_and_reports() {
+    let fake = FakePlatform::default();
+    assert!(apply_effect(&fake, &AppEffect::SetTerminalTitle("TPI".into())).is_ok());
+    assert_eq!(fake.titles.borrow().as_slice(), ["TPI"]);
+}
+
+/// 未支持的 effect（OpenFilePicker）反馈错误，不静默。
+#[test]
+fn unsupported_effect_reports_error() {
+    let fake = FakePlatform::default();
+    let err = apply_effect(&fake, &AppEffect::OpenFilePicker { filter: None })
+        .expect_err("未实现 effect 必须反馈");
+    assert!(!err.is_empty());
+}

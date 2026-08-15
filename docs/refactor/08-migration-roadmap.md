@@ -553,11 +553,23 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收达成：help/completion/dispatch 来自同一 snapshot ✓；旧命令 golden ✓；全量 53
   target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P3-04 Platform effects adapter
+#### P3-04 Platform effects adapter — **DONE（2026-08-14）**
 
 - clipboard/open URL/terminal title/file picker 等通过 `AppEffect`。
 - error 反馈回 controller，不 `let _ =` 静默失败。
 - 验收：Windows/Linux fake + 少量人工。
+- 实施：`src/app/effects.rs`：`PlatformEffects` trait（copy_to_clipboard/open_url/
+  set_terminal_title/notify，全部返回 `Result<(),String>`）+ `LocalPlatformEffects`
+  （Windows 剪贴板/`cmd start` 打开 URL/ANSI OSC0 标题）+ `apply_effect(&dyn
+  PlatformEffects, &AppEffect) -> Result<(),String>`。scheme 校验（http/https）在
+  effects 边界统一执行；未实现的 OpenFilePicker 明确反馈错误（不静默）；Draw 由
+  surface 处理。TUI 的 UiEffect::OpenUrl 处理保留（P3-05 headless 起用新边界）。
+- 验收测试：`tests/app_controller.rs` 增 5 断言（FakePlatform）：clipboard 成功+失败
+  反馈、open_url 非 http 拒绝且不执行、平台失败反馈、terminal title、未实现 effect
+  反馈。Windows/Linux 共用 fake（platform 无关）；本地实现少量人工验证（标题 ANSI）。
+- 验收达成：clipboard/open URL/terminal title/file picker 经 AppEffect ✓；error 反馈
+  回 controller（不 let _ = 静默）✓；Windows/Linux fake 通过 ✓；全量 53 target 绿；
+  fmt/clippy/arch_gate 清洁。
 
 #### P3-05 Headless JSON surface
 
