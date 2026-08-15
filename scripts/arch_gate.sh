@@ -53,7 +53,7 @@ check "R2:agent->tui" "src/agent" "(use crate::tui|crate::tui::)"
 #     P4-02 逐 consumer 迁移后逐行删除，直至 global_registry 整体移除）。
 check "R3:global_registry" "src tests" "global_registry\(\)" \
     "src/tool/registry.rs|pub fn global_registry" \
-    "src/agent/tool_runtime.rs|global_registry" \
+    "src/agent/mod.rs|global_registry" \
     "src/doctor.rs|global_registry" \
     "src/mcp/manager.rs|global_registry" \
     "tests/remote_traverse.rs|global_registry" \
