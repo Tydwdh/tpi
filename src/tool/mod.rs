@@ -10,6 +10,7 @@ pub mod command;
 pub mod edit;
 pub mod files;
 pub mod inspect;
+pub mod invariants;
 pub mod outcome;
 pub mod pipeline;
 pub mod plan;

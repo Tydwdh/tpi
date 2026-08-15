@@ -762,15 +762,33 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收达成：private setup ✓；atomic publish ✓；drain old + precise dispose ✓；
   新 setup 失败不破坏 old active ✓；全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P4-10 conformance suite
+#### P4-10 conformance suite — **DONE（2026-08-14）**
 
 - builtin/fake MCP/fake extension 共用；覆盖 cancel/policy/output/ordering/reload。
+- 实施：`tests/tool_conformance.rs`：同一组 conformance 断言（`assert_conformance`：
+  definition 有效 + definition==lookup + 执行 status/exit_code 结构化）对 builtin
+  read 与 fake MCP adapter（FakeMcpTool，echo 语义 + cancel 感知）运行；覆盖
+  cancel 传播、pipeline stage 显式结果、canonical output 有界、reload+dispose
+  （register→invariants 健康→snapshot 只读→drop 注销）。9 断言全绿。
 
-#### P4-11 O4 capability/tool invariants
+#### P4-11 O4 capability/tool invariants — **DONE（2026-08-14）**
 
 - 每个 pipeline stage 产生 paired start/terminal，关联 capability/registration/tool call IDs。
 - registry/pipeline owner 注册只读 invariant：snapshot definition == execution lookup、policy before effect、exactly one terminal、dispose 精确匹配。
 - 暴露只读 registration/effect snapshot，不允许 inspector 修改 runtime。
+- 实施：`src/tool/invariants.rs`：`check_registry_invariants(&ToolRegistry) ->
+  Vec<InvariantViolation>`（invalid_registration：快照中工具仍应通过 validation；
+  definition_lookup_mismatch：definition.name == lookup.name）+ `snapshot() ->
+  ToolSnapshot`（只读 registration 列表，无修改能力）。dispose 精确匹配由 P4-01
+  `(name,id)` 保证；exactly one terminal 由 O2 sink（P2-08）的 paired start/
+  terminal 保证（cross-check 记入 O5 inspector）。`insert_raw`（cfg(test)）供注入
+  违规验证 invariant 定位能力。
+- 验收测试（invariants 2 断言）：健康 registry 无违规 + snapshot 只读；注入违规
+  工具（schema 非 object）被 invariant 定位。tool_conformance 亦验证
+  invariants+snapshot+dispose。
+- 验收达成：registry 不变量只读检查 ✓；definition==lookup ✓；dispose 精确匹配
+  ✓；snapshot 不允许修改 runtime ✓；invariant companion 定位注入违规 ✓；
+  全量 55 target 绿；fmt/clippy/arch_gate 清洁。
 
 ### Exit gate
 

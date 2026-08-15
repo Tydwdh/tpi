@@ -153,6 +153,17 @@ impl ToolRegistry {
         self.tools.remove(name);
     }
 
+    /// P4-11 测试：直接插入（绕过验证，模拟非法来源；不变量检查必须定位）。
+    #[cfg(test)]
+    pub(crate) fn insert_raw(
+        &mut self,
+        name: &str,
+        id: crate::ids::RegistrationId,
+        tool: Arc<dyn Tool>,
+    ) {
+        self.tools.insert(name.to_string(), (id, tool));
+    }
+
     /// P4-01：`(name, id)` 同时匹配才删除——old disposer 绝不删除 replacement。
     pub fn unregister_entry(&mut self, name: &str, id: crate::ids::RegistrationId) {
         if let Some((existing, _)) = self.tools.get(name)
