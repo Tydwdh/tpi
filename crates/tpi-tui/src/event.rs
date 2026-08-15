@@ -4,9 +4,9 @@
 //! 送入 reducer（ScrollUp/Down、ClickTool/ClickReasoning、Selection 的语义
 //! 位置），reducer 不依赖终端或渲染器。
 
-use crate::agent::RuntimeEvent;
-use crate::tui::interaction::TextPosition;
+use crate::interaction::TextPosition;
 use ratatui::crossterm::event::KeyEvent;
+use tpi_agent::agent::RuntimeEvent;
 
 /// 进入 reducer 的 UI 事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,13 +32,13 @@ pub enum UiEvent {
     /// 鼠标点击命中工具卡片（Renderer hit-test 后）。
     ClickTool(String),
     /// 鼠标点击命中折叠的 reasoning 行（Renderer hit-test 后；EntryId §4.1）。
-    ClickReasoning(crate::tui::scroll::EntryId),
+    ClickReasoning(crate::scroll::EntryId),
     /// 鼠标点击命中链接文本（§成熟化；Renderer hit-test 后，参数是 URL）。
     ClickLink(String),
     /// 点击/拖拽垂直 scrollbar（§24）：参数是点击行在转录区内的偏移（0-based）。
     ScrollbarClick(u16),
     /// 侧边栏大纲点击：跳转到对应用户消息（锁定 transcript 到该 entry）。
-    SidebarJump(crate::tui::scroll::EntryId),
+    SidebarJump(crate::scroll::EntryId),
     /// 侧边栏内部滚动（大纲/todo 过长时；§用户诉求：限定区域 + 滚动条）。
     SidebarScroll(/* up */ bool),
     /// 侧边栏滚动条点击/拖拽：按比例跳转（参数 = 点击行在侧边栏内偏移）。

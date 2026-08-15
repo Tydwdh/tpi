@@ -7,6 +7,7 @@ members = [
   "crates/tpi-ui-types",
   "crates/tpi-config",
   "crates/tpi-agent",
+  "crates/tpi-tui",
 ]
 resolver = "2"
 
@@ -24,6 +25,7 @@ tpi-capabilities = { path = "crates/tpi-capabilities" }
 tpi-ui-types = { path = "crates/tpi-ui-types" }
 tpi-config = { path = "crates/tpi-config" }
 tpi-agent = { path = "crates/tpi-agent" }
+tpi-tui = { path = "crates/tpi-tui" }
 tokio = { version = "1.53", features = [
   "rt-multi-thread", "macros", "process", "signal", "sync",
   "time", "fs", "io-util"

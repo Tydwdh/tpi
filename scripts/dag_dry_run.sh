@@ -19,7 +19,7 @@ LAYER[core]="crates/tpi-core/src"
 LAYER[session]="crates/tpi-session/src"
 LAYER[capabilities]="crates/tpi-capabilities/src"
 LAYER[agent]="crates/tpi-agent/src"
-LAYER[tui]="src/tui"
+LAYER[tui]="crates/tpi-tui/src"
 LAYER[adapters]="src/app.rs src/app src/web.rs src/doctor.rs src/eval src/auth src/clipboard src/main.rs"
 
 # 层顺序（数字越小越底层）。

@@ -9,11 +9,11 @@
 
 use std::collections::HashMap;
 
-use crate::outcome::ToolStatus;
-use crate::plan::Plan;
-use crate::session::Usage;
-use crate::tui::interaction::TextPosition;
-use crate::tui::scroll::{EntryId, ScrollAnchor, ScrollMode};
+use crate::interaction::TextPosition;
+use crate::scroll::{EntryId, ScrollAnchor, ScrollMode};
+use tpi_core::outcome::ToolStatus;
+use tpi_core::plan::Plan;
+use tpi_session::Usage;
 
 /// 右侧边栏（§用户诉求：todo + 用户消息大纲，opencode 式）。
 ///
@@ -261,8 +261,8 @@ impl ModalState {
         let title = title.into();
         let body = body.into();
         Self {
-            title: crate::tui::text::truncate_middle_utf8(&title, 512, "…"),
-            body: crate::tui::text::truncate_middle_utf8(
+            title: crate::text::truncate_middle_utf8(&title, 512, "…"),
+            body: crate::text::truncate_middle_utf8(
                 &body,
                 MAX_MODAL_BODY,
                 "\n…[modal truncated]…\n",
@@ -598,10 +598,10 @@ pub struct ViewModel {
     pub reasoning_expanded: std::collections::HashSet<EntryId>,
     /// 鼠标点击命中的目标（工具卡片/reasoning 行；§24 高亮反馈）。
     /// Overlay 打开期间该行高亮；关闭 Overlay 后清除。
-    pub active_hit: Option<crate::tui::HitTarget>,
+    pub active_hit: Option<crate::HitTarget>,
     /// 应用内选择复制（语义位置：entry + 逻辑文本偏移，不依赖屏幕坐标；
     /// resize/rewrap/滚动不改变选中内容）。`Some` = 正在选择或已有选区。
-    pub selection: Option<crate::tui::interaction::TextSelection>,
+    pub selection: Option<crate::interaction::TextSelection>,
     /// 本会话累计 token 用量（AgentOutcome.usage 累积，§16.2：无 pricing 时显示 usage）。
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -749,19 +749,19 @@ impl ViewModel {
     /// User/Assistant 按原文重建；工具结果重建为净化后的卡片（§用户诉求：
     /// 恢复会话后看到工具卡片细节，而不是 `bash: status: succeeded` 残留；
     /// revision 等模型元数据由 user_visible_output 剥掉）。
-    pub fn load_history(&mut self, history: &[crate::provider::ChatMessage]) {
+    pub fn load_history(&mut self, history: &[tpi_agent::provider::ChatMessage]) {
         self.reset_for_new_session();
         for message in history {
             match message {
-                crate::provider::ChatMessage::User(text) => {
+                tpi_agent::provider::ChatMessage::User(text) => {
                     self.push_line(LineKind::User, text.clone());
                 }
-                crate::provider::ChatMessage::Assistant { content, .. } => {
+                tpi_agent::provider::ChatMessage::Assistant { content, .. } => {
                     if !content.is_empty() {
                         self.push_line(LineKind::Assistant, content.clone());
                     }
                 }
-                crate::provider::ChatMessage::Tool { name, content, .. } => {
+                tpi_agent::provider::ChatMessage::Tool { name, content, .. } => {
                     let visible = user_visible_output(name, content);
                     let card = ToolCard {
                         id: format!("hist-{name}-{}", self.transcript.len()),
@@ -769,7 +769,7 @@ impl ViewModel {
                         target: None,
                         command: None,
                         state: ToolCardState::Done {
-                            status: crate::outcome::ToolStatus::Succeeded,
+                            status: tpi_core::outcome::ToolStatus::Succeeded,
                             duration_ms: 0,
                             exit_code: None,
                         },
@@ -784,7 +784,7 @@ impl ViewModel {
                     };
                     self.push_tool_card(card);
                 }
-                crate::provider::ChatMessage::System(text) => {
+                tpi_agent::provider::ChatMessage::System(text) => {
                     self.push_line(LineKind::System, text.clone());
                 }
             }
@@ -949,12 +949,11 @@ impl ViewModel {
                 let marker = "…[truncated]";
                 let content_budget = MAX_MESSAGE_CHARS.saturating_sub(marker.len());
                 if msg.text.len() > content_budget {
-                    let keep = crate::tui::text::floor_char_boundary(&msg.text, content_budget);
+                    let keep = crate::text::floor_char_boundary(&msg.text, content_budget);
                     msg.text.truncate(keep);
                 }
                 let content_room = content_budget.saturating_sub(msg.text.len());
-                let keep =
-                    crate::tui::text::floor_char_boundary(text, content_room.min(text.len()));
+                let keep = crate::text::floor_char_boundary(text, content_room.min(text.len()));
                 msg.text.push_str(&text[..keep]);
                 msg.text.push_str(marker);
                 msg.truncated = true;
@@ -962,7 +961,7 @@ impl ViewModel {
         } else if !msg.truncated {
             let marker = "…[truncated]";
             let content_budget = MAX_MESSAGE_CHARS.saturating_sub(marker.len());
-            let keep = crate::tui::text::floor_char_boundary(&msg.text, content_budget);
+            let keep = crate::text::floor_char_boundary(&msg.text, content_budget);
             msg.text.truncate(keep);
             msg.text.push_str(marker);
             msg.truncated = true;
@@ -1130,7 +1129,7 @@ impl ViewModel {
         let max_start = total - area;
         let ratio = ratio.clamp(0.0, 1.0);
         let target = (ratio * max_start as f64).round() as usize;
-        let (entry, row) = crate::tui::scroll::locate_row(&ids, &heights, target);
+        let (entry, row) = crate::scroll::locate_row(&ids, &heights, target);
         self.lock_to(entry, row);
     }
 
@@ -1177,7 +1176,7 @@ impl ViewModel {
         let Some(search) = &mut self.search else {
             return;
         };
-        search.query = crate::tui::text::truncate_middle_utf8(query, MAX_SEARCH_QUERY, "…");
+        search.query = crate::text::truncate_middle_utf8(query, MAX_SEARCH_QUERY, "…");
         search.recompute(&mut self.transcript);
         if let Some(first) = search.hits.first().copied() {
             self.lock_to(first, 0);
@@ -1262,9 +1261,8 @@ impl ViewModel {
         if let Some((entry, row)) = base {
             let ids: Vec<EntryId> = self.transcript.iter().map(Entry::id).collect();
             let heights = self.current_heights(&ids);
-            let top_row = crate::tui::scroll::row_of(&ids, &heights, entry, row);
-            let new_top =
-                crate::tui::scroll::move_by_rows(&ids, &heights, top_row, -(delta as isize));
+            let top_row = crate::scroll::row_of(&ids, &heights, entry, row);
+            let new_top = crate::scroll::move_by_rows(&ids, &heights, top_row, -(delta as isize));
             self.lock_to(new_top.0, new_top.1);
         }
     }
@@ -1277,11 +1275,11 @@ impl ViewModel {
         if let Some((entry, row)) = self.scroll_base() {
             let ids: Vec<EntryId> = self.transcript.iter().map(Entry::id).collect();
             let heights = self.current_heights(&ids);
-            let top_row = crate::tui::scroll::row_of(&ids, &heights, entry, row);
+            let top_row = crate::scroll::row_of(&ids, &heights, entry, row);
             let total: usize = heights.iter().sum();
             let area = self.transcript_rows.max(1) as usize;
-            let new_top = crate::tui::scroll::move_by_rows(&ids, &heights, top_row, delta as isize);
-            let new_row = crate::tui::scroll::row_of(&ids, &heights, new_top.0, new_top.1);
+            let new_top = crate::scroll::move_by_rows(&ids, &heights, top_row, delta as isize);
+            let new_row = crate::scroll::row_of(&ids, &heights, new_top.0, new_top.1);
             if new_row.saturating_add(area) >= total {
                 // 滚到最底部：回到 Follow（新内容自动跟随）。
                 // 此前保持 Locked 会让用户滚到底后新内容不再自动跟上，
@@ -1331,11 +1329,11 @@ impl ViewModel {
             return;
         }
         let entry_id = self.alloc_entry_id();
-        let name = crate::tui::text::truncate_middle_utf8(&name.into(), MAX_TOOL_NAME, "…");
-        let target = target
-            .map(|value| crate::tui::text::truncate_middle_utf8(&value, MAX_TOOL_TARGET, "…"));
-        let command = command
-            .map(|value| crate::tui::text::truncate_middle_utf8(&value, MAX_CARD_COMMAND, "…"));
+        let name = crate::text::truncate_middle_utf8(&name.into(), MAX_TOOL_NAME, "…");
+        let target =
+            target.map(|value| crate::text::truncate_middle_utf8(&value, MAX_TOOL_TARGET, "…"));
+        let command =
+            command.map(|value| crate::text::truncate_middle_utf8(&value, MAX_CARD_COMMAND, "…"));
         self.live.tools.insert(
             call_id.clone(),
             LiveTool {
@@ -1378,11 +1376,11 @@ impl ViewModel {
                 .len()
                 .saturating_add(text.len())
                 .saturating_sub(MAX_CARD_OUTPUT);
-            let drop = crate::tui::text::floor_char_boundary(current, overflow.min(current.len()));
+            let drop = crate::text::floor_char_boundary(current, overflow.min(current.len()));
             current.drain(..drop);
             // 单块超大时只保留其尾部（起点同样按字符边界对齐）。
             let remaining = MAX_CARD_OUTPUT.saturating_sub(current.len());
-            let tail = crate::tui::text::suffix_by_bytes_safe(&text, remaining);
+            let tail = crate::text::suffix_by_bytes_safe(&text, remaining);
             current.push_str(tail);
         } else {
             current.push_str(&text);
@@ -1481,7 +1479,7 @@ impl ViewModel {
         let id = id.into();
         if let Some(tool) = self.live.tools.get(&id) {
             self.overlay = Some(OverlayState::for_tool(&tool.card));
-            self.active_hit = Some(crate::tui::HitTarget::Tool(id));
+            self.active_hit = Some(crate::HitTarget::Tool(id));
             return;
         }
         for entry in self.transcript.iter().rev() {
@@ -1490,7 +1488,7 @@ impl ViewModel {
             {
                 self.overlay = Some(OverlayState::for_tool(card));
                 // §24：点击后高亮命中行（Overlay 打开期间）。
-                self.active_hit = Some(crate::tui::HitTarget::Tool(id));
+                self.active_hit = Some(crate::HitTarget::Tool(id));
                 return;
             }
         }
@@ -1556,7 +1554,7 @@ impl ViewModel {
         }
         self.overlay = Some(OverlayState::for_reasoning(&line.text));
         // §24：点击后高亮命中行。
-        self.active_hit = Some(crate::tui::HitTarget::Reasoning(id));
+        self.active_hit = Some(crate::HitTarget::Reasoning(id));
     }
 
     /// 打开操作型 Modal（§42）。
@@ -1572,7 +1570,7 @@ impl ViewModel {
 
     /// 开始应用内选择（语义位置：entry + 逻辑文本偏移）。
     pub fn selection_start(&mut self, position: TextPosition) {
-        self.selection = Some(crate::tui::interaction::TextSelection {
+        self.selection = Some(crate::interaction::TextSelection {
             anchor: position,
             focus: position,
         });
@@ -1701,7 +1699,7 @@ impl ViewModel {
         diff: Option<String>,
     ) {
         let ToolIdentity { id, name } = identity.into();
-        let name = crate::tui::text::truncate_middle_utf8(&name, MAX_TOOL_NAME, "…");
+        let name = crate::text::truncate_middle_utf8(&name, MAX_TOOL_NAME, "…");
         let tail = tail.into();
         // §用户诉求：TUI 卡片只显示用户可见内容——剥离面向模型的 envelope
         // 元数据头（status/revision/path/lines 等）。入库即净化：渲染与复制
@@ -1859,8 +1857,8 @@ impl ViewModel {
                 .retain(|id| !removed_set.contains(id));
             if let Some(hit) = &mut self.active_hit {
                 let valid = match hit {
-                    crate::tui::HitTarget::Reasoning(id) => !removed_set.contains(id),
-                    crate::tui::HitTarget::Tool(id) => !removed_tool_ids.contains(id),
+                    crate::HitTarget::Reasoning(id) => !removed_set.contains(id),
+                    crate::HitTarget::Tool(id) => !removed_tool_ids.contains(id),
                 };
                 if !valid {
                     self.active_hit = None;
@@ -1898,7 +1896,7 @@ impl ViewModel {
         let Some(rest) = self.input.strip_prefix('/') else {
             return;
         };
-        let items: Vec<(String, String)> = crate::tui::SLASH_COMMANDS
+        let items: Vec<(String, String)> = crate::SLASH_COMMANDS
             .iter()
             .filter(|(name, _)| name.starts_with(rest))
             .map(|(name, desc)| (name.to_string(), desc.to_string()))
@@ -2020,11 +2018,11 @@ fn bound_tail(tail: &str) -> String {
 }
 
 fn bound_message(text: &str) -> String {
-    crate::tui::text::truncate_middle_utf8(text, MAX_MESSAGE_CHARS, "\n…[message truncated]…\n")
+    crate::text::truncate_middle_utf8(text, MAX_MESSAGE_CHARS, "\n…[message truncated]…\n")
 }
 
 fn bound_diff(diff: &str) -> String {
-    crate::tui::text::truncate_middle_utf8(diff, MAX_CARD_DIFF, "\n…[diff truncated]…\n")
+    crate::text::truncate_middle_utf8(diff, MAX_CARD_DIFF, "\n…[diff truncated]…\n")
 }
 
 fn entry_memory_bytes(entry: &Entry) -> usize {
@@ -2049,7 +2047,7 @@ fn canonical_semantic_text(kind: LineKind, raw: &str, width: Option<usize>) -> S
     match kind {
         // markdown 渲染的正文：User/Assistant 走同一 renderer。
         LineKind::User | LineKind::Assistant => {
-            let rendered = crate::tui::render_markdown(raw, crate::tui::theme::Theme::omp(), width);
+            let rendered = crate::render_markdown(raw, crate::theme::Theme::omp(), width);
             rendered
                 .iter()
                 .map(|line| {
@@ -2210,13 +2208,13 @@ fn user_visible_output(name: &str, text: &str) -> (String, Option<usize>) {
 
 /// 工具卡片的语义文本（§PointerHit：copy 从内容提取，不反推渲染结果）。
 ///
-/// P0-1：与渲染行**同一窗口**——基于 [`crate::tui::tool_card::card_semantic_rows`]
+/// P0-1：与渲染行**同一窗口**——基于 [`crate::tool_card::card_semantic_rows`]
 /// （主行 + 折叠窗口内内容行的 canonical 文本）按 `\n` 拼接。
 /// 此前用完整 body（diff/output/tail 全量），collapsed/failed tail/running tail
 /// 状态下渲染只显示部分行，`RowSemantic.char_start` 与这里 offset 错位，
 /// 卡片内选中/复制会错选。改为与渲染同源后 offset 恒对齐。
 fn card_semantic_text(card: &ToolCard) -> String {
-    crate::tui::tool_card::card_semantic_rows(card).join("\n")
+    crate::tool_card::card_semantic_rows(card).join("\n")
 }
 
 /// 卡片输出有界化（保留尾部；完整输出仍可通过 read @artifact 读取）。
@@ -2228,7 +2226,7 @@ fn bound_output(output: &str) -> String {
     // “…” 是 3 字节 UTF-8，截断窗口相应减 3，保证总长不超过 MAX_CARD_OUTPUT。
     format!(
         "…{}",
-        crate::tui::text::suffix_by_bytes_safe(output, MAX_CARD_OUTPUT - 3)
+        crate::text::suffix_by_bytes_safe(output, MAX_CARD_OUTPUT - 3)
     )
 }
 

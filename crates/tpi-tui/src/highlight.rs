@@ -310,15 +310,15 @@ mod tests {
     /// §用户诉求（edit 高亮）：edit 输出能通过路径解析出语言。
     #[test]
     fn diff_output_language_via_path() {
-        use crate::tui::model::ToolCard;
-        use crate::tui::tool_card::tool_output_language;
+        use crate::model::ToolCard;
+        use crate::tool_card::tool_output_language;
         let card = ToolCard {
             id: "c1".into(),
             name: "edit".into(),
             target: Some("edit src/main.rs".into()),
             command: None,
-            state: crate::tui::model::ToolCardState::Done {
-                status: crate::outcome::ToolStatus::Succeeded,
+            state: crate::model::ToolCardState::Done {
+                status: tpi_core::outcome::ToolStatus::Succeeded,
                 duration_ms: 0,
                 exit_code: Some(0),
             },

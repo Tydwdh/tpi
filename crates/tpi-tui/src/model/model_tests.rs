@@ -444,7 +444,7 @@ mod tests {
         assert!(view.has_at_token());
         view.refresh_at_menu();
         let menu = view.menu.as_ref().expect("@ 菜单应打开");
-        assert_eq!(menu.kind, crate::tui::model::MenuKind::File);
+        assert_eq!(menu.kind, crate::model::MenuKind::File);
         assert_eq!(menu.items.len(), 2, "只显示前缀匹配的文件");
         // Enter 补全：@token 被替换为选中路径。
         view.menu.as_mut().unwrap().selected = 0;
@@ -648,7 +648,7 @@ mod p2_card_nav_tests {
         view.push_line(LineKind::User, "旧会话问题");
         view.push_line(LineKind::Assistant, "旧会话回答");
         view.push_stream_delta(LineKind::Assistant, "流式中");
-        view.plan = Some(crate::plan::Plan {
+        view.plan = Some(tpi_core::plan::Plan {
             explanation: Some("旧计划".into()),
             items: Vec::new(),
         });
@@ -656,7 +656,7 @@ mod p2_card_nav_tests {
         view.output_tokens = 456;
         view.context_usage = Some((10, 100));
         view.open_modal("/old", "旧 modal");
-        view.lock_to(crate::tui::scroll::EntryId(1), 0);
+        view.lock_to(crate::scroll::EntryId(1), 0);
         view.reset_for_new_session();
         assert!(view.transcript.is_empty(), "transcript 必须清空");
         assert!(view.live.assistant.is_none() && view.live.reasoning.is_none());
@@ -673,12 +673,12 @@ mod p2_card_nav_tests {
         let mut view = ViewModel::default();
         view.push_line(LineKind::User, "旧内容"); // 先有旧屏幕
         let history = vec![
-            crate::provider::ChatMessage::User("新会话问题".into()),
-            crate::provider::ChatMessage::Assistant {
+            tpi_agent::provider::ChatMessage::User("新会话问题".into()),
+            tpi_agent::provider::ChatMessage::Assistant {
                 content: "新会话回答".into(),
                 tool_calls: Vec::new(),
             },
-            crate::provider::ChatMessage::Tool {
+            tpi_agent::provider::ChatMessage::Tool {
                 tool_call_id: "call-1".into(),
                 name: "bash".into(),
                 content: "status: failed\\nerror: x".into(),
@@ -706,14 +706,14 @@ mod p2_card_nav_tests {
     fn load_history_rebuilds_sanitized_tool_cards() {
         let mut view = ViewModel::default();
         let history = vec![
-            crate::provider::ChatMessage::Tool {
+            tpi_agent::provider::ChatMessage::Tool {
                 tool_call_id: "call-1".into(),
                 name: "read".into(),
                 content:
                     "[revision=b3:abc]\npath: src/a.rs\nlines: 10-12 of 50\n\nline 10\nline 11"
                         .into(),
             },
-            crate::provider::ChatMessage::Tool {
+            tpi_agent::provider::ChatMessage::Tool {
                 tool_call_id: "call-2".into(),
                 name: "bash".into(),
                 content: "status: succeeded\noutput: 4 bytes\n\nhi".into(),
@@ -756,7 +756,7 @@ mod p2_card_nav_tests {
 
         view.open_tool_overlay("call-1");
         assert!(
-            matches!(&view.active_hit, Some(crate::tui::HitTarget::Tool(id)) if id == "call-1"),
+            matches!(&view.active_hit, Some(crate::HitTarget::Tool(id)) if id == "call-1"),
             "点击后必须设置 active_hit: {:?}",
             view.active_hit
         );
@@ -771,8 +771,8 @@ mod p2_card_nav_tests {
     /// 语义选区指向内容而非屏幕坐标；反向拖动由 normalized() 处理。
     #[test]
     fn selection_state_lifecycle() {
-        use crate::tui::interaction::TextPosition;
-        use crate::tui::scroll::EntryId;
+        use crate::interaction::TextPosition;
+        use crate::scroll::EntryId;
         let mut view = ViewModel::default();
         assert!(view.selection.is_none());
 
@@ -818,8 +818,8 @@ mod p2_card_nav_tests {
     /// 选区指向 (entry, offset)，resize/滚动后仍精确；无选区返回空。
     #[test]
     fn selected_text_extracts_from_transcript_entries() {
-        use crate::tui::interaction::TextPosition;
-        use crate::tui::scroll::EntryId;
+        use crate::interaction::TextPosition;
+        use crate::scroll::EntryId;
         let mut view = ViewModel::default();
         view.push_line(LineKind::User, "hello world");
         view.push_line(LineKind::Assistant, "second line");
@@ -854,7 +854,7 @@ mod p2_card_nav_tests {
     /// 运行中拖选 → Agent 输出结束 → Ctrl+C 复制不悬空。
     #[test]
     fn streaming_selection_survives_finalize() {
-        use crate::tui::interaction::TextPosition;
+        use crate::interaction::TextPosition;
         let mut view = ViewModel::default();
         view.push_stream_delta(LineKind::Assistant, "streaming content");
         // streaming 期间选中（entry_id 已分配）。
@@ -888,8 +888,8 @@ mod p2_card_nav_tests {
     /// selected_text 能覆盖 tool 输出（情况 A：仅 tool 运行时）。
     #[test]
     fn live_tool_selection_survives_finalize() {
-        use crate::tui::interaction::TextPosition;
-        use crate::tui::scroll::EntryId;
+        use crate::interaction::TextPosition;
+        use crate::scroll::EntryId;
         // P0-1：body 必须可见才可选中——collapsed_lines=0（默认折叠）时
         // 渲染只显示主行，语义文本也只有主行（渲染与复制同窗口）。
         let mut view = ViewModel {

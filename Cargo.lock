@@ -2798,6 +2798,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "onig"
+version = "6.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc3cbf698f9438986c11a880c90a6d04b9de27575afd28bbf45b154b6c709e2"
+dependencies = [
+ "bitflags 2.13.1",
+ "libc",
+ "once_cell",
+ "onig_sys",
+]
+
+[[package]]
+name = "onig_sys"
+version = "69.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e68317604e77e53b85896388e1a803c1d21b74c899ec9e5e1112db90735edd7"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4694,6 +4716,7 @@ dependencies = [
  "flate2",
  "fnv",
  "once_cell",
+ "onig",
  "plist",
  "regex-syntax",
  "serde",
@@ -5138,6 +5161,7 @@ dependencies = [
  "tpi-config",
  "tpi-core",
  "tpi-session",
+ "tpi-tui",
  "tpi-ui-types",
  "tracing",
  "tracing-appender",
@@ -5258,6 +5282,37 @@ dependencies = [
  "tpi-core",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "tpi-tui"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "camino",
+ "html2text",
+ "proptest",
+ "pulldown-cmark",
+ "ratatui",
+ "regex",
+ "serde",
+ "serde_json",
+ "syntect",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tpi-agent",
+ "tpi-capabilities",
+ "tpi-config",
+ "tpi-core",
+ "tpi-session",
+ "tpi-ui-types",
+ "tracing",
+ "two-face",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

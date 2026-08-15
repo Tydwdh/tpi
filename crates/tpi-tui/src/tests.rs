@@ -1,12 +1,12 @@
 //! tui/mod.rs 的渲染测试（从 `mod tests` 内联块迁出；子模块可经 `super::*`
 //! 访问父模块私有项，行为与内联等价）。
 use super::*;
-use crate::tui::event::UiEvent;
-use crate::tui::model::LineKind;
-use crate::tui::model::ToolCardState;
-use crate::tui::reducer;
-use crate::tui::state::UiState;
-use crate::tui::tool_card::{render_diff_lines, tool_name_style};
+use crate::event::UiEvent;
+use crate::model::LineKind;
+use crate::model::ToolCardState;
+use crate::reducer;
+use crate::state::UiState;
+use crate::tool_card::{render_diff_lines, tool_name_style};
 
 /// §修复：UsageUpdated 事件实时累加到累计字段（不等 run 结束）——
 /// footer 的 ↑↓⇄ 与缓存命中率因此同口径（累计 cache_read / 累计 input），
@@ -16,7 +16,7 @@ fn usage_updated_accumulates_incrementally() {
     let mut state = UiState::new(ViewModel::default());
     reducer::update(
         &mut state,
-        UiEvent::Agent(crate::agent::RuntimeEvent::UsageUpdated {
+        UiEvent::Agent(tpi_agent::agent::RuntimeEvent::UsageUpdated {
             input_tokens: 1000,
             output_tokens: 200,
             cache_read_tokens: 600,
@@ -28,7 +28,7 @@ fn usage_updated_accumulates_incrementally() {
     // 第二次（下一轮请求）继续累加，而不是覆盖。
     reducer::update(
         &mut state,
-        UiEvent::Agent(crate::agent::RuntimeEvent::UsageUpdated {
+        UiEvent::Agent(tpi_agent::agent::RuntimeEvent::UsageUpdated {
             input_tokens: 500,
             output_tokens: 100,
             cache_read_tokens: 300,
@@ -49,7 +49,7 @@ fn reconnect_prompt_shows_time_and_attempt_count() {
     // attempt > 1（同轮第 2 次恢复）：不追加行，仅累计 reconnect_count。
     reducer::update(
         &mut state,
-        UiEvent::Agent(crate::agent::RuntimeEvent::StreamRecovering { attempt: 2 }),
+        UiEvent::Agent(tpi_agent::agent::RuntimeEvent::StreamRecovering { attempt: 2 }),
     );
     assert_eq!(state.view.reconnect_count, 1);
     assert!(
@@ -60,7 +60,7 @@ fn reconnect_prompt_shows_time_and_attempt_count() {
     // 第一次恢复（attempt == 1）：追加带时间戳与次数的提示行。
     reducer::update(
         &mut state,
-        UiEvent::Agent(crate::agent::RuntimeEvent::StreamRecovering { attempt: 1 }),
+        UiEvent::Agent(tpi_agent::agent::RuntimeEvent::StreamRecovering { attempt: 1 }),
     );
     assert_eq!(state.view.reconnect_count, 2);
     let text = entry_text(&state.view.transcript[0]);
@@ -77,7 +77,7 @@ fn reconnect_prompt_shows_time_and_attempt_count() {
     // TurnRestarting 第一次（attempt == 1）：同样追加。
     reducer::update(
         &mut state,
-        UiEvent::Agent(crate::agent::RuntimeEvent::TurnRestarting { attempt: 1 }),
+        UiEvent::Agent(tpi_agent::agent::RuntimeEvent::TurnRestarting { attempt: 1 }),
     );
     assert_eq!(state.view.reconnect_count, 3);
     let text2 = entry_text(&state.view.transcript[1]);
@@ -86,17 +86,17 @@ fn reconnect_prompt_shows_time_and_attempt_count() {
     // 同轮后续 TurnRestarting（attempt > 1）：静默。
     reducer::update(
         &mut state,
-        UiEvent::Agent(crate::agent::RuntimeEvent::TurnRestarting { attempt: 3 }),
+        UiEvent::Agent(tpi_agent::agent::RuntimeEvent::TurnRestarting { attempt: 3 }),
     );
     assert_eq!(state.view.reconnect_count, 4);
     assert_eq!(state.view.transcript.len(), 2, "同轮后续重启不得追加提示行");
 }
 
 /// 取 Entry 的文本（Message 行）；测试辅助。
-fn entry_text(entry: &crate::tui::model::Entry) -> String {
+fn entry_text(entry: &crate::model::Entry) -> String {
     match entry {
-        crate::tui::model::Entry::Message { line, .. } => line.text.clone(),
-        crate::tui::model::Entry::Tool { .. } => String::new(),
+        crate::model::Entry::Message { line, .. } => line.text.clone(),
+        crate::model::Entry::Tool { .. } => String::new(),
     }
 }
 
@@ -182,7 +182,7 @@ fn tool_card_only_header_clickable() {
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::outcome::ToolStatus::Failed,
+        tpi_core::outcome::ToolStatus::Failed,
         10,
         Some(1),
         "第一行\n第二行\n第三行\n第四行",
@@ -214,7 +214,7 @@ fn tool_card_only_header_clickable() {
 /// 侧边栏 Todo 显示全部项目，活跃项优先、完成历史沉底。
 #[test]
 fn sidebar_plan_shows_all_active_items_before_history() {
-    use crate::plan::{Plan, PlanItem, PlanStatus};
+    use tpi_core::plan::{Plan, PlanItem, PlanStatus};
     let plan = Plan {
         explanation: None,
         items: vec![
@@ -551,7 +551,7 @@ fn markdown_table_wraps_cells_within_width() {
         let w: usize = line
             .spans
             .iter()
-            .map(|s| crate::tui::text::display_width(s.content.as_ref()))
+            .map(|s| crate::text::display_width(s.content.as_ref()))
             .sum();
         assert!(w <= 24, "表格行不得超宽: '{text}' w={w}");
     }
@@ -601,7 +601,7 @@ fn markdown_table_degrades_to_records_on_narrow_width() {
         let width: usize = line
             .spans
             .iter()
-            .map(|span| crate::tui::text::display_width(span.content.as_ref()))
+            .map(|span| crate::text::display_width(span.content.as_ref()))
             .sum();
         assert!(width <= 8, "records 行不得超宽: {line:?}");
     }
@@ -697,7 +697,7 @@ fn tool_card_shows_diff_without_expanding() {
             target: Some("src/lib.rs".into()),
             command: None,
             state: ToolCardState::Done {
-                status: crate::outcome::ToolStatus::Succeeded,
+                status: tpi_core::outcome::ToolStatus::Succeeded,
                 duration_ms: 10,
                 exit_code: Some(0),
             },
@@ -759,7 +759,7 @@ fn tool_card_diff_limits_length_when_collapsed() {
         target: None,
         command: None,
         state: ToolCardState::Done {
-            status: crate::outcome::ToolStatus::Succeeded,
+            status: tpi_core::outcome::ToolStatus::Succeeded,
             duration_ms: 10,
             exit_code: Some(0),
         },
@@ -853,7 +853,7 @@ fn tool_card_running_shows_spinner_and_done_shows_status() {
         target: Some("bash: cargo test".into()),
         command: None,
         state: ToolCardState::Done {
-            status: crate::outcome::ToolStatus::Failed,
+            status: tpi_core::outcome::ToolStatus::Failed,
             duration_ms: 1234,
             exit_code: Some(2),
         },
@@ -1018,7 +1018,7 @@ fn expanded_card_shows_full_output() {
         target: None,
         command: None,
         state: ToolCardState::Done {
-            status: crate::outcome::ToolStatus::Succeeded,
+            status: tpi_core::outcome::ToolStatus::Succeeded,
             duration_ms: 10,
             exit_code: Some(0),
         },
@@ -1053,7 +1053,7 @@ fn read_card_shows_real_line_numbers() {
         target: Some("src/lib.rs".into()),
         command: None,
         state: ToolCardState::Done {
-            status: crate::outcome::ToolStatus::Succeeded,
+            status: tpi_core::outcome::ToolStatus::Succeeded,
             duration_ms: 5,
             exit_code: Some(0),
         },
@@ -1151,7 +1151,7 @@ fn overlay_clears_background_before_rendering() {
     view.begin_tool("c", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c", "bash"),
-        crate::outcome::ToolStatus::Failed,
+        tpi_core::outcome::ToolStatus::Failed,
         1,
         Some(1),
         "err",
@@ -1211,16 +1211,16 @@ fn sidebar_renders_todo_outline_and_shrinks_main() {
     view.push_line(LineKind::Assistant, "回复一");
     view.push_line(LineKind::User, "第二条用户消息更长一些用于测试截断");
     // 计划项（todo 段）。
-    view.plan = Some(crate::plan::Plan {
+    view.plan = Some(tpi_core::plan::Plan {
         explanation: None,
         items: vec![
-            crate::plan::PlanItem {
+            tpi_core::plan::PlanItem {
                 text: "实现侧边栏".into(),
-                status: crate::plan::PlanStatus::InProgress,
+                status: tpi_core::plan::PlanStatus::InProgress,
             },
-            crate::plan::PlanItem {
+            tpi_core::plan::PlanItem {
                 text: "写测试".into(),
-                status: crate::plan::PlanStatus::Pending,
+                status: tpi_core::plan::PlanStatus::Pending,
             },
         ],
     });
@@ -1228,7 +1228,7 @@ fn sidebar_renders_todo_outline_and_shrinks_main() {
     view.sidebar.open = true;
     let width: u16 = 80;
     let buf = draw_to_test_backend(&mut view, width, 24);
-    let sidebar_w = crate::tui::model::SIDEBAR_WIDTH;
+    let sidebar_w = crate::model::SIDEBAR_WIDTH;
     // 边栏右对齐：占据最右 SIDEBAR_WIDTH 列。
     let sidebar_start_x = width.saturating_sub(sidebar_w);
     // 边栏出现 todo 标题。
@@ -1267,7 +1267,7 @@ fn sidebar_closed_does_not_shrink_main() {
     let mut view = ViewModel::default();
     view.push_line(LineKind::User, "一条消息");
     let buf = draw_to_test_backend(&mut view, 80, 24);
-    let sidebar_w = crate::tui::model::SIDEBAR_WIDTH;
+    let sidebar_w = crate::model::SIDEBAR_WIDTH;
     let sidebar_start_x = 80u16.saturating_sub(sidebar_w);
     // 边栏区域不应出现边栏竖线（未打开）。
     let cell = buf[(sidebar_start_x, 1)].symbol();
@@ -1285,21 +1285,21 @@ fn session_modal_and_menu_stay_within_main_area_when_sidebar_open() {
     }
     view.sidebar.open = true;
     // /sessions：底部会话菜单 + 靠上 Modal 预览（同一场景，菜单也随主区收窄）。
-    view.menu = Some(crate::tui::model::MenuView {
+    view.menu = Some(crate::model::MenuView {
         items: vec![(
             "0123456789abcdef0123456789abcdef".into(),
             "会话A · 12-31 10:00 · 42 事件".into(),
         )],
         selected: 0,
-        kind: crate::tui::model::MenuKind::Session,
-        session_previews: vec![vec![crate::tui::model::MenuPreviewLine {
+        kind: crate::model::MenuKind::Session,
+        session_previews: vec![vec![crate::model::MenuPreviewLine {
             is_user: true,
             text: "你好".into(),
         }]],
     });
     view.open_modal("/sessions", "你 你好\nAI 你好");
     let buf = draw_to_test_backend(&mut view, 80, 24);
-    let sidebar_start_x = 80u16 - crate::tui::model::SIDEBAR_WIDTH;
+    let sidebar_start_x = 80u16 - crate::model::SIDEBAR_WIDTH;
     // Modal 上边框行含 ┌ 与 ┐：┐ 的 x 坐标必须 < sidebar_start_x。
     let mut right_corner_x = None;
     for y in 0..24u16 {
@@ -1325,21 +1325,21 @@ fn session_modal_and_menu_stay_within_main_area_when_sidebar_open() {
 #[test]
 fn sidebar_todo_wraps_long_text_by_cell_width() {
     let mut view = ViewModel {
-        plan: Some(crate::plan::Plan {
+        plan: Some(tpi_core::plan::Plan {
             explanation: None,
-            items: vec![crate::plan::PlanItem {
+            items: vec![tpi_core::plan::PlanItem {
                 text: "第一项：重构侧边栏布局与渲染管线使其支持长文本折行显示".into(),
-                status: crate::plan::PlanStatus::InProgress,
+                status: tpi_core::plan::PlanStatus::InProgress,
             }],
         }),
-        sidebar: crate::tui::model::SidebarState {
+        sidebar: crate::model::SidebarState {
             open: true,
             ..Default::default()
         },
         ..Default::default()
     };
     let buf = draw_to_test_backend(&mut view, 80, 24);
-    let sidebar_start_x = 80u16 - crate::tui::model::SIDEBAR_WIDTH;
+    let sidebar_start_x = 80u16 - crate::model::SIDEBAR_WIDTH;
     // 收集侧边栏全部行（逐 cell 拼接；CJK 中间插空格，过滤后断言）。
     let mut rows: Vec<String> = Vec::new();
     for y in 0..24u16 {
@@ -1390,27 +1390,27 @@ fn sidebar_todo_wraps_long_text_by_cell_width() {
 #[test]
 fn sidebar_clears_todo_when_plan_fully_terminal() {
     let mut view = ViewModel {
-        plan: Some(crate::plan::Plan {
+        plan: Some(tpi_core::plan::Plan {
             explanation: None,
             items: vec![
-                crate::plan::PlanItem {
+                tpi_core::plan::PlanItem {
                     text: "完成的任务甲".into(),
-                    status: crate::plan::PlanStatus::Completed,
+                    status: tpi_core::plan::PlanStatus::Completed,
                 },
-                crate::plan::PlanItem {
+                tpi_core::plan::PlanItem {
                     text: "取消的任务乙".into(),
-                    status: crate::plan::PlanStatus::Cancelled,
+                    status: tpi_core::plan::PlanStatus::Cancelled,
                 },
             ],
         }),
-        sidebar: crate::tui::model::SidebarState {
+        sidebar: crate::model::SidebarState {
             open: true,
             ..Default::default()
         },
         ..Default::default()
     };
     let buf = draw_to_test_backend(&mut view, 80, 24);
-    let sidebar_start_x = 80u16 - crate::tui::model::SIDEBAR_WIDTH;
+    let sidebar_start_x = 80u16 - crate::model::SIDEBAR_WIDTH;
     let mut sidebar_text = String::new();
     for y in 0..24u16 {
         for x in sidebar_start_x..80u16 {
@@ -1433,27 +1433,27 @@ fn sidebar_clears_todo_when_plan_fully_terminal() {
 #[test]
 fn sidebar_keeps_terminal_history_when_open_items_exist() {
     let mut view = ViewModel {
-        plan: Some(crate::plan::Plan {
+        plan: Some(tpi_core::plan::Plan {
             explanation: None,
             items: vec![
-                crate::plan::PlanItem {
+                tpi_core::plan::PlanItem {
                     text: "已完成的任务".into(),
-                    status: crate::plan::PlanStatus::Completed,
+                    status: tpi_core::plan::PlanStatus::Completed,
                 },
-                crate::plan::PlanItem {
+                tpi_core::plan::PlanItem {
                     text: "进行中的任务".into(),
-                    status: crate::plan::PlanStatus::InProgress,
+                    status: tpi_core::plan::PlanStatus::InProgress,
                 },
             ],
         }),
-        sidebar: crate::tui::model::SidebarState {
+        sidebar: crate::model::SidebarState {
             open: true,
             ..Default::default()
         },
         ..Default::default()
     };
     let buf = draw_to_test_backend(&mut view, 80, 24);
-    let sidebar_start_x = 80u16 - crate::tui::model::SIDEBAR_WIDTH;
+    let sidebar_start_x = 80u16 - crate::model::SIDEBAR_WIDTH;
     let mut sidebar_text = String::new();
     for y in 0..24u16 {
         for x in sidebar_start_x..80u16 {
@@ -1508,9 +1508,7 @@ fn reasoning_overlay_uses_thinking_border_title() {
     for _ in 0..40 {
         view.push_line(LineKind::Assistant, "背景文字X".repeat(4));
     }
-    view.overlay = Some(crate::tui::model::OverlayState::for_reasoning(
-        "let me think",
-    ));
+    view.overlay = Some(crate::model::OverlayState::for_reasoning("let me think"));
     let buf = draw_to_test_backend(&mut view, 80, 24);
     // Find the overlay top border row (Block title is drawn there).
     let mut border_row = None;
@@ -1773,8 +1771,8 @@ fn tool_name_style_is_category_colored() {
 /// 视觉行。选中第 2、3 个 entry 的第一字符起 → 对应 window 行 1-2 高亮。
 #[test]
 fn selection_highlights_selected_window_rows() {
-    use crate::tui::interaction::TextPosition;
-    use crate::tui::scroll::EntryId;
+    use crate::interaction::TextPosition;
+    use crate::scroll::EntryId;
     let mut view = ViewModel::default();
     for i in 0..6 {
         view.push_line(LineKind::Assistant, format!("line {i}"));
@@ -1858,7 +1856,7 @@ fn table_after_text_is_copyable() {
     // 模拟 renderer 写回语义宽度（RenderFrame 在真实路径里做，此处手动设）。
     view.semantic_width = Some(40);
     // 选中整个 entry（覆盖全文），验证复制文本包含表格后的文字。
-    use crate::tui::interaction::{TextPosition, TextSelection};
+    use crate::interaction::{TextPosition, TextSelection};
     let entry_id = view.transcript[0].id();
     view.selection = Some(TextSelection {
         anchor: TextPosition {
@@ -1900,7 +1898,7 @@ fn table_after_text_is_copyable() {
 /// semantic_rows 每行都能定位到对应 entry 的文本，且语义文本能命中真实内容。
 #[test]
 fn semantic_rows_align_with_window_and_map_text() {
-    use crate::tui::scroll::EntryId;
+    use crate::scroll::EntryId;
     let mut view = ViewModel::default();
     view.push_line(LineKind::Assistant, "hello world");
     view.push_line(LineKind::Assistant, "second line");
@@ -1950,7 +1948,7 @@ fn semantic_rows_align_with_window_and_map_text() {
 /// §InteractionRefactor：hit_text 从屏幕坐标命中语义位置——CJK 按 cell 宽度。
 #[test]
 fn hit_text_maps_screen_column_to_char_offset() {
-    use crate::tui::interaction::{TextPosition, cell_to_char};
+    use crate::interaction::{TextPosition, cell_to_char};
     // 纯函数直接验证（渲染层 hit_text 复用同一映射）。
     let text = "abc你好xyz";
     assert_eq!(cell_to_char(text, 3), 3, "你 的第 1 个 cell 是 char 3");
@@ -1973,7 +1971,7 @@ fn hit_text_maps_screen_column_to_char_offset() {
 /// - 首行 decor = 逻辑行前缀宽度，续行 decor = 0（P0-2 修复）。
 #[test]
 fn wrap_with_semantic_produces_exact_mapping() {
-    use crate::tui::scroll::EntryId;
+    use crate::scroll::EntryId;
     let entry_id = EntryId(1);
     // 模拟 User 消息：rail "│ " + "you  " = 7 cell 装饰，正文 "hello"。
     let line = Line::from(vec![
@@ -2055,8 +2053,8 @@ fn wrap_with_semantic_produces_exact_mapping() {
 /// ViewModel::selected_text 的 char 级提取。选中中间 3 个字符 → 精确返回。
 #[test]
 fn arbitrary_char_selection_is_char_precise() {
-    use crate::tui::interaction::{TextPosition, cell_to_char, chars_to_cells};
-    use crate::tui::model::LineKind;
+    use crate::interaction::{TextPosition, cell_to_char, chars_to_cells};
+    use crate::model::LineKind;
     let mut view = ViewModel::default();
     view.push_line(LineKind::Assistant, "hello world");
     let mut cache = HashMap::new();
@@ -2236,7 +2234,7 @@ fn read_tool_card_highlights_source_without_polluting_semantics() {
         target: Some("read src/main.rs".into()),
         command: None,
         state: ToolCardState::Done {
-            status: crate::outcome::ToolStatus::Succeeded,
+            status: tpi_core::outcome::ToolStatus::Succeeded,
             duration_ms: 1,
             exit_code: None,
         },
@@ -2374,7 +2372,7 @@ fn diff_line_padding_keeps_panel_background() {
     view.begin_tool("c1", "edit", Some("src/main.rs".into()), None);
     view.finish_tool(
         ("c1", "edit"),
-        crate::outcome::ToolStatus::Succeeded,
+        tpi_core::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "",
@@ -2427,7 +2425,7 @@ fn tool_card_body_bg_matches_panel() {
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::outcome::ToolStatus::Succeeded,
+        tpi_core::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "第一行输出\n第二行输出",
@@ -2657,8 +2655,8 @@ fn live_reasoning_expanded_rows_are_clickable_to_collapse() {
 /// 且复制内容与高亮一致（offset 对齐）。
 #[test]
 fn selecting_part_of_tool_card_highlights_only_that_row() {
-    use crate::tui::interaction::TextPosition;
-    use crate::tui::scroll::EntryId;
+    use crate::interaction::TextPosition;
+    use crate::scroll::EntryId;
     let mut view = ViewModel {
         collapsed_lines: 10, // 显示内容行（默认 0 折叠）。
         ..Default::default()
@@ -2666,7 +2664,7 @@ fn selecting_part_of_tool_card_highlights_only_that_row() {
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::outcome::ToolStatus::Succeeded,
+        tpi_core::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "第一行输出\n第二行输出\n第三行输出",
@@ -2730,8 +2728,8 @@ fn selecting_part_of_tool_card_highlights_only_that_row() {
 /// 验证：在可见 tail 行内选中一小段，复制内容与语义文本同窗口 offset 精确。
 #[test]
 fn failed_tool_card_tail_window_selection_aligns_with_visible_rows() {
-    use crate::tui::interaction::TextPosition;
-    use crate::tui::scroll::EntryId;
+    use crate::interaction::TextPosition;
+    use crate::scroll::EntryId;
     // 10 行输出，失败：折叠态渲染只显示末尾 4 行（FAILED_LINES）。
     let output = (0..10)
         .map(|i| format!("第{i}行输出"))
@@ -2744,7 +2742,7 @@ fn failed_tool_card_tail_window_selection_aligns_with_visible_rows() {
     view.begin_tool("c1", "bash", Some("cmd".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::outcome::ToolStatus::Failed,
+        tpi_core::outcome::ToolStatus::Failed,
         10,
         Some(1),
         output.clone(),
@@ -2808,7 +2806,7 @@ fn tool_card_default_zero_collapses_to_main_row_only() {
         target: None,
         command: None,
         state: ToolCardState::Done {
-            status: crate::outcome::ToolStatus::Succeeded,
+            status: tpi_core::outcome::ToolStatus::Succeeded,
             duration_ms: 10,
             exit_code: Some(0),
         },
@@ -2844,7 +2842,7 @@ fn zero_collapsed_tool_cards_have_no_gap_between() {
     view.begin_tool("c1", "bash", Some("cmd1".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::outcome::ToolStatus::Succeeded,
+        tpi_core::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "out1",
@@ -2853,7 +2851,7 @@ fn zero_collapsed_tool_cards_have_no_gap_between() {
     view.begin_tool("c2", "read", Some("file.rs".into()), None);
     view.finish_tool(
         ("c2", "read"),
-        crate::outcome::ToolStatus::Succeeded,
+        tpi_core::outcome::ToolStatus::Succeeded,
         5,
         Some(0),
         "out2",
@@ -2954,7 +2952,7 @@ fn compact_tool_card_keeps_gap_before_thinking() {
     view.begin_tool("c1", "bash", Some("cmd1".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::outcome::ToolStatus::Succeeded,
+        tpi_core::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "out1",
@@ -2992,7 +2990,7 @@ fn compact_tool_card_keeps_gap_before_assistant() {
     view.begin_tool("c1", "bash", Some("cmd1".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::outcome::ToolStatus::Succeeded,
+        tpi_core::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "out1",
@@ -3157,7 +3155,7 @@ fn history_tail_compact_tool_keeps_gap_before_live_reasoning() {
     view.begin_tool("c1", "bash", Some("cmd1".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::outcome::ToolStatus::Succeeded,
+        tpi_core::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "out1",
@@ -3187,7 +3185,7 @@ fn live_thinking_keeps_gap_across_wrap_cache() {
     view.begin_tool("c1", "bash", Some("cmd1".into()), None);
     view.finish_tool(
         ("c1", "bash"),
-        crate::outcome::ToolStatus::Succeeded,
+        tpi_core::outcome::ToolStatus::Succeeded,
         10,
         Some(0),
         "out1",
@@ -3265,16 +3263,16 @@ fn live_compact_tool_cards_have_no_gap_between() {
 fn model_menu_enter_sets_pending_model() {
     let mut state = UiState::new(ViewModel::default());
     // 挂载模型菜单（app 的 /model 分支等价构造）。
-    state.view.menu = Some(crate::tui::model::MenuView {
+    state.view.menu = Some(crate::model::MenuView {
         items: vec![
             ("gpt-4o".to_string(), "openai（当前）".to_string()),
             ("claude-sonnet".to_string(), "anthropic".to_string()),
         ],
         selected: 1,
-        kind: crate::tui::model::MenuKind::Model,
+        kind: crate::model::MenuKind::Model,
         session_previews: Vec::new(),
     });
-    state.view.modal = Some(crate::tui::model::ModalState::new(
+    state.view.modal = Some(crate::model::ModalState::new(
         "/model",
         "当前模型".to_string(),
     ));
@@ -3297,13 +3295,13 @@ fn model_menu_enter_sets_pending_model() {
 #[test]
 fn model_menu_navigation_keeps_menu() {
     let mut state = UiState::new(ViewModel::default());
-    state.view.menu = Some(crate::tui::model::MenuView {
+    state.view.menu = Some(crate::model::MenuView {
         items: vec![
             ("gpt-4o".to_string(), "openai".to_string()),
             ("claude-sonnet".to_string(), "anthropic".to_string()),
         ],
         selected: 0,
-        kind: crate::tui::model::MenuKind::Model,
+        kind: crate::model::MenuKind::Model,
         session_previews: Vec::new(),
     });
     let _ = reducer::update(

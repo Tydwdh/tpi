@@ -1,8 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::tui::editor::Editor;
-use crate::tui::keymap::Keymap;
-use crate::tui::model::ViewModel;
+use crate::editor::Editor;
+use crate::keymap::Keymap;
+use crate::model::ViewModel;
 
 /// TUI 全部 UI 状态（app 层唯一持有的状态对象；reducer 只改它）。
 #[derive(Debug, Clone)]
@@ -32,7 +32,7 @@ pub struct UiState {
     pub force_compaction: bool,
     /// 大粘贴占位符存储（§用户诉求）：id → 真实内容。输入框只渲染
     /// `[Pasted Content N chars]` 占位符；提交时经
-    /// [`crate::tui::paste::expand_paste_placeholders`] 展开成全文一起发送。
+    /// [`crate::paste::expand_paste_placeholders`] 展开成全文一起发送。
     /// 真实内容不进 `Editor`，因此不受 `MAX_INPUT_BYTES` 截断，也不分块上屏。
     pub pasted: HashMap<String, String>,
 }
@@ -66,7 +66,7 @@ impl UiState {
     /// 内容在提交、清空或取消 composer 时统一释放；不能中途淘汰旧条目，
     /// 否则屏幕上仍存在的占位符将无法还原。
     pub fn store_paste(&mut self, text: String) -> String {
-        let placeholder = crate::tui::paste::next_paste_placeholder(&self.pasted, &text);
+        let placeholder = crate::paste::next_paste_placeholder(&self.pasted, &text);
         self.pasted.insert(placeholder.clone(), text);
         placeholder
     }
@@ -93,9 +93,9 @@ impl UiState {
     /// 入队一条待提交消息（Enter 提交）。超上限时丢弃最旧并写入系统行提示
     /// （避免无限增长，同时让“消息被丢弃”对用户可见）。
     pub fn push_pending(&mut self, message: String) {
-        let message = crate::tui::text::truncate_middle_utf8(
+        let message = crate::text::truncate_middle_utf8(
             &message,
-            crate::tui::editor::MAX_INPUT_BYTES,
+            crate::editor::MAX_INPUT_BYTES,
             "\n…[input truncated]…\n",
         );
         if message.is_empty() {
@@ -105,10 +105,10 @@ impl UiState {
             let dropped = self.pending_messages.pop_front().unwrap_or_default();
             self.pending_messages.push_back(message);
             self.view.push_line(
-                crate::tui::model::LineKind::System,
+                crate::model::LineKind::System,
                 format!(
                     "排队消息超过 {PENDING_CAP} 条，最旧消息已丢弃：{}（请等当前 run 结束后再提交）",
-                    crate::tui::text::truncate_middle_utf8(&dropped, 160, "…")
+                    crate::text::truncate_middle_utf8(&dropped, 160, "…")
                 ),
             );
             return;

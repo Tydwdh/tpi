@@ -543,7 +543,7 @@ fn render_table(
     // 列分类与指标（§codex collect_table_column_metrics）。
     let metrics: Vec<TableColMetric> = (0..cols)
         .map(|col| {
-            let mut max_width = crate::tui::text::display_width(&header[col]);
+            let mut max_width = crate::text::display_width(&header[col]);
             let mut body_token_w = 0usize;
             let mut total_words = 0usize;
             let mut total_cells = 0usize;
@@ -551,10 +551,10 @@ fn render_table(
             let mut total_token_count = 0usize;
             for row in &body {
                 let cell = &row[col];
-                max_width = max_width.max(crate::tui::text::display_width(cell));
+                max_width = max_width.max(crate::text::display_width(cell));
                 let mut words = 0usize;
                 for token in cell.split_whitespace() {
-                    let w = crate::tui::text::display_width(token);
+                    let w = crate::text::display_width(token);
                     body_token_w = body_token_w.max(w);
                     long_tokens += usize::from(w >= 20);
                     words += 1;
@@ -567,7 +567,7 @@ fn render_table(
             }
             let header_token = header[col]
                 .split_whitespace()
-                .map(crate::tui::text::display_width)
+                .map(crate::text::display_width)
                 .max()
                 .unwrap_or(0);
             let kind = if long_tokens > 0
@@ -654,7 +654,7 @@ fn render_table(
             let mut spans: Vec<Span<'static>> = vec![Span::styled("│", border)];
             for (col, w) in widths.iter().enumerate() {
                 let cell_text = wrapped[col].get(line).cloned().unwrap_or_default();
-                let pad = w.saturating_sub(crate::tui::text::display_width(&cell_text));
+                let pad = w.saturating_sub(crate::text::display_width(&cell_text));
                 let (left, right) = match alignments[col] {
                     Alignment::Left | Alignment::None => (0, pad),
                     Alignment::Center => (pad / 2, pad - pad / 2),
@@ -791,7 +791,7 @@ fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
     let mut cur = String::new();
     let mut cur_w = 0usize;
     for word in text.split_whitespace() {
-        let word_w = crate::tui::text::display_width(word);
+        let word_w = crate::text::display_width(word);
         if word_w <= width {
             let separator = usize::from(!cur.is_empty());
             if cur_w + separator + word_w <= width {
@@ -817,7 +817,7 @@ fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
             cur_w = 0;
         }
         for ch in word.chars() {
-            let char_w = crate::tui::text::char_cell_width(ch);
+            let char_w = crate::text::char_cell_width(ch);
             if cur_w + char_w > width && !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
                 cur_w = 0;
@@ -861,7 +861,7 @@ fn render_table_records(
             } else {
                 format!("{label}: {cell}")
             };
-            if crate::tui::text::display_width(&combined) <= width {
+            if crate::text::display_width(&combined) <= width {
                 let mut spans = Vec::new();
                 if !label.is_empty() {
                     spans.push(Span::styled(

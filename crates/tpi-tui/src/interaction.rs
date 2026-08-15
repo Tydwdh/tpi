@@ -13,8 +13,8 @@
 //! [`PointerHit`] 完成（renderer 提供布局快照）。状态机本身是纯函数，
 //! 输入解析后的 [`PointerInput`]，输出语义化 [`UiEvent`]。
 
-use crate::tui::event::UiEvent;
-use crate::tui::scroll::EntryId;
+use crate::event::UiEvent;
+use crate::scroll::EntryId;
 
 /// 语义文本位置：指向某个 transcript entry 的逻辑文本偏移（char 边界）。
 ///
@@ -395,7 +395,7 @@ pub fn cell_to_char(text: &str, column: usize) -> usize {
     let mut char_off = 0usize;
     let mut cell_off = 0usize;
     for ch in text.chars() {
-        let w = crate::tui::text::char_cell_width(ch);
+        let w = crate::text::char_cell_width(ch);
         if cell_off + w > column {
             break;
         }
@@ -410,7 +410,7 @@ pub fn cell_to_char(text: &str, column: usize) -> usize {
 pub fn chars_to_cells(text: &str, char_count: usize) -> usize {
     text.chars()
         .take(char_count)
-        .map(crate::tui::text::char_cell_width)
+        .map(crate::text::char_cell_width)
         .sum()
 }
 
@@ -724,9 +724,9 @@ mod tests {
     /// 只测 Gesture 会漏掉「SelectionStart 无 producer → selection 恒 None」。
     #[test]
     fn drag_through_reducer_sets_view_selection() {
-        use crate::tui::model::ViewModel;
-        use crate::tui::reducer;
-        use crate::tui::state::UiState;
+        use crate::model::ViewModel;
+        use crate::reducer;
+        use crate::state::UiState;
         let mut state = UiState::new(ViewModel::default());
         let mut g = PointerGesture::default();
         let p1 = TextPosition {

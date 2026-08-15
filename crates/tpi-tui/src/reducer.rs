@@ -8,13 +8,13 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::agent::{DeltaKind, RuntimeEvent};
-use crate::session::Usage;
-use crate::tui::effect::UiEffect;
-use crate::tui::event::UiEvent;
-use crate::tui::keymap::KeyAction;
-use crate::tui::model::{LineKind, MenuKind, StatusLine};
-use crate::tui::state::UiState;
+use crate::effect::UiEffect;
+use crate::event::UiEvent;
+use crate::keymap::KeyAction;
+use crate::model::{LineKind, MenuKind, StatusLine};
+use crate::state::UiState;
+use tpi_agent::agent::{DeltaKind, RuntimeEvent};
+use tpi_session::Usage;
 
 /// 当前本地时间 `HH:MM:SS`（重连/续写提示的时间戳，Claude Code 式）。
 /// 本地时区不可用时退回 UTC；失败（几乎不可能）退回空串。
@@ -41,7 +41,7 @@ fn sync_session_preview(state: &mut UiState) {
     let Some(preview) = menu.session_previews.get(menu.selected) else {
         return;
     };
-    let body = crate::tui::model::preview_lines_to_body(preview);
+    let body = crate::model::preview_lines_to_body(preview);
     if let Some(modal) = &mut state.view.modal {
         modal.body = body;
         modal.scroll = 0;
@@ -151,7 +151,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
     if blocking {
         // §成熟化：Link Overlay 响应 Enter（打开 URL）与 c（复制 URL）。
         if let Some(overlay) = &state.view.overlay
-            && overlay.kind == crate::tui::model::OverlayKind::Link
+            && overlay.kind == crate::model::OverlayKind::Link
         {
             let url = overlay.body.clone();
             match key.code {
@@ -232,7 +232,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             let text = if text.is_empty() {
                 text
             } else {
-                crate::tui::paste::expand_paste_placeholders(&text, &state.pasted)
+                crate::paste::expand_paste_placeholders(&text, &state.pasted)
             };
             // editor 已提交并清空，旁路内容已展开进消息；及时释放真实粘贴
             // 文本，避免大剪贴板在整个会话中常驻内存。
@@ -243,7 +243,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
                 if state.running {
                     state.view.transient_hint = Some(format!(
                         "已排队：{}",
-                        crate::tui::text::truncate_middle_utf8(&text, 160, "…")
+                        crate::text::truncate_middle_utf8(&text, 160, "…")
                     ));
                 }
                 state.push_pending(text);
@@ -565,7 +565,7 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
                     format!(
                         "[{}] ⟳ 模型连接中断，正在自动续写…（第 {attempt}/{} 次）",
                         now_hhmmss(),
-                        crate::agent::MAX_STREAM_RECOVERIES
+                        tpi_agent::agent::MAX_STREAM_RECOVERIES
                     ),
                 );
             }
@@ -582,7 +582,7 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
                     format!(
                         "[{}] ⟳ 工具调用中断，正在重新生成该轮回答…（第 {attempt}/{} 次）",
                         now_hhmmss(),
-                        crate::agent::MAX_TURN_RESTARTS
+                        tpi_agent::agent::MAX_TURN_RESTARTS
                     ),
                 );
             }
@@ -609,7 +609,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if state.view.overlay.is_some() || state.view.modal.is_some() {
                 return Vec::new();
             }
-            let text = crate::tui::paste::normalize_newlines(text);
+            let text = crate::paste::normalize_newlines(text);
             if state.view.search.is_some() {
                 // BUG-014：搜索打开时粘贴应进入搜索框，而不是 composer。
                 let mut query = state
@@ -619,10 +619,10 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
                     .map(|s| s.query.clone())
                     .unwrap_or_default();
                 let room = (4 * 1024usize).saturating_sub(query.len());
-                let keep = crate::tui::text::floor_char_boundary(&text, room.min(text.len()));
+                let keep = crate::text::floor_char_boundary(&text, room.min(text.len()));
                 query.push_str(&text[..keep]);
                 state.view.update_search_query(&query);
-            } else if crate::tui::paste::is_large_paste(&text) {
+            } else if crate::paste::is_large_paste(&text) {
                 // §用户诉求：大粘贴不真实渲染——全文存入旁路，输入框只放
                 // 占位符；提交时一次性展开（避免分块上屏/MAX_INPUT_BYTES 截断/
                 // 行尾 Enter 批次边界误判提交）。
@@ -632,14 +632,14 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
                 refresh_menus(state);
             } else {
                 let truncated = state.editor.text().len().saturating_add(text.len())
-                    > crate::tui::editor::MAX_INPUT_BYTES;
+                    > crate::editor::MAX_INPUT_BYTES;
                 state.editor.insert_str(&text);
                 state.sync_input();
                 refresh_menus(state);
                 if truncated {
                     state.view.transient_hint = Some(format!(
                         "输入已截断到 {} KiB",
-                        crate::tui::editor::MAX_INPUT_BYTES / 1024
+                        crate::editor::MAX_INPUT_BYTES / 1024
                     ));
                 }
             }
@@ -655,7 +655,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             {
                 return Vec::new();
             }
-            let placeholder = crate::tui::paste::next_paste_placeholder(&state.pasted, &text);
+            let placeholder = crate::paste::next_paste_placeholder(&state.pasted, &text);
             if state
                 .editor
                 .replace_suffix_before_cursor(&rendered_suffix, &placeholder)
@@ -680,10 +680,8 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
                 {
                     let mut query = prefix.to_owned();
                     let room = (4 * 1024usize).saturating_sub(query.len());
-                    let keep = crate::tui::text::floor_char_boundary(
-                        &full_text,
-                        room.min(full_text.len()),
-                    );
+                    let keep =
+                        crate::text::floor_char_boundary(&full_text, room.min(full_text.len()));
                     query.push_str(&full_text[..keep]);
                     state.view.update_search_query(&query);
                 }
@@ -700,7 +698,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if let Some(old_placeholder) = matching {
                 state.pasted.remove(&old_placeholder);
                 let new_placeholder =
-                    crate::tui::paste::next_paste_placeholder(&state.pasted, &full_text);
+                    crate::paste::next_paste_placeholder(&state.pasted, &full_text);
                 if state
                     .editor
                     .replace_suffix_before_cursor(&old_placeholder, &new_placeholder)
@@ -782,7 +780,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new();
             }
-            state.view.overlay = Some(crate::tui::model::OverlayState::for_link(&url));
+            state.view.overlay = Some(crate::model::OverlayState::for_link(&url));
             Vec::new()
         }
         UiEvent::SidebarJump(entry) => {

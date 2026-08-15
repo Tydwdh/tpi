@@ -249,7 +249,7 @@ impl Renderer {
 
     /// 屏幕坐标 → 语义位置（§PointerHit：hit-test 从布局映射得到
     /// entry + 逻辑 char 偏移；CJK 按 cell 宽度精确定位，扣 rail 前缀）。
-    pub fn hit_text(&self, column: u16, row: u16) -> Option<crate::tui::interaction::TextPosition> {
+    pub fn hit_text(&self, column: u16, row: u16) -> Option<crate::interaction::TextPosition> {
         let rect = self.last_transcript_rect?;
         if column < rect.x || row < rect.y || row >= rect.y + rect.height {
             return None;
@@ -260,8 +260,8 @@ impl Renderer {
         // 等前缀不参与语义偏移），再按 cell 宽度映射 char（CJK/emoji 精确）。
         let col = column.saturating_sub(rect.x) as usize;
         let semantic_col = col.saturating_sub(row_semantic.decor);
-        let char_off = crate::tui::interaction::cell_to_char(&row_semantic.text, semantic_col);
-        Some(crate::tui::interaction::TextPosition {
+        let char_off = crate::interaction::cell_to_char(&row_semantic.text, semantic_col);
+        Some(crate::interaction::TextPosition {
             entry_id: row_semantic.entry_id,
             offset: row_semantic.char_start + char_off,
         })
@@ -282,7 +282,7 @@ impl Renderer {
         // 屏幕列 → 语义内 char 偏移（与 hit_text 同一映射）。
         let col = column.saturating_sub(rect.x) as usize;
         let semantic_col = col.saturating_sub(row_semantic.decor);
-        let char_off = crate::tui::interaction::cell_to_char(&row_semantic.text, semantic_col);
+        let char_off = crate::interaction::cell_to_char(&row_semantic.text, semantic_col);
         let links = &row_semantic.links;
         // 命中 char 落在 [start, end) 即命中；列落在链接文本后半格（2-cell 字符
         // 右半）也命中该链接（cell_to_char 已归一到前一 char）。
@@ -463,7 +463,7 @@ fn render_frame(
     let (main_area, sidebar_area) = if view.sidebar.open {
         let main_w = area
             .width
-            .saturating_sub(crate::tui::model::SIDEBAR_WIDTH)
+            .saturating_sub(crate::model::SIDEBAR_WIDTH)
             .max(1);
         (
             Rect::new(area.x, area.y, main_w, area.height),
@@ -761,7 +761,7 @@ fn plan_window(
     }
     let area_h = area_h.max(1) as usize;
     let mut window_start =
-        crate::tui::scroll::window_start_row(&ids, &heights, &view.scroll_mode, area_h);
+        crate::scroll::window_start_row(&ids, &heights, &view.scroll_mode, area_h);
     // §PointerHit：Follow 模式、无 live 流式内容时，若最后一个 transcript entry
     // 是完成态工具卡片且高度超过视口，锚定到卡片主行（状态/exit code 可见），
     // 避免主行被 `total - area_h` 的底部对齐滚出视口。
@@ -780,7 +780,7 @@ fn plan_window(
         }
     }
     // 写回布局结果：视口顶部行 + 视口高度（renderer 写回，滚动基础）。
-    view.layout_top = Some(crate::tui::scroll::locate_row(&ids, &heights, window_start));
+    view.layout_top = Some(crate::scroll::locate_row(&ids, &heights, window_start));
     view.transcript_rows = area_h as u16;
 
     // 按全局行切片：逐 entry 取窗口内的行。
@@ -935,9 +935,8 @@ fn plan_window(
             // char 交集 → 语义 cell 范围 → 加装饰前缀得到视觉 cell 范围。
             let from_sel = from_char - row_lo;
             let to_sel = to_char - row_lo;
-            let cell_from =
-                crate::tui::interaction::chars_to_cells(&row.text, from_sel) + row.decor;
-            let cell_to = crate::tui::interaction::chars_to_cells(&row.text, to_sel) + row.decor;
+            let cell_from = crate::interaction::chars_to_cells(&row.text, from_sel) + row.decor;
+            let cell_to = crate::interaction::chars_to_cells(&row.text, to_sel) + row.decor;
             if let Some(line) = window.get_mut(i) {
                 // §PointerHit invariant：selection 只能改 style，绝不能改文本/
                 // 宽度/换行/hit 区域/semantic mapping。逐 span 拆三段
@@ -963,7 +962,7 @@ fn plan_window(
                     let mut after = String::new();
                     let mut w = 0usize;
                     for ch in span.content.chars() {
-                        let cw = crate::tui::text::char_cell_width(ch);
+                        let cw = crate::text::char_cell_width(ch);
                         let start = w;
                         w += cw;
                         if start < hit_from {
@@ -1172,7 +1171,7 @@ fn wrap_with_semantic(
                     is_line_start = false;
                     continue;
                 }
-                let w = crate::tui::text::char_cell_width(ch);
+                let w = crate::text::char_cell_width(ch);
                 let is_decor = is_line_start && line_cell < decor;
                 // 超宽折行：先 flush 当前视觉行，续行补 rail。
                 if cur_w + w > width && !cur.is_empty() {
@@ -1338,7 +1337,7 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
                     }
                     continue;
                 }
-                let w = crate::tui::text::char_cell_width(ch);
+                let w = crate::text::char_cell_width(ch);
                 if cur_w + w > width && !cur.is_empty() {
                     out.push(Line::from(std::mem::take(&mut cur)));
                     cur_w = 0;
@@ -2168,8 +2167,8 @@ fn cached_markdown(
 }
 
 /// 侧边栏 Todo 项：当前项优先，其余开放项随后，终态项沉底。侧边栏自身可滚动。
-fn sidebar_plan_items(plan: &crate::plan::Plan) -> Vec<&crate::plan::PlanItem> {
-    use crate::plan::PlanStatus;
+fn sidebar_plan_items(plan: &tpi_core::plan::Plan) -> Vec<&tpi_core::plan::PlanItem> {
+    use tpi_core::plan::PlanStatus;
     let rank = |status| match status {
         PlanStatus::InProgress => 0,
         PlanStatus::Pending => 1,
@@ -2222,23 +2221,23 @@ fn draw_sidebar(
         Some(plan) if !plan.items.is_empty() && has_open => {
             for item in sidebar_plan_items(plan) {
                 let (marker, style) = match item.status {
-                    crate::plan::PlanStatus::Completed => (
+                    tpi_core::plan::PlanStatus::Completed => (
                         "[x]",
                         Style::default()
                             .fg(theme.muted)
                             .bg(theme.surface)
                             .add_modifier(Modifier::DIM),
                     ),
-                    crate::plan::PlanStatus::InProgress => {
+                    tpi_core::plan::PlanStatus::InProgress => {
                         ("[>]", Style::default().fg(theme.warning).bg(theme.surface))
                     }
-                    crate::plan::PlanStatus::Pending => {
+                    tpi_core::plan::PlanStatus::Pending => {
                         ("[ ]", Style::default().fg(theme.muted).bg(theme.surface))
                     }
-                    crate::plan::PlanStatus::Blocked => {
+                    tpi_core::plan::PlanStatus::Blocked => {
                         ("[!]", Style::default().fg(theme.error).bg(theme.surface))
                     }
-                    crate::plan::PlanStatus::Cancelled => (
+                    tpi_core::plan::PlanStatus::Cancelled => (
                         "[-]",
                         Style::default()
                             .fg(theme.muted)
@@ -2249,7 +2248,7 @@ fn draw_sidebar(
                 // §用户诉求：todo 长文本折行显示完整（不截断）；marker 占 4 列
                 // （3 字符 + 空格），续行缩进 4 列对齐。CJK 双宽按 2 cells 折行。
                 let wrapped =
-                    crate::tui::text::wrap_to_cell_width(&item.text, content_w.saturating_sub(4));
+                    crate::text::wrap_to_cell_width(&item.text, content_w.saturating_sub(4));
                 for (index, segment) in wrapped.iter().enumerate() {
                     let prefix = if index == 0 {
                         format!("{marker} ")
@@ -2278,8 +2277,7 @@ fn draw_sidebar(
         hits.push(None);
     } else {
         for (entry_id, text) in &outline {
-            let shown =
-                crate::tui::text::truncate_to_cell_width(text, content_w.saturating_sub(1), "…");
+            let shown = crate::text::truncate_to_cell_width(text, content_w.saturating_sub(1), "…");
             // 大纲行可点击：整行用 hover 色提示可跳转。
             lines.push(Line::from(vec![Span::styled(
                 format!(" {shown}"),
@@ -2493,7 +2491,7 @@ fn draw_footer(
     let mut clipped: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     for span in spans {
-        let w = crate::tui::text::display_width(span.content.as_ref());
+        let w = crate::text::display_width(span.content.as_ref());
         if used + w > available {
             break;
         }
@@ -2581,7 +2579,7 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, view: &ViewModel, theme: t
             .map(|s| s.content.as_ref())
             .collect::<String>()
             .chars()
-            .map(crate::tui::text::char_cell_width)
+            .map(crate::text::char_cell_width)
             .sum();
         if cur < area.width as usize {
             spans.push(Span::styled(
@@ -2666,7 +2664,7 @@ fn input_cursor_cell(input: &str, cursor: usize, width: u16) -> (u16, u16) {
     let row = rows.len().saturating_sub(1) as u16;
     let last_w = rows
         .last()
-        .map(|s| s.chars().map(crate::tui::text::char_cell_width).sum())
+        .map(|s| s.chars().map(crate::text::char_cell_width).sum())
         .unwrap_or(0) as u16;
     let col = if row == 0 {
         PROMPT_WIDTH + last_w
@@ -2692,7 +2690,7 @@ fn input_wrap(text: &str, width: usize, prompt_w: usize) -> Vec<String> {
             w = 0;
             continue;
         }
-        let cw = crate::tui::text::char_cell_width(ch);
+        let cw = crate::text::char_cell_width(ch);
         if w + cw > budget(row) && w > 0 {
             rows.push(String::new());
             row += 1;
@@ -2928,7 +2926,7 @@ fn menu_floating_width(menu: &model::MenuView, max_w: u16) -> u16 {
     let label_w = menu
         .items
         .iter()
-        .map(|(name, desc)| crate::tui::text::display_width(&menu_item_texts(menu, name, desc).0))
+        .map(|(name, desc)| crate::text::display_width(&menu_item_texts(menu, name, desc).0))
         .max()
         .unwrap_or(0);
     // §用户诉求（菜单截断怪相）：辅助列按**最长描述自适应**，不再用固定
@@ -2937,7 +2935,7 @@ fn menu_floating_width(menu: &model::MenuView, max_w: u16) -> u16 {
     let sub_w = menu
         .items
         .iter()
-        .map(|(name, desc)| crate::tui::text::display_width(&menu_item_texts(menu, name, desc).1))
+        .map(|(name, desc)| crate::text::display_width(&menu_item_texts(menu, name, desc).1))
         .max()
         .unwrap_or(0);
     // ▸+空格(2) + 两列间距(2) + 左右边框(2)。
@@ -2991,8 +2989,8 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
     let mut texts: Vec<(String, String)> = Vec::with_capacity(total);
     for (name, desc) in &menu.items {
         let (label, sub) = menu_item_texts(menu, name, desc);
-        label_w = label_w.max(crate::tui::text::display_width(&label));
-        sub_w = sub_w.max(crate::tui::text::display_width(&sub));
+        label_w = label_w.max(crate::text::display_width(&label));
+        sub_w = sub_w.max(crate::text::display_width(&sub));
         texts.push((label, sub));
     }
     // 每行前缀（选中标记 ▸ + 空格）占 2 列；两列间距 2 列。
@@ -3072,9 +3070,9 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
         // §用户诉求（菜单截断怪相）：描述是短句，超宽用**尾部截断**
         // （保留开头 + …）——中段截断会保留孤立的尾字符（如“…代码高亮）”，
         // 读起来残缺。
-        let pad = label_w.saturating_sub(crate::tui::text::display_width(label)) + 2;
+        let pad = label_w.saturating_sub(crate::text::display_width(label)) + 2;
         let room = inner_w.saturating_sub(label_w + 4);
-        let sub_shown = crate::tui::text::truncate_head_to_cell_width(sub, room, "…");
+        let sub_shown = crate::text::truncate_head_to_cell_width(sub, room, "…");
         spans.push(Span::styled(
             format!("{}{sub_shown}", " ".repeat(pad)),
             Style::default().fg(theme.muted).bg(bg),
@@ -3128,7 +3126,7 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
 }
 
 fn fmt_duration(ms: u64) -> String {
-    crate::tui::model::fmt_duration(ms)
+    crate::model::fmt_duration(ms)
 }
 
 fn fmt_tokens(n: u64) -> String {

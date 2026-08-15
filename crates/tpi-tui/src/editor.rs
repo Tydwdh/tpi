@@ -99,7 +99,7 @@ impl Editor {
 
     pub fn insert_str(&mut self, s: &str) {
         let room = MAX_INPUT_BYTES.saturating_sub(self.text.len());
-        let keep = crate::tui::text::floor_char_boundary(s, room.min(s.len()));
+        let keep = crate::text::floor_char_boundary(s, room.min(s.len()));
         self.edit(EditOp::Insert, |editor| {
             editor.text.insert_str(editor.cursor, &s[..keep]);
             editor.cursor += keep;
@@ -181,7 +181,7 @@ impl Editor {
         let mut width = 0usize;
         let mut offset = end;
         for (i, ch) in self.text[start..end].char_indices() {
-            let w = crate::tui::text::char_cell_width(ch);
+            let w = crate::text::char_cell_width(ch);
             if width + w > col {
                 offset = start + i;
                 break;
@@ -367,11 +367,7 @@ impl Editor {
         self.text = if text.len() <= MAX_INPUT_BYTES {
             text
         } else {
-            crate::tui::text::truncate_middle_utf8(
-                &text,
-                MAX_INPUT_BYTES,
-                "\n…[input truncated]…\n",
-            )
+            crate::text::truncate_middle_utf8(&text, MAX_INPUT_BYTES, "\n…[input truncated]…\n")
         };
         self.cursor = self.text.len();
         self.preferred_column = None;

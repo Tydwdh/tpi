@@ -133,7 +133,7 @@ fn push_output_rows(
 fn card_content_rows(card: &ToolCard, theme: theme::Theme) -> Vec<CardContentRow> {
     let is_failed = matches!(
         &card.state,
-        ToolCardState::Done { status, .. } if *status != crate::outcome::ToolStatus::Succeeded
+        ToolCardState::Done { status, .. } if *status != tpi_core::outcome::ToolStatus::Succeeded
     );
     let error_style = Style::default().fg(theme.error).add_modifier(Modifier::DIM);
     let text_style = Style::default().fg(theme.text);
@@ -229,7 +229,7 @@ fn visible_window(card: &ToolCard, total: usize) -> (usize, usize, Option<String
     const RUNNING_LINES: usize = 3;
     let is_failed = matches!(
         &card.state,
-        ToolCardState::Done { status, .. } if *status != crate::outcome::ToolStatus::Succeeded
+        ToolCardState::Done { status, .. } if *status != tpi_core::outcome::ToolStatus::Succeeded
     );
     let is_running = matches!(&card.state, ToolCardState::Running);
     // 折叠态：collapsed_lines==0 → 只显示主行，不显示任何正文（overflow=true）；
@@ -284,12 +284,12 @@ pub(super) fn tool_card_lines(
             theme.info,
         ),
         ToolCardState::Done { status, .. } => match status {
-            crate::outcome::ToolStatus::Succeeded => ("✓", theme.success),
-            crate::outcome::ToolStatus::Failed => ("✗", theme.error),
-            crate::outcome::ToolStatus::TimedOut => ("⏱", theme.warning),
-            crate::outcome::ToolStatus::Cancelled => ("−", theme.muted),
-            crate::outcome::ToolStatus::Interrupted => ("⏹", theme.warning),
-            crate::outcome::ToolStatus::Rejected => ("⊘", theme.warning),
+            tpi_core::outcome::ToolStatus::Succeeded => ("✓", theme.success),
+            tpi_core::outcome::ToolStatus::Failed => ("✗", theme.error),
+            tpi_core::outcome::ToolStatus::TimedOut => ("⏱", theme.warning),
+            tpi_core::outcome::ToolStatus::Cancelled => ("−", theme.muted),
+            tpi_core::outcome::ToolStatus::Interrupted => ("⏹", theme.warning),
+            tpi_core::outcome::ToolStatus::Rejected => ("⊘", theme.warning),
         },
     };
     // metadata（固定右侧区域）：duration [· exit code]。
@@ -436,7 +436,7 @@ fn tool_card_meta(card: &ToolCard) -> String {
     } = &card.state
     {
         meta.push_str(&fmt_duration(*duration_ms));
-        if *status != crate::outcome::ToolStatus::Succeeded
+        if *status != tpi_core::outcome::ToolStatus::Succeeded
             && let Some(code) = exit_code
         {
             meta.push_str(&format!(" · exit {code}"));
@@ -625,7 +625,7 @@ fn truncate_display(text: &str, max_width: usize) -> String {
     let mut out = String::new();
     let mut w = 0usize;
     for ch in text.chars() {
-        let cw = crate::tui::text::char_cell_width(ch);
+        let cw = crate::text::char_cell_width(ch);
         if w + cw + 1 > max_width {
             out.push('…');
             return out;
