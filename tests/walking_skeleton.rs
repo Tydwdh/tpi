@@ -113,6 +113,9 @@ async fn fake_provider_drives_full_read_edit_verify_loop() {
             interactive: true,
             force_compaction: false,
             workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         },
     )
     .await

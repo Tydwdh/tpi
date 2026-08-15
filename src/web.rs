@@ -65,6 +65,8 @@ struct ServerState {
     log_path: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// 单调递增的 run 序号（/api/send 响应带出，轮询按它认领结果）。
     next_run: AtomicU64,
+    /// P4 gate：composition root 注入的工具注册表。
+    registry: std::sync::Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
 }
 
 /// 启动局域网网页服务（阻塞直到监听失败或 Ctrl-C）。
@@ -109,6 +111,9 @@ pub async fn serve(config: Arc<Config>, port: u16, token: Option<String>) -> Res
         workspace_root,
         log_path: std::sync::Mutex::new(log_path),
         next_run: AtomicU64::new(0),
+        registry: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::tool::registry::builtin_registry(),
+        )),
     });
 
     let listener = TcpListener::bind(("0.0.0.0", port))
@@ -533,6 +538,7 @@ async fn run_agent(state: &Arc<ServerState>, content: String) -> RunResult {
                 interactive: false,
                 force_compaction: false,
                 workspace: None,
+                registry: state.registry.clone(),
             },
         )
         .await;

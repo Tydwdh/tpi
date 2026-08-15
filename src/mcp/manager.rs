@@ -46,10 +46,14 @@ pub struct McpManager {
 
 impl McpManager {
     pub fn new() -> Self {
-        Self::with_registry(crate::tool::registry::global_registry())
+        // 独立 registry（不共享进程级全局；生产路径由 composition root
+        // 注入同一个 registry，见 AppServices::from_config）。
+        Self::with_registry(std::sync::Arc::new(std::sync::Mutex::new(
+            ToolRegistry::new(),
+        )))
     }
 
-    /// 注入自定义 registry（测试用：隔离的本地 registry）。
+    /// 注入自定义 registry（composition root / 测试：隔离的本地 registry）。
     pub fn with_registry(registry: Arc<std::sync::Mutex<ToolRegistry>>) -> Self {
         Self {
             servers: HashMap::new(),

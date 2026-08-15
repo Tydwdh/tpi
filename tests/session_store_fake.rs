@@ -237,6 +237,9 @@ async fn fake_store_runs_agent_flow() {
             interactive: false,
             force_compaction: false,
             workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         },
     )
     .await

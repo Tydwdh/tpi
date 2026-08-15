@@ -123,6 +123,7 @@ pub async fn run_headless<P: Provider, S: SessionStore>(
     history: &[crate::provider::ChatMessage],
     message: String,
     current_cancel: &Arc<Mutex<Option<CancellationToken>>>,
+    registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
 ) -> Result<HeadlessOutput, String> {
     let cancel = CancellationToken::new();
     *crate::util::lock_mutex(current_cancel, "current_cancel") = Some(cancel.clone());
@@ -147,6 +148,7 @@ pub async fn run_headless<P: Provider, S: SessionStore>(
             interactive: false,
             force_compaction: false,
             workspace: None,
+            registry,
         },
     )
     .await;

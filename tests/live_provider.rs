@@ -57,6 +57,9 @@ async fn live_provider_smoke_opt_in() {
             interactive: true,
             force_compaction: false,
             workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         },
     )
     .await
@@ -124,6 +127,9 @@ async fn live_canary_2_real_tool_call_loop() {
                 interactive: true,
                 force_compaction: false,
                 workspace: None,
+                registry: std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi::tool::registry::builtin_registry(),
+                )),
             },
         ),
     )

@@ -151,6 +151,9 @@ async fn run_fake(label: &str) -> Result<agent::AgentOutcome, String> {
             interactive: false,
             force_compaction: false,
             workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         },
     )
     .await

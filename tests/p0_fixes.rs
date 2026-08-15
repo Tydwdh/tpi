@@ -86,6 +86,9 @@ async fn p0_1_prompt_mode_survives_delta_flood() {
             &[],
             "hello".to_string(),
             current_cancel,
+            std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         ),
     )
     .await
@@ -147,6 +150,9 @@ async fn p0_2_compaction_survives_delta_flood() {
                 interactive: false,
                 force_compaction: false,
                 workspace: None,
+                registry: std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi::tool::registry::builtin_registry(),
+                )),
             },
         ),
     )

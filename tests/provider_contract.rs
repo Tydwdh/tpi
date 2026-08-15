@@ -709,6 +709,9 @@ async fn invalid_tool_args_produce_observation_without_breaking_session() {
             interactive: true,
             force_compaction: false,
             workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         },
     )
     .await
@@ -826,6 +829,9 @@ async fn provider_failure_keeps_session_recoverable() {
         &[],
         "hello".into(),
         current_cancel.clone(),
+        std::sync::Arc::new(std::sync::Mutex::new(
+            tpi::tool::registry::builtin_registry(),
+        )),
     )
     .await;
     assert!(result.is_err(), "provider 失败必须传播为 Err");

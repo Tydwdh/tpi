@@ -128,6 +128,8 @@ pub struct AppServices<P: Provider> {
     pub conversation: Conversation,
     pub current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     pub mcp_manager: crate::mcp::manager::McpManager,
+    /// P4 gate：composition root 持有的工具注册表（builtin + MCP 同一实例）。
+    pub registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
 }
 
 impl AppServices<OpenAiCompatClient> {
@@ -168,6 +170,11 @@ impl AppServices<OpenAiCompatClient> {
         }
         let workspace_root = config.workspace_root.clone();
         let sessions_root = config.sessions_root.clone();
+        // P4 gate：composition root 一次性构造注册表（builtin 注册；MCP 工具
+        // 与 agent run 共享同一实例）。
+        let registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>> = Arc::new(
+            std::sync::Mutex::new(crate::tool::registry::builtin_registry()),
+        );
         let api_key = crate::config::read_api_key(&config)?;
         let provider = OpenAiCompatClient::new(
             config.model.base_url.clone(),
@@ -201,7 +208,8 @@ impl AppServices<OpenAiCompatClient> {
             provider,
             conversation,
             current_cancel,
-            mcp_manager: crate::mcp::manager::McpManager::new(),
+            mcp_manager: crate::mcp::manager::McpManager::with_registry(registry.clone()),
+            registry,
         })
     }
 }
@@ -227,6 +235,7 @@ pub async fn run_with_services<P: Provider>(
         mut conversation,
         current_cancel,
         mut mcp_manager,
+        registry,
     } = services;
 
     if non_interactive {
@@ -250,6 +259,7 @@ pub async fn run_with_services<P: Provider>(
                 history,
                 message,
                 current_cancel.clone(),
+                registry.clone(),
             )
             .await?
         };
@@ -276,6 +286,7 @@ pub async fn run_with_services<P: Provider>(
         prompt,
         current_cancel.clone(),
         &mut mcp_manager,
+        registry,
     )
     .await?;
     Ok(None)
@@ -451,6 +462,7 @@ pub async fn run_prompt_once<P: Provider>(
     history: &[ChatMessage],
     message: String,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
 ) -> Result<agent::AgentOutcome, String> {
     let cancel = CancellationToken::new();
     *crate::util::lock_mutex(&current_cancel, "current_cancel") = Some(cancel.clone());
@@ -472,6 +484,7 @@ pub async fn run_prompt_once<P: Provider>(
             interactive: false,
             force_compaction: false,
             workspace: None,
+            registry,
         },
     )
     .await;
@@ -504,6 +517,7 @@ async fn interactive_loop<P: Provider>(
     initial_prompt: &str,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     mcp_manager: &mut crate::mcp::manager::McpManager,
+    registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
 ) -> Result<(), String> {
     use crate::tui::event::UiEvent;
     use crate::tui::model::LineKind;
@@ -1096,6 +1110,7 @@ async fn interactive_loop<P: Provider>(
                         renderer: &mut renderer,
                         key_rx: &mut key_rx,
                         current_cancel: current_cancel.clone(),
+                        registry: registry.clone(),
                     },
                 )
                 .await
@@ -1220,6 +1235,7 @@ async fn interactive_loop<P: Provider>(
                         renderer: &mut renderer,
                         key_rx: &mut key_rx,
                         current_cancel: current_cancel.clone(),
+                        registry: registry.clone(),
                     },
                 )
                 .await
@@ -1934,6 +1950,8 @@ struct InteractiveIo<'a> {
     renderer: &'a mut Renderer,
     key_rx: &'a mut mpsc::Receiver<TerminalInput>,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    /// P4 gate：composition root 注入的工具注册表（agent run 使用）。
+    registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
 }
 
 async fn run_interactive<P: Provider>(
@@ -1956,6 +1974,7 @@ async fn run_interactive<P: Provider>(
         renderer,
         key_rx,
         current_cancel,
+        registry,
     } = io;
     let cancel = CancellationToken::new();
     *crate::util::lock_mutex(&current_cancel, "current_cancel") = Some(cancel.clone());
@@ -1983,6 +2002,7 @@ async fn run_interactive<P: Provider>(
             interactive: true,
             force_compaction: force,
             workspace: None,
+            registry,
         },
     );
     tokio::pin!(run_future);

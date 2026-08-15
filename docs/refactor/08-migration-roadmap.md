@@ -656,20 +656,25 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收达成：ABA red test 先写并通过修复 ✓；entry/id 精确删除 ✓；重复名规则显式
   （覆盖=新 id，旧 disposer 无效）✓；全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P4-02 composition root 注入 registry — **DONE（2026-08-14）**
+#### P4-02 composition root 注入 registry — **DONE（2026-08-14，含 global_registry 移除）**
 
 - 为现有 constructor 增 registry 参数；测试用 fresh registry。
 - 新调用禁止 `global_registry()`，逐 consumer 迁移后删除。
-- 实施：`ToolRuntime::new` 增 `registry: Arc<Mutex<ToolRegistry>>` 参数（删除函数
-  体内 global_registry()），调用点（agent/mod.rs）显式注入；`McpManager` 已有
-  `with_registry`（fresh registry 注入点，mcp_contract 3 处测试用 fresh registry
-  验证隔离）。`doctor.rs`（诊断命令，进程级全局目录合理）保留 global_registry。
-  残余：agent::run 构造 ToolRuntime 时传 global_registry()（RunInput 57 处构造点
-  成本过高，完整 composition 迁移推迟到 P7 物理 crate 时随 composition root
-  彻底化）；global_registry 删除条件（所有 consumer 显式注入）记入 P10-01 清理。
+- 实施（追加 2026-08-14 收尾）：`global_registry()` **整体移除**（定义删除）。
+  `RunInput` 新增 `registry` 字段（composition root 注入）；`AppServices` 新增
+  `registry` 字段，`from_config` 一次性构造 `builtin_registry()` 并注入
+  `McpManager::with_registry(registry.clone())`（生产路径 MCP 工具与 agent run
+  共享同一实例）；`run_with_services`/`run_prompt_once`/`run_interactive`
+  （registry 经 InteractiveIo）/`run_headless`/`eval`/`web`/`doctor` 全部显式
+  注入（测试各自持有独立 builtin registry；mcp_agent 的 RunInput 用
+  `registry.clone()` 与 manager 同一实例）。arch_gate R3 规则删除（allowlist
+  只减不增）。全量 56 target 绿；fmt/clippy/arch_gate 清洁。
+- 早期实施记录：`ToolRuntime::new` 增 registry 参数（删除函数体内
+  global_registry()），调用点（agent/mod.rs）显式注入；`McpManager` 已有
+  `with_registry`（fresh registry 注入点）。
 - 验收达成：constructor（ToolRuntime/McpManager）增 registry 参数 ✓；测试用 fresh
-  registry（mcp_contract）✓；新调用禁止 global_registry（新增代码不调用）✓；
-  全量 54 target 绿；fmt/clippy/arch_gate 清洁。
+  registry ✓；新调用禁止 global_registry ✓；**global_registry 定义与全部调用点
+  已删除（arch_gate R3 随迁移除）** ✓；全量 56 target 绿；fmt/clippy/arch_gate 清洁。
 
 #### P4-03 immutable `ActiveToolSet` — **DONE（2026-08-14）**
 

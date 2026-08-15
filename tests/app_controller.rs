@@ -73,6 +73,7 @@ fn services() -> AppServices<EchoProvider> {
         conversation: tpi::session::conversation::Conversation::new(),
         current_cancel: Arc::new(Mutex::new(None)),
         mcp_manager: tpi::mcp::manager::McpManager::new(),
+        registry: Arc::new(Mutex::new(tpi::tool::registry::builtin_registry())),
     }
 }
 

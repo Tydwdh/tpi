@@ -131,6 +131,9 @@ async fn agent_solves_task_on_remote_workspace() {
             interactive: false,
             force_compaction: false,
             workspace: Some(remote_workspace),
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         },
     )
     .await
@@ -231,6 +234,9 @@ async fn agent_request_includes_workspace_identity() {
             interactive: false,
             force_compaction: false,
             workspace: Some(remote_workspace),
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         },
     )
     .await

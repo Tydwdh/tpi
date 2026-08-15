@@ -49,6 +49,9 @@ async fn p0_1_history_never_duplicates_across_turns() {
                 history,
                 format!("U{i}"),
                 current_cancel.clone(),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi::tool::registry::builtin_registry(),
+                )),
             )
             .await
             .expect("run should succeed")
@@ -130,6 +133,9 @@ async fn p0_2_empty_text_tool_call_replays_legal_protocol() {
             interactive: true,
             force_compaction: false,
             workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         },
     )
     .await
@@ -195,6 +201,9 @@ async fn p0_3_runtime_projection_matches_resume_projection() {
             interactive: true,
             force_compaction: false,
             workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         },
     )
     .await
@@ -266,6 +275,9 @@ impl ReplayHarness {
                 interactive: true,
                 force_compaction: false,
                 workspace: None,
+                registry: std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi::tool::registry::builtin_registry(),
+                )),
             },
         )
         .await
@@ -486,6 +498,9 @@ async fn replay_cancelled_run_matches_runtime() {
             interactive: true,
             force_compaction: false,
             workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         },
     )
     .await
@@ -554,6 +569,9 @@ async fn replay_after_compaction_matches_runtime() {
             interactive: true,
             force_compaction: false,
             workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         },
     )
     .await
@@ -650,6 +668,9 @@ async fn ten_turns_context_grows_linearly() {
                 history,
                 format!("U{i}"),
                 current_cancel.clone(),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi::tool::registry::builtin_registry(),
+                )),
             )
             .await
             .expect("run should succeed")

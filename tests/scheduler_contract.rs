@@ -85,6 +85,9 @@ async fn run_with(
             interactive: true,
             force_compaction: false,
             workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
         },
     )
     .await
@@ -426,6 +429,9 @@ async fn cancellation_during_parallel_bash_cancels_all() {
                 interactive: true,
                 force_compaction: false,
                 workspace: None,
+                registry: std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi::tool::registry::builtin_registry(),
+                )),
             },
         )
         .await

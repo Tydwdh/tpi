@@ -34,9 +34,11 @@ fn test_server_config(name: &str) -> tpi::mcp::config::McpServerConfig {
 /// mcp::e2e-server::echo）→ adapter 执行 → 结果返回模型 → 完成。
 #[tokio::test]
 async fn mcp_tool_executes_inside_agent_loop() {
-    // 注册 MCP server 到全局 registry（agent 的 ToolRuntime 读取同一目录）。
-    let mut manager = tpi::mcp::manager::McpManager::new();
-    let registry = tpi::tool::registry::global_registry();
+    // 注册 MCP server 到注入 registry（agent 的 ToolRuntime 读取同一目录）。
+    let registry = std::sync::Arc::new(std::sync::Mutex::new(
+        tpi::tool::registry::builtin_registry(),
+    ));
+    let mut manager = tpi::mcp::manager::McpManager::with_registry(registry.clone());
     {
         manager
             .start_server(test_server_config("e2e-server"))
@@ -99,6 +101,7 @@ async fn mcp_tool_executes_inside_agent_loop() {
             interactive: false,
             force_compaction: false,
             workspace: None,
+            registry: registry.clone(),
         },
     )
     .await
@@ -133,8 +136,10 @@ async fn mcp_tool_executes_inside_agent_loop() {
 #[tokio::test]
 async fn tool_selector_filters_irrelevant_mcp_tools_from_model() {
     // 注册两个 server（工具名带明确语义）。
-    let mut manager = tpi::mcp::manager::McpManager::new();
-    let registry = tpi::tool::registry::global_registry();
+    let registry = std::sync::Arc::new(std::sync::Mutex::new(
+        tpi::tool::registry::builtin_registry(),
+    ));
+    let mut manager = tpi::mcp::manager::McpManager::with_registry(registry.clone());
     {
         manager
             .start_server(test_server_config("ctx-a"))
@@ -172,6 +177,7 @@ async fn tool_selector_filters_irrelevant_mcp_tools_from_model() {
             interactive: false,
             force_compaction: false,
             workspace: None,
+            registry: registry.clone(),
         },
     )
     .await

@@ -108,6 +108,9 @@ pub struct RunInput<'a> {
     /// ActiveWorkspace（§26-§30）：None = Local（默认）；Some = 远端/自定义
     /// workspace（R4：agent 测试注入 remote workspace，bash/file 按此分发）。
     pub workspace: Option<crate::workspace::ActiveWorkspace>,
+    /// P4-02/P4 gate：工具注册表由 composition root 注入（builtin + MCP 同一
+    /// registry；禁止 global registry）。
+    pub registry: std::sync::Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
 }
 
 /// 不可恢复的 run 失败（§19.1）。
@@ -293,6 +296,7 @@ pub async fn run<P: Provider, S: crate::session::store::SessionStore>(
         interactive,
         force_compaction,
         workspace,
+        registry,
     } = input;
     let run_id = session.begin_run();
     // O1（P1-07）：一次 public Agent Run = 一个 TraceId；span 用 SpanId。
@@ -319,6 +323,7 @@ pub async fn run<P: Provider, S: crate::session::store::SessionStore>(
             interactive,
             force_compaction,
             workspace,
+            registry,
         },
     )
     .instrument(span)
@@ -341,6 +346,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
         interactive,
         force_compaction,
         workspace,
+        registry,
     } = input;
     // P1-05：run_inner 只读窄视图 AgentConfig。
     let agent_cfg = config.agent_config();
@@ -521,8 +527,8 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
         interactive,
         initial_plan,
         active_workspace,
-        // P4-02：registry 由 composition root 注入（新调用禁止 global_registry）。
-        crate::tool::registry::global_registry(),
+        // P4-02/P4 gate：registry 由 composition root 注入（无全局）。
+        registry,
     );
 
     let mut turn = 0u32;

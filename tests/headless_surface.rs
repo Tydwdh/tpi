@@ -63,6 +63,9 @@ async fn headless_reaches_equivalent_terminal_state() {
         &[],
         "hello".into(),
         &cancel_slot,
+        std::sync::Arc::new(std::sync::Mutex::new(
+            tpi::tool::registry::builtin_registry(),
+        )),
     )
     .await
     .expect("headless run 成功");
@@ -106,6 +109,9 @@ async fn headless_persists_session_events() {
         &[],
         "hi".into(),
         &cancel_slot,
+        std::sync::Arc::new(std::sync::Mutex::new(
+            tpi::tool::registry::builtin_registry(),
+        )),
     )
     .await
     .expect("headless run");

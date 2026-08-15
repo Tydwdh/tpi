@@ -63,6 +63,9 @@ fn services_with(
         conversation: Conversation::new(),
         current_cancel: std::sync::Arc::new(std::sync::Mutex::new(None)),
         mcp_manager: tpi::mcp::manager::McpManager::new(),
+        registry: std::sync::Arc::new(std::sync::Mutex::new(
+            tpi::tool::registry::builtin_registry(),
+        )),
     }
 }
 
