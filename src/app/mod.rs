@@ -11,6 +11,8 @@
 //! 命令补全菜单（Tab）、输入历史（↑/↓）、多行输入（Alt+Enter）、
 //! 思考折叠（Alt+T）、动画时钟（spinner）。
 
+pub mod intent;
+
 use std::sync::{Arc, Mutex};
 
 use camino::Utf8PathBuf;
@@ -72,6 +74,46 @@ pub enum SessionTarget {
     New,
     Continue,
     Resume(String),
+}
+
+/// P3-01 adapter：slash 命令文本 → 语义 [`AppCommand`]。
+/// 旧 pump（`handle_slash_command`）仍直接消费；P3-03 registry 将统一派发。
+pub fn command_from_slash(message: &str) -> Option<intent::AppCommand> {
+    use intent::AppCommand;
+    let msg = message.trim();
+    match msg {
+        "/quit" | "/exit" => Some(AppCommand::Quit),
+        "/cancel" => Some(AppCommand::CancelRun),
+        "/new" => Some(AppCommand::StartNewSession),
+        "/compact" => Some(AppCommand::CompactNow),
+        "/retry" => Some(AppCommand::RetryLast),
+        "/mcp" if msg.starts_with("/mcp") => Some(AppCommand::OpenModal { name: "mcp".into() }),
+        "/settings" => Some(AppCommand::OpenModal {
+            name: "settings".into(),
+        }),
+        "/help" => Some(AppCommand::OpenModal {
+            name: "help".into(),
+        }),
+        "/session" => Some(AppCommand::OpenModal {
+            name: "session".into(),
+        }),
+        "/sessions" => Some(AppCommand::OpenModal {
+            name: "sessions".into(),
+        }),
+        "/theme" => Some(AppCommand::OpenModal {
+            name: "theme".into(),
+        }),
+        "/diff" => Some(AppCommand::OpenModal {
+            name: "diff".into(),
+        }),
+        "/doctor" => Some(AppCommand::OpenModal {
+            name: "doctor".into(),
+        }),
+        "/thinking" => Some(AppCommand::OpenModal {
+            name: "thinking".into(),
+        }),
+        _ => None, // 非 slash 命令（普通消息）
+    }
 }
 
 /// slash 命令分派结果：`interactive_loop` 据其短路 run 路径。
