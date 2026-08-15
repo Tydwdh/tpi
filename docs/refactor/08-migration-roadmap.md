@@ -714,10 +714,22 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收达成：无副作用工具 canonical output ✓；投影回现有 ToolOutcome（模型/session/
   UI 不变）✓；bounded output ✓；全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P4-07 替换四个 tool-name protocol
+#### P4-07 替换四个 tool-name protocol — **DONE（2026-08-14）**
 
 - 顺序：workspace effect -> plan -> request input -> web finalizer。
 - 每项独立 typed directive/effect test，删除对应 name branch。
+- 实施：把 `name == "update_plan"/"web_fetch"/"request_input"` 的 string 比较替换为
+  `BuiltinTool::from_name(name)` enum 判定（typed directive/effect）：
+  - tool_runtime.rs：plan 工具不发 ToolStarted（is_plan_tool）、web_fetch 成功摘要化
+    （WebFetch）、update_plan 成功后发 PlanUpdated（UpdatePlan）、request_input 挂起
+    检测（RequestInput）；
+  - agent/mod.rs：ensure_plan_state_messages 的 update_plan 检测（UpdatePlan）。
+  每项伴随原分支行为不变（纯判定方式替换）；agent 19 断言全绿证明行为保持。
+  workspace effect 无独立 name branch（workspace 由 ToolContext/ActiveWorkspace
+  分发，P4-07 顺序首项经盘点无需改动）。
+- 验收达成：四个 name protocol 全部 typed 化（生产代码无 tool-name string 分支）✓；
+  每项行为保持（agent/tool_runtime 测试全过）✓；全量 54 target 绿；
+  fmt/clippy/arch_gate 清洁。
 
 #### P4-08 scoped overlays/setup transaction
 

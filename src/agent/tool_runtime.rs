@@ -518,7 +518,9 @@ error: invalid_arguments
             // 工具真正启动前通知（语义事实 + 原始参数；P1-03：target/command 展示
             // 摘要由 app projector 生成，agent 不再产生 view 字段）。
             let kind_name = kind.name().to_string();
-            if kind_name != "update_plan" {
+            // P4-07：typed 分类（BuiltinTool enum，不再 string 比较）。
+            let is_plan_tool = BuiltinTool::from_name(kind.name()) == Some(BuiltinTool::UpdatePlan);
+            if !is_plan_tool {
                 let _ = ui
                     .send(LiveEvent::ToolStarted {
                         call_id: calls[source_index].call_id,
@@ -557,7 +559,8 @@ error: invalid_arguments
         for (index, mut outcome) in results_vec {
             // §用户诉求（C）：web_fetch 成功结果摘要化——主模型上下文只看到
             // 摘要而非全文（省 token、抗页面注入）；摘要失败降级保留原文。
-            if calls[index].name == "web_fetch" {
+            // P4-07：typed 判定（web_fetch 摘要化是 web finalizer effect）。
+            if BuiltinTool::from_name(&calls[index].name) == Some(BuiltinTool::WebFetch) {
                 let prompt =
                     serde_json::from_str::<crate::tool::web::WebFetchArgs>(&calls[index].arguments)
                         .ok()
@@ -602,7 +605,10 @@ error: invalid_arguments
             // plan 快照内容即版本指纹：build_context 每次注入相同快照时
             // 尾部稳定（缓存全命中），只有 plan 变化那轮尾部 miss——
             // 无需额外版本状态。
-            if outcome.status == ToolStatus::Succeeded && calls[index].name == "update_plan" {
+            // P4-07：typed 判定（plan 更新是 typed directive）。
+            if outcome.status == ToolStatus::Succeeded
+                && BuiltinTool::from_name(&calls[index].name) == Some(BuiltinTool::UpdatePlan)
+            {
                 let plan = tool_runtime.plan_snapshot();
                 if let Some(plan) = plan {
                     session
@@ -667,7 +673,8 @@ error: invalid_arguments
         // questions（TUI 选项选择器用）。
         let suspend_args = wave.iter().find_map(|call| {
             let source = &calls[call.source_index];
-            if source.name != "request_input" {
+            // P4-07：typed 判定（request_input 挂起是 typed directive）。
+            if BuiltinTool::from_name(&source.name) != Some(BuiltinTool::RequestInput) {
                 return None;
             }
             let succeeded = results

@@ -1550,7 +1550,8 @@ fn ensure_plan_state_messages(
         matches!(
             message,
             ChatMessage::Tool { name, content, .. }
-                if name == "update_plan" && tool_result_succeeded(content)
+                if crate::tool::BuiltinTool::from_name(name) == Some(crate::tool::BuiltinTool::UpdatePlan)
+                    && tool_result_succeeded(content)
         )
     });
     if already_present {
