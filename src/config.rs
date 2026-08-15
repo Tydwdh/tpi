@@ -110,7 +110,12 @@ pub struct ShellFile {
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct ModelFile {
+    /// 默认模型（`tpi --model` 未指定时使用；向后兼容）。
     pub primary: Option<PrimaryModelFile>,
+    /// 多模型列表（P8：`tpi --model <name>` 从 primary + profiles 中选择）。
+    /// workspace 的 profiles 整表覆盖 home 的 profiles（不逐项合并）。
+    #[serde(default)]
+    pub profiles: Vec<PrimaryModelFile>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,6 +129,10 @@ pub struct PrimaryModelFile {
     pub context_window: Option<u64>,
     /// 从环境变量读取 API key 的变量名（默认 TPI_API_KEY）。
     pub api_key_env: Option<String>,
+    /// 直接在配置文件保存的 API key（§用户需求：不用系统变量；
+    /// 优先级：环境变量 > 配置文件 api_key > 凭据管理器）。
+    /// 注意：明文存 key，配置文件请勿提交到版本库（建议 chmod 600）。
+    pub api_key: Option<String>,
     /// 输入/输出单价（每百万 token，美元；§16.2 花费展示，可选）。
     #[serde(default)]
     pub price_input: Option<f64>,
@@ -161,6 +170,8 @@ pub struct AgentLimitsFile {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub model: ModelConfig,
+    /// 全部可用模型（primary 第一 + profiles；`tpi --model <name>` 从中选择）。
+    pub models: Vec<ModelConfig>,
     pub limits: LimitsConfig,
     pub workspace_root: Utf8PathBuf,
     pub sessions_root: std::path::PathBuf,
@@ -202,6 +213,8 @@ pub struct ModelConfig {
     pub max_output_tokens: Option<u32>,
     pub context_window: Option<u64>,
     pub api_key_env: String,
+    /// 配置文件直存的 API key（None = 走环境变量/凭据管理器）。
+    pub api_key: Option<String>,
     /// 输入/输出单价（每百万 token，美元；None = 不显示花费）。
     pub price_input: Option<f64>,
     pub price_output: Option<f64>,
@@ -339,9 +352,11 @@ pub(crate) fn test_config(workspace_root: &Utf8PathBuf) -> Config {
             max_output_tokens: None,
             context_window: None,
             api_key_env: "TPI_TEST_API_KEY".into(),
+            api_key: None,
             price_input: None,
             price_output: None,
         },
+        models: Vec::new(),
         limits: LimitsConfig::default(),
         workspace_root: workspace_root.clone(),
         sessions_root: std::path::PathBuf::from(".tpi-test-sessions"),
@@ -396,8 +411,35 @@ pub(crate) fn load_from_home(
             )
         })?;
 
-    let name = cli_model.unwrap_or(&primary.name).to_string();
-    validate_model(&primary, &name)?;
+    // P8 多模型：primary + profiles 构成可用列表（按 name 去重，primary 优先）。
+    let mut models: Vec<PrimaryModelFile> = Vec::new();
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        for m in std::iter::once(primary.clone()).chain(merged.model.profiles.clone()) {
+            if seen.insert(m.name.clone()) {
+                models.push(m);
+            }
+        }
+    }
+    // `--model <name>` 从列表选择；未指定用 primary。
+    let selected = match cli_model {
+        Some(cli) => models
+            .iter()
+            .find(|m| m.name == cli)
+            .cloned()
+            .ok_or_else(|| {
+                let available = models
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("--model {cli} 未找到；可用模型：{available}")
+            })?,
+        None => primary,
+    };
+
+    let name = selected.name.clone();
+    validate_model(&selected, &name)?;
     let source = if cli_model.is_some() {
         "cli --model".to_string()
     } else if workspace_has_model {
@@ -464,10 +506,10 @@ pub(crate) fn load_from_home(
     }
 
     let safety_reserve_tokens = merged.context.safety_reserve_tokens.unwrap_or(8192);
-    if let Some(context_window) = primary.context_window
+    if let Some(context_window) = selected.context_window
         && crate::context::usable_input(
             context_window,
-            u64::from(primary.max_output_tokens.unwrap_or(0)),
+            u64::from(selected.max_output_tokens.unwrap_or(0)),
             safety_reserve_tokens,
         ) == 0
     {
@@ -476,18 +518,37 @@ pub(crate) fn load_from_home(
         );
     }
 
+    // 全部模型转 ModelConfig（含 api_key；供 /settings 与选择展示）。
+    let models: Vec<ModelConfig> = models
+        .into_iter()
+        .map(|m| ModelConfig {
+            provider: m.provider,
+            name: m.name,
+            base_url: m.base_url,
+            reasoning: m.reasoning,
+            max_output_tokens: m.max_output_tokens,
+            context_window: m.context_window,
+            api_key_env: m.api_key_env.unwrap_or_else(|| "TPI_API_KEY".into()),
+            api_key: m.api_key,
+            price_input: m.price_input,
+            price_output: m.price_output,
+        })
+        .collect();
+
     Ok(Config {
         model: ModelConfig {
-            provider: primary.provider,
+            provider: selected.provider,
             name,
-            base_url: primary.base_url,
-            reasoning: primary.reasoning,
-            max_output_tokens: primary.max_output_tokens,
-            context_window: primary.context_window,
-            api_key_env: primary.api_key_env.unwrap_or_else(|| "TPI_API_KEY".into()),
-            price_input: primary.price_input,
-            price_output: primary.price_output,
+            base_url: selected.base_url,
+            reasoning: selected.reasoning,
+            max_output_tokens: selected.max_output_tokens,
+            context_window: selected.context_window,
+            api_key_env: selected.api_key_env.unwrap_or_else(|| "TPI_API_KEY".into()),
+            api_key: selected.api_key,
+            price_input: selected.price_input,
+            price_output: selected.price_output,
         },
+        models,
         limits,
         workspace_root: workspace_root.clone(),
         sessions_root: home.join("sessions"),
@@ -528,6 +589,13 @@ fn merge(home: ConfigFile, workspace: ConfigFile) -> ConfigFile {
     ConfigFile {
         model: ModelFile {
             primary: workspace.model.primary.or(home.model.primary),
+            // profiles 整表覆盖（workspace 优先；不逐项合并——模型列表是
+            // 声明式的，混搭两层会产生歧义）。
+            profiles: if workspace.model.profiles.is_empty() {
+                home.model.profiles
+            } else {
+                workspace.model.profiles
+            },
         },
         agent: AgentFile {
             limits: merge_limits(home.agent.limits, workspace.agent.limits),
@@ -607,6 +675,13 @@ fn validate_model(primary: &PrimaryModelFile, effective_name: &str) -> Result<()
     {
         return Err("model.primary.api_key_env 不是有效的环境变量名".into());
     }
+    // api_key 直存：只做基本健全性（有值且无换行/空白包裹）。
+    if primary.api_key.as_deref().is_some_and(|key| {
+        let trimmed = key.trim();
+        trimmed.is_empty() || trimmed != key || key.contains('\n') || key.contains('\r')
+    }) {
+        return Err("model.api_key 不能为空或含换行（请去掉首尾空白）".into());
+    }
     if primary.max_output_tokens == Some(0) {
         return Err("model.primary.max_output_tokens 必须大于 0".into());
     }
@@ -653,18 +728,23 @@ fn read_system_md(path: &std::path::Path) -> Result<Option<String>, String> {
 
 /// 读取 API key（§18.4：环境变量显式覆盖；keyring 属 M6）。
 pub fn read_api_key(config: &Config) -> Result<String, String> {
-    // §18.4：环境变量是显式覆盖；否则从 Windows Credential Manager 读取
-    //（`tpi auth set <provider>` 写入，配置只保存 credential label）。
+    // §18.4 + P8：优先级——环境变量（显式覆盖）> 配置文件 api_key（用户需求
+    // 直存）> Windows Credential Manager（`tpi auth set`）。
     if let Ok(key) = std::env::var(&config.model.api_key_env)
         && !key.is_empty()
     {
         return Ok(key);
     }
+    if let Some(key) = &config.model.api_key
+        && !key.trim().is_empty()
+    {
+        return Ok(key.clone());
+    }
     if let Some(key) = crate::auth::auth_get(&config.model.provider)? {
         return Ok(key);
     }
     Err(format!(
-        "未找到 API key：请设置环境变量 {} 或运行 `tpi auth set {}` 写入凭据（§18.4）",
+        "未找到 API key：请在配置文件的 model.api_key、环境变量 {} 中设置，或运行 `tpi auth set {}` 写入凭据（§18.4）",
         config.model.api_key_env, config.model.provider
     ))
 }
@@ -673,6 +753,94 @@ pub fn read_api_key(config: &Config) -> Result<String, String> {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+
+    /// P8：多模型——profiles 列表构建；`--model <name>` 从列表选择。
+    #[test]
+    fn multi_model_profiles_and_cli_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            r#"
+[model.primary]
+provider = "openai"
+name = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+
+[[model.profiles]]
+provider = "openai"
+name = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"
+
+[[model.profiles]]
+provider = "anthropic"
+name = "claude-sonnet"
+base_url = "https://api.anthropic.com/v1"
+"#,
+        )
+        .unwrap();
+        let ws = Utf8PathBuf::from_path_buf(dir.path().join("ws")).unwrap();
+        std::fs::create_dir_all(ws.join(".tpi")).unwrap();
+        // 默认：primary。
+        let cfg = load_from_home(&ws, None, &home).unwrap();
+        assert_eq!(cfg.model.name, "gpt-4o", "默认选中 primary");
+        assert_eq!(cfg.models.len(), 3, "primary + 2 profiles");
+        // --model 选 profile。
+        let cfg = load_from_home(&ws, Some("claude-sonnet"), &home).unwrap();
+        assert_eq!(cfg.model.name, "claude-sonnet", "--model 选择 profile");
+        assert_eq!(cfg.model.provider, "anthropic");
+        // --model 未找到：报错列出可用模型。
+        let err = load_from_home(&ws, Some("nope"), &home).unwrap_err();
+        assert!(err.contains("nope 未找到"), "{err}");
+        assert!(err.contains("gpt-4o"), "错误信息列出可用模型: {err}");
+    }
+
+    /// P8：API key 直存配置文件——读取优先级 env > 配置 api_key > 凭据。
+    #[test]
+    fn api_key_from_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            r#"
+[model.primary]
+provider = "openai"
+name = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-config-file-key"
+"#,
+        )
+        .unwrap();
+        let ws = Utf8PathBuf::from_path_buf(dir.path().join("ws")).unwrap();
+        std::fs::create_dir_all(ws.join(".tpi")).unwrap();
+        let cfg = load_from_home(&ws, None, &home).unwrap();
+        assert_eq!(cfg.model.api_key.as_deref(), Some("sk-config-file-key"));
+        // read_api_key 从配置读取。
+        assert_eq!(read_api_key(&cfg).unwrap(), "sk-config-file-key");
+    }
+
+    /// P8：api_key 校验——空/带换行/首尾空白拒绝。
+    #[test]
+    fn api_key_validation() {
+        let base = PrimaryModelFile {
+            provider: "openai".into(),
+            name: "gpt-4o".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            reasoning: None,
+            max_output_tokens: None,
+            context_window: None,
+            api_key_env: None,
+            api_key: Some(" sk-with-space".into()),
+            price_input: None,
+            price_output: None,
+        };
+        assert!(validate_model(&base, "gpt-4o").is_err(), "首尾空白拒绝");
+        let mut ok = base;
+        ok.api_key = Some("sk-valid".into());
+        assert!(validate_model(&ok, "gpt-4o").is_ok());
+    }
 
     /// §用户诉求：默认不限制——护栏字段默认全 0，且 validate_limits 接受
     /// （仅 max_parallel_tools 必须 > 0）。

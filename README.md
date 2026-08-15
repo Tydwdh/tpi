@@ -31,10 +31,41 @@ tpi "修复这个测试"            # 进入交互并提交首条消息
 tpi -p "解释失败原因"         # 非交互，stdout 只输出最终答案
 tpi --continue               # 继续当前 workspace 最近 session
 tpi --resume <session-id>    # 恢复指定 session（完整 id 或唯一前缀）
+tpi --model <name>           # 从配置的多个模型中选择（primary + profiles）
 tpi auth set <provider>      # 把 token 写入 Windows Credential Manager
 tpi init                     # 交互式生成配置
 tpi doctor                   # 环境检查（config/模型/API key/Git Bash/目录）
 ```
+
+## 模型配置（~/.tpi/config.toml 或 <workspace>/.tpi/config.toml）
+
+`[model.primary]` 是默认模型；`[[model.profiles]]` 可配置多个备选模型，
+`tpi --model <name>` 选择（按 `name` 匹配，未指定时用 primary）。
+API key 可直接写在配置文件的 `api_key` 字段（无需系统变量）；读取优先级：
+环境变量（`api_key_env`，显式覆盖）> 配置文件 `api_key` > Windows 凭据管理器
+（`tpi auth set`）。
+
+```toml
+[model.primary]
+provider = "openai"
+name = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."          # 可省略；省略时走环境变量/凭据管理器
+
+[[model.profiles]]           # 备选模型（可选）
+provider = "anthropic"
+name = "claude-sonnet"
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-ant-..."
+
+[[model.profiles]]
+provider = "openai"
+name = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"
+```
+
+> 注意：`api_key` 是明文存储，请勿把配置文件提交到版本库
+> （Windows 下建议限制文件权限；或改用 `tpi auth set` 存凭据管理器）。
 
 ## 文档
 
