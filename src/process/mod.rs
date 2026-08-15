@@ -6,6 +6,7 @@
 pub mod capture;
 pub mod host;
 pub mod managed;
+pub mod supervisor;
 
 use std::path::PathBuf;
 

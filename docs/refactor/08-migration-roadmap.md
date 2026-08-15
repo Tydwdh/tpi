@@ -358,11 +358,25 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   既有 5 个 crash 场景全过（不退化）；全量 49 target 绿；fmt/clippy/arch_gate
   清洁。
 
-#### P2-05 `Supervisor` walking skeleton
+#### P2-05 `Supervisor` walking skeleton — **DONE（2026-08-14）**
 
 - 先拥有一个无害 background task，验证 cancel/close/wait/aggregate error。
 - 使用 CancellationToken + TaskTracker；建立 leak test。
 - 验收：100 次 start/shutdown 后 tracked tasks 为 0。
+- 实施：`src/process/supervisor.rs` 新增 `Supervisor`（ADR-006 协议落地）：
+  - `spawn(name, f)`：父 token 派生 child token（父 cancel 传播全部），
+    TaskTracker 跟踪（quiescence）；
+  - `shutdown()`：固定顺序 cancel → close → wait（tracker.wait）→ 汇总错误，
+    幂等；
+  - `token()/tracked()/is_cancelled()`。
+  - 测试（4 断言）：无害循环任务 shutdown 后 tracked==0；**100 次 start/
+    shutdown tracked 始终归 0**（leak test 核心验收）；panic 任务不阻塞
+    quiescence；外部 cancel 传播到子任务。
+  - 错误汇总（aggregate error）在 P2-06 迁 watchdog 时引入 join_handles
+    补全（walking skeleton 阶段以 tracked==0 为 quiescence 验收）。
+- 验收达成：100 次 start/shutdown 后 tracked==0 ✓；cancel/close/wait 协议
+  成立 ✓；全量 49 target 绿；fmt/clippy/arch_gate 清洁。
+  P2-06（迁 watchdog/tool forwarder）基于本 Supervisor。
 
 #### P2-06 迁 Agent watchdog/tool forwarder
 
