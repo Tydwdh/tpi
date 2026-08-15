@@ -31,6 +31,19 @@ pub enum ToolOrigin {
     },
 }
 
+/// External 工具可声明的调度访问类别（P8-10 subagent 并行）。
+///
+/// 默认 `WorkspaceUnknown`：批内串行执行（MCP 等未知副作用工具保持保守）。
+/// 只读工具（如 `subagent`：child 白名单仅 read/list/search/glob）可声明
+/// `ReadOnly`，与同批 read/search 进入同一 wave 并行执行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAccessClass {
+    /// 未知副作用：按源顺序串行（默认；MCP 等 External 工具现状）。
+    WorkspaceUnknown,
+    /// 只读访问 workspace：可与其他只读工具并行；与写工具冲突时串行。
+    ReadOnly,
+}
+
 impl std::fmt::Display for ToolOrigin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -79,6 +92,12 @@ pub trait Tool: Send + Sync {
             return Err(format!("工具 {name} 的 input_schema 必须是 JSON object"));
         }
         Ok(())
+    }
+
+    /// 调度访问类别（P8-10）：默认 `WorkspaceUnknown`（串行保守）；
+    /// 只读 External 工具覆写为 `ReadOnly` 与批内只读工具并行。
+    fn access_class(&self) -> ToolAccessClass {
+        ToolAccessClass::WorkspaceUnknown
     }
 }
 

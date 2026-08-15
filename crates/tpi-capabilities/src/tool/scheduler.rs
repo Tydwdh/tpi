@@ -117,6 +117,17 @@ fn file_lock(scope: FileScope, mode: AccessMode) -> ToolAccess {
     }])
 }
 
+/// 只读 workspace 级访问声明（P8-10：External 只读工具，如 `subagent`——
+/// child 白名单仅 read/list/search/glob，无写副作用）。与其他只读工具并行；
+/// 与批内写工具冲突时按 write 独占 wave 串行。
+pub fn read_workspace_lock(
+    workspace_root: &camino::Utf8PathBuf,
+    allow_outside_workspace: bool,
+) -> ToolAccess {
+    let root = crate::tool::resolve_lock_path(workspace_root, ".", allow_outside_workspace);
+    file_lock(FileScope::Recursive(root), AccessMode::Read)
+}
+
 /// 两个文件作用域是否冲突（§12.1：同一 root 下祖先/后代包含关系且至少一方为 write）。
 pub fn scopes_conflict(a: &FileScope, b: &FileScope) -> bool {
     fn path_of(scope: &FileScope) -> &camino::Utf8PathBuf {

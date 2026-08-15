@@ -346,6 +346,20 @@ async fn execute_batch<P: Provider, S: tpi_session::store::SessionStore>(
         let Some(tool) = BuiltinTool::from_name(&call.name) else {
             // 外部工具（MCP adapter）？P4-03：用 Step 快照（不锁 registry）。
             if let Some(adapter) = tool_runtime.active_set().external.get(&call.name).cloned() {
+                // P8-10：External 工具的调度访问类别——`ReadOnly`（subagent 等
+                // 只读工具）与批内 read/search 并行；默认 `WorkspaceUnknown`
+                //（MCP 等未知副作用）保持串行保守。
+                let access = match adapter.access_class() {
+                    tpi_capabilities::tool::registry::ToolAccessClass::ReadOnly => {
+                        tpi_capabilities::tool::scheduler::read_workspace_lock(
+                            &config.workspace_root,
+                            config.allow_outside_workspace,
+                        )
+                    }
+                    tpi_capabilities::tool::registry::ToolAccessClass::WorkspaceUnknown => {
+                        ToolAccess::WorkspaceUnknown
+                    }
+                };
                 prepared.push(PreparedCall {
                     source_index: index,
                     kind: tpi_capabilities::tool::scheduler::PreparedKind::External {
@@ -353,7 +367,7 @@ async fn execute_batch<P: Provider, S: tpi_session::store::SessionStore>(
                         args_json: call.arguments.clone(),
                         adapter,
                     },
-                    access: ToolAccess::WorkspaceUnknown,
+                    access,
                     action_key: action_key_from_name(&call.name, &call.arguments),
                     plan: None,
                 });

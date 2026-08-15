@@ -528,3 +528,88 @@ async fn repeated_failing_action_blocked_in_agent_loop() {
             .contains("repeated_without_progress")
     );
 }
+
+/// P8-10（方案 A）：`subagent` 声明 `ReadOnly` 访问类别后，与批内内置 read
+/// 合并进同一 wave（并行）；与冲突 write 隔离串行。
+#[test]
+fn read_only_external_tools_share_wave_with_reads_but_not_writes() {
+    use tpi::agent::scheduler::{FileScope, ResourceId, ResourceLock};
+    use tpi::tool::scheduler::read_workspace_lock;
+
+    let root = Utf8PathBuf::from("C:/ws");
+    let external_readonly = |index: usize| PreparedCall {
+        source_index: index,
+        kind: tpi::agent::scheduler::PreparedKind::External {
+            name: "subagent".into(),
+            args_json: r#"{"instruction":"调查"}"#.into(),
+            adapter: std::sync::Arc::new(tpi::tool::registry::BuiltinToolAdapter::new(
+                tpi::tool::implemented_tools()
+                    .into_iter()
+                    .find(|t| t.name() == "read")
+                    .unwrap(),
+            )),
+        },
+        access: read_workspace_lock(&root, true),
+        action_key: format!("s{index}"),
+        plan: None,
+    };
+    let file_read = |index: usize, path: &str| PreparedCall {
+        source_index: index,
+        kind: tpi::agent::scheduler::PreparedKind::Builtin {
+            tool: tpi::tool::BuiltinTool::Read,
+            args: tpi::tool::ValidatedArgs::Read(tpi::tool::files::ReadArgs {
+                path: path.into(),
+                start_line: 1,
+                line_count: 10,
+            }),
+        },
+        access: ToolAccess::Resources(vec![ResourceLock {
+            resource: ResourceId::File(FileScope::Exact(Utf8PathBuf::from(path))),
+            mode: tpi::agent::scheduler::AccessMode::Read,
+        }]),
+        action_key: format!("r{index}"),
+        plan: None,
+    };
+    let file_write = |index: usize, path: &str| PreparedCall {
+        source_index: index,
+        kind: tpi::agent::scheduler::PreparedKind::Builtin {
+            tool: tpi::tool::BuiltinTool::Write,
+            args: tpi::tool::ValidatedArgs::Write(tpi::tool::files::WriteArgs {
+                path: path.into(),
+                content: "x".into(),
+                revision: None,
+            }),
+        },
+        access: ToolAccess::Resources(vec![ResourceLock {
+            resource: ResourceId::File(FileScope::Exact(Utf8PathBuf::from(path))),
+            mode: tpi::agent::scheduler::AccessMode::Write,
+        }]),
+        action_key: format!("w{index}"),
+        plan: None,
+    };
+
+    // 两个 ReadOnly external + 内置 read → 单 wave（全部并行）。
+    let calls = vec![
+        external_readonly(0),
+        file_read(1, "a.rs"),
+        external_readonly(2),
+    ];
+    let waves = build_waves(calls, 4);
+    assert_eq!(
+        waves.len(),
+        1,
+        "ReadOnly external 必须与内置 read 合并进同一 wave（并行）: {waves:?}"
+    );
+    assert_eq!(waves[0].len(), 3);
+
+    // ReadOnly external 与冲突 write → 独立 wave（write 独占，串行）。
+    let calls = vec![external_readonly(0), file_write(1, "a.rs")];
+    let waves = build_waves(calls, 4);
+    assert_eq!(
+        waves.len(),
+        2,
+        "ReadOnly external 与 workspace 内 write 必须隔离: {waves:?}"
+    );
+    assert!(waves[0][0].source_index == 0);
+    assert!(waves[1][0].source_index == 1);
+}
