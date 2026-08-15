@@ -5,18 +5,18 @@
 
 use std::time::Duration;
 
-use crate::ids::ToolCallId;
 use crate::provider::trace;
 use crate::provider::{
     ChatMessage, FinishReason, ModelRequest, Provider, ProviderError, ProviderEvent,
     ProviderResponse,
 };
-use crate::session::Usage;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+use tpi_core::ids::ToolCallId;
+use tpi_session::Usage;
 
 /// 最大尝试次数（含首次请求；§7.3：指数退避，最多 10 次 = 9 次重试）。
 const MAX_ATTEMPTS: u32 = 10;
@@ -712,7 +712,7 @@ async fn consume_stream(
         }
         if event.event == "error" {
             let mut message = event.data;
-            crate::util::truncate_to_char_boundary(&mut message, MAX_ERROR_BODY_BYTES);
+            tpi_core::util::truncate_to_char_boundary(&mut message, MAX_ERROR_BODY_BYTES);
             return ConsumeResult::Failed {
                 error: ProviderError::Protocol(format!("provider error event: {message}")),
                 retryable: false,
@@ -1144,7 +1144,7 @@ mod tests {
         let with_calls = ChatMessage::Assistant {
             content: "reading".into(),
             tool_calls: vec![crate::provider::ToolCall {
-                call_id: crate::ids::ToolCallId::new_v7(),
+                call_id: tpi_core::ids::ToolCallId::new_v7(),
                 provider_id: "call_x".into(),
                 name: "read".into(),
                 arguments: "{}".into(),

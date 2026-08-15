@@ -14,7 +14,7 @@
 //! 禁止业务模块直接依赖 exporter DTO（OTel 等）——本模块是唯一的
 //! trace 领域类型源。
 
-use crate::ids::{RunId, SessionId, SpanId, TraceId};
+use tpi_core::ids::{RunId, SessionId, SpanId, TraceId};
 
 /// TraceRecord schema 版本（O2 sink 读取时校验；与 session schema 独立）。
 pub const TRACE_SCHEMA_VERSION: u16 = 1;

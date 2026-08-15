@@ -8,18 +8,14 @@
 
 pub use tpi_core::{ids, message, outcome, plan, revision, util};
 // session crate 顶层即 session 模块（module alias 保持 `crate::session` 路径）。
+pub use tpi_agent::{agent, context, provider, subagent, trace};
 pub use tpi_capabilities::{mcp, process, remote, shell, skills, tool, workspace};
 pub use tpi_config::{auth, config};
 pub use tpi_session as session;
 
-pub mod agent;
 pub mod app;
 pub mod clipboard;
-pub mod context;
 pub mod doctor;
 pub mod eval;
-pub mod provider;
-pub mod subagent;
-pub mod trace;
 pub mod tui;
 pub mod web;

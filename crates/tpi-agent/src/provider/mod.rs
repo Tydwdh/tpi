@@ -6,8 +6,8 @@
 //! 第一版只有 OpenAI-compatible 一个实现 + 测试用 fake provider；
 //! 第二个真实 adapter 出现时再从已稳定的输入/事件类型提取边界（§7.1）。
 
-use crate::session::Usage;
 use tokio_util::sync::CancellationToken;
+use tpi_session::Usage;
 
 pub mod catalog;
 pub mod openai_compat;
@@ -47,9 +47,9 @@ pub enum FinishReason {
 }
 
 /// P7 下沉：`ChatMessage` / `ToolCall` / `ToolDef` 是纯数据，定义在 domain 层
-/// （`crate::message`）；此处 re-export 保持对外契约不变（`provider::ChatMessage`
+/// （`tpi_core::message`）；此处 re-export 保持对外契约不变（`provider::ChatMessage`
 /// 等仍可用，golden parity 由测试保证）。
-pub use crate::message::{ChatMessage, ToolCall, ToolDef};
+pub use tpi_core::message::{ChatMessage, ToolCall, ToolDef};
 
 /// 一次模型请求。
 #[derive(Debug, Clone)]

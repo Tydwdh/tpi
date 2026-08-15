@@ -5133,6 +5133,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "tpi-agent",
  "tpi-capabilities",
  "tpi-config",
  "tpi-core",
@@ -5146,6 +5147,34 @@ dependencies = [
  "unicode-width",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tpi-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "camino",
+ "eventsource-stream",
+ "futures-util",
+ "proptest",
+ "ratatui",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tpi-capabilities",
+ "tpi-config",
+ "tpi-core",
+ "tpi-session",
+ "tpi-ui-types",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -11,16 +11,16 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{LiveEvent, RunFailure};
-use crate::config::Config;
-use crate::ids::ToolCallId;
-use crate::outcome::{StoredToolOutcome, ToolOutcome, ToolStatus};
-use crate::plan::Plan;
 use crate::provider::{ChatMessage, FinishReason, ModelRequest, Provider, ProviderEvent, ToolCall};
-use crate::session::{RecoveryMetadata, SessionEvent, Usage};
-use crate::tool::edit::SnapshotStore;
-use crate::tool::search::ScanSnapshot;
-use crate::tool::{self, BuiltinTool, ToolContext, ToolStreamEvent};
 use camino::Utf8PathBuf;
+use tpi_capabilities::tool::edit::SnapshotStore;
+use tpi_capabilities::tool::search::ScanSnapshot;
+use tpi_capabilities::tool::{self, BuiltinTool, ToolContext, ToolStreamEvent};
+use tpi_config::config::Config;
+use tpi_core::ids::ToolCallId;
+use tpi_core::outcome::{StoredToolOutcome, ToolOutcome, ToolStatus};
+use tpi_core::plan::Plan;
+use tpi_session::{RecoveryMetadata, SessionEvent, Usage};
 
 pub(super) struct ToolRuntime {
     config: RuntimeConfig,
@@ -30,13 +30,13 @@ pub(super) struct ToolRuntime {
     scan_snapshots: Arc<Mutex<HashMap<String, ScanSnapshot>>>,
     snapshot_store: Arc<Mutex<SnapshotStore>>,
     current_plan: Arc<Mutex<Option<Plan>>>,
-    shell: Arc<Mutex<crate::shell::ShellSessionState>>,
-    workspace: Arc<Mutex<crate::workspace::ActiveWorkspace>>,
+    shell: Arc<Mutex<tpi_capabilities::shell::ShellSessionState>>,
+    workspace: Arc<Mutex<tpi_capabilities::workspace::ActiveWorkspace>>,
     /// ManagedProcess registry（session 级；background bash + process 工具共享）。
-    processes: Arc<Mutex<crate::process::managed::ProcessRegistry>>,
+    processes: Arc<Mutex<tpi_capabilities::process::managed::ProcessRegistry>>,
     /// ToolRegistry（builtin + MCP；agent 工具目录，README2 Phase 5）。
     /// Mutex：Phase 3 的 McpManager 运行时注册 MCP 工具。
-    registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
+    registry: Arc<std::sync::Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
     /// P4-03：当前 Step 的不可变工具快照（reload 构建，Step 内复用）。
     /// Mutex：ToolRuntime 需跨线程（web spawn）；Step 内锁一次 clone 复用。
     active: std::sync::Mutex<Option<ActiveToolSet>>,
@@ -50,8 +50,10 @@ pub(super) struct ActiveToolSet {
     #[allow(dead_code)]
     pub defs: Vec<crate::provider::ToolDef>,
     /// 外部工具 lookup（MCP adapter；builtin 经 BuiltinTool::from_name）。
-    pub external:
-        std::collections::HashMap<String, std::sync::Arc<dyn crate::tool::registry::Tool>>,
+    pub external: std::collections::HashMap<
+        String,
+        std::sync::Arc<dyn tpi_capabilities::tool::registry::Tool>,
+    >,
 }
 
 #[derive(Clone)]
@@ -69,8 +71,8 @@ impl ToolRuntime {
         cancel: CancellationToken,
         interactive: bool,
         initial_plan: Option<Plan>,
-        active_workspace: crate::workspace::ActiveWorkspace,
-        registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
+        active_workspace: tpi_capabilities::workspace::ActiveWorkspace,
+        registry: Arc<std::sync::Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
     ) -> Self {
         // §W0/R4：workspace 由调用方注入（默认 Local；测试可传 remote）。
         // ctx.shell 与 workspace 内 shell 共享同一 Arc。
@@ -98,20 +100,22 @@ impl ToolRuntime {
             current_plan: Arc::new(Mutex::new(initial_plan)),
             shell,
             workspace,
-            processes: Arc::new(Mutex::new(crate::process::managed::ProcessRegistry::new())),
+            processes: Arc::new(Mutex::new(
+                tpi_capabilities::process::managed::ProcessRegistry::new(),
+            )),
             registry,
         }
     }
 
     pub(super) fn plan_snapshot(&self) -> Option<Plan> {
-        crate::util::lock_mutex(&self.current_plan, "current_plan").clone()
+        tpi_core::util::lock_mutex(&self.current_plan, "current_plan").clone()
     }
 
     /// P4-03：构建当前 Step 的不可变工具快照并返回 defs（Step 内执行共用）。
     /// 每次 reload 在 Step 边界锁 registry；Step 内执行不再锁。
     pub(super) fn reload(&self, context: &str) -> Vec<crate::provider::ToolDef> {
         let registry = self.registry.lock().unwrap();
-        let selector = crate::tool::selector::ToolSelector::default();
+        let selector = tpi_capabilities::tool::selector::ToolSelector::default();
         let defs: Vec<crate::provider::ToolDef> = selector
             .select(registry.descriptors(), context)
             .into_iter()
@@ -123,7 +127,7 @@ impl ToolRuntime {
             .collect();
         let external: std::collections::HashMap<
             String,
-            std::sync::Arc<dyn crate::tool::registry::Tool>,
+            std::sync::Arc<dyn tpi_capabilities::tool::registry::Tool>,
         > = registry
             .list()
             .into_iter()
@@ -148,15 +152,15 @@ impl ToolRuntime {
 
     /// 当前 workspace 快照（§R4：build_context 注入 identity 用；clone 避免
     /// 返回指向 MutexGuard 临时值的引用）。
-    pub(super) fn workspace_snapshot(&self) -> crate::workspace::ActiveWorkspace {
-        crate::util::lock_mutex(&self.workspace, "workspace").clone()
+    pub(super) fn workspace_snapshot(&self) -> tpi_capabilities::workspace::ActiveWorkspace {
+        tpi_core::util::lock_mutex(&self.workspace, "workspace").clone()
     }
 
     /// ManagedProcess 上下文快照（§25/§26/§60）：active + 近期状态变化的进程。
     /// 空 = 无活跃进程（不注入，避免 context 膨胀）。返回文本由 build_context
     /// 以 system 角色注入（harness metadata，非 User 消息，§26）。
     pub(super) fn processes_snapshot(&self) -> Option<String> {
-        let reg = crate::util::lock_mutex(&self.processes, "process_registry");
+        let reg = tpi_core::util::lock_mutex(&self.processes, "process_registry");
         let lines = reg.snapshot_lines(&[]);
         if lines.is_empty() {
             return None;
@@ -202,7 +206,7 @@ pub(super) enum BatchEnd {
     /// 携带完整参数：渲染文本（`args.render()`）供 session/TUI 展示，
     /// 结构化 questions 供 TUI 选项选择器（键盘交互）使用。
     SuspendRequested {
-        args: crate::tool::request_input::RequestInputArgs,
+        args: tpi_capabilities::tool::request_input::RequestInputArgs,
     },
 }
 
@@ -218,21 +222,21 @@ pub(super) enum BatchEnd {
 /// (ToolStarted/RecoveryMetadata) → execute wave (parallel Pure/Read, serial
 /// Write/WorkspaceUnknown) → observe (no-progress) → persist (ToolCompleted)
 /// → refill results by source index.
-pub(super) struct ToolBatchExecutor<'a, S: crate::session::store::SessionStore> {
+pub(super) struct ToolBatchExecutor<'a, S: tpi_session::store::SessionStore> {
     config: &'a Config,
     session: &'a mut S,
     messages: &'a mut Vec<ChatMessage>,
-    progress: &'a mut crate::tool::scheduler::ProgressTracker,
+    progress: &'a mut tpi_capabilities::tool::scheduler::ProgressTracker,
     runtime: &'a ToolRuntime,
     ui: &'a mpsc::Sender<LiveEvent>,
 }
 
-impl<'a, S: crate::session::store::SessionStore> ToolBatchExecutor<'a, S> {
+impl<'a, S: tpi_session::store::SessionStore> ToolBatchExecutor<'a, S> {
     pub(super) fn new(
         config: &'a Config,
         session: &'a mut S,
         messages: &'a mut Vec<ChatMessage>,
-        progress: &'a mut crate::tool::scheduler::ProgressTracker,
+        progress: &'a mut tpi_capabilities::tool::scheduler::ProgressTracker,
         runtime: &'a ToolRuntime,
         ui: &'a mpsc::Sender<LiveEvent>,
     ) -> Self {
@@ -264,19 +268,19 @@ impl<'a, S: crate::session::store::SessionStore> ToolBatchExecutor<'a, S> {
 /// 3. 同 wave 无冲突 Pure/Read 并行（受 `max_parallel_tools` 限制）；
 ///    Write / WorkspaceUnknown 按源顺序；
 /// 4. 结果无论完成先后都按原 call index 送回 provider（§12.2 第 6 条）。
-async fn execute_batch<P: Provider, S: crate::session::store::SessionStore>(
+async fn execute_batch<P: Provider, S: tpi_session::store::SessionStore>(
     executor: ToolBatchExecutor<'_, S>,
     provider: &mut P,
     calls: Vec<ToolCall>,
     tool_calls_total: &mut u32,
     usage_total: &mut Usage,
 ) -> Result<BatchEnd, RunFailure> {
-    use crate::tool::scheduler::{
+    use futures_util::future::join_all;
+    use std::collections::HashMap;
+    use tpi_capabilities::tool::scheduler::{
         PreparedCall, ToolAccess, action_key, action_key_from_name, build_waves,
         stable_observation, state_stamp_from_ctx,
     };
-    use futures_util::future::join_all;
-    use std::collections::HashMap;
 
     let ToolBatchExecutor {
         config,
@@ -305,7 +309,7 @@ async fn execute_batch<P: Provider, S: crate::session::store::SessionStore>(
                     .unwrap_or(name.clone());
                 let outcome = ToolOutcome::failed(
                     &tool_label,
-                    crate::outcome::ModelPayload {
+                    tpi_core::outcome::ModelPayload {
                         status: ToolStatus::Rejected,
                         program: None,
                         exit_code: None,
@@ -334,7 +338,7 @@ async fn execute_batch<P: Provider, S: crate::session::store::SessionStore>(
             if let Some(adapter) = tool_runtime.active_set().external.get(&call.name).cloned() {
                 prepared.push(PreparedCall {
                     source_index: index,
-                    kind: crate::tool::scheduler::PreparedKind::External {
+                    kind: tpi_capabilities::tool::scheduler::PreparedKind::External {
                         name: call.name.clone(),
                         args_json: call.arguments.clone(),
                         adapter,
@@ -358,7 +362,7 @@ async fn execute_batch<P: Provider, S: crate::session::store::SessionStore>(
         };
         match tool.parse_args(&call.arguments) {
             Ok(args) => {
-                let access = crate::tool::scheduler::tool_access(
+                let access = tpi_capabilities::tool::scheduler::tool_access(
                     tool,
                     &args,
                     &config.workspace_root,
@@ -373,7 +377,7 @@ async fn execute_batch<P: Provider, S: crate::session::store::SessionStore>(
                 );
                 prepared.push(PreparedCall {
                     source_index: index,
-                    kind: crate::tool::scheduler::PreparedKind::Builtin { tool, args },
+                    kind: tpi_capabilities::tool::scheduler::PreparedKind::Builtin { tool, args },
                     access,
                     action_key: action_key(tool, &call.arguments),
                     plan,
@@ -382,7 +386,7 @@ async fn execute_batch<P: Provider, S: crate::session::store::SessionStore>(
             Err(message) => {
                 let outcome = ToolOutcome::failed(
                     tool.name(),
-                    crate::outcome::ModelPayload {
+                    tpi_core::outcome::ModelPayload {
                         status: ToolStatus::Rejected,
                         program: None,
                         exit_code: None,
@@ -427,14 +431,16 @@ error: invalid_arguments
         for call in &wave {
             let source = &calls[call.source_index];
             let requires_wa = match &call.kind {
-                crate::tool::scheduler::PreparedKind::Builtin { tool, .. } => {
+                tpi_capabilities::tool::scheduler::PreparedKind::Builtin { tool, .. } => {
                     tool.requires_write_ahead()
                 }
-                crate::tool::scheduler::PreparedKind::External { .. } => false,
+                tpi_capabilities::tool::scheduler::PreparedKind::External { .. } => false,
             };
             // §10.7：复用预检阶段生成的同一 plan（temp/backup 路径一致）。
             let recovery = if requires_wa {
-                if let crate::tool::scheduler::PreparedKind::Builtin { tool, .. } = call.kind {
+                if let tpi_capabilities::tool::scheduler::PreparedKind::Builtin { tool, .. } =
+                    call.kind
+                {
                     recovery_metadata(
                         tool,
                         source,
@@ -473,7 +479,7 @@ error: invalid_arguments
         // P2-06：stream forwarder 由 Supervisor 跟踪（join 而非 abort）。
         // channel 关闭（所有 output_tx sender drop）时 recv 返回 None，任务自然
         // 结束；wave 结束时 drop(output_tx) 后 join。
-        let mut stream_supervisor = crate::process::supervisor::Supervisor::new();
+        let mut stream_supervisor = tpi_capabilities::process::supervisor::Supervisor::new();
         let mut stream_output_rx = Some(output_rx);
         stream_supervisor.spawn("tool.stream_forwarder", move |_| async move {
             let Some(mut rx) = stream_output_rx.take() else {
@@ -536,10 +542,10 @@ error: invalid_arguments
                     (source_index, outcome.into_stored())
                 } else {
                     let outcome = match kind {
-                        crate::tool::scheduler::PreparedKind::Builtin { tool, args } => {
+                        tpi_capabilities::tool::scheduler::PreparedKind::Builtin { tool, args } => {
                             tool::execute(tool, args, &ctx, plan.as_ref()).await
                         }
-                        crate::tool::scheduler::PreparedKind::External {
+                        tpi_capabilities::tool::scheduler::PreparedKind::External {
                             name: _,
                             args_json,
                             adapter,
@@ -555,10 +561,11 @@ error: invalid_arguments
             // 摘要而非全文（省 token、抗页面注入）；摘要失败降级保留原文。
             // P4-07：typed 判定（web_fetch 摘要化是 web finalizer effect）。
             if BuiltinTool::from_name(&calls[index].name) == Some(BuiltinTool::WebFetch) {
-                let prompt =
-                    serde_json::from_str::<crate::tool::web::WebFetchArgs>(&calls[index].arguments)
-                        .ok()
-                        .and_then(|args| args.prompt);
+                let prompt = serde_json::from_str::<tpi_capabilities::tool::web::WebFetchArgs>(
+                    &calls[index].arguments,
+                )
+                .ok()
+                .and_then(|args| args.prompt);
                 maybe_summarize_web_fetch(
                     provider,
                     config,
@@ -580,7 +587,7 @@ error: invalid_arguments
                     .iter()
                     .find(|p| p.source_index == index)
                     .map(|p| p.access.clone())
-                    .unwrap_or(crate::tool::scheduler::ToolAccess::Pure);
+                    .unwrap_or(tpi_capabilities::tool::scheduler::ToolAccess::Pure);
                 let ctx = tool_runtime.context(calls[index].call_id, None);
                 format!(
                     "{}|{}",
@@ -679,8 +686,10 @@ error: invalid_arguments
             }
             // 工具成功执行意味着参数已通过预检；解析失败（理论不可能）
             // 时回退为空参数，由 agent 层以默认文本挂起。
-            serde_json::from_str::<crate::tool::request_input::RequestInputArgs>(&source.arguments)
-                .ok()
+            serde_json::from_str::<tpi_capabilities::tool::request_input::RequestInputArgs>(
+                &source.arguments,
+            )
+            .ok()
         });
         if let Some(args) = suspend_args {
             return Ok(BatchEnd::SuspendRequested { args });
@@ -841,7 +850,7 @@ fn extract_external_content(output: &str) -> Option<&str> {
 fn repeated_outcome(tool: &str, action_key: &str) -> ToolOutcome {
     ToolOutcome::failed(
         tool,
-        crate::outcome::ModelPayload {
+        tpi_core::outcome::ModelPayload {
             status: ToolStatus::Rejected,
             program: None,
             exit_code: None,
@@ -884,7 +893,7 @@ fn tool_result_message(call: &ToolCall, outcome: &StoredToolOutcome) -> ChatMess
 fn unknown_tool_outcome(name: &str) -> StoredToolOutcome {
     ToolOutcome::failed(
         name,
-        crate::outcome::ModelPayload {
+        tpi_core::outcome::ModelPayload {
             status: ToolStatus::Rejected,
             program: None,
             exit_code: None,
@@ -918,9 +927,12 @@ fn write_tool_plan(
                     parsed.path
                 }
             };
-            let target_path =
-                crate::tool::resolve_write_path(workspace_root, &target, allow_outside_workspace)
-                    .ok()?;
+            let target_path = tpi_capabilities::tool::resolve_write_path(
+                workspace_root,
+                &target,
+                allow_outside_workspace,
+            )
+            .ok()?;
             Some(tool::edit::prepare_commit(&target_path))
         }
         _ => None,
@@ -948,7 +960,7 @@ fn recovery_metadata(
             let parsed = serde_json::from_str::<tool::edit::EditArgs>(arguments).ok()?;
             let (temp, backup) = plan_paths(plan?);
             // §9.1：内部记录使用绝对路径（session 是内部事实源；恢复器据此定位文件）。
-            let target = crate::tool::resolve_write_path(
+            let target = tpi_capabilities::tool::resolve_write_path(
                 workspace_root,
                 &parsed.path,
                 allow_outside_workspace,
@@ -972,7 +984,7 @@ fn recovery_metadata(
         (BuiltinTool::Write, arguments) => {
             let parsed = serde_json::from_str::<tool::files::WriteArgs>(arguments).ok()?;
             let (temp, backup) = plan_paths(plan?);
-            let target = crate::tool::resolve_write_path(
+            let target = tpi_capabilities::tool::resolve_write_path(
                 workspace_root,
                 &parsed.path,
                 allow_outside_workspace,
@@ -1024,7 +1036,7 @@ mod tests {
     /// 无法证明恢复完成）必须保留恢复现场。
     #[test]
     fn backup_cleanup_policy_keeps_recovery_on_failure() {
-        use crate::outcome::ToolStatus;
+        use tpi_core::outcome::ToolStatus;
         assert!(backup_cleanup_allowed(ToolStatus::Succeeded));
         assert!(!backup_cleanup_allowed(ToolStatus::Failed));
         assert!(!backup_cleanup_allowed(ToolStatus::Rejected));
@@ -1068,12 +1080,12 @@ mod tests {
         }
         let mut provider = NoopProvider;
         // P1 Exit gate：tui 依赖收敛在 config 模块（config::test_config）。
-        let config = crate::config::test_config(&camino::Utf8PathBuf::from("fake"));
+        let config = tpi_config::config::test_config(&camino::Utf8PathBuf::from("fake"));
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut usage = Usage::default();
-        let outcome = crate::outcome::ToolOutcome::failed(
+        let outcome = tpi_core::outcome::ToolOutcome::failed(
             "web_fetch",
-            crate::outcome::ModelPayload {
+            tpi_core::outcome::ModelPayload {
                 status: ToolStatus::Failed,
                 program: None,
                 exit_code: None,
@@ -1142,10 +1154,10 @@ mod tests {
         }
         let mut provider = FixedProvider { answered: false };
         // P1 Exit gate：tui 依赖收敛在 config 模块（config::test_config）。
-        let config = crate::config::test_config(&camino::Utf8PathBuf::from("fake"));
+        let config = tpi_config::config::test_config(&camino::Utf8PathBuf::from("fake"));
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut usage = Usage::default();
-        let mut outcome = crate::outcome::ToolOutcome::succeeded(
+        let mut outcome = tpi_core::outcome::ToolOutcome::succeeded(
             "web_fetch",
             "status: succeeded\ntool: web_fetch\nurl: https://example.com\nhttp: 200\n\n<external_content source=\"https://example.com\">\n页面正文……\n</external_content>\nartifact: @artifact/s/id\n".into(),
         )

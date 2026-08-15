@@ -9,7 +9,7 @@
 pub mod child;
 pub mod parallel;
 
-use crate::ids::{SessionId, SpanId, TraceId};
+use tpi_core::ids::{SessionId, SpanId, TraceId};
 
 /// 子代理只读能力白名单（P8 初始规格：只读调查）。
 /// P7-02 拆 crate：定义在 capabilities（tool::registry），此处 re-export

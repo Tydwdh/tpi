@@ -12,11 +12,11 @@ use crate::provider::ChatMessage;
 /// `max(ceil(utf8_bytes / 3), unicode_scalar_count)`。
 /// P7-02 拆 crate：estimate_tokens 下沉 tpi-core；此处 re-export 保持
 /// `crate::context::estimate_tokens` 路径兼容。
-pub use crate::revision::estimate_tokens;
+pub use tpi_core::revision::estimate_tokens;
 
 /// P7-02 拆 crate：prune_messages 下沉 tpi-core（完整版）；此处 re-export
 /// 保持 `crate::context::prune_messages` 路径兼容。
-pub use crate::revision::prune_messages;
+pub use tpi_core::revision::prune_messages;
 
 /// 估算一组消息的 token 数。
 pub fn estimate_messages(messages: &[ChatMessage]) -> u64 {
@@ -64,7 +64,7 @@ fn estimate_message(message: &ChatMessage) -> u64 {
 /// 可用输入预算（§15.4）：`usable_input = context_window - max_output_tokens -
 /// safety_reserve`。P7-02 拆 crate：实现下沉 tpi-core（revision::usable_input），
 /// 此处 re-export 保持 `crate::context::usable_input` 路径兼容。
-pub use crate::revision::usable_input;
+pub use tpi_core::revision::usable_input;
 
 /// 是否触发 compaction（§15.4：`projected_input > usable_input`）。
 pub fn should_compact(projected: u64, usable: u64) -> bool {

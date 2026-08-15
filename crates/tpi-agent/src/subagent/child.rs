@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{self, RunInput};
-use crate::ids::RunId;
 use crate::provider::Provider;
-use crate::session::store::SessionLog;
 use crate::subagent::{SubagentProvider, SubagentReport, SubagentRequest};
-use crate::tool::registry::{ToolRegistry, read_only_registry};
-use crate::workspace::ActiveWorkspace;
+use tpi_capabilities::tool::registry::{ToolRegistry, read_only_registry};
+use tpi_capabilities::workspace::ActiveWorkspace;
+use tpi_core::ids::RunId;
+use tpi_session::store::SessionLog;
 
 /// in-process child provider（P8-04）。
 ///
@@ -24,7 +24,7 @@ use crate::workspace::ActiveWorkspace;
 /// provider——parent 阻塞等 child，child 独占自己的实例；concurrency 1 无竞争）。
 pub struct InProcessChildProvider<P, F> {
     make_provider: F,
-    config: Arc<crate::config::Config>,
+    config: Arc<tpi_config::config::Config>,
     workspace: ActiveWorkspace,
     _provider: std::marker::PhantomData<P>,
 }
@@ -32,7 +32,7 @@ pub struct InProcessChildProvider<P, F> {
 impl<P, F> InProcessChildProvider<P, F> {
     pub fn new(
         make_provider: F,
-        config: Arc<crate::config::Config>,
+        config: Arc<tpi_config::config::Config>,
         workspace: ActiveWorkspace,
     ) -> Self {
         Self {
@@ -138,7 +138,7 @@ impl<P: Provider + Send, F: FnMut() -> P + Send> SubagentProvider for InProcessC
 
         // parent cancel 传播：child run 以 Cancelled 正常结束（§11.5 取消是正常
         // 终态，非错误）——此时 parent 不需要 report，按契约返回 Err。
-        if outcome.reason == crate::session::CompletionReason::Cancelled {
+        if outcome.reason == tpi_session::CompletionReason::Cancelled {
             return Err("child run cancelled（parent cancel 传播）".into());
         }
         // O8：report commit（因果链终点：parent 发起 -> child run -> report）。
@@ -160,10 +160,10 @@ impl<P: Provider + Send, F: FnMut() -> P + Send> SubagentProvider for InProcessC
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::provider::{Provider, ProviderResponse};
     use crate::subagent::ReadOnlyCapability;
-    use crate::workspace::LocalWorkspace;
+    use tpi_capabilities::workspace::LocalWorkspace;
+    use tpi_config::config::Config;
 
     /// 脚本化 fake provider（实现 Provider；测试专用）。
     pub(crate) struct ChildFake;
@@ -183,7 +183,7 @@ mod tests {
             let response = crate::provider::ProviderResponse {
                 finish_reason: crate::provider::FinishReason::Stop,
                 tool_calls: Vec::new(),
-                usage: crate::session::Usage::default(),
+                usage: tpi_session::Usage::default(),
             };
             let _ = events
                 .send(crate::provider::ProviderEvent::TextDelta(
@@ -197,7 +197,7 @@ mod tests {
     pub(crate) fn test_config() -> Arc<Config> {
         let dir = tempfile::tempdir().unwrap();
         let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-        let mut config = crate::config::test_config(&root);
+        let mut config = tpi_config::config::test_config(&root);
         config.workspace_root = root.clone();
         config.sessions_root = root.join("sessions").into();
         config.artifacts_root = root.join("artifacts").into();
@@ -215,7 +215,7 @@ mod tests {
                 false,
             )),
         );
-        let child = crate::ids::SessionId::new_v7();
+        let child = tpi_core::ids::SessionId::new_v7();
         let report = provider
             .run_investigation(
                 SubagentRequest {
@@ -262,7 +262,7 @@ mod tests {
             .run_investigation(
                 SubagentRequest {
                     instruction: "调查".into(),
-                    child_session: crate::ids::SessionId::new_v7(),
+                    child_session: tpi_core::ids::SessionId::new_v7(),
                     capabilities: vec![ReadOnlyCapability::Read],
                     parent: None,
                 },
@@ -295,7 +295,7 @@ mod o8_tests {
     use super::tests::{ChildFake, test_config};
     use super::*;
     use crate::subagent::{ParentTraceContext, ReadOnlyCapability};
-    use crate::workspace::LocalWorkspace;
+    use tpi_capabilities::workspace::LocalWorkspace;
 
     /// child run 总是新 TraceId；report 携带（parent 可查询）。
     #[tokio::test]
@@ -312,7 +312,7 @@ mod o8_tests {
             .run_investigation(
                 SubagentRequest {
                     instruction: "调查".into(),
-                    child_session: crate::ids::SessionId::new_v7(),
+                    child_session: tpi_core::ids::SessionId::new_v7(),
                     capabilities: vec![ReadOnlyCapability::Read],
                     parent: None,
                 },
@@ -330,8 +330,8 @@ mod o8_tests {
     #[test]
     fn parent_trace_context_constructs_and_links_in_catalog() {
         let ctx = ParentTraceContext {
-            trace_id: crate::ids::TraceId::new_v7(),
-            span_id: crate::ids::SpanId::new_v7(),
+            trace_id: tpi_core::ids::TraceId::new_v7(),
+            span_id: tpi_core::ids::SpanId::new_v7(),
         };
         // link 事件名已在 trace catalog 登记（无孤儿 name）。
         assert!(crate::trace::is_registered("subagent.link"));
@@ -357,11 +357,11 @@ mod o8_tests {
             .run_investigation(
                 SubagentRequest {
                     instruction: "调查".into(),
-                    child_session: crate::ids::SessionId::new_v7(),
+                    child_session: tpi_core::ids::SessionId::new_v7(),
                     capabilities: vec![ReadOnlyCapability::Read],
                     parent: Some(ParentTraceContext {
-                        trace_id: crate::ids::TraceId::new_v7(),
-                        span_id: crate::ids::SpanId::new_v7(),
+                        trace_id: tpi_core::ids::TraceId::new_v7(),
+                        span_id: tpi_core::ids::SpanId::new_v7(),
                     }),
                 },
                 cancel,

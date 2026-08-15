@@ -11,21 +11,21 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use crate::config::Config;
+use tpi_config::config::Config;
 
 pub mod answer;
 pub mod limits;
 /// 调度原语（§12：资源声明 / waves / 无进展检测）物理上属于 tool 领域
 /// （src/tool/scheduler.rs）。此处 re-export 仅兼容既有 `agent::scheduler`
-/// 引用（测试契约）；新代码请直接用 `crate::tool::scheduler`，
+/// 引用（测试契约）；新代码请直接用 `tpi_capabilities::tool::scheduler`，
 /// 测试引用迁移完成后删除本行（AGENTS.md §27 清理）。
-pub use crate::tool::scheduler;
+pub use tpi_capabilities::tool::scheduler;
 mod tool_runtime;
 use self::tool_runtime::{BatchEnd, ToolBatchExecutor, ToolRuntime};
-use crate::ids::{EventId, RequestId, ToolCallId};
-use crate::outcome::{StoredToolOutcome, ToolStatus};
 use crate::provider::{ChatMessage, ModelRequest, Provider, ProviderEvent, ToolCall};
-use crate::session::{
+use tpi_core::ids::{EventId, RequestId, ToolCallId};
+use tpi_core::outcome::{StoredToolOutcome, ToolStatus};
+use tpi_session::{
     self, AssistantMessage, CompletionReason, ModelRef, RunLimits, SessionEvent, Usage,
 };
 
@@ -84,7 +84,7 @@ pub struct AgentOutcome {
     /// （TUI 显示问题并等待用户回答；非挂起为 None）。
     pub awaiting_input: Option<AwaitingInput>,
     /// O8（P8-09）：本次 run 的 trace id（子代理 link/lineage 溯源用）。
-    pub trace_id: crate::ids::TraceId,
+    pub trace_id: tpi_core::ids::TraceId,
 }
 
 /// §13：`request_input` 挂起的结构化信息。
@@ -94,7 +94,7 @@ pub struct AgentOutcome {
 /// 列表（TUI 内联展示在 transcript，单问题带选项时支持数字编号回答）。
 pub struct AwaitingInput {
     pub text: String,
-    pub questions: Vec<crate::tool::request_input::RequestInputQuestion>,
+    pub questions: Vec<tpi_capabilities::tool::request_input::RequestInputQuestion>,
 }
 
 /// Inputs that describe one agent run independently of its provider, session,
@@ -109,10 +109,10 @@ pub struct RunInput<'a> {
     pub force_compaction: bool,
     /// ActiveWorkspace（§26-§30）：None = Local（默认）；Some = 远端/自定义
     /// workspace（R4：agent 测试注入 remote workspace，bash/file 按此分发）。
-    pub workspace: Option<crate::workspace::ActiveWorkspace>,
+    pub workspace: Option<tpi_capabilities::workspace::ActiveWorkspace>,
     /// P4-02/P4 gate：工具注册表由 composition root 注入（builtin + MCP 同一
     /// registry；禁止 global registry）。
-    pub registry: std::sync::Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
+    pub registry: std::sync::Arc<std::sync::Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
 }
 
 /// 不可恢复的 run 失败（§19.1）。
@@ -208,7 +208,7 @@ pub enum LiveEvent {
     /// 接近 wall-time 预算。
     BudgetWarning,
     /// `update_plan` 提交后的独立状态。
-    PlanUpdated { plan: crate::plan::Plan },
+    PlanUpdated { plan: tpi_core::plan::Plan },
     /// 流中断后正在自动续写（text-only attempt 恢复）。
     StreamRecovering { attempt: u32 },
     /// partial tool-call 后整个 model step 重新生成。
@@ -266,7 +266,7 @@ pub enum RuntimeEvent {
     /// 接近 wall-time 预算（P1-3：TUI 状态栏/系统行提示，此前只写日志）。
     BudgetWarning,
     /// `update_plan` 提交后的独立 UI 状态；不作为聊天流水的一部分。
-    PlanUpdated { plan: crate::plan::Plan },
+    PlanUpdated { plan: tpi_core::plan::Plan },
     /// 流中断后正在自动续写（第二阶段 §4.3：text-only attempt 恢复）。
     StreamRecovering { attempt: u32 },
     /// partial tool-call 后整个 model turn 重新生成（第三阶段 §4.3）。
@@ -284,7 +284,7 @@ pub enum DeltaKind {
 }
 
 /// 执行一次完整 run（§6.2）。
-pub async fn run<P: Provider, S: crate::session::store::SessionStore>(
+pub async fn run<P: Provider, S: tpi_session::store::SessionStore>(
     provider: &mut P,
     session: &mut S,
     config: &Config,
@@ -304,8 +304,8 @@ pub async fn run<P: Provider, S: crate::session::store::SessionStore>(
     // O1（P1-07）：一次 public Agent Run = 一个 TraceId；span 用 SpanId。
     // 只在真实边界注入（这里是 agent 的入口边界），后续 follow-up 新 run
     // 生成新 TraceId，跨 run 因果用显式 link（O8/P8 子代理时落地）。
-    let trace_id = crate::ids::TraceId::new_v7();
-    let span_id = crate::ids::SpanId::new_v7();
+    let trace_id = tpi_core::ids::TraceId::new_v7();
+    let span_id = tpi_core::ids::SpanId::new_v7();
     let span = tracing::info_span!("agent.run", %run_id, %trace_id, %span_id);
     // O0（Medium-7）：async 函数体不能用同步 enter guard 跨 await 持有——
     // thread-local scope 在 future yield 后仍持锁，同线程其他任务会被错误
@@ -334,12 +334,12 @@ pub async fn run<P: Provider, S: crate::session::store::SessionStore>(
 }
 
 /// `run` 的实际执行体（由 `run` 以 `.instrument(span)` 包裹，见 O0）。
-async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
+async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
     provider: &mut P,
     session: &mut S,
     config: &Config,
-    run_id: crate::ids::RunId,
-    trace_id: crate::ids::TraceId,
+    run_id: tpi_core::ids::RunId,
+    trace_id: tpi_core::ids::TraceId,
     input: RunInput<'_>,
 ) -> Result<AgentOutcome, RunFailure> {
     let RunInput {
@@ -391,7 +391,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
     // §用户诉求：max_wall_time_minutes=0（默认）不启动 watchdog——不限制。
     // P2-06：watchdog 逻辑由 Supervisor 直接承载（不再嵌套 spawn_watchdog 的
     // 内部 spawn；保留 limits::spawn_watchdog 供测试与诊断）。
-    let mut watchdog_supervisor = crate::process::supervisor::Supervisor::new();
+    let mut watchdog_supervisor = tpi_capabilities::process::supervisor::Supervisor::new();
     if agent_cfg.limits.max_wall_time_minutes > 0 {
         let warn_ui = ui.clone();
         let cause_for_watchdog = cancel_cause.clone();
@@ -428,7 +428,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
 
     let mut usage_total = Usage::default();
     let mut messages: Vec<ChatMessage> = history.to_vec();
-    let initial_plan = crate::session::latest_plan_from_events(
+    let initial_plan = tpi_session::latest_plan_from_events(
         &session
             .events_with_seq()
             .map_err(|e| RunFailure::Session(format!("read events: {e}")))?,
@@ -518,11 +518,11 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
     // 工具共享状态与 ToolContext 构造由 run-scoped runtime 统一管理。
     // §R4：workspace 由调用方注入（测试可传 remote）；None = Local。
     let active_workspace = workspace.unwrap_or_else(|| {
-        let local = crate::workspace::LocalWorkspace::new(
+        let local = tpi_capabilities::workspace::LocalWorkspace::new(
             agent_cfg.workspace_root.clone(),
             config.allow_outside_workspace,
         );
-        crate::workspace::ActiveWorkspace::local(local)
+        tpi_capabilities::workspace::ActiveWorkspace::local(local)
     });
     let tool_runtime = ToolRuntime::new(
         config,
@@ -546,7 +546,7 @@ async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
     // §13：`request_input` 挂起时模型的问题（随 AgentOutcome 返回给 app 层显示）。
     let mut awaiting_input: Option<AwaitingInput> = None;
     // §12.3：确定性无进展检测（不调用额外模型）。
-    let mut progress = crate::tool::scheduler::ProgressTracker::default();
+    let mut progress = tpi_capabilities::tool::scheduler::ProgressTracker::default();
     // §15.4：同一阈值区间内 compaction 失败后不反复调用模型。
     let mut compaction_failed = false;
     let final_reason: CompletionReason = 'run_loop: loop {
@@ -1254,9 +1254,9 @@ async fn forward_provider_event(
 }
 
 /// 把 provider 错误分类为会话中断原因（§4.3）。
-fn interrupt_cause(error: &crate::provider::ProviderError) -> crate::session::InterruptCause {
+fn interrupt_cause(error: &crate::provider::ProviderError) -> tpi_session::InterruptCause {
     use crate::provider::ProviderError;
-    use crate::session::InterruptCause;
+    use tpi_session::InterruptCause;
     match error {
         ProviderError::Connection(_) | ProviderError::StreamInterrupted(_) => {
             InterruptCause::Connection
@@ -1293,7 +1293,7 @@ fn is_transient_transport_error(error: &crate::provider::ProviderError) -> bool 
 }
 
 /// compaction 一轮（§15.4）。
-async fn compact_turn<P: Provider, S: crate::session::store::SessionStore>(
+async fn compact_turn<P: Provider, S: tpi_session::store::SessionStore>(
     provider: &mut P,
     messages: &mut Vec<ChatMessage>,
     session: &mut S,
@@ -1334,7 +1334,7 @@ async fn compact_turn<P: Provider, S: crate::session::store::SessionStore>(
     let events = session
         .events_with_seq()
         .map_err(|e| CompactionFailure::Session(e.to_string()))?;
-    let projected = crate::session::project_messages_with_ranges(&events);
+    let projected = tpi_session::project_messages_with_ranges(&events);
     let recent_start_seq = if projected.len() == pruned.len() {
         projected[split..]
             .iter()
@@ -1344,7 +1344,7 @@ async fn compact_turn<P: Provider, S: crate::session::store::SessionStore>(
     } else {
         next_seq
     };
-    let covered = crate::session::EventRange {
+    let covered = tpi_session::EventRange {
         start: EventId::from_u128(1),
         end: EventId::from_u128(recent_start_seq as u128),
     };
@@ -1417,7 +1417,7 @@ async fn compact_turn<P: Provider, S: crate::session::store::SessionStore>(
     session
         .commit(&SessionEvent::CompactionCommitted {
             covered,
-            summary: crate::session::CompactSummary {
+            summary: tpi_session::CompactSummary {
                 text: summary_text.clone(),
             },
         })
@@ -1453,7 +1453,7 @@ fn system_prompt_text(system_prompt_extra: Option<&str>, ephemeral_system: Optio
     }
     // §Skills（README2 §20）：模型需要先看到 Available skills（metadata-only，
     // 不加载 body）才会调用 activate_skill。
-    let available = crate::skills::SkillManager::global()
+    let available = tpi_capabilities::skills::SkillManager::global()
         .lock()
         .map(|manager| manager.available())
         .unwrap_or_default();
@@ -1499,8 +1499,8 @@ fn build_context(
     config: &Config,
     messages: &[ChatMessage],
     ephemeral_system: Option<&str>,
-    plan: Option<&crate::plan::Plan>,
-    workspace: Option<&crate::workspace::ActiveWorkspace>,
+    plan: Option<&tpi_core::plan::Plan>,
+    workspace: Option<&tpi_capabilities::workspace::ActiveWorkspace>,
     process_snapshot: Option<&str>,
 ) -> Vec<ChatMessage> {
     // P1-05：build_context 只读窄视图 AgentConfig。
@@ -1529,7 +1529,7 @@ fn build_context(
     // §注入可靠性（用户反馈）：历史里 update_plan 的 tool result 不再带快照，
     // 但**必须**让模型区分“当前权威快照”与任何历史计划文本——用专属标记
     // 前缀 + 明确“以此为准，忽略历史中的任何旧计划”，防止模型引用过期快照。
-    let snapshot = crate::plan::plan_snapshot(plan);
+    let snapshot = tpi_core::plan::plan_snapshot(plan);
     if !snapshot.is_empty() {
         out.push(ChatMessage::System(format!(
             "[当前计划·唯一权威·完整快照·以此为准]（每次 update_plan 都提交完整显式计划；每完成一项立即单独标记 completed，未完成项保持 pending/in_progress，不要一次性把全部项标记 completed。需要用户决定或外部条件时，先标记 blocked，再提问；忽略对话历史中出现的任何旧计划）：\n{snapshot}"
@@ -1554,12 +1554,15 @@ fn tool_result_succeeded(content: &str) -> bool {
 
 /// 确保当前 runtime history 至少包含一次成功计划结果。只在恢复/压缩边界调用，
 /// 补入的消息随后随真实 assistant/tool 事实向后增长，不会每轮重新占据尾部。
-fn ensure_plan_state_messages(messages: &mut Vec<ChatMessage>, plan: Option<&crate::plan::Plan>) {
+fn ensure_plan_state_messages(
+    messages: &mut Vec<ChatMessage>,
+    plan: Option<&tpi_core::plan::Plan>,
+) {
     let already_present = messages.iter().any(|message| {
         matches!(
             message,
             ChatMessage::Tool { name, content, .. }
-                if crate::tool::BuiltinTool::from_name(name) == Some(crate::tool::BuiltinTool::UpdatePlan)
+                if tpi_capabilities::tool::BuiltinTool::from_name(name) == Some(tpi_capabilities::tool::BuiltinTool::UpdatePlan)
                     && tool_result_succeeded(content)
         )
     });
@@ -1573,8 +1576,8 @@ fn ensure_plan_state_messages(messages: &mut Vec<ChatMessage>, plan: Option<&cra
 
 /// Compaction 可能只留下 summary 与独立持久化的 PlanReplaced。此时用合法的
 /// assistant/tool 配对恢复运行时计划，避免重新伪造一条 User 指令。
-fn append_restored_plan_round(messages: &mut Vec<ChatMessage>, plan: &crate::plan::Plan) {
-    let snapshot = crate::plan::plan_snapshot(Some(plan));
+fn append_restored_plan_round(messages: &mut Vec<ChatMessage>, plan: &tpi_core::plan::Plan) {
+    let snapshot = tpi_core::plan::plan_snapshot(Some(plan));
     if snapshot.is_empty() {
         return;
     }
@@ -1613,10 +1616,10 @@ pub fn interrupted_as_messages(
 pub fn session_path(
     sessions_root: &std::path::Path,
     workspace_root: &camino::Utf8PathBuf,
-    session_id: crate::ids::SessionId,
+    session_id: tpi_core::ids::SessionId,
 ) -> PathBuf {
     sessions_root
-        .join(session::workspace_id_for(workspace_root.as_std_path()))
+        .join(tpi_session::workspace_id_for(workspace_root.as_std_path()))
         .join(format!("{session_id}.jsonl"))
 }
 
@@ -1634,14 +1637,14 @@ mod tests {
         build_context, ensure_plan_state_messages, recoverable_stream_interrupt,
         recovery_overlap_bytes,
     };
-    use crate::plan::{Plan, PlanItem, PlanStatus};
     use crate::provider::ChatMessage;
+    use tpi_core::plan::{Plan, PlanItem, PlanStatus};
 
     /// 最小可用 Config（build_context 只读 system_prompt_extra 等字段）。
     /// P1 Exit gate：经 config::test_config 构造（tui 依赖收敛在 config），
     /// agent 测试不再直接引用 crate::tui。
-    fn unit_config() -> crate::config::Config {
-        crate::config::test_config(&camino::Utf8PathBuf::from("fake"))
+    fn unit_config() -> tpi_config::config::Config {
+        tpi_config::config::test_config(&camino::Utf8PathBuf::from("fake"))
     }
 
     struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);

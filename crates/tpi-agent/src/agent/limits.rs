@@ -7,17 +7,17 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::config::LimitsConfig;
+use tpi_config::config::LimitsConfig;
 
 /// 接近预算的提示阈值（剩余 10%）。
 const WARN_REMAINING_RATIO: f64 = 0.1;
 
 /// §16：取消来源 → run 结束原因（watchdog 超时 ≠ 用户取消）。
-pub fn cancel_reason_for_cause(cause: u8) -> crate::session::CompletionReason {
+pub fn cancel_reason_for_cause(cause: u8) -> tpi_session::CompletionReason {
     if cause == CANCEL_CAUSE_WALL_TIME {
-        crate::session::CompletionReason::WallTimeExceeded
+        tpi_session::CompletionReason::WallTimeExceeded
     } else {
-        crate::session::CompletionReason::Cancelled
+        tpi_session::CompletionReason::Cancelled
     }
 }
 /// watchdog 到期原因。
@@ -82,7 +82,7 @@ pub fn spawn_watchdog_with_wall(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::CompletionReason;
+    use tpi_session::CompletionReason;
 
     /// §16：wall-time 来源映射为 WallTimeExceeded，用户来源映射为 Cancelled。
     #[test]

@@ -18,7 +18,7 @@ declare -A LAYER
 LAYER[core]="crates/tpi-core/src"
 LAYER[session]="crates/tpi-session/src"
 LAYER[capabilities]="crates/tpi-capabilities/src"
-LAYER[agent]="src/agent src/context src/provider"
+LAYER[agent]="crates/tpi-agent/src"
 LAYER[tui]="src/tui"
 LAYER[adapters]="src/app.rs src/app src/web.rs src/doctor.rs src/eval src/auth src/clipboard src/main.rs"
 

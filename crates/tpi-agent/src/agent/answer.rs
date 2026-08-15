@@ -7,7 +7,7 @@
 //!
 //! 先 fake state tests；集成到 request_input 在 agent 接线时完成。
 
-use crate::ids::RequestId;
+use tpi_core::ids::RequestId;
 
 /// 答案路由（标识等待答案的请求归属）。
 #[derive(Debug, Clone, PartialEq, Eq)]

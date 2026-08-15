@@ -95,8 +95,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::SessionId;
     use crate::subagent::ReadOnlyCapability;
+    use tpi_core::ids::SessionId;
 
     /// 计数 fake provider：进入时 +1（记录峰值并发），sleep 后 -1。
     struct CountingFake {
