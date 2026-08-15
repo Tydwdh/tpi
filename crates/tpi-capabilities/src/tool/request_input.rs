@@ -159,7 +159,11 @@ impl RequestInputArgs {
 }
 
 /// 工具入口：成功即表示“请求已发出”，run 将挂起等待用户输入。
-pub async fn request_input(args: RequestInputArgs, _ctx: &ToolContext) -> ToolOutcome {
+///
+/// 非交互 run（`-p`/web：`ctx.interactive == false`）没有用户可答：
+/// 挂起后 run 永远等不到输入。这里直接拒绝，让模型基于现有信息继续，
+/// 而不是产生一个无人能恢复的挂起（batch 执行器只对 Succeeded 挂起）。
+pub async fn request_input(args: RequestInputArgs, ctx: &ToolContext) -> ToolOutcome {
     let rejected = |output: String| {
         ToolOutcome::failed(
             "request_input",
@@ -174,6 +178,12 @@ pub async fn request_input(args: RequestInputArgs, _ctx: &ToolContext) -> ToolOu
             },
         )
     };
+    if !ctx.interactive {
+        return rejected(
+            "status: rejected\ntool: request_input\nerror: unavailable_in_non_interactive_run\n\n当前 run 非交互（无用户可答）：request_input 不可用。请基于已有信息继续完成任务；确实缺少关键决定时，在最终回复中说明缺少的输入及其影响。"
+                .into(),
+        );
+    }
     let Some(questions) = args.normalized_questions() else {
         return rejected(
             "status: rejected\ntool: request_input\nerror: invalid_arguments\n\nquestion 不能为空：需要明确向用户提出的问题。".into(),

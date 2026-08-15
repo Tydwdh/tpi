@@ -3530,6 +3530,45 @@ mod question_modal_tests {
         }
     }
 
+    /// §askuser 修复：Selecting 模式直接打字即进入自定义回答（此前字符键
+    /// 全部被拦截——单问题/有选项时用户直接输入没有任何反应）。
+    #[test]
+    fn typing_enters_custom_edit_directly() {
+        let mut state = state_with(single_q()); // custom = true
+        // 不打导航键/数字键，直接打字符：进入编辑并插入字符。
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Char('我'))));
+        let q = state.view.question.as_ref().unwrap();
+        assert_eq!(q.mode, QuestionMode::EditingCustom, "字符键直接进编辑");
+        assert_eq!(q.custom_input, "我");
+        for c in "的环境".chars() {
+            reducer::update(&mut state, UiEvent::Key(key(KeyCode::Char(c))));
+        }
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        match &effects[0] {
+            UiEffect::QuestionSubmitted(text) => assert!(text.contains("我的环境"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// custom=false 时字符键仍被拦截（只能选选项，不能输入自定义文本）。
+    #[test]
+    fn typing_blocked_when_custom_disabled() {
+        let mut state = state_with(vec![QuestionView {
+            question: "确认删除？".into(),
+            header: None,
+            options: vec![QuestionOptionView {
+                label: "是".into(),
+                description: String::new(),
+            }],
+            multiple: false,
+            custom: false,
+        }]);
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Char('x'))));
+        let q = state.view.question.as_ref().unwrap();
+        assert_eq!(q.mode, QuestionMode::Selecting, "custom=false 时字符键拦截");
+        assert!(q.custom_input.is_empty());
+    }
+
     #[test]
     fn multiple_single_question_done_item_submits() {
         // multiple + custom=false：选两个后到“完成”项 Enter 提交。
@@ -3559,6 +3598,211 @@ mod question_modal_tests {
         match &effects[0] {
             UiEffect::QuestionSubmitted(text) => {
                 assert!(text.contains("react") && text.contains("vue"), "{text}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// §13 修复：多问题 Review 页未全部回答时 Enter 不提交（模型不能收到
+    /// 空答案）；模态保持 Review，用户可返回补答或 Esc 拒绝。
+    #[test]
+    fn review_with_unanswered_question_does_not_submit() {
+        let mut state = state_with(vec![
+            QuestionView {
+                question: "Q1".into(),
+                header: Some("一".into()),
+                options: vec![QuestionOptionView {
+                    label: "a".into(),
+                    description: String::new(),
+                }],
+                multiple: false,
+                custom: false,
+            },
+            QuestionView {
+                question: "Q2".into(),
+                header: Some("二".into()),
+                options: vec![QuestionOptionView {
+                    label: "b".into(),
+                    description: String::new(),
+                }],
+                multiple: false,
+                custom: false,
+            },
+        ]);
+        // 答 Q1 → 自动进 Q2 tab。
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        // 不答 Q2，直接用 Tab 推进到 Review（Tab 可跳过未答问题）。
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Tab)));
+        assert_eq!(
+            state.view.question.as_ref().unwrap().mode,
+            QuestionMode::Review,
+            "Tab 可进入 Review（即使 Q2 未答）"
+        );
+        assert!(
+            !state.view.question.as_ref().unwrap().all_answered(),
+            "Q2 未答"
+        );
+        // §askuser 修复：Review Enter 未全答 → 不提交，跳到第一个未答问题
+        // 并给出明确提示（此前静默拦截，用户以为已提交、看不到任何反应）。
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        assert!(effects.is_empty(), "未全答时 Enter 不得提交: {effects:?}");
+        assert_eq!(
+            state.view.question.as_ref().unwrap().mode,
+            QuestionMode::Selecting,
+            "未全答时跳回编辑页而非保持 Review"
+        );
+        assert_eq!(
+            state.view.question.as_ref().unwrap().tab,
+            1,
+            "跳到第一个未答问题 Q2"
+        );
+        assert!(
+            state
+                .view
+                .transient_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("未回答")),
+            "给出未答提示"
+        );
+        // 已在 Q2 编辑页：直接答 Q2 → 自动进 Review → 提交。
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // 答 Q2
+        assert!(state.view.question.as_ref().unwrap().all_answered());
+        // 答完自动进 Review（advance_tab 到末尾）。
+        assert_eq!(
+            state.view.question.as_ref().unwrap().mode,
+            QuestionMode::Review
+        );
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        assert!(
+            matches!(&effects[0], UiEffect::QuestionSubmitted(text) if text.contains("Q2: b")),
+            "补答后应提交: {effects:?}"
+        );
+    }
+
+    /// §13 修复：无选项且 custom=false 的问题在模态里必须有输入通道
+    ///（app 投影层强制 custom；这里验证 reducer 对无选项 custom 问题的
+    /// 编辑路径可用）。
+    #[test]
+    fn optionless_question_enters_custom_edit() {
+        let mut state = state_with(vec![QuestionView {
+            question: "随便说点什么".into(),
+            header: None,
+            options: Vec::new(),
+            multiple: false,
+            custom: true,
+        }]);
+        // 无选项：唯一一项就是自定义项，Enter 直接进入编辑。
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        assert!(effects.is_empty());
+        assert_eq!(
+            state.view.question.as_ref().unwrap().mode,
+            QuestionMode::EditingCustom,
+            "无选项问题 Enter 应进入自定义编辑"
+        );
+        for c in "我的回答".chars() {
+            reducer::update(&mut state, UiEvent::Key(key(KeyCode::Char(c))));
+        }
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        assert!(
+            matches!(&effects[0], UiEffect::QuestionSubmitted(text) if text.contains("我的回答")),
+            "{effects:?}"
+        );
+    }
+
+    /// §bug 修复：multiple + custom=true（默认投影）时必须有“完成”项可提交——
+    /// 否则用户勾选后无法确定（Enter 只 toggle、自定义编辑后也不提交），
+    /// 只能 Esc 拒绝。完成项位于自定义项之后（index = options.len()+1）。
+    #[test]
+    fn multiple_with_custom_has_done_item() {
+        let mut state = state_with(vec![QuestionView {
+            question: "选框架？".into(),
+            header: None,
+            options: vec![
+                QuestionOptionView {
+                    label: "react".into(),
+                    description: String::new(),
+                },
+                QuestionOptionView {
+                    label: "vue".into(),
+                    description: String::new(),
+                },
+            ],
+            multiple: true,
+            custom: true,
+        }]);
+        assert_eq!(
+            state.view.question.as_ref().unwrap().option_count(),
+            4,
+            "2 选项 + 自定义 + 完成"
+        );
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // 选 react
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down)));
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // 选 vue
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down))); // 自定义项
+        assert!(
+            state.view.question.as_ref().unwrap().on_custom(),
+            "第 3 项为自定义项"
+        );
+        assert!(!state.view.question.as_ref().unwrap().on_done());
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down))); // 完成项
+        assert!(
+            state.view.question.as_ref().unwrap().on_done(),
+            "第 4 项为完成项"
+        );
+        assert!(
+            !state.view.question.as_ref().unwrap().on_custom(),
+            "完成项不得误判为自定义项"
+        );
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        match &effects[0] {
+            UiEffect::QuestionSubmitted(text) => {
+                assert!(text.contains("react") && text.contains("vue"), "{text}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 多问题 + multiple + custom：最后一题的完成项进 Review（不直接提交），
+    /// Review Enter 提交全部（未答时拦截、补答后可提交）。
+    #[test]
+    fn multi_question_multiple_done_goes_review_then_submits() {
+        let mk = |q: &str, h: &str| QuestionView {
+            question: q.into(),
+            header: Some(h.into()),
+            options: vec![QuestionOptionView {
+                label: "a".into(),
+                description: String::new(),
+            }],
+            multiple: true,
+            custom: true,
+        };
+        let mut state = state_with(vec![mk("Q1", "一"), mk("Q2", "二")]);
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // Q1 选 a
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down))); // Q1 自定义
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down))); // Q1 完成项
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // → Review
+        assert_eq!(
+            state.view.question.as_ref().unwrap().mode,
+            QuestionMode::Review,
+            "完成项进 Review（Q2 未答）"
+        );
+        // §askuser 修复：Review Enter 未全答 → 自动跳到第一个未答问题 Q2
+        //（不再停留在 Review，也不需要 Tab 导航）。
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        assert!(effects.is_empty(), "未全答时不得提交: {effects:?}");
+        assert_eq!(
+            state.view.question.as_ref().unwrap().tab,
+            1,
+            "Enter 自动跳到 Q2"
+        );
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // Q2 选 a
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down))); // Q2 自定义
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down))); // Q2 完成项
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // → Review
+        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
+        match &effects[0] {
+            UiEffect::QuestionSubmitted(text) => {
+                assert!(text.contains("Q1: a") && text.contains("Q2: a"), "{text}")
             }
             other => panic!("{other:?}"),
         }

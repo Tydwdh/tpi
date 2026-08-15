@@ -692,6 +692,54 @@ error: invalid_arguments
             .ok()
         });
         if let Some(args) = suspend_args {
+            // §13 补齐：挂起后**后续 wave 不再执行**，但本批 assistant turn 已携带
+            // 全部 tool_calls--它们必须有对应的 tool result（消息单元原子性，
+            // §30 第 9 条同源问题：ToolRequested 无 ToolCompleted 的调用在
+            // resume 重放时产生非法 provider 消息序列）。为剩余未执行调用合成
+            // 标准化拒绝（含 tool_budget_exceeded 同款形态）并持久化。
+            let executed: std::collections::HashSet<usize> = results.keys().copied().collect();
+            for (index, skipped) in calls.iter().enumerate() {
+                if executed.contains(&index) {
+                    continue;
+                }
+                let tool_label = BuiltinTool::from_name(&skipped.name)
+                    .map(|t| t.name().to_string())
+                    .unwrap_or_else(|| skipped.name.clone());
+                let outcome = ToolOutcome::failed(
+                    &tool_label,
+                    tpi_core::outcome::ModelPayload {
+                        status: ToolStatus::Rejected,
+                        program: None,
+                        exit_code: None,
+                        duration_ms: 0,
+                        output: format!(
+                            "status: rejected\ntool: {tool_label}\nerror: run_suspended_before_execution\n\nrun 因 request_input 挂起，本调用未执行。用户回答后可重新发起。"
+                        ),
+                        effect: None,
+                        artifact: None,
+                    },
+                )
+                .into_stored();
+                session
+                    .append_event(&SessionEvent::ToolRequested {
+                        call: skipped.clone(),
+                    })
+                    .and_then(|_| session.complete_tool(skipped.call_id, &outcome))
+                    .map_err(|e| RunFailure::Session(e.to_string()))?;
+                // UI 侧也补一张终态卡（否则卡片永远停在 running）。
+                let _ = ui
+                    .send(LiveEvent::ToolCompleted {
+                        call_id: skipped.call_id,
+                        name: skipped.name.clone(),
+                        status: outcome.status,
+                        duration_ms: 0,
+                        exit_code: None,
+                        output: outcome.model_payload.output.clone(),
+                        diff: None,
+                    })
+                    .await;
+                results.insert(index, outcome);
+            }
             return Ok(BatchEnd::SuspendRequested { args });
         }
     }

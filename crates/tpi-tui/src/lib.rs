@@ -2794,6 +2794,47 @@ fn draw_modal(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: t
 /// `request_input` 交互模态渲染（opencode 形态）：tab 栏（多问题）+
 /// 问题正文 + 选项列表（label + description 副行；multiple 勾选；custom 项）
 /// + Review 页 + footer 快捷键提示。
+///
+/// [`question_selected_row`]：选中项在 Selecting/EditingCustom 页 content 里的
+/// 逻辑行号（与 content 构建同构：标题 2 行 + tab 栏 2 行 + 正文 1 行 +
+/// 空行 1 行 + 逐选项行）。内容超高时窗口用它跟随选中项/编辑输入框。
+fn question_selected_row(
+    question: &crate::model::QuestionModalState,
+    cur: &crate::model::QuestionView,
+) -> Option<usize> {
+    use crate::model::QuestionMode;
+    if !matches!(
+        question.mode,
+        QuestionMode::Selecting | QuestionMode::EditingCustom
+    ) {
+        return None;
+    }
+    let multi = question.questions.len() > 1;
+    let mut row = 2; // 标题 + 空行
+    if multi {
+        row += 2; // tab 栏 + 空行
+    }
+    row += 2; // 问题正文 + 空行
+    for (index, option) in cur.options.iter().enumerate() {
+        if index == question.selected {
+            return Some(row);
+        }
+        row += 1;
+        if !option.description.is_empty() {
+            row += 1;
+        }
+    }
+    // 自定义项 / 完成项（在全部选项之后）。自定义项在 options.len()，
+    // 完成项在 options.len() + custom（multiple 时总有完成项）。
+    if cur.custom {
+        if question.selected == cur.options.len() {
+            return Some(row);
+        }
+        row += 1;
+    }
+    Some(row)
+}
+
 fn draw_question(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: theme::Theme) {
     use crate::model::QuestionMode;
     let Some(question) = &view.question else {
@@ -2932,9 +2973,9 @@ fn draw_question(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme
                     ]));
                 }
             }
-            // multiple 且无 custom 时：完成项（提交当前多选）。
-            if cur.multiple && !cur.custom {
-                let i = cur.options.len();
+            // multiple 时：完成项（提交当前多选；位于自定义项之后）。
+            if cur.multiple {
+                let i = cur.options.len() + usize::from(cur.custom);
                 let active = question.selected == i;
                 content.push(Line::from(vec![
                     Span::styled(
@@ -2977,6 +3018,7 @@ fn draw_question(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme
                     .add_modifier(Modifier::BOLD),
             ));
             content.push(Line::default());
+            let all_answered = question.all_answered();
             for (i, q) in question.questions.iter().enumerate() {
                 let answered = question.answers.get(i).is_some_and(|a| !a.is_empty());
                 content.push(Line::from(vec![
@@ -2999,14 +3041,39 @@ fn draw_question(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme
                     ),
                 ]));
             }
+            content.push(Line::default());
+            // §13 修复：未全部回答时不能提交（reducer 已拦截 Enter）——
+            // 这里明示原因，避免用户按 Enter 无反应还不知为什么。
+            content.push(Line::styled(
+                if all_answered {
+                    "Enter 提交全部 · Esc 拒绝".to_string()
+                } else {
+                    "还有未回答的问题：↑↓ 返回补答 · Esc 拒绝".to_string()
+                },
+                Style::default().fg(if all_answered {
+                    theme.success
+                } else {
+                    theme.warning
+                }),
+            ));
         }
         QuestionMode::Done => {}
     }
 
     let wrapped = wrap_lines(content, inner_w);
     let total = wrapped.len();
-    let scroll = 0usize;
-    let start = scroll;
+    // §修复：内容超高时窗口跟随选中项（而非固定从 0 截断）--否则选项多/
+    // 终端矮时高亮项滚出视野，用户看不到自己在哪；无选中态的页面
+    //（Review/Done/EditingCustom）退回顶部。
+    let selected_row = question_selected_row(question, cur);
+    let scroll = match selected_row {
+        Some(row) if total > inner_h => {
+            // 选中行尽量落在窗口中部，避免在边缘反复跳动。
+            (row.saturating_sub(inner_h / 2)).min(total - inner_h)
+        }
+        _ => 0,
+    };
+    let start = scroll.min(total.saturating_sub(inner_h));
     let window = wrapped[start..start + inner_h.min(total)].to_vec();
 
     frame.render_widget(ratatui::widgets::Clear, rect);

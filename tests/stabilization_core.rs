@@ -528,8 +528,9 @@ async fn replay_after_compaction_matches_runtime() {
     // history 消息太少则压缩不显著（NotSignificant）而不提交。当前 schema 下
     // 9000 让触发点落在 history 已有足够消息可显著压缩的位置；8500（旧值）
     // 在原始 schema 下等效，但 request_input 多问题升级（description/schema
-    // 变大）后提前触发导致本场景不再提交 compaction，故窗口需重新标定。
-    h.config.model.context_window = Some(9000);
+    // 变大）与“非交互不可用”说明追加后提前触发导致本场景不再提交
+    // compaction，故窗口重新标定到 9500。
+    h.config.model.context_window = Some(9500);
     h.config.safety_reserve_tokens = 100;
 
     // 状态机：工具请求按序 read×10（中等输出累积 context，第 5-6 轮触发

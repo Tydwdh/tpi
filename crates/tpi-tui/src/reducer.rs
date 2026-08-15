@@ -122,6 +122,34 @@ fn handle_question_key(state: &mut UiState, key: KeyEvent, effects: &mut Vec<UiE
     if q.mode == QuestionMode::Review {
         match key.code {
             KeyCode::Enter => {
+                // §13 修复：未全部回答时不提交（与 submit_single 的空答案拦截
+                // 同语义）--否则模型收到“Q: （空）”仍不知答案；提示用户先补答。
+                if !q.all_answered() {
+                    // §askuser 修复：未全答时 Enter 不再静默——跳到第一个未答
+                    // 问题并给出明确提示（此前静默拦截让用户“以为全部提交”，
+                    // 只看到模态没反应，感觉被卡住）。
+                    let unanswered = q
+                        .questions
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| q.answers.get(*i).is_none_or(|a| a.is_empty()))
+                        .count();
+                    let first = q
+                        .questions
+                        .iter()
+                        .enumerate()
+                        .find(|(i, _)| q.answers.get(*i).is_none_or(|a| a.is_empty()))
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    q.mode = QuestionMode::Selecting;
+                    q.tab = first;
+                    q.selected = 0;
+                    state.view.transient_hint = Some(format!(
+                        "还有 {unanswered} 个问题未回答，已跳到第 {} 题；全部答完后再到 Review 提交",
+                        first + 1
+                    ));
+                    return true;
+                }
                 q.mode = QuestionMode::Done;
                 let text = q.answers_text();
                 effects.push(UiEffect::QuestionSubmitted(text));
@@ -131,6 +159,29 @@ fn handle_question_key(state: &mut UiState, key: KeyEvent, effects: &mut Vec<UiE
                 q.mode = QuestionMode::Done;
                 q.rejected = true;
                 effects.push(UiEffect::QuestionRejected);
+                return true;
+            }
+            // §13 修复：Review 不是死胡同--导航键回到第一个未答问题的
+            // 编辑页（全答时回到第一题），用户可补答后再进 Review。
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Char('h')
+            | KeyCode::Char('l')
+            | KeyCode::Char('j')
+            | KeyCode::Char('k') => {
+                q.mode = QuestionMode::Selecting;
+                q.tab = q
+                    .questions
+                    .iter()
+                    .enumerate()
+                    .find(|(i, _)| q.answers.get(*i).is_none_or(|a| a.is_empty()))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                q.selected = 0;
                 return true;
             }
             _ => return true,
@@ -201,6 +252,14 @@ fn handle_question_key(state: &mut UiState, key: KeyEvent, effects: &mut Vec<UiE
             q.mode = QuestionMode::Done;
             q.rejected = true;
             effects.push(UiEffect::QuestionRejected);
+        }
+        // §askuser 修复：用户直接打字即进入自定义回答——此前 Selecting
+        // 模式拦截所有字符键（除数字快选/导航字母），单问题有选项时用户
+        // 想输入自定义文本没有任何反应（“只有一个用户输入时无法输入”）。
+        // 当前问题允许自定义时，字符键直接进入编辑并插入该字符。
+        KeyCode::Char(c) if q.questions[q.tab].custom => {
+            q.mode = QuestionMode::EditingCustom;
+            q.custom_input.push(c);
         }
         _ => {}
     }
@@ -1000,7 +1059,10 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
         UiEvent::SidebarJump(entry) => {
             // §用户诉求：点击大纲行 → 锁定到该用户消息；侧边栏保持打开
             //（连续浏览/跳转多段对话；用户可自行 Ctrl+B 关闭）。
-            if state.view.modal.is_some() || state.view.overlay.is_some() {
+            if state.view.modal.is_some()
+                || state.view.overlay.is_some()
+                || state.view.question.is_some()
+            {
                 return Vec::new();
             }
             state.view.lock_to(entry, 0);

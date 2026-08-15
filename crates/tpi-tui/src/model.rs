@@ -358,22 +358,23 @@ impl QuestionModalState {
         }
     }
 
-    /// 当前问题的选项总数（含自定义项；multiple 且无 custom 时含“完成”项）。
+    /// 当前问题的选项总数（含自定义项与“完成”项：multiple 时总有完成项，
+    /// 位于自定义项之后——否则 multiple+custom 时用户无提交通道）。
     pub fn option_count(&self) -> usize {
         let q = &self.questions[self.tab];
-        q.options.len() + usize::from(q.custom) + usize::from(q.multiple && !q.custom)
+        q.options.len() + usize::from(q.custom) + usize::from(q.multiple)
     }
 
-    /// 当前是否选中自定义项（最后一项且 custom）。
+    /// 当前是否选中自定义项（custom 时的倒数第二伪项）。
     pub fn on_custom(&self) -> bool {
         let q = &self.questions[self.tab];
-        q.custom && self.selected >= q.options.len()
+        q.custom && self.selected == q.options.len()
     }
 
-    /// 当前是否选中“完成”项（multiple 且无 custom 的最后一个伪项）。
+    /// 当前是否选中“完成”项（multiple 的最后一个伪项；在自定义项之后）。
     pub fn on_done(&self) -> bool {
         let q = &self.questions[self.tab];
-        q.multiple && !q.custom && self.selected >= q.options.len()
+        q.multiple && self.selected >= q.options.len() + usize::from(q.custom)
     }
 
     /// 所有问题都已回答（Review 可提交）。

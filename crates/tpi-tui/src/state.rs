@@ -83,11 +83,16 @@ impl UiState {
 
     /// 是否存在待消费的排队输入（app 主循环据此决定是否可跳过键盘阻塞等待；
     /// BUG-003：`tpi "prompt"` 与 run 结束后排队的消息必须无需按键即可执行）。
+    /// §13 修复：/model 菜单选中结果（pending_model）也是待消费输入——
+    /// 漏掉它会让主循环阻塞在 key_rx.recv()，切换模型后必须再按一个键才生效。
+    /// （`request_input` 模态答案存在 app 层局部变量，由主循环的
+    /// modal_answer_pending 条件处理，不在此队列。）
     pub fn has_pending_work(&self) -> bool {
         !self.pending_messages.is_empty()
             || self.pending_session.is_some()
             || self.pending_theme.is_some()
             || self.pending_retry.is_some()
+            || self.pending_model.is_some()
     }
 
     /// 入队一条待提交消息（Enter 提交）。超上限时丢弃最旧并写入系统行提示

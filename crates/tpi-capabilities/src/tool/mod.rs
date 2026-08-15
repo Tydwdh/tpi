@@ -349,6 +349,8 @@ Example: process action=status id=\"p17\"; process action=wait id=\"p17\" timeou
 permission, or additional information that only the user can provide. \
 The run SUSPENDS at this point (it does not end): questions are shown to the user, \
 their answers are recorded, and the run continues with full history. \
+Only available in interactive runs - in non-interactive mode (print/web) it is \
+rejected; proceed with existing information instead. \
 Supports multiple questions in one call: pass a `questions` array; each item may \
 carry a `header` grouping title and suggested `options` the user can pick (by number) \
 or override with custom text. Batch related questions into one call instead of \

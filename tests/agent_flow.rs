@@ -817,3 +817,171 @@ async fn request_input_legacy_single_question_still_works() {
         vec!["是", "否"]
     );
 }
+
+/// §13 回归：非交互 run（interactive=false，`-p`/web）中 `request_input`
+/// 被拒绝而不是挂起——否则 run 挂起后无人可答，永远等不到输入。
+#[tokio::test]
+async fn request_input_rejected_in_non_interactive_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    // 第一轮：模型尝试 request_input（会被拒绝）；第二轮：正常收尾。
+    let mut provider = FakeProvider::new(vec![
+        FakeResponse::with_tool_calls(vec![fixtures::fake_provider::tool_call(
+            "request_input",
+            serde_json::json!({"question": "要跑测试吗？"}),
+        )]),
+        FakeResponse::text("没有用户可答，我基于现有信息继续"),
+    ]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, _rx) = mpsc::channel(32);
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "跑一下".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: false,
+            force_compaction: false,
+            workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
+        },
+    )
+    .await
+    .expect("run succeeds");
+
+    // 不挂起：正常完成（模型拿到拒绝结果后继续）。
+    assert_eq!(outcome.reason, CompletionReason::Stop);
+    assert!(outcome.awaiting_input.is_none(), "非交互不得挂起");
+    // 拒绝信息已送达模型（第二轮请求能看到）。
+    let joined: Vec<String> = provider.requests[1]
+        .messages
+        .iter()
+        .map(|m| match m {
+            ChatMessage::User(text) | ChatMessage::System(text) => text.clone(),
+            ChatMessage::Assistant { content, .. } => content.clone(),
+            ChatMessage::Tool { content, .. } => content.clone(),
+        })
+        .collect();
+    let joined = joined.join("\n");
+    assert!(
+        joined.contains("unavailable_in_non_interactive_run"),
+        "模型应看到拒绝原因: {joined}"
+    );
+    // session 事实：request_input 是 Rejected 工具结果，且没有挂起事件。
+    let events = read_events(session.path()).expect("read session");
+    let types: Vec<&str> = events.iter().map(SessionEvent::type_name).collect();
+    assert!(!types.contains(&"user_input_requested"), "{types:?}");
+    let rejected = events.iter().any(|event| {
+        matches!(
+            event,
+            SessionEvent::ToolCompleted { outcome, .. }
+                if outcome.status == tpi::outcome::ToolStatus::Rejected
+                    && outcome.session_metadata.tool == "request_input"
+        )
+    });
+    assert!(rejected, "request_input 必须是 Rejected 结果: {types:?}");
+}
+
+/// §13 回归：挂起时同一批中**后续 wave** 的工具调用不再执行，但必须有
+/// 对应的 ToolRequested/ToolCompleted（Rejected）——否则 resume 重建的
+/// 消息序列里 assistant.tool_calls 缺少 tool result，provider 拒绝。
+/// 构造：request_input（Pure，wave 1）+ bash（WorkspaceUnknown，wave 2）。
+#[tokio::test]
+async fn suspend_persists_rejected_outcomes_for_later_waves() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = FakeProvider::new(vec![FakeResponse::with_tool_calls(vec![
+        fixtures::fake_provider::tool_call(
+            "request_input",
+            serde_json::json!({"question": "继续吗？"}),
+        ),
+        fixtures::fake_provider::tool_call(
+            "bash",
+            serde_json::json!({"command": "echo never runs"}),
+        ),
+    ])]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, _rx) = mpsc::channel(32);
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "确认".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+            workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
+        },
+    )
+    .await
+    .expect("run succeeds");
+
+    assert_eq!(outcome.reason, CompletionReason::AwaitingUserInput);
+
+    // session 事实：两个工具都有完整生命周期（bash 是 Rejected）。
+    let events = read_events(session.path()).expect("read session");
+    let requested: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolRequested { call } => Some(call.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        requested.contains(&"request_input") && requested.contains(&"bash"),
+        "两个调用都必须有 ToolRequested: {requested:?}"
+    );
+    let bash_completed = events.iter().any(|event| {
+        matches!(
+            event,
+            SessionEvent::ToolCompleted { outcome, .. }
+                if outcome.session_metadata.tool == "bash"
+                    && outcome.status == tpi::outcome::ToolStatus::Rejected
+                    && outcome.model_payload.output.contains("run_suspended_before_execution")
+        )
+    });
+    assert!(bash_completed, "bash 必须持久化为 Rejected（未执行）");
+
+    // resume 重放：每条 assistant tool_call 都有对应 tool result（协议合法）。
+    let history = tpi::session::replay_messages(session.path()).expect("replay");
+    let assistant_calls: usize = history
+        .iter()
+        .map(|m| match m {
+            ChatMessage::Assistant { tool_calls, .. } => tool_calls.len(),
+            _ => 0,
+        })
+        .sum();
+    let tool_results: usize = history
+        .iter()
+        .filter(|m| matches!(m, ChatMessage::Tool { .. }))
+        .count();
+    assert_eq!(
+        assistant_calls, tool_results,
+        "assistant tool_calls 与 tool result 必须一一对应（否则 resume 序列非法）: {history:?}"
+    );
+}

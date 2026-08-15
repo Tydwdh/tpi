@@ -59,6 +59,8 @@ struct PendingInput {
     options: Vec<String>,
     /// `request_input` 模态已提交的答案（Some = 自动 resume，不等待输入框）。
     answer: Option<String>,
+    /// 模态被 Esc 拒绝（dismissed 语义）：resume 时给出拒绝反馈。
+    dismissed: bool,
 }
 
 /// §13（内联）：挂起时用户提交的回答——单问题带选项时，纯数字（1..=N）
@@ -74,6 +76,32 @@ fn map_pending_answer(pending: &PendingInput, answer: &str) -> String {
     } else {
         answer.to_string()
     }
+}
+
+/// §13：把 capabilities 的 `RequestInputQuestion` 投影为 TUI 的 `QuestionView`。
+///
+/// 无选项且禁止自定义的问题在模态里无法回答（没有可选行、Enter 无效、
+/// 只能 Esc 拒绝）——强制允许自定义输入兜底，保证任何合法问题都能回答。
+fn project_questions(
+    questions: &[tpi_capabilities::tool::request_input::RequestInputQuestion],
+) -> Vec<crate::tui::model::QuestionView> {
+    questions
+        .iter()
+        .map(|q| crate::tui::model::QuestionView {
+            question: q.question.clone(),
+            header: q.header.clone(),
+            options: q
+                .options
+                .iter()
+                .map(|o| crate::tui::model::QuestionOptionView {
+                    label: o.label().to_string(),
+                    description: o.description().to_string(),
+                })
+                .collect(),
+            multiple: q.multiple,
+            custom: q.custom || q.options.is_empty(),
+        })
+        .collect()
 }
 
 /// 会话定位方式（§18.3）。
@@ -1015,7 +1043,14 @@ where
         // 时必须立即消费，不能先阻塞等待键盘事件——否则 `tpi "prompt"` 与
         // “run 结束后自动执行下一条”都要再按一次键才生效。
         let mut need_draw = false;
-        if !ui_state.has_pending_work() {
+        // §13 修复：模态答案已提交（pending_question.answer = Some）时也必须
+        // 立即消费（resume），不能阻塞等键盘——否则用户提交答案后要再按
+        // 一个键才继续。`pending_question` 是 app 局部变量，UiState 的
+        // has_pending_work 看不到它，这里显式并入阻塞条件。
+        let modal_answer_pending = pending_question
+            .as_ref()
+            .is_some_and(|p| p.answer.is_some());
+        if !ui_state.has_pending_work() && !modal_answer_pending {
             // 处理键盘事件（空闲时阻塞等待，不空转）。
             tokio::select! {
                 event = key_rx.recv() => {
@@ -1039,12 +1074,14 @@ where
                                         pending_question = Some(PendingInput {
                                             options: Vec::new(),
                                             answer: Some(answer),
+                                            dismissed: false,
                                         });
                                     }
                                     EffectResult::QuestionRejected => {
                                         pending_question = Some(PendingInput {
                                             options: Vec::new(),
                                             answer: Some("（用户拒绝了该问题）".into()),
+                                            dismissed: true,
                                         });
                                     }
                                     EffectResult::Continue => {}
@@ -1078,9 +1115,11 @@ where
                         }
                         // 鼠标：统一走 Pointer State Machine（§InteractionRefactor），
                         // §PointerHit ⑥：统一鼠标 dispatch（idle 与 run 同一实现）。
+                        // question 模态打开时视为顶层弹层（不穿透到背后）。
                         Some(TerminalInput::Event(Event::Mouse(mouse))) => {
                             let overlay_open = ui_state.view.overlay.is_some()
-                                || ui_state.view.modal.is_some();
+                                || ui_state.view.modal.is_some()
+                                || ui_state.view.question.is_some();
                             let events = handle_mouse(
                                 mouse,
                                 &renderer,
@@ -1193,8 +1232,49 @@ where
                             ui_state.view.load_history(conversation.history());
                             ui_state.view.plan = conversation.plan().cloned();
                             last_failed = None;
+                            // §13：跨会话的 request_input 挂起不可恢复（旧 session 的
+                            // 问题不属于新会话上下文）；恢复的会话若尾部有未回答的
+                            // UserInputRequested，提示用户直接输入即可继续。
+                            pending_question = None;
+                            ui_state.view.question = None;
+                            let resumed_pending_input = conversation
+                                .log()
+                                .and_then(|log| {
+                                    crate::session::read_events(log.path())
+                                        .ok()
+                                        .and_then(|events| {
+                                            let ended_awaiting = events.last().is_some_and(
+                                                |last| {
+                                                    matches!(
+                                                        last,
+                                                        SessionEvent::RunCompleted {
+                                                            reason:
+                                                                crate::session::CompletionReason::AwaitingUserInput,
+                                                            ..
+                                                        }
+                                                    )
+                                                },
+                                            );
+                                            if !ended_awaiting {
+                                                return None;
+                                            }
+                                            events.iter().rev().find_map(|event| match event {
+                                                SessionEvent::UserInputRequested { prompt } => {
+                                                    Some(prompt.clone())
+                                                }
+                                                _ => None,
+                                            })
+                                        })
+                                });
                             let label = session_resume_label(conversation.log());
                             ui_state.view.push_line(LineKind::System, label);
+                            if let Some(_prompt) = resumed_pending_input {
+                                ui_state.view.push_line(
+                                    LineKind::System,
+                                    "该会话曾因 request_input 挂起：直接输入回答即可继续（或忽略它开启新话题）"
+                                        .to_string(),
+                                );
+                            }
                         }
                         Err(error) => {
                             ui_state
@@ -1319,97 +1399,15 @@ where
                 &current_cancel,
                 &mut last_failed,
                 mcp_manager,
+                &mut pending_question,
             )? {
                 SlashAction::Quit => break,
                 SlashAction::Consumed => continue,
                 SlashAction::NotCommand => {}
             }
-            // `request_input` 模态已提交答案（QuestionSubmitted/Rejected）：
-            // 自动 resume——不 push User 行、不依赖输入框输入。
-            if let Some(pending) = pending_question.take()
-                && let Some(answer) = pending.answer
-            {
-                // 记录 UserInputReceived（durable 事实）并继续 run。
-                let run_result = {
-                    let (session_log, history) = conversation.parts_for_run()?;
-                    session_log
-                        .commit(&SessionEvent::UserInputReceived {
-                            content: answer.clone(),
-                        })
-                        .map_err(|e| e.to_string())?;
-                    run_interactive(
-                        provider,
-                        session_log,
-                        config,
-                        history,
-                        answer.clone(),
-                        false,
-                        InteractiveIo {
-                            ui_state: &mut ui_state,
-                            renderer: &mut renderer,
-                            key_rx: &mut key_rx,
-                            current_cancel: current_cancel.clone(),
-                            registry: registry.clone(),
-                        },
-                    )
-                    .await
-                };
-                let outcome = match run_result {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        conversation.refresh_from_log()?;
-                        ui_state.view.status = crate::tui::model::StatusLine::Idle;
-                        ui_state.view.step = 0;
-                        ui_state.view.push_line(
-                            LineKind::System,
-                            format!(
-                                "run 失败，session 已保留：{}",
-                                friendly_provider_failure(&error)
-                            ),
-                        );
-                        renderer
-                            .draw(&mut ui_state.view)
-                            .map_err(|e| e.to_string())?;
-                        last_failed = Some(RetryTarget {
-                            message: answer,
-                            reason: crate::session::CompletionReason::Error,
-                        });
-                        continue;
-                    }
-                };
-                conversation.refresh_from_log()?;
-                if outcome.reason == crate::session::CompletionReason::AwaitingUserInput {
-                    pending_question =
-                        outcome
-                            .awaiting_input
-                            .as_ref()
-                            .map(|awaiting| PendingInput {
-                                options: if awaiting.questions.len() == 1 {
-                                    awaiting.questions[0]
-                                        .options
-                                        .iter()
-                                        .map(|o| o.label().to_string())
-                                        .collect()
-                                } else {
-                                    Vec::new()
-                                },
-                                answer: None,
-                            });
-                }
-                match outcome.reason {
-                    crate::session::CompletionReason::ProviderInterrupted
-                    | crate::session::CompletionReason::ProviderUnavailable
-                    | crate::session::CompletionReason::Error => {
-                        last_failed = Some(RetryTarget {
-                            message: answer.clone(),
-                            reason: outcome.reason,
-                        });
-                    }
-                    _ => last_failed = None,
-                }
-                ui_state.view.push_line(LineKind::System, "─".repeat(40));
-                continue;
-            }
+            // `request_input` 模态已提交答案（QuestionSubmitted/Rejected）
+            // 的消费已移至 pending 消息分支之外（见下方独立块）：模态提交
+            // 时不消费 pending 消息，也不因 slash 命令分支 continue 被跳过。
             ui_state.view.push_line(LineKind::User, message.clone());
             renderer
                 .draw(&mut ui_state.view)
@@ -1498,6 +1496,7 @@ where
                             Vec::new()
                         },
                         answer: None,
+                        dismissed: false,
                     }
                 });
             }
@@ -1509,6 +1508,114 @@ where
                 | crate::session::CompletionReason::Error => {
                     last_failed = Some(RetryTarget {
                         message: message.clone(),
+                        reason: outcome.reason,
+                    });
+                }
+                _ => last_failed = None,
+            }
+            ui_state.view.push_line(LineKind::System, "─".repeat(40));
+        }
+
+        // `request_input` 模态已提交答案（QuestionSubmitted/Rejected）：自动
+        // resume。独立于 pending 消息分支：模态提交时通常没有排队消息，
+        // 原实现把检查放在 `pop_pending()` 分支内，导致答案滞留到下一次任意
+        // 消息提交才被消费（且会被 slash 分支 continue 跳过、与普通消息互吞）。
+        if let Some(pending) = pending_question.take()
+            && let Some(answer) = pending.answer
+        {
+            // 模态提交即关闭模态（无论后续 run 成败，模态不再留在屏幕上）。
+            ui_state.view.question = None;
+            // §askuser 反馈：提交/拒绝后先给用户明确反馈行。此前模态关闭后
+            // 直接 resume——模型若再次 request_input，用户只看到模态又弹出、
+            // 拒绝后也不清楚是否生效，产生“被卡住”的体验。
+            if pending.dismissed {
+                ui_state.view.push_line(
+                    LineKind::System,
+                    String::from("已拒绝该问题（dismissed）：可继续输入其他指令"),
+                );
+            } else {
+                let summary = crate::tui::text::truncate_middle_utf8(&answer, 80, "…");
+                ui_state
+                    .view
+                    .push_line(LineKind::System, format!("已提交回答：{summary}"));
+            }
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+            // 记录 UserInputReceived（durable 事实）并继续 run（答案作为
+            // resume run 的 user_message 提交；不另 push User 行）。
+            let run_result = {
+                let (session_log, history) = conversation.parts_for_run()?;
+                session_log
+                    .commit(&SessionEvent::UserInputReceived {
+                        content: answer.clone(),
+                    })
+                    .map_err(|e| e.to_string())?;
+                run_interactive(
+                    provider,
+                    session_log,
+                    config,
+                    history,
+                    answer.clone(),
+                    false,
+                    InteractiveIo {
+                        ui_state: &mut ui_state,
+                        renderer: &mut renderer,
+                        key_rx: &mut key_rx,
+                        current_cancel: current_cancel.clone(),
+                        registry: registry.clone(),
+                    },
+                )
+                .await
+            };
+            let outcome = match run_result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    conversation.refresh_from_log()?;
+                    ui_state.view.status = crate::tui::model::StatusLine::Idle;
+                    ui_state.view.step = 0;
+                    ui_state.view.push_line(
+                        LineKind::System,
+                        format!(
+                            "run 失败，session 已保留：{}",
+                            friendly_provider_failure(&error)
+                        ),
+                    );
+                    renderer
+                        .draw(&mut ui_state.view)
+                        .map_err(|e| e.to_string())?;
+                    last_failed = Some(RetryTarget {
+                        message: answer,
+                        reason: crate::session::CompletionReason::Error,
+                    });
+                    continue;
+                }
+            };
+            conversation.refresh_from_log()?;
+            if outcome.reason == crate::session::CompletionReason::AwaitingUserInput {
+                pending_question = outcome
+                    .awaiting_input
+                    .as_ref()
+                    .map(|awaiting| PendingInput {
+                        options: if awaiting.questions.len() == 1 {
+                            awaiting.questions[0]
+                                .options
+                                .iter()
+                                .map(|o| o.label().to_string())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
+                        answer: None,
+                        dismissed: false,
+                    });
+            }
+            match outcome.reason {
+                crate::session::CompletionReason::ProviderInterrupted
+                | crate::session::CompletionReason::ProviderUnavailable
+                | crate::session::CompletionReason::Error => {
+                    last_failed = Some(RetryTarget {
+                        message: answer.clone(),
                         reason: outcome.reason,
                     });
                 }
@@ -1548,6 +1655,7 @@ fn handle_slash_command(
     current_cancel: &Arc<Mutex<Option<CancellationToken>>>,
     last_failed: &mut Option<RetryTarget>,
     mcp_manager: &mut crate::mcp::manager::McpManager,
+    pending_question: &mut Option<PendingInput>,
 ) -> Result<SlashAction, String> {
     use crate::app::slash::SLASH_COMMANDS;
     // P1-05：slash 命令的 TUI 展示字段也走窄视图 UiConfig。
@@ -1817,6 +1925,11 @@ workspace: {}
         "/new" => {
             conversation.reset();
             *last_failed = None;
+            // §13：新会话不再欠任何 request_input 答案；旧问题的 pending/模态
+            // 必须一并清除（否则新会话首条消息会被当成旧问题的回答：
+            // 记录孤儿 UserInputReceived + 误映射选项编号）。
+            *pending_question = None;
+            ui_state.view.question = None;
             // BUG-006：屏幕投影必须与已清空的上下文同步（否则显示旧 session）。
             ui_state.view.reset_for_new_session();
             push_system_line(&mut ui_state.view, renderer, "已开始新会话".to_string())?;
@@ -2345,7 +2458,8 @@ async fn run_interactive<P: Provider>(
                     Some(TerminalInput::Event(Event::Mouse(mouse))) => {
                         // §PointerHit ⑥：统一鼠标 dispatch（idle 与 run 同一实现）。
                         let overlay_open = ui_state.view.overlay.is_some()
-                            || ui_state.view.modal.is_some();
+                            || ui_state.view.modal.is_some()
+                            || ui_state.view.question.is_some();
                         let events = handle_mouse(mouse, renderer, &mut pointer_gesture, overlay_open);
                         let changed = !events.is_empty();
                         for event in events {
@@ -2464,24 +2578,7 @@ async fn run_interactive<P: Provider>(
             // tab/自定义回答/拒绝）。投影：capabilities 的 RequestInputQuestion
             // → tui 的 QuestionView。
             if let Some(awaiting) = outcome.awaiting_input.as_ref() {
-                let views = awaiting
-                    .questions
-                    .iter()
-                    .map(|q| crate::tui::model::QuestionView {
-                        question: q.question.clone(),
-                        header: q.header.clone(),
-                        options: q
-                            .options
-                            .iter()
-                            .map(|o| crate::tui::model::QuestionOptionView {
-                                label: o.label().to_string(),
-                                description: o.description().to_string(),
-                            })
-                            .collect(),
-                        multiple: q.multiple,
-                        custom: q.custom,
-                    })
-                    .collect::<Vec<_>>();
+                let views = project_questions(&awaiting.questions);
                 if !views.is_empty() {
                     ui_state.view.question =
                         Some(crate::tui::model::QuestionModalState::new(views));
@@ -3090,6 +3187,7 @@ mod tests {
         let pending = PendingInput {
             options: vec!["生产".into(), "staging".into()],
             answer: None,
+            dismissed: false,
         };
         assert_eq!(map_pending_answer(&pending, "1"), "生产");
         assert_eq!(
@@ -3104,8 +3202,39 @@ mod tests {
         let free = PendingInput {
             options: Vec::new(),
             answer: None,
+            dismissed: false,
         };
         assert_eq!(map_pending_answer(&free, "1"), "1", "无选项时数字原样");
+    }
+
+    /// §13 修复：RequestInputQuestion → QuestionView 投影——无选项且禁止
+    /// 自定义的问题在模态里无法回答（死胡同），投影层强制允许自定义。
+    #[test]
+    fn project_questions_forces_custom_for_optionless() {
+        use tpi_capabilities::tool::request_input::{QuestionOption, RequestInputQuestion};
+        let questions = vec![
+            RequestInputQuestion {
+                question: "选一个".into(),
+                header: None,
+                options: vec![QuestionOption::Plain("是".into())],
+                multiple: false,
+                custom: false,
+            },
+            // 无选项 + custom=false：死胡同，必须被强制为可自定义。
+            RequestInputQuestion {
+                question: "自由输入".into(),
+                header: None,
+                options: Vec::new(),
+                multiple: false,
+                custom: false,
+            },
+        ];
+        let views = project_questions(&questions);
+        assert_eq!(views.len(), 2);
+        assert!(!views[0].custom, "有选项时保留 custom=false");
+        assert_eq!(views[0].options.len(), 1);
+        assert!(views[1].custom, "无选项必须强制可自定义");
+        assert!(views[1].options.is_empty());
     }
 
     /// §用户诉求：--resume 前缀匹配——完整 UUID 直解、唯一前缀补全（大小写
