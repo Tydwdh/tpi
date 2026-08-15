@@ -1147,11 +1147,23 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 - handshake/capability/trust/disconnect；同一 suite。
 
-#### P8-09 O8 parent/child trace links
+#### P8-09 O8 parent/child trace links - **DONE（2026-08-14）**
 
 - child 新 trace + parent span link；durable lineage 与 trace link 双向引用。
 - 跨进程只传 opaque correlation context；不能传播时标 `remote_boundary`/gap。
 - parent cancel、child terminal、report commit 的因果链可查询。
+- 实施：`AgentOutcome.trace_id`（run 的 TraceId 回传）；`SubagentRequest.parent`
+  （`ParentTraceContext`：parent trace/span；None = remote_boundary--独立测试/
+  诊断路径无 parent 可链）；`SubagentReport.trace_id` + `cancelled`。child 执行
+  （`src/subagent/child.rs`）总是新 TraceId（depth 1 不继承 parent trace）；
+  `subagent.link` 事件（parent_trace_id/parent_span_id/child_trace_id/
+  child_session_id 双向引用；无 parent 记 remote_boundary）+
+  `subagent.report_committed` 事件（因果链终点）；trace catalog 登记两事件名
+  （无孤儿 name，`trace_catalog_is_complete` 强制）。跨进程 opaque context =
+  `ParentTraceContext`（Copy 纯 id，无内部状态泄漏）。
+- 验收测试（subagent o8_tests 3 断言）：report 携带自身 trace id；catalog 登记
+  + ParentTraceContext 构造；cancel 因果链（parent cancel -> child Cancelled
+  终态 -> Err 无 report commit）。subagent 共 11 断言全绿。
 
 ### P8 后续项状态（2026-08-14）
 
