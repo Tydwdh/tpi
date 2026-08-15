@@ -313,11 +313,26 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收达成：in-memory fake 跑 agent_flow ✓；单写者/seq/recovery 对 adapter ✓；
   全量 47 target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P2-03 conversation/transcript/plan projector
+#### P2-03 conversation/transcript/plan projector — **DONE（2026-08-14）**
 
 - 分别建立纯 `apply/rebuild`；现有 `Conversation` 做 facade。
 - 属性测试 incremental == rebuild。
 - 验收：失败 run refresh 行为与 golden 一致。
+- 实施：`src/session/projector.rs` 新增纯 `ConversationProjector`：
+  - `rebuild(events)` 全量重建（history + plan，复用 store 投影）；
+  - `apply(seq, event)` 增量记录（O(1) 追加）；
+  - `history()/plan()` 读时惰性重投影（等价全量 rebuild）——incremental apply
+    不重复实现投影逻辑（避免 ToolRequested 关联/compaction prune 双实现漂移）；
+  - `from_history`（accept_context 的外部完整 context 注入）。
+  `Conversation` 改 facade：`history/plan` 字段替换为 `projector`；
+  `resume/refresh_from_log` 经 `events_with_seq()`（P2-02 port）喂 `rebuild`，
+  不再直接碰文件路径（replay_messages/latest_plan 文件版不再被 Conversation 用）。
+- 属性测试 `tests/projector_property.rs`（7 断言）：全类型序列的任意前缀
+  `apply == rebuild`（history/plan）；proptest 随机序列 + 中间前缀；
+  projector 与 store::project_messages 等价（防未来漂移）。
+- 验收达成：incremental == rebuild ✓（含空投影与随机截断）；失败 run refresh
+  走 events_with_seq + rebuild（golden 语义不变，conversation 测试全过）；
+  全量 48 target 绿；fmt/clippy/arch_gate 清洁。
 
 #### P2-04 durability barrier 类型化
 

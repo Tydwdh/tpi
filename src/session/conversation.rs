@@ -11,8 +11,10 @@ use camino::Utf8PathBuf;
 use crate::ids::{RunId, SessionId, ToolCallId};
 use crate::provider::ChatMessage;
 
+use super::projector::ConversationProjector;
 use super::protocol::Plan;
-use super::{SessionLog, latest_plan, recovery, replay_messages, workspace_id_for};
+use super::store::SessionStore;
+use super::{SessionLog, recovery, workspace_id_for};
 
 /// 一个会话的 durable log 与当前模型上下文投影。
 ///
@@ -20,8 +22,8 @@ use super::{SessionLog, latest_plan, recovery, replay_messages, workspace_id_for
 /// history 始终作为一个整体变化。
 pub struct Conversation {
     log: Option<SessionLog>,
-    history: Vec<ChatMessage>,
-    plan: Option<Plan>,
+    /// 纯投影器（P2-03 facade：history/plan 经它重建，不直接持有）。
+    projector: ConversationProjector,
 }
 
 impl Default for Conversation {
@@ -34,8 +36,7 @@ impl Conversation {
     pub fn new() -> Self {
         Self {
             log: None,
-            history: Vec::new(),
-            plan: None,
+            projector: ConversationProjector::new(),
         }
     }
 
@@ -81,12 +82,12 @@ impl Conversation {
         log.sync_data()
             .map_err(|error| format!("同步 session 失败: {error}"))?;
 
-        let history = replay_messages(&path).map_err(|error| format!("重建历史失败: {error}"))?;
-        let plan = latest_plan(&path).map_err(|error| format!("重建计划失败: {error}"))?;
+        let events = crate::session::read_events_with_seq(&path)
+            .map_err(|error| format!("读取事件失败: {error}"))?;
+        let projector = ConversationProjector::rebuild(&events);
         Ok(Self {
             log: Some(log),
-            history,
-            plan,
+            projector,
         })
     }
 
@@ -108,20 +109,19 @@ impl Conversation {
     /// 开始一个没有 durable 状态和历史投影的新会话。
     pub fn reset(&mut self) {
         self.log = None;
-        self.history.clear();
-        self.plan = None;
+        self.projector = ConversationProjector::new();
     }
 
     pub fn log(&self) -> Option<&SessionLog> {
         self.log.as_ref()
     }
 
-    pub fn history(&self) -> &[ChatMessage] {
-        &self.history
+    pub fn history(&mut self) -> &[ChatMessage] {
+        self.projector.history()
     }
 
-    pub fn plan(&self) -> Option<&Plan> {
-        self.plan.as_ref()
+    pub fn plan(&mut self) -> Option<&Plan> {
+        self.projector.plan()
     }
 
     /// agent run 所需的两个一致视图。
@@ -129,26 +129,29 @@ impl Conversation {
         let Some(log) = self.log.as_mut() else {
             return Err("内部错误：conversation 尚未创建 session".into());
         };
-        Ok((log, &self.history))
+        let history = self.projector.history();
+        Ok((log, history))
     }
 
     /// `AgentOutcome.messages` 是完整 context，不是增量；只能整体接纳。
     pub fn accept_context(&mut self, complete_context: Vec<ChatMessage>) {
-        self.history = complete_context;
+        // facade：把完整 context 作为新投影的历史（等价于 replace 语义）。
+        // 事件缓冲无法从 context 反向重建，因此标记为"外部注入"（不 dirty，
+        // 下次 refresh_from_log 会用 durable log 覆盖）。
+        self.projector = ConversationProjector::from_history(complete_context, None);
     }
 
     /// run 在返回 `Err` 前可能已经提交了 User/Assistant/Tool 事件。
     /// 从 durable log 重建可避免 app 猜测“失败到哪一步”并手工拼接残缺 history。
     pub fn refresh_from_log(&mut self) -> Result<(), String> {
         let Some(log) = self.log.as_ref() else {
-            self.history.clear();
-            self.plan = None;
+            self.projector = ConversationProjector::new();
             return Ok(());
         };
-        self.history = replay_messages(log.path())
-            .map_err(|error| format!("run 失败后重建历史失败: {error}"))?;
-        self.plan =
-            latest_plan(log.path()).map_err(|error| format!("run 结束后重建计划失败: {error}"))?;
+        let events = log
+            .events_with_seq()
+            .map_err(|error| format!("run 失败后读取事件失败: {error}"))?;
+        self.projector = ConversationProjector::rebuild(&events);
         Ok(())
     }
 }

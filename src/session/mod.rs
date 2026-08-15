@@ -8,6 +8,7 @@
 
 pub mod artifact;
 pub mod conversation;
+pub mod projector;
 pub mod protocol;
 pub mod recovery;
 pub mod repair;
@@ -15,6 +16,7 @@ pub mod store;
 
 // P2-01：store 层 re-export（原 mod.rs 的 public API 保持不变；迁移完成后
 // 调用方可改 `session::store::` 直引，re-export 留待 P10 清理）。
+pub use projector::{ConversationProjector, plan_from_events};
 pub use protocol::{
     AssistantMessage, CompactSummary, CompletionReason, Envelope, EventBody, EventRange,
     InterruptCause, MAX_SESSION_EVENT_BYTES, ModelRef, RecoveryMetadata, RunLimits, SCHEMA_VERSION,
