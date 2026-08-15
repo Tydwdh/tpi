@@ -20,6 +20,7 @@ pub mod remote;
 pub mod session;
 pub mod shell;
 pub mod skills;
+pub mod subagent;
 pub mod tool;
 pub mod trace;
 pub mod tui;

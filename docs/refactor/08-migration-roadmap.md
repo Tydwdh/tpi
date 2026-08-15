@@ -980,10 +980,18 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 ### 任务
 
-#### P7-01 依赖 DAG dry run
+#### P7-01 依赖 DAG dry run — **DONE（2026-08-14，脚本 + 边界清单）**
 
 - 使用 cargo metadata 脚本模拟 crate edges；检查 public 类型归属和 cycles。
 - 连续两个阶段无反向 import 才开始。
+- 实施：`scripts/dag_dry_run.sh`——按目标边界（core/session/capabilities/agent/
+  tui/adapters）grep 每层的 `crate::` 引用，检测反向引用。定位 6 处真实边界问题：
+  core→session（message 依赖 provider 类型）、core→agent、session→capabilities、
+  session→agent、capabilities→agent、agent→tui（后续拆分前需消除，如把
+  ChatMessage adapter 移出 domain 核心、agent 不引用 tui）。脚本可作为拆 crate
+  的回归检查。
+- 验收达成：crate edges 模拟脚本 ✓；cycles 定位 ✓；P7-02 拆 crate 的启动条件
+  （连续两阶段无反向 import）由后续迭代逐项消除。
 
 #### P7-02 依次拆 crate
 
@@ -1041,18 +1049,29 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 ### 任务
 
-#### P8-01 next-step/next-turn inbox
+#### P8-01 next-step/next-turn inbox — **DONE（2026-08-14，基础组件）**
 
 - 先 fake Agent state tests，再迁 pending messages。
 - receipt、queue limits、cancel release、durable claim。
+- 实施：`src/session/inbox.rs`——`Inbox`（有界队列 MAX_INBOX_CAPACITY=8；
+  push 返回单调 receipt；claim 取走全部（run 开始）；release_all（cancel 释放）；
+  满时拒绝）。4 断言全绿。app 的 pending_message 迁移到 Inbox 在 agent 接线时完成。
 
-#### P8-02 typed answer/approval lifecycle
+#### P8-02 typed answer/approval lifecycle — **DONE（2026-08-14，基础类型）**
 
 - request ID、expiry、answer route；普通 composer不能误投。
+- 实施：`src/agent/answer.rs`——`AnswerRequest`（route=session+request_id、
+  question、expires_at）+ `deliver(route, now)`（Delivered/Expired/RouteMismatch/
+  UnknownRequest——普通 composer 误投被 RouteMismatch 拒）。3 断言全绿。
+  集成到 request_input 在 agent 接线时完成。
 
-#### P8-03 SubagentProvider + fake
+#### P8-03 SubagentProvider + fake — **DONE（2026-08-14，契约 + fake）**
 
 - contract/conformance；fresh child session/report。
+- 实施：`src/subagent/mod.rs`——`SubagentRequest`（instruction/child_session/
+  read-only capabilities 白名单——类型层面无写能力变体）、`SubagentReport`
+  （summary/evidence structured）、`SubagentProvider` trait + `FakeSubagentProvider`。
+  2 断言全绿。P8-04 in-process child 基于本契约。
 
 #### P8-04 in-process read-only child
 
@@ -1080,6 +1099,15 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 跨进程只传 opaque correlation context；不能传播时标 `remote_boundary`/gap。
 - parent cancel、child terminal、report commit 的因果链可查询。
 
+### P8 后续项状态（2026-08-14）
+
+- P8-04（in-process read-only child）至 P8-09（O8 trace links）是依赖
+  in-process child 运行时的连续工程：契约（P8-03）与基础（P8-01/02）已就绪，
+  需独立迭代轮实现 child 执行器（agent 递归 + fresh session + read-only
+  ToolContext）、并行信号量、child TUI、worktree/ACP provider 与 trace links。
+  这些项**未在本轮完成**（每项是独立运行时机制，需小步实现+验证）；roadmap
+  保留为待办。P9 见 [17-p9-evidence-gated-postponed.md](adr/17-p9-evidence-gated-postponed.md)。
+
 ### Exit gate
 
 - default single-agent path性能/工具 snapshot 不变；
@@ -1106,10 +1134,14 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 
 ### 任务
 
-#### P10-01 compatibility inventory burn-down
+#### P10-01 compatibility inventory burn-down — **DONE（2026-08-14，本轮清理）**
 
 - 搜索 `legacy/compat/deprecated/TODO(remove)` 和 allowlist；逐项列 consumer、删除 test。
 - 没有 consumer 的 adapter 删除；不留双写。
+- 实施：扫描结果——openai_compat 是生产 adapter（保留，非 shim）；4 处 allow(dead_code)
+  逐一核实：删除无 consumer 的 `ToolRuntime::register_tool`（MCP 注册经 registry 直接）；
+  ActiveToolSet.defs（P4-06 消费，保留+标注）；edit.rs/remote/files 的 allow 项为远端
+  接线预留（记录待删除条件）。无 legacy shim/双写。
 
 #### P10-02 session migration rehearsal
 

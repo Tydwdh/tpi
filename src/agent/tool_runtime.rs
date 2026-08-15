@@ -146,12 +146,6 @@ impl ToolRuntime {
             .expect("active set 未 reload")
     }
 
-    /// 注册外部工具（MCP manager 调用；Phase 5 交付时由 app 接线）。
-    #[allow(dead_code)]
-    pub(super) fn register_tool(&self, tool: std::sync::Arc<dyn crate::tool::registry::Tool>) {
-        self.registry.lock().unwrap().register(tool);
-    }
-
     /// 当前 workspace 快照（§R4：build_context 注入 identity 用；clone 避免
     /// 返回指向 MutexGuard 临时值的引用）。
     pub(super) fn workspace_snapshot(&self) -> crate::workspace::ActiveWorkspace {

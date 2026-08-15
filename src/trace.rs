@@ -442,10 +442,7 @@ mod tests {
         let view = inspect(&stats);
         assert_eq!(view.gaps, 1, "gap 可见");
         assert!((view.completeness_ratio - 0.8).abs() < 1e-9, "完整性如实");
-        assert!(
-            (view.completeness_ratio - 1.0).abs() >= 1e-9,
-            "不伪装完整"
-        );
+        assert!((view.completeness_ratio - 1.0).abs() >= 1e-9, "不伪装完整");
     }
 
     /// 空 sink：完整（无记录）。

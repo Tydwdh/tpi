@@ -13,6 +13,7 @@ use tracing::Instrument as _;
 
 use crate::config::Config;
 
+pub mod answer;
 pub mod limits;
 /// 调度原语（§12：资源声明 / waves / 无进展检测）物理上属于 tool 领域
 /// （src/tool/scheduler.rs）。此处 re-export 仅兼容既有 `agent::scheduler`
