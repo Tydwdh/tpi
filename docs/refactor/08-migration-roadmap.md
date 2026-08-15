@@ -294,11 +294,24 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
   - re-export 兼容层（`session::X` 直引）留待 P10-01 清理（删除条件：调用方
     已迁移到 `session::store::X`）。
 
-#### P2-02 `SessionStore` port + JSONL adapter
+#### P2-02 `SessionStore` port + JSONL adapter — **DONE（2026-08-14）**
 
 - 从当前真实调用抽最小接口。
 - current `SessionLog` 先实现；Agent 通过 port。
 - 验收：in-memory fake 跑 agent_flow；单写者/seq/recovery tests 对 adapter 运行。
+- 实施：`session::store::SessionStore` trait（begin_run/session_id/seq/path/
+  append_event/sync_data/write_ahead_tool/complete_tool/events_with_seq）；
+  `SessionLog` 实现（JSONL adapter，转发既有方法）。agent 泛型化
+  `run<P, S: SessionStore>`（含 run_inner/compact_turn/ToolBatchExecutor/execute_batch），
+  agent 不再直接碰文件路径——`latest_plan(session.path())` 改为
+  `latest_plan_from_events(&session.events_with_seq())`，compaction 的
+  `read_events_with_seq(session.path())` 改为 `session.events_with_seq()`。
+- 测试 `tests/session_store_fake.rs`（8 断言）：InMemoryStore（Vec 存储，无文件）
+  实现 SessionStore 跑完整 agent_flow（事件序列 User/RunStarted/Assistant/
+  RunCompleted）；adapter 单写者/seq 严格递增/write-ahead 顺序（ToolRequested→
+  ToolStarted→ToolCompleted）契约；两 store 隔离。
+- 验收达成：in-memory fake 跑 agent_flow ✓；单写者/seq/recovery 对 adapter ✓；
+  全量 47 target 绿；fmt/clippy/arch_gate 清洁。
 
 #### P2-03 conversation/transcript/plan projector
 

@@ -29,7 +29,45 @@ pub fn workspace_id_for(workspace_root: &Path) -> String {
     digest.to_hex()[..12].to_string()
 }
 
-/// Append-only session 日志。
+/// `SessionStore` port（P2-02）：agent 依赖的最小 session 写接口。
+///
+/// - [`SessionLog`]（JSONL adapter）实现本 trait；
+/// - in-memory fake（测试）实现本 trait 跑 agent_flow；
+/// - agent 通过 `&mut S: SessionStore` 访问，不知道 JSONL/文件细节。
+///
+/// 单写者：同一时刻只有一个 `&mut S` 持有者（Rust 借用保证）；seq 由实现
+/// 维护（append 返回新 seq）；recovery/单写者/seq 契约由 adapter 测试验证。
+pub trait SessionStore {
+    /// 当前 run 边界（durable RunStarted 前调用）。
+    fn begin_run(&mut self) -> RunId;
+    /// session 身份（UI/上下文展示）。
+    fn session_id(&self) -> SessionId;
+    /// 当前已提交事件数（seq）。
+    fn seq(&self) -> u64;
+    /// durable 事实源路径（诊断/恢复用；adapter 返回文件路径，fake 返回占位）。
+    fn path(&self) -> &std::path::Path;
+    /// append 一个 durable 事件，返回新 seq。
+    fn append_event(&mut self, event: &SessionEvent) -> std::io::Result<u64>;
+    /// flush 到 durable boundary（write-ahead 的 commit point）。
+    fn sync_data(&mut self) -> std::io::Result<()>;
+    /// 写工具执行前记录恢复信息（ToolStarted + sync）。
+    fn write_ahead_tool(
+        &mut self,
+        call_id: ToolCallId,
+        recovery: Option<RecoveryMetadata>,
+    ) -> std::io::Result<()>;
+    /// 工具终态（ToolCompleted + sync）。
+    fn complete_tool(
+        &mut self,
+        call_id: ToolCallId,
+        outcome: &StoredToolOutcome,
+    ) -> std::io::Result<()>;
+    /// 读取全部事件（含 seq）——投影/恢复的最小读取接口。
+    /// agent 不直接碰文件路径（P2-02：path() 仅诊断用）。
+    fn events_with_seq(&self) -> std::io::Result<Vec<(u64, SessionEvent)>>;
+}
+
+/// Append-only session 日志（JSONL adapter，实现 [`SessionStore`]）。
 pub struct SessionLog {
     session_id: SessionId,
     run_id: RunId,
@@ -251,6 +289,45 @@ impl SessionLog {
     }
 }
 
+/// SessionLog 是 JSONL adapter：直接转发到既有方法（P2-02）。
+impl SessionStore for SessionLog {
+    fn begin_run(&mut self) -> RunId {
+        SessionLog::begin_run(self)
+    }
+    fn session_id(&self) -> SessionId {
+        SessionLog::session_id(self)
+    }
+    fn seq(&self) -> u64 {
+        SessionLog::seq(self)
+    }
+    fn path(&self) -> &std::path::Path {
+        SessionLog::path(self)
+    }
+    fn append_event(&mut self, event: &SessionEvent) -> std::io::Result<u64> {
+        SessionLog::append_event(self, event)
+    }
+    fn sync_data(&mut self) -> std::io::Result<()> {
+        SessionLog::sync_data(self)
+    }
+    fn write_ahead_tool(
+        &mut self,
+        call_id: ToolCallId,
+        recovery: Option<RecoveryMetadata>,
+    ) -> std::io::Result<()> {
+        SessionLog::write_ahead_tool(self, call_id, recovery)
+    }
+    fn complete_tool(
+        &mut self,
+        call_id: ToolCallId,
+        outcome: &StoredToolOutcome,
+    ) -> std::io::Result<()> {
+        SessionLog::complete_tool(self, call_id, outcome)
+    }
+    fn events_with_seq(&self) -> std::io::Result<Vec<(u64, SessionEvent)>> {
+        crate::session::read_events_with_seq(SessionLog::path(self))
+    }
+}
+
 /// 读取 session 的全部事件（含残行丢弃）。
 pub fn read_events(path: &Path) -> std::io::Result<Vec<SessionEvent>> {
     Ok(read_events_and_max_seq(path)?.0)
@@ -268,6 +345,14 @@ pub fn latest_plan(path: &Path) -> std::io::Result<Option<Plan>> {
             SessionEvent::PlanReplaced { plan } => Some(plan),
             _ => None,
         }))
+}
+
+/// latest_plan 的 events 版（P2-02）：从 `events_with_seq` 读取，不依赖文件路径。
+pub fn latest_plan_from_events(events: &[(u64, SessionEvent)]) -> std::io::Result<Option<Plan>> {
+    Ok(events.iter().rev().find_map(|(_, event)| match event {
+        SessionEvent::PlanReplaced { plan } => Some(plan.clone()),
+        _ => None,
+    }))
 }
 
 /// 读取全部事件并保留 envelope seq（P0-3/§19B：中间存在损坏行时

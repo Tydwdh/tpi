@@ -24,7 +24,7 @@ use self::tool_runtime::{BatchEnd, ToolBatchExecutor, ToolRuntime};
 use crate::ids::{EventId, RequestId, ToolCallId};
 use crate::provider::{ChatMessage, ModelRequest, Provider, ProviderEvent, ToolCall};
 use crate::session::{
-    self, AssistantMessage, CompletionReason, ModelRef, RunLimits, SessionEvent, SessionLog, Usage,
+    self, AssistantMessage, CompletionReason, ModelRef, RunLimits, SessionEvent, Usage,
 };
 use crate::tool::outcome::{StoredToolOutcome, ToolStatus};
 
@@ -288,9 +288,9 @@ pub enum DeltaKind {
 }
 
 /// 执行一次完整 run（§6.2）。
-pub async fn run<P: Provider>(
+pub async fn run<P: Provider, S: crate::session::store::SessionStore>(
     provider: &mut P,
-    session: &mut SessionLog,
+    session: &mut S,
     config: &Config,
     input: RunInput<'_>,
 ) -> Result<AgentOutcome, RunFailure> {
@@ -335,9 +335,9 @@ pub async fn run<P: Provider>(
 }
 
 /// `run` 的实际执行体（由 `run` 以 `.instrument(span)` 包裹，见 O0）。
-async fn run_inner<P: Provider>(
+async fn run_inner<P: Provider, S: crate::session::store::SessionStore>(
     provider: &mut P,
-    session: &mut SessionLog,
+    session: &mut S,
     config: &Config,
     run_id: crate::ids::RunId,
     input: RunInput<'_>,
@@ -414,8 +414,12 @@ async fn run_inner<P: Provider>(
 
     let mut usage_total = Usage::default();
     let mut messages: Vec<ChatMessage> = history.to_vec();
-    let initial_plan = crate::session::latest_plan(session.path())
-        .map_err(|e| RunFailure::Session(format!("restore plan: {e}")))?;
+    let initial_plan = crate::session::latest_plan_from_events(
+        &session
+            .events_with_seq()
+            .map_err(|e| RunFailure::Session(format!("read events: {e}")))?,
+    )
+    .map_err(|e| RunFailure::Session(format!("restore plan: {e}")))?;
     // 恢复态只补一次并留在本轮 runtime history 中；不能在每次 request 构造时
     // 都把计划重新追加到尾部，否则即使改成 Tool 角色也会持续抢占最新上下文。
     ensure_plan_state_messages(&mut messages, initial_plan.as_ref());
@@ -982,7 +986,7 @@ async fn run_inner<P: Provider>(
 
         // 6. 工具调用（§12.2 batch 调度）。
         if !response.tool_calls.is_empty() {
-            let batch = ToolBatchExecutor::new(
+            let batch = ToolBatchExecutor::<'_, _>::new(
                 config,
                 session,
                 &mut messages,
@@ -1287,10 +1291,10 @@ fn is_transient_transport_error(error: &crate::provider::ProviderError) -> bool 
 }
 
 /// compaction 一轮（§15.4）。
-async fn compact_turn<P: Provider>(
+async fn compact_turn<P: Provider, S: crate::session::store::SessionStore>(
     provider: &mut P,
     messages: &mut Vec<ChatMessage>,
-    session: &mut SessionLog,
+    session: &mut S,
     config: &Config,
     cancel: &CancellationToken,
     usage_total: &mut Usage,
@@ -1323,7 +1327,8 @@ async fn compact_turn<P: Provider>(
     let next_seq = seq
         .checked_add(1)
         .ok_or_else(|| CompactionFailure::Session("session seq 已耗尽".into()))?;
-    let events = crate::session::read_events_with_seq(session.path())
+    let events = session
+        .events_with_seq()
         .map_err(|e| CompactionFailure::Session(e.to_string()))?;
     let projected = crate::session::project_messages_with_ranges(&events);
     let recent_start_seq = if projected.len() == pruned.len() {

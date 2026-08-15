@@ -14,7 +14,7 @@ use super::{LiveEvent, RunFailure};
 use crate::config::Config;
 use crate::ids::ToolCallId;
 use crate::provider::{ChatMessage, FinishReason, ModelRequest, Provider, ProviderEvent, ToolCall};
-use crate::session::{RecoveryMetadata, SessionEvent, SessionLog, Usage};
+use crate::session::{RecoveryMetadata, SessionEvent, Usage};
 use crate::tool::edit::SnapshotStore;
 use crate::tool::outcome::{StoredToolOutcome, ToolOutcome, ToolStatus};
 use crate::tool::plan::Plan;
@@ -187,19 +187,19 @@ pub(super) enum BatchEnd {
 /// (ToolStarted/RecoveryMetadata) → execute wave (parallel Pure/Read, serial
 /// Write/WorkspaceUnknown) → observe (no-progress) → persist (ToolCompleted)
 /// → refill results by source index.
-pub(super) struct ToolBatchExecutor<'a> {
+pub(super) struct ToolBatchExecutor<'a, S: crate::session::store::SessionStore> {
     config: &'a Config,
-    session: &'a mut SessionLog,
+    session: &'a mut S,
     messages: &'a mut Vec<ChatMessage>,
     progress: &'a mut crate::tool::scheduler::ProgressTracker,
     runtime: &'a ToolRuntime,
     ui: &'a mpsc::Sender<LiveEvent>,
 }
 
-impl<'a> ToolBatchExecutor<'a> {
+impl<'a, S: crate::session::store::SessionStore> ToolBatchExecutor<'a, S> {
     pub(super) fn new(
         config: &'a Config,
-        session: &'a mut SessionLog,
+        session: &'a mut S,
         messages: &'a mut Vec<ChatMessage>,
         progress: &'a mut crate::tool::scheduler::ProgressTracker,
         runtime: &'a ToolRuntime,
@@ -233,8 +233,8 @@ impl<'a> ToolBatchExecutor<'a> {
 /// 3. 同 wave 无冲突 Pure/Read 并行（受 `max_parallel_tools` 限制）；
 ///    Write / WorkspaceUnknown 按源顺序；
 /// 4. 结果无论完成先后都按原 call index 送回 provider（§12.2 第 6 条）。
-async fn execute_batch<P: Provider>(
-    executor: ToolBatchExecutor<'_>,
+async fn execute_batch<P: Provider, S: crate::session::store::SessionStore>(
+    executor: ToolBatchExecutor<'_, S>,
     provider: &mut P,
     calls: Vec<ToolCall>,
     tool_calls_total: &mut u32,

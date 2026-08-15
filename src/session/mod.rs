@@ -24,9 +24,9 @@ pub use store::read_envelopes;
 pub(crate) use store::{SessionProtocolState, open_and_lock_session};
 
 pub use store::{
-    SessionLog, compacted_range, latest_plan, project_domain_messages, project_messages,
-    project_messages_with_ranges, read_events, read_events_and_max_seq, read_events_with_seq,
-    replay_domain_messages, replay_messages, workspace_id_for,
+    SessionLog, compacted_range, latest_plan, latest_plan_from_events, project_domain_messages,
+    project_messages, project_messages_with_ranges, read_events, read_events_and_max_seq,
+    read_events_with_seq, replay_domain_messages, replay_messages, workspace_id_for,
 };
 
 #[cfg(test)]
