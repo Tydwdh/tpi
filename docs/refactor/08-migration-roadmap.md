@@ -746,10 +746,21 @@ O-track 不是第二套 event bus。它只观察既有 command/event/effect/owne
 - 验收达成：root/session overlay lookup ✓；setup fault rollback ✓；默认静态 roster
   保持 ✓；全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
-#### P4-09 MCP generation reload
+#### P4-09 MCP generation reload — **DONE（2026-08-14）**
 
 - private setup -> atomic publish -> drain old -> precise dispose。
 - 新 setup 失败不破坏 old active。
+- 实施：`src/mcp/manager.rs`：
+  - `start_server` 注册事务化：任一工具注册失败 → drop 已注册句柄（rollback，不留
+    孤儿注册）；
+  - `restart_server` 改 atomic publish：先暂存旧（不 kill）→ 启动新（private setup，
+    新注册 P4-01 新 id）→ 新成功后才 kill 旧 + drop 旧 registrations（精确 dispose，
+    不影响新）；新 setup 失败旧 active 原样保留。
+- 验收测试：`tests/mcp_contract.rs` 增 `restart_failure_keeps_old_active`（restart 到
+  未配置 server 失败 → 旧工具保留 + 旧 client 仍可调用）。mcp_contract 16 断言全绿；
+  既有 restart（218/255 工具重新注册/旧工具先注销）保持。
+- 验收达成：private setup ✓；atomic publish ✓；drain old + precise dispose ✓；
+  新 setup 失败不破坏 old active ✓；全量 54 target 绿；fmt/clippy/arch_gate 清洁。
 
 #### P4-10 conformance suite
 

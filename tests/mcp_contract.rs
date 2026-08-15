@@ -320,3 +320,40 @@ async fn shutdown_clears_reader_tasks_and_child() {
         "shutdown 后 reader task 必须清零（Supervisor join）"
     );
 }
+
+/// P4-09：restart 先 setup 新再 drain 旧——新 server 启动失败不破坏旧 active。
+/// （用不存在的 server 配置触发启动失败；旧 server 应仍可调用。）
+#[tokio::test]
+async fn restart_failure_keeps_old_active() {
+    let registry = Arc::new(Mutex::new(ToolRegistry::new()));
+    let mut manager = McpManager::with_registry(registry.clone());
+    let config = test_server_config("keep-old-server");
+    let count = manager.start_server(config).await.unwrap();
+    assert_eq!(count, 4);
+
+    // restart 到不存在的 server：新 setup 失败 → 旧 active 保持。
+    let err = manager
+        .restart_server("keep-old-server", &[])
+        .await
+        .expect_err("未配置的 server 必须失败");
+    assert!(!err.to_string().is_empty());
+    // 旧工具仍注册（旧 active 未被破坏）。
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .get("mcp::keep-old-server::echo")
+            .is_some(),
+        "新 setup 失败后旧工具必须保留"
+    );
+    // 旧 client 仍可调用。
+    let echo_tool = registry
+        .lock()
+        .unwrap()
+        .get("mcp::keep-old-server::echo")
+        .unwrap();
+    let ctx = fixtures::test_tool_context(&camino::Utf8PathBuf::from("."));
+    let outcome = echo_tool.execute(r#"{"text":"x"}"#, &ctx).await;
+    assert_eq!(outcome.status, tpi::tool::outcome::ToolStatus::Succeeded);
+    manager.shutdown_all().await;
+}

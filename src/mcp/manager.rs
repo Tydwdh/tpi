@@ -69,6 +69,8 @@ impl McpManager {
         let available = Arc::new(AtomicBool::new(true));
 
         let tool_count = tools.len();
+        // P4-09：private setup 的注册事务——任一注册失败回滚已注册工具
+        // （不留孤儿注册；新 setup 失败不破坏旧 active）。
         let mut registrations = Vec::with_capacity(tool_count);
         for tool in tools {
             let internal = format!("mcp::{server_id}::{}", tool.name);
@@ -81,10 +83,14 @@ impl McpManager {
                 client.clone(),
                 available.clone(),
             );
-            registrations.push(
-                ToolRegistry::register_owned(&self.registry, Arc::new(adapter))
-                    .map_err(McpError::Protocol)?,
-            );
+            match ToolRegistry::register_owned(&self.registry, Arc::new(adapter)) {
+                Ok(reg) => registrations.push(reg),
+                Err(e) => {
+                    // rollback：注销已注册的（drop 句柄）；返回错误。
+                    drop(registrations);
+                    return Err(McpError::Protocol(e));
+                }
+            }
         }
         self.servers.insert(
             server_id.clone(),
@@ -116,16 +122,21 @@ impl McpManager {
         server_id: &str,
         configs: &[McpServerConfig],
     ) -> Result<usize, McpError> {
-        if let Some(running) = self.servers.remove(server_id) {
-            let client = running.client.clone();
-            let mut guard = client.lock().await;
-            guard.kill().await;
-            // running drop → _registrations 自动注销（无需前缀扫描）。
-        }
         let Some(config) = configs.iter().find(|c| c.name == server_id).cloned() else {
             return Err(McpError::Protocol(format!("server {server_id} 未配置")));
         };
-        self.start_server(config).await
+        // P4-09：atomic publish——先暂存旧（不 kill），启动新（private setup）；
+        // 新成功后才 drain 旧（kill + drop 旧 registrations 按旧 id 注销）。
+        // 新 setup 失败：旧 active 原样保留（servers 表项未动）。
+        let old = self.servers.remove(server_id);
+        let started = self.start_server(config).await?;
+        if let Some(running) = old {
+            let client = running.client.clone();
+            let mut guard = client.lock().await;
+            guard.kill().await;
+            // running drop → 旧 _registrations 自动注销（精确 dispose，不影响新）。
+        }
+        Ok(started)
     }
 
     /// 各 server 状态（Phase 3 /mcp 页面）。
