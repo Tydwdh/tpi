@@ -10,13 +10,11 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::ids::{RunId, SessionId, ToolCallId};
-use crate::message::{ChatMessage, ToolCall};
-use crate::outcome::StoredToolOutcome;
-use crate::plan::Plan;
-use crate::session::protocol::{
-    self, Envelope, EventBody, RecoveryMetadata, SCHEMA_VERSION, SessionEvent,
-};
+use crate::protocol::{self, Envelope, EventBody, RecoveryMetadata, SCHEMA_VERSION, SessionEvent};
+use tpi_core::ids::{RunId, SessionId, ToolCallId};
+use tpi_core::message::{ChatMessage, ToolCall};
+use tpi_core::outcome::StoredToolOutcome;
+use tpi_core::plan::Plan;
 
 pub(crate) use protocol::MAX_SESSION_EVENTS;
 
@@ -142,7 +140,7 @@ impl SessionLog {
         let workspace_id = workspace_id_for(workspace_root);
         let dir = sessions_root.join(&workspace_id);
         std::fs::create_dir_all(&dir)?;
-        if crate::util::is_symlink_or_reparse(&dir)? {
+        if tpi_core::util::is_symlink_or_reparse(&dir)? {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "session workspace 目录不能是符号链接或 reparse point",
@@ -183,7 +181,7 @@ impl SessionLog {
         let path = sessions_root
             .join(&workspace_id)
             .join(format!("{session_id}.jsonl"));
-        if crate::util::is_symlink_or_reparse(
+        if tpi_core::util::is_symlink_or_reparse(
             path.parent()
                 .ok_or_else(|| std::io::Error::other("session 路径缺少父目录"))?,
         )? {
@@ -269,12 +267,12 @@ impl SessionLog {
             .map_err(std::io::Error::other)?;
         let mut bytes = serde_json::to_vec(&envelope)
             .map_err(|e| std::io::Error::other(format!("serialize event: {e}")))?;
-        if bytes.len() > crate::session::protocol::MAX_SESSION_EVENT_BYTES {
+        if bytes.len() > crate::protocol::MAX_SESSION_EVENT_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "session event 超过 {} 字节上限",
-                    crate::session::protocol::MAX_SESSION_EVENT_BYTES
+                    crate::protocol::MAX_SESSION_EVENT_BYTES
                 ),
             ));
         }
@@ -362,7 +360,7 @@ impl SessionStore for SessionLog {
         SessionLog::complete_tool(self, call_id, outcome)
     }
     fn events_with_seq(&self) -> std::io::Result<Vec<(u64, SessionEvent)>> {
-        crate::session::read_events_with_seq(SessionLog::path(self))
+        crate::read_events_with_seq(SessionLog::path(self))
     }
 }
 
@@ -416,7 +414,9 @@ pub fn replay_messages(path: &Path) -> std::io::Result<Vec<ChatMessage>> {
 /// domain message，provider converter 再生成旧 `ChatMessage`）。
 /// 等价性：`replay_domain_messages -> ChatMessage::from` 与 `replay_messages`
 /// 语义等价（`tests/domain_message.rs` golden parity 验证）。
-pub fn replay_domain_messages(path: &Path) -> std::io::Result<Vec<crate::message::DomainMessage>> {
+pub fn replay_domain_messages(
+    path: &Path,
+) -> std::io::Result<Vec<tpi_core::message::DomainMessage>> {
     let events = read_events_with_seq(path)?;
     Ok(project_domain_messages(&events))
 }
@@ -438,7 +438,7 @@ pub fn project_messages(events: &[(u64, SessionEvent)]) -> Vec<ChatMessage> {
 /// events -> domain messages（无 recent-prune；`project_messages` 的 domain 形态）。
 pub fn project_domain_messages(
     events: &[(u64, SessionEvent)],
-) -> Vec<crate::message::DomainMessage> {
+) -> Vec<tpi_core::message::DomainMessage> {
     let ranges = project_messages_with_ranges(events);
     let (Some(end), Some(comp_seq), _) = compacted_range(events) else {
         return ranges.into_iter().map(|(m, _, _)| m).collect();
@@ -446,9 +446,9 @@ pub fn project_domain_messages(
     let mut result = Vec::with_capacity(ranges.len());
     for (message, start, _) in ranges {
         if start >= end && start < comp_seq {
-            let single = crate::context::prune_messages(vec![ChatMessage::from(&message)]);
+            let single = tpi_core::revision::prune_messages(vec![ChatMessage::from(&message)]);
             match single.into_iter().next() {
-                Some(item) => result.push(crate::message::DomainMessage::from(&item)),
+                Some(item) => result.push(tpi_core::message::DomainMessage::from(&item)),
                 None => {
                     // prune 不改变消息数量是不变量；异常时丢日志并跳过该消息
                     // （保留其余消息，避免整个投影失败）。
@@ -509,8 +509,8 @@ pub fn compacted_range(
 /// （只覆盖真正被压缩的事件，runtime 保留的 recent 在 replay 端也必须保留）。
 pub fn project_messages_with_ranges(
     events: &[(u64, SessionEvent)],
-) -> Vec<(crate::message::DomainMessage, u64, u64)> {
-    use crate::message::{DomainContentBlock, DomainMessage, DomainRole};
+) -> Vec<(tpi_core::message::DomainMessage, u64, u64)> {
+    use tpi_core::message::{DomainContentBlock, DomainMessage, DomainRole};
     // 1. 最新 compaction 覆盖范围（P0-8：covered.end exclusive，跳过 seq < end）。
     let (compacted_up_to, _, summary_text) = compacted_range(events);
 
@@ -728,7 +728,7 @@ impl SessionProtocolState {
 fn read_envelopes_state(path: &Path) -> std::io::Result<EnvelopeRead> {
     read_envelopes_state_with_limits(
         path,
-        crate::session::protocol::MAX_SESSION_EVENT_BYTES,
+        crate::protocol::MAX_SESSION_EVENT_BYTES,
         MAX_SESSION_EVENTS,
     )
 }
@@ -756,9 +756,9 @@ pub(crate) fn read_envelopes_state_with_limits(
 
     loop {
         let line_start = offset;
-        let line = match crate::util::read_line_bounded(&mut reader, max_event_bytes)? {
-            crate::util::BoundedLineRead::Eof => break,
-            crate::util::BoundedLineRead::TooLong => {
+        let line = match tpi_core::util::read_line_bounded(&mut reader, max_event_bytes)? {
+            tpi_core::util::BoundedLineRead::Eof => break,
+            tpi_core::util::BoundedLineRead::TooLong => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
@@ -768,7 +768,7 @@ pub(crate) fn read_envelopes_state_with_limits(
                     ),
                 ));
             }
-            crate::util::BoundedLineRead::Line(line) => line,
+            tpi_core::util::BoundedLineRead::Line(line) => line,
         };
         line_number = line_number.saturating_add(1);
         offset = offset

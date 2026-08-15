@@ -14,8 +14,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::ids::ToolCallId;
-use crate::session::{Envelope, SCHEMA_VERSION, SessionEvent};
+use crate::{Envelope, SCHEMA_VERSION, SessionEvent};
+use tpi_core::ids::ToolCallId;
 
 /// 一行损坏信息（供 doctor / CLI 展示）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +64,7 @@ fn scan_lines(path: &Path) -> std::io::Result<ScanResult> {
         .file_stem()
         .and_then(|stem| stem.to_str())
         .and_then(|stem| uuid::Uuid::parse_str(stem).ok())
-        .map(crate::ids::SessionId);
+        .map(tpi_core::ids::SessionId);
     let mut expected_session = expected_from_name;
     let mut previous_seq = 0u64;
     let mut event_ids = std::collections::HashSet::new();
@@ -76,9 +76,9 @@ fn scan_lines(path: &Path) -> std::io::Result<ScanResult> {
 
     loop {
         let line =
-            match crate::util::read_line_bounded(&mut reader, super::MAX_SESSION_EVENT_BYTES)? {
-                crate::util::BoundedLineRead::Eof => break,
-                crate::util::BoundedLineRead::TooLong => {
+            match tpi_core::util::read_line_bounded(&mut reader, super::MAX_SESSION_EVENT_BYTES)? {
+                tpi_core::util::BoundedLineRead::Eof => break,
+                tpi_core::util::BoundedLineRead::TooLong => {
                     line_number += 1;
                     bad.push(BadLine {
                         line: line_number,
@@ -87,7 +87,7 @@ fn scan_lines(path: &Path) -> std::io::Result<ScanResult> {
                     });
                     continue;
                 }
-                crate::util::BoundedLineRead::Line(line) => line,
+                tpi_core::util::BoundedLineRead::Line(line) => line,
             };
         line_number += 1;
         let has_newline = line.terminated;
@@ -255,7 +255,12 @@ pub fn repair(path: &Path) -> std::io::Result<RepairReport> {
         let (session_id, run_id) = good
             .last()
             .map(|(_, _, e)| (e.session_id, e.run_id))
-            .unwrap_or_else(|| (crate::ids::SessionId::new_v7(), crate::ids::RunId::new_v7()));
+            .unwrap_or_else(|| {
+                (
+                    tpi_core::ids::SessionId::new_v7(),
+                    tpi_core::ids::RunId::new_v7(),
+                )
+            });
         let mut seq = max_seq;
         for (call_id, provider_id, outcome) in &recovered.interrupted {
             let Ok(call_id) = uuid::Uuid::parse_str(call_id).map(ToolCallId) else {
@@ -289,14 +294,14 @@ pub fn repair(path: &Path) -> std::io::Result<RepairReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::RunId;
-    use crate::session::{SessionEvent, SessionLog, read_events, workspace_id_for};
+    use crate::{SessionEvent, SessionLog, read_events, workspace_id_for};
     use camino::Utf8PathBuf;
+    use tpi_core::ids::RunId;
 
     fn make_session() -> (
         tempfile::TempDir,
         Utf8PathBuf,
-        crate::ids::SessionId,
+        tpi_core::ids::SessionId,
         std::path::PathBuf,
     ) {
         let dir = tempfile::tempdir().unwrap();
@@ -304,7 +309,7 @@ mod tests {
         let sessions_root = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions_root).unwrap();
         let workspace_id = workspace_id_for(workspace.as_std_path());
-        let session_id = crate::ids::SessionId::new_v7();
+        let session_id = tpi_core::ids::SessionId::new_v7();
         let path = sessions_root
             .join(&workspace_id)
             .join(format!("{session_id}.jsonl"));
@@ -431,8 +436,8 @@ mod tests {
             session_id,
         )
         .unwrap();
-        let call = crate::message::ToolCall {
-            call_id: crate::ids::ToolCallId::new_v7(),
+        let call = tpi_core::message::ToolCall {
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
             provider_id: "provider-call".into(),
             name: "read".into(),
             arguments: "{}".into(),
@@ -464,7 +469,7 @@ mod tests {
             events.iter().any(|e| matches!(
                 e,
                 SessionEvent::ToolCompleted { outcome, .. }
-                    if outcome.status == crate::outcome::ToolStatus::Interrupted
+                    if outcome.status == tpi_core::outcome::ToolStatus::Interrupted
             )),
             "必须包含合成的 Interrupted ToolCompleted: {events:?}"
         );

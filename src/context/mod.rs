@@ -10,21 +10,13 @@ use crate::provider::ChatMessage;
 
 /// token 保守估算（§15.4：tokenizer 不可用时）：
 /// `max(ceil(utf8_bytes / 3), unicode_scalar_count)`。
-pub fn estimate_tokens(text: &str) -> u64 {
-    let scalars = text.chars().count() as u64;
-    // §PointerHit 6：更贴近真实 tokenizer 的启发式——
-    // CJK（每字符多字节，常见 ~1 token/字）与 ASCII/code（~4 chars/token）分开算。
-    // 旧实现 `max(bytes/3, scalars)` 对 ASCII 给 1 char/token，过保守导致
-    // compaction 过早触发。
-    let cjk_count = text
-        .chars()
-        .filter(|c| matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3000}'..='\u{303F}'))
-        .count() as u64;
-    let ascii_scalars = scalars.saturating_sub(cjk_count);
-    // ASCII/code：~3 chars/token（比旧 1 char/token 合理，比 4 保守些，
-    // 避免过少导致 compaction 触发延迟）。
-    (cjk_count + ascii_scalars.div_ceil(3)).max(1)
-}
+/// P7-02 拆 crate：estimate_tokens 下沉 tpi-core；此处 re-export 保持
+/// `crate::context::estimate_tokens` 路径兼容。
+pub use crate::revision::estimate_tokens;
+
+/// P7-02 拆 crate：prune_messages 下沉 tpi-core（完整版）；此处 re-export
+/// 保持 `crate::context::prune_messages` 路径兼容。
+pub use crate::revision::prune_messages;
 
 /// 估算一组消息的 token 数。
 pub fn estimate_messages(messages: &[ChatMessage]) -> u64 {
@@ -93,143 +85,6 @@ pub const MIN_KEEP_TURNS: usize = 2;
 /// 失败诊断、实际 diff、用户约束和当前计划保留更高权重。
 /// P1-5：结构化关键行（status/program/exit_code/artifact/error）不在 tail 时
 /// 显式保留——否则模型会失去 artifact 引用等恢复入口。
-pub fn prune_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    const MAX_TOOL_OUTPUT_TOKENS: u64 = 800;
-    messages
-        .into_iter()
-        .map(|message| match message {
-            ChatMessage::Tool {
-                tool_call_id,
-                name,
-                content,
-            } => {
-                if estimate_tokens(&content) > MAX_TOOL_OUTPUT_TOKENS {
-                    ChatMessage::Tool {
-                        tool_call_id,
-                        name,
-                        content: prune_tool_output(&content),
-                    }
-                } else {
-                    ChatMessage::Tool {
-                        tool_call_id,
-                        name,
-                        content,
-                    }
-                }
-            }
-            other => other,
-        })
-        .collect()
-}
-
-/// P1-5：单条工具输出的确定性缩略——digest + 结构化关键行 + 尾部 8 行。
-/// 关键行（artifact/error/status/exit_code/program）即使不在尾部也保留，
-/// 避免模型失去完整输出入口（如 `artifact: @artifact/...`）。
-fn prune_tool_output(content: &str) -> String {
-    const MAX_PRUNED_TOKENS: u64 = 800;
-    const MAX_KEY_TOKENS: u64 = 400;
-    const MAX_LINES_PER_KEY: usize = 2;
-    const MAX_LINE_CHARS: usize = 256;
-
-    let digest = blake3::hash(content.as_bytes());
-    let tail: Vec<String> = content
-        .lines()
-        .rev()
-        .take(8)
-        .map(|line| truncate_line(line, MAX_LINE_CHARS))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    let mut key_lines: Vec<String> = Vec::new();
-    let mut key_counts = [0usize; 5];
-    let mut omitted_key_lines = 0usize;
-    let mut line_count = 0usize;
-    for line in content.lines() {
-        line_count = line_count.saturating_add(1);
-        let trimmed = line.trim_start();
-        let key_kind = if trimmed.starts_with("status:") {
-            Some(0)
-        } else if trimmed.starts_with("program:") {
-            Some(1)
-        } else if trimmed.starts_with("exit_code:") {
-            Some(2)
-        } else if trimmed.starts_with("artifact:") {
-            Some(3)
-        } else if trimmed.starts_with("error:") {
-            Some(4)
-        } else {
-            None
-        };
-        let Some(key_kind) = key_kind else { continue };
-        let bounded = truncate_line(line, MAX_LINE_CHARS);
-        if tail.contains(&bounded) || key_lines.contains(&bounded) {
-            continue;
-        }
-        if key_counts[key_kind] >= MAX_LINES_PER_KEY {
-            omitted_key_lines = omitted_key_lines.saturating_add(1);
-            continue;
-        }
-        key_counts[key_kind] += 1;
-        key_lines.push(bounded);
-    }
-    let mut out = format!(
-        "[output pruned: {} tokens, digest {}]",
-        estimate_tokens(content),
-        &digest.to_hex()[..16]
-    );
-    if !key_lines.is_empty() {
-        for line in key_lines {
-            if !push_line_within_budget(&mut out, &line, MAX_KEY_TOKENS) {
-                omitted_key_lines = omitted_key_lines.saturating_add(1);
-            }
-        }
-    }
-    if omitted_key_lines > 0 {
-        let marker = format!("[{} additional key lines omitted]", omitted_key_lines);
-        let _ = push_line_within_budget(&mut out, &marker, MAX_KEY_TOKENS);
-    }
-    if line_count > 8 {
-        let _ = push_line_within_budget(&mut out, "--- tail ---", MAX_PRUNED_TOKENS);
-    }
-    for line in tail {
-        if !push_line_within_budget(&mut out, &line, MAX_PRUNED_TOKENS) {
-            let _ = push_line_within_budget(
-                &mut out,
-                "[remaining tail lines omitted]",
-                MAX_PRUNED_TOKENS,
-            );
-            break;
-        }
-    }
-    debug_assert!(estimate_tokens(&out) <= MAX_PRUNED_TOKENS);
-    out
-}
-
-fn truncate_line(line: &str, max_chars: usize) -> String {
-    let mut chars = line.chars();
-    let prefix: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{prefix}… [line truncated]")
-    } else {
-        prefix
-    }
-}
-
-fn push_line_within_budget(out: &mut String, line: &str, max_tokens: u64) -> bool {
-    let original_len = out.len();
-    out.push('\n');
-    out.push_str(line);
-    if estimate_tokens(out) <= max_tokens {
-        true
-    } else {
-        out.truncate(original_len);
-        false
-    }
-}
-
-/// Compaction summary schema（§15.4 固定字段；§用户诉求：给出输出示例，
-/// 引导模型严格照格式输出——只列字段名时模型常自由发挥导致解析失败）。
 pub const SUMMARY_SCHEMA: &str = "\
 请把下面的会话事实压缩为结构化摘要。
 
@@ -549,45 +404,6 @@ mod tests {
 
     /// P1-5：prune 后结构化关键行（artifact 引用/error/status）必须保留，
     /// 即使它们不在尾部 8 行内——否则模型失去完整输出入口。
-    #[test]
-    fn prune_keeps_structured_key_lines() {
-        // 构造 >800 token 的输出：artifact 引用在中间（不在尾部）。
-        let mut content = String::from(
-            "status: succeeded\ntool: bash\nprogram: bash\nexit_code: 0\nartifact: @artifact/abc123\n\n",
-        );
-        content.push_str(&"line of filler content\n".repeat(200));
-        content.push_str("final tail line\n");
-        let pruned = prune_tool_output(&content);
-        assert!(
-            pruned.contains("artifact: @artifact/abc123"),
-            "artifact 引用必须保留: {pruned}"
-        );
-        assert!(pruned.contains("status: succeeded"), "status 必须保留");
-        assert!(pruned.contains("exit_code: 0"), "exit_code 必须保留");
-        assert!(pruned.contains("final tail line"), "尾部诊断保留");
-        assert!(
-            pruned.matches("line of filler content").count() <= 7,
-            "非关键内容只允许出现在 tail 8 行内（实际 {} 行）",
-            pruned.matches("line of filler content").count()
-        );
-    }
-
-    #[test]
-    fn prune_result_stays_bounded_with_key_line_flood_and_huge_tail_line() {
-        let mut content = String::new();
-        for index in 0..10_000 {
-            content.push_str(&format!("error: repeated diagnostic {index}\n"));
-        }
-        content.push_str("artifact: @artifact/session/id\n");
-        content.push_str(&"界".repeat(20_000));
-
-        let pruned = prune_tool_output(&content);
-        assert!(estimate_tokens(&pruned) <= 800, "裁剪结果仍超限");
-        assert!(pruned.contains("artifact: @artifact/session/id"));
-        assert!(pruned.contains("additional key lines omitted"));
-        assert!(pruned.contains("line truncated"));
-    }
-
     #[test]
     fn significant_shrink_handles_extreme_token_counts_without_overflow() {
         assert!(!is_significant_shrink(u64::MAX, u64::MAX - 1));

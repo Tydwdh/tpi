@@ -43,7 +43,7 @@ impl ArtifactWriter {
         tool: &str,
         mime: &str,
     ) -> std::io::Result<Self> {
-        if !crate::util::validate_artifact_component(session_id) {
+        if !tpi_core::util::validate_artifact_component(session_id) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "invalid artifact session id",
@@ -52,12 +52,12 @@ impl ArtifactWriter {
         let dir = artifacts_root.join(session_id);
         std::fs::create_dir_all(&dir)?;
         let dir_meta = std::fs::symlink_metadata(&dir)?;
-        if !dir_meta.is_dir() || crate::util::is_symlink_or_reparse(&dir)? {
+        if !dir_meta.is_dir() || tpi_core::util::is_symlink_or_reparse(&dir)? {
             return Err(std::io::Error::other(
                 "artifact session path is not a regular directory",
             ));
         }
-        let id = crate::ids::EventId::new_v7().to_string();
+        let id = tpi_core::ids::EventId::new_v7().to_string();
         let internal_path = dir.join(format!("{id}.out"));
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -155,8 +155,8 @@ pub fn find(
     session_id: &str,
     id: &str,
 ) -> Option<ArtifactRecord> {
-    if !crate::util::validate_artifact_component(session_id)
-        || !crate::util::validate_artifact_component(id)
+    if !tpi_core::util::validate_artifact_component(session_id)
+        || !tpi_core::util::validate_artifact_component(id)
     {
         return None;
     }
@@ -164,7 +164,7 @@ pub fn find(
     let meta = std::fs::symlink_metadata(&path).ok()?;
     if !meta.file_type().is_file()
         || meta.file_type().is_symlink()
-        || crate::util::is_symlink_or_reparse(&path).ok()?
+        || tpi_core::util::is_symlink_or_reparse(&path).ok()?
     {
         return None;
     }

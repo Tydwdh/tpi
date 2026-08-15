@@ -10,8 +10,8 @@
 //!
 //! 验收：任意合法 prefix、incremental == replay、sink drop 不影响 append。
 
-use crate::ids::SessionId;
-use crate::session::protocol::SessionEvent;
+use crate::protocol::SessionEvent;
+use tpi_core::ids::SessionId;
 
 /// projector 版本：去重三元组的组成部分；语义变化时递增（旧 telemetry 重新投影）。
 pub const PROJECTOR_VERSION: u32 = 1;

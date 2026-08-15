@@ -18,9 +18,9 @@
 //! [`Conversation`]（conversation.rs）是 facade：持有 `SessionLog` 与本
 //! 投影器；恢复/刷新经 `events_with_seq()`（P2-02 port）喂给 `rebuild`。
 
-use crate::message::ChatMessage;
-use crate::session::protocol::{Plan, SessionEvent};
-use crate::session::store::compacted_range;
+use crate::protocol::{Plan, SessionEvent};
+use crate::store::compacted_range;
+use tpi_core::message::ChatMessage;
 
 /// 会话的纯投影状态（事件缓冲 + 惰性投影结果）。
 #[derive(Debug, Clone, Default)]
@@ -40,7 +40,7 @@ impl ConversationProjector {
 
     /// 全量重建（等价于逐条 apply；属性测试 incremental == rebuild）。
     pub fn rebuild(events: &[(u64, SessionEvent)]) -> Self {
-        let history = crate::session::store::project_messages(events);
+        let history = crate::store::project_messages(events);
         let plan = plan_from_events(events);
         Self {
             events: events.to_vec(),

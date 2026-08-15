@@ -8,10 +8,10 @@
 
 use std::path::Path;
 
-use crate::outcome::Effect;
-use crate::outcome::{ModelPayload, StoredToolOutcome, ToolMetadata, ToolStatus};
-use crate::outcome::{ToolRecoveryPolicy, tool_recovery_policy};
-use crate::session::{RecoveryMetadata, SessionEvent, read_events};
+use crate::{RecoveryMetadata, SessionEvent, read_events};
+use tpi_core::outcome::Effect;
+use tpi_core::outcome::{ModelPayload, StoredToolOutcome, ToolMetadata, ToolStatus};
+use tpi_core::outcome::{ToolRecoveryPolicy, tool_recovery_policy};
 
 /// 恢复结果。
 pub struct RecoveryOutcome {
@@ -158,7 +158,7 @@ fn revision_of_path(path: &Path) -> std::io::Result<Option<String>> {
     std::io::copy(&mut file, &mut hasher)?;
     Ok(Some(format!(
         "{}{}",
-        crate::tool::edit::REVISION_PREFIX,
+        tpi_core::revision::REVISION_PREFIX,
         hasher.finalize().to_hex()
     )))
 }
@@ -203,7 +203,7 @@ mod tests {
             tool: "write".into(),
             target_path: target.to_string_lossy().into_owned(),
             expected_revision: String::new(),
-            candidate_revision: Some(crate::tool::edit::revision_of(content)),
+            candidate_revision: Some(tpi_core::revision::revision_of(content)),
             temp_path: temp.to_string_lossy().into_owned(),
             backup_path: None,
         };

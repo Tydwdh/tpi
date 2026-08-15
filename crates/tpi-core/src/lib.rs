@@ -8,4 +8,5 @@ pub mod ids;
 pub mod message;
 pub mod outcome;
 pub mod plan;
+pub mod revision;
 pub mod util;

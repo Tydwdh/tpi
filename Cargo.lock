@@ -5100,6 +5100,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tpi-core",
+ "tpi-session",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -5114,10 +5115,26 @@ dependencies = [
 name = "tpi-core"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "schemars",
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "tpi-session"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "camino",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tpi-core",
  "tracing",
  "uuid",
 ]

@@ -2,6 +2,7 @@
 members = [
   ".",
   "crates/tpi-core",
+  "crates/tpi-session",
 ]
 resolver = "2"
 
@@ -14,6 +15,7 @@ description = "A personal terminal coding agent for Windows"
 
 [dependencies]
 tpi-core = { path = "crates/tpi-core" }
+tpi-session = { path = "crates/tpi-session" }
 tokio = { version = "1.53", features = [
   "rt-multi-thread", "macros", "process", "signal", "sync",
   "time", "fs", "io-util"

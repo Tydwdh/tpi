@@ -5,10 +5,10 @@
 //! 稳定 wire（schema/seq/event_id/timestamp + EventBody）。wire 格式是
 //! 长期兼容面：**P2-01 拆分不改任何字段/序列化**（golden hash 证明）。
 
-use crate::ids::{EventId, RequestId, RunId, SessionId, ToolCallId};
-use crate::message::ToolCall;
-use crate::outcome::StoredToolOutcome;
 use serde::{Deserialize, Serialize};
+use tpi_core::ids::{EventId, RequestId, RunId, SessionId, ToolCallId};
+use tpi_core::message::ToolCall;
+use tpi_core::outcome::StoredToolOutcome;
 
 /// 模型引用（§7.2 模型角色；M1 只有 primary）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,7 +37,7 @@ pub struct AssistantMessage {
 }
 
 /// 原子短计划（§13）。
-pub use crate::plan::Plan;
+pub use tpi_core::plan::Plan;
 
 /// 事件区间，用于 compaction 覆盖范围（§15.4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,3 +1,5 @@
+//! TPI session 层（P7-02 拆 crate：durable JSONL 事件存储 + 投影 + 恢复）。
+//!
 //! Session 持久层（P2-01 拆分后：protocol/codec/store 各归其位）。
 //!
 //! - [`protocol`]：durable domain event + envelope + wire 类型（领域 API + 稳定 wire）；
@@ -40,11 +42,11 @@ pub use store::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{EventId, RequestId, RunId, SessionId, ToolCallId};
-    use crate::message::{ChatMessage, ToolCall};
-    use crate::session::store::read_envelopes_state_with_limits;
+    use crate::store::read_envelopes_state_with_limits;
     use camino::Utf8PathBuf;
     use std::path::PathBuf;
+    use tpi_core::ids::{EventId, RequestId, RunId, SessionId, ToolCallId};
+    use tpi_core::message::{ChatMessage, ToolCall};
 
     /// 中间/已换行的损坏记录不能静默跳过；只有未换行的尾部残片可丢弃。
     #[test]
@@ -175,7 +177,7 @@ mod tests {
         let mut log =
             SessionLog::create(&sessions_root, workspace.as_std_path(), RunId::new_v7()).unwrap();
         let call_id = ToolCallId::new_v7();
-        let outcome = crate::outcome::ToolOutcome::succeeded("read", "ok".into()).into_stored();
+        let outcome = tpi_core::outcome::ToolOutcome::succeeded("read", "ok".into()).into_stored();
 
         assert!(
             log.append_event(&SessionEvent::ToolCompleted { call_id, outcome })

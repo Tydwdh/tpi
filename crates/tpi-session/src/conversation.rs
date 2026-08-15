@@ -8,8 +8,8 @@ use std::path::Path;
 
 use camino::Utf8PathBuf;
 
-use crate::ids::{RunId, SessionId, ToolCallId};
-use crate::message::ChatMessage;
+use tpi_core::ids::{RunId, SessionId, ToolCallId};
+use tpi_core::message::ChatMessage;
 
 use super::projector::ConversationProjector;
 use super::protocol::Plan;
@@ -82,8 +82,8 @@ impl Conversation {
         log.sync_data()
             .map_err(|error| format!("同步 session 失败: {error}"))?;
 
-        let events = crate::session::read_events_with_seq(&path)
-            .map_err(|error| format!("读取事件失败: {error}"))?;
+        let events =
+            crate::read_events_with_seq(&path).map_err(|error| format!("读取事件失败: {error}"))?;
         let projector = ConversationProjector::rebuild(&events);
         Ok(Self {
             log: Some(log),
@@ -159,10 +159,10 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::ToolCallId;
-    use crate::message::ToolCall;
-    use crate::plan::{Plan, PlanItem, PlanStatus};
-    use crate::session::{AssistantMessage, SessionEvent};
+    use crate::{AssistantMessage, SessionEvent};
+    use tpi_core::ids::ToolCallId;
+    use tpi_core::message::ToolCall;
+    use tpi_core::plan::{Plan, PlanItem, PlanStatus};
 
     fn workspace() -> (tempfile::TempDir, Utf8PathBuf) {
         let dir = tempfile::tempdir().unwrap();

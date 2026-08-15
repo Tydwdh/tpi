@@ -6,7 +6,9 @@
 //! P7-02 拆 crate：core 层（ids/message/plan/outcome/util）已拆为 `tpi-core`
 //! crate；此处 re-export 保持 `tpi::ids` 等路径兼容（逐步迁移引用后再移除）。
 
-pub use tpi_core::{ids, message, outcome, plan, util};
+pub use tpi_core::{ids, message, outcome, plan, revision, util};
+// session crate 顶层即 session 模块（module alias 保持 `crate::session` 路径）。
+pub use tpi_session as session;
 
 pub mod agent;
 pub mod app;
@@ -20,7 +22,6 @@ pub mod mcp;
 pub mod process;
 pub mod provider;
 pub mod remote;
-pub mod session;
 pub mod shell;
 pub mod skills;
 pub mod subagent;
