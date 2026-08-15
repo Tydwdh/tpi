@@ -16,9 +16,9 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use crate::process::managed::{ManagedProcessState, ProcessId, wait_process};
 use crate::tool::ToolContext;
+use tpi_core::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 
 /// 默认 wait 上限（§20：建议 5 秒窗口）。
 pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 5_000;
@@ -102,7 +102,7 @@ fn parse_id(args: &ProcessArgs) -> Option<ProcessId> {
 }
 
 fn list_processes(ctx: &ToolContext) -> ToolOutcome {
-    let reg = crate::util::lock_mutex(&ctx.processes, "process_registry");
+    let reg = tpi_core::util::lock_mutex(&ctx.processes, "process_registry");
     let lines: Vec<String> = reg.iter().map(|p| p.status_line()).collect();
     let body = if lines.is_empty() {
         "（当前无 managed process）".to_string()
@@ -116,7 +116,7 @@ fn list_processes(ctx: &ToolContext) -> ToolOutcome {
 }
 
 fn status_process(ctx: &ToolContext, id: ProcessId) -> ToolOutcome {
-    let reg = crate::util::lock_mutex(&ctx.processes, "process_registry");
+    let reg = tpi_core::util::lock_mutex(&ctx.processes, "process_registry");
     let Some(process) = reg.get(id) else {
         return not_found(id);
     };
@@ -146,7 +146,7 @@ fn status_process(ctx: &ToolContext, id: ProcessId) -> ToolOutcome {
 }
 
 fn output_process(ctx: &ToolContext, id: ProcessId) -> ToolOutcome {
-    let reg = crate::util::lock_mutex(&ctx.processes, "process_registry");
+    let reg = tpi_core::util::lock_mutex(&ctx.processes, "process_registry");
     let Some(process) = reg.get(id) else {
         return not_found(id);
     };
@@ -174,7 +174,7 @@ async fn wait_process_tool(ctx: &ToolContext, id: ProcessId, timeout: Duration) 
     let Some(state) = wait_process(&ctx.processes, id, timeout).await else {
         return not_found(id);
     };
-    let reg = crate::util::lock_mutex(&ctx.processes, "process_registry");
+    let reg = tpi_core::util::lock_mutex(&ctx.processes, "process_registry");
     let process = reg.get(id);
     let runtime = process
         .map(|p| match p.finished_at {
@@ -204,7 +204,7 @@ async fn wait_process_tool(ctx: &ToolContext, id: ProcessId, timeout: Duration) 
 /// cancel（任务书 §22）：请求取消 → drain task 执行 TerminateJobObject。
 /// 等待状态实际迁移（最多 3 秒）后返回真实结果；无法确认时如实 Unknown。
 async fn cancel_process(ctx: &ToolContext, id: ProcessId) -> ToolOutcome {
-    let requested = crate::util::lock_mutex(&ctx.processes, "process_registry").cancel(id);
+    let requested = tpi_core::util::lock_mutex(&ctx.processes, "process_registry").cancel(id);
     if !requested {
         return not_found_or_ended(id);
     }

@@ -166,7 +166,7 @@ impl McpManager {
     /// 注册的工具并入**进程级共享 registry**（ToolRuntime 读取 → agent loop
     /// 可调用，README2 Phase 5）。
     pub async fn start_from_config(&mut self) -> usize {
-        let home = crate::config::tpi_home();
+        let home = tpi_core::util::tpi_home();
         let configs = crate::mcp::config::load_enabled(&home);
         let mut started = 0usize;
         for config in configs {

@@ -12,13 +12,9 @@ pub mod parallel;
 use crate::ids::{SessionId, SpanId, TraceId};
 
 /// 子代理只读能力白名单（P8 初始规格：只读调查）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadOnlyCapability {
-    Read,
-    List,
-    Search,
-    Glob,
-}
+/// P7-02 拆 crate：定义在 capabilities（tool::registry），此处 re-export
+/// 保持 `tpi::subagent::ReadOnlyCapability` 路径兼容。
+pub use tpi_capabilities::tool::registry::ReadOnlyCapability;
 
 /// O8（P8-09）：发起子代理的 parent trace 上下文（link 双向引用的 parent 侧）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -11,7 +11,7 @@ pub mod edit;
 pub mod files;
 pub mod inspect;
 pub mod invariants;
-pub use crate::outcome::{Effect, ModelPayload, ToolOutcome, ToolStatus};
+pub use tpi_core::outcome::{Effect, ModelPayload, ToolOutcome, ToolStatus};
 pub mod pipeline;
 pub mod plan_exec;
 pub mod policy;
@@ -26,7 +26,7 @@ pub mod web;
 use camino::Utf8PathBuf;
 use tokio_util::sync::CancellationToken;
 
-use crate::message::ToolDef;
+use tpi_core::message::ToolDef;
 
 /// 工具 schema 的 JSON 序列化（schemars 生成，理论上不会失败）。
 /// 失败时记录日志并返回 null（模型将看到无参数 schema，但进程不崩溃）。
@@ -193,7 +193,8 @@ pub(crate) enum ToolExecutionClass {
 }
 
 impl ToolExecutionClass {
-    pub(crate) fn requires_write_ahead(self) -> bool {
+    /// 是否需要 write-ahead（跨 crate：agent 的 tool_runtime 用）。
+    pub fn requires_write_ahead(self) -> bool {
         matches!(self, Self::FileWriteExact | Self::WorkspaceUnknown)
     }
 }
@@ -258,7 +259,8 @@ impl BuiltinTool {
         }
     }
 
-    pub(crate) fn requires_write_ahead(self) -> bool {
+    /// 是否需要 write-ahead（跨 crate：agent 的 tool_runtime 用）。
+    pub fn requires_write_ahead(self) -> bool {
         self.execution_class().requires_write_ahead()
     }
 
@@ -422,7 +424,9 @@ Example: activate_skill name=\"rust-review\""
                 schema_value::<request_input::RequestInputArgs>("request_input")
             }
             BuiltinTool::RuntimeInspect => schema_value::<inspect::InspectArgs>("runtime_inspect"),
-            BuiltinTool::UpdatePlan => schema_value::<crate::plan::UpdatePlanArgs>("update_plan"),
+            BuiltinTool::UpdatePlan => {
+                schema_value::<tpi_core::plan::UpdatePlanArgs>("update_plan")
+            }
             BuiltinTool::WebSearch => schema_value::<web::WebSearchArgs>("web_search"),
             BuiltinTool::WebFetch => schema_value::<web::WebFetchArgs>("web_fetch"),
             BuiltinTool::ActivateSkill => {
@@ -482,7 +486,7 @@ pub enum ValidatedArgs {
     Process(process::ProcessArgs),
     RequestInput(request_input::RequestInputArgs),
     RuntimeInspect(inspect::InspectArgs),
-    UpdatePlan(crate::plan::UpdatePlanArgs),
+    UpdatePlan(tpi_core::plan::UpdatePlanArgs),
     WebSearch(web::WebSearchArgs),
     WebFetch(web::WebFetchArgs),
     ActivateSkill(crate::skills::activate::ActivateSkillArgs),
@@ -539,7 +543,7 @@ impl ValidatedArgs {
 /// UI streaming 建无限队列；工具自身输出仍有界：24 KiB tail + artifact）。
 pub struct ToolStreamEvent {
     /// 工具调用的内部 id（与 ToolStarted 事件一致，UI 按此匹配卡片）。
-    pub call_id: crate::ids::ToolCallId,
+    pub call_id: tpi_core::ids::ToolCallId,
     /// 流标识（STREAM_STDOUT / STREAM_STDERR）。
     pub stream: u8,
     pub text: String,
@@ -559,7 +563,7 @@ pub struct ToolContext {
     /// 当前 session id（artifact 引用与 cursor 作用域）。
     pub session_id: String,
     /// 当前工具调用的内部 id（流式输出事件按此匹配 UI 卡片）。
-    pub call_id: crate::ids::ToolCallId,
+    pub call_id: tpi_core::ids::ToolCallId,
     /// 流式输出通道（bash 实时输出；None = 无 UI 订阅）。
     pub output_tx: Option<tokio::sync::mpsc::Sender<ToolStreamEvent>>,
     /// list/search 分页 snapshot（session 作用域；cursor 翻页不重新扫描，§8.4）。
@@ -570,7 +574,7 @@ pub struct ToolContext {
     /// session-local bounded SnapshotStore（§10.1）。
     pub snapshot_store: std::sync::Arc<std::sync::Mutex<crate::tool::edit::SnapshotStore>>,
     /// 当前原子短计划（§13；agent loop 持有，update_plan 原子替换）。
-    pub current_plan: std::sync::Arc<std::sync::Mutex<Option<crate::plan::Plan>>>,
+    pub current_plan: std::sync::Arc<std::sync::Mutex<Option<tpi_core::plan::Plan>>>,
     /// Logical Shell Session（任务书 §S1：属于 Workspace；bash 工具读写）。
     /// 与 `workspace` 内的 shell 是同一状态源（构造时共享 Arc）。
     pub shell: std::sync::Arc<std::sync::Mutex<crate::shell::ShellSessionState>>,
@@ -794,16 +798,16 @@ fn canonical_ancestor(path: &std::path::Path) -> Option<std::path::PathBuf> {
     }
 }
 
-/// P7 下沉：`validate_artifact_component` 移入 core（`crate::util`），此处
+/// P7 下沉：`validate_artifact_component` 移入 core（`tpi_core::util`），此处
 /// re-export 保持 `tool::validate_artifact_component` 兼容。
-pub use crate::util::validate_artifact_component;
+pub use tpi_core::util::validate_artifact_component;
 
 /// 路径被拒绝时的标准 tool outcome。
 pub fn path_rejected_outcome(tool: &str, error: PathResolveError) -> ToolOutcome {
     ToolOutcome::failed(
         tool,
-        crate::outcome::ModelPayload {
-            status: crate::outcome::ToolStatus::Rejected,
+        tpi_core::outcome::ModelPayload {
+            status: tpi_core::outcome::ToolStatus::Rejected,
             program: None,
             exit_code: None,
             duration_ms: 0,
@@ -953,7 +957,7 @@ mod tests {
                     ToolExecutionClass::FileWriteExact | ToolExecutionClass::WorkspaceUnknown
                 )
             );
-            // recovery 策略已下沉 core（crate::outcome::tool_recovery_policy），
+            // recovery 策略已下沉 core（tpi_core::outcome::tool_recovery_policy），
             // 一致性由 outcome::recovery_policy_tests 保证。
         }
     }
@@ -967,15 +971,17 @@ mod tests {
                 ToolExecutionClass::Pure
                 | ToolExecutionClass::FileReadExact
                 | ToolExecutionClass::FileReadRecursive => {
-                    crate::outcome::ToolRecoveryPolicy::NoEffect
+                    tpi_core::outcome::ToolRecoveryPolicy::NoEffect
                 }
                 ToolExecutionClass::FileWriteExact => {
-                    crate::outcome::ToolRecoveryPolicy::FileCommit
+                    tpi_core::outcome::ToolRecoveryPolicy::FileCommit
                 }
-                ToolExecutionClass::WorkspaceUnknown => crate::outcome::ToolRecoveryPolicy::Unknown,
+                ToolExecutionClass::WorkspaceUnknown => {
+                    tpi_core::outcome::ToolRecoveryPolicy::Unknown
+                }
             };
             assert_eq!(
-                crate::outcome::tool_recovery_policy(tool.name()),
+                tpi_core::outcome::tool_recovery_policy(tool.name()),
                 expected,
                 "core 策略与 BuiltinTool 执行分类一致: {}",
                 tool.name()
@@ -1073,7 +1079,7 @@ mod tests {
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),
             session_id: "test-session".into(),
-            call_id: crate::ids::ToolCallId::new_v7(),
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
             output_tx: None,
             scan_snapshots: Default::default(),
             shell_path: None,
@@ -1099,7 +1105,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(outcome.status, crate::outcome::ToolStatus::Succeeded);
+        assert_eq!(outcome.status, tpi_core::outcome::ToolStatus::Succeeded);
         assert!(outcome.model_text().contains("hello 世界"));
     }
 

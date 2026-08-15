@@ -8,9 +8,9 @@
 //! Stage 序列：`parse → (plan/approval) → execute → output`。
 //! 每次迁移后跑 existing scheduler/recovery suites（验收）。
 
-use crate::outcome::{StoredToolOutcome, ToolOutcome};
 use crate::tool::ToolContext;
 use crate::tool::registry::Tool;
+use tpi_core::outcome::{StoredToolOutcome, ToolOutcome};
 
 /// 显式 stage 结果（每个阶段有明确产出，供 inspector/审计消费）。
 #[derive(Debug, Clone, PartialEq)]
@@ -71,7 +71,7 @@ pub async fn run_canonical_pure_pipeline(
 ) -> Result<StageResult, String> {
     let tool_name = tool.name().to_string();
     let outcome = tool.execute(args_json, ctx).await;
-    if outcome.status == crate::outcome::ToolStatus::Failed {
+    if outcome.status == tpi_core::outcome::ToolStatus::Failed {
         return Ok(StageResult::Executed {
             tool: tool_name,
             outcome,
@@ -100,7 +100,7 @@ pub async fn run_pure_pipeline(
     // Stage 2: plan（Pure 无副作用，无 write-ahead）。
     // Stage 3: execute。
     let outcome = tool.execute(args_json, ctx).await;
-    if outcome.status == crate::outcome::ToolStatus::Failed {
+    if outcome.status == tpi_core::outcome::ToolStatus::Failed {
         return Ok(StageResult::Executed {
             tool: tool_name,
             outcome,
@@ -127,7 +127,7 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             artifacts_root: std::path::PathBuf::from("/tmp/art"),
             session_id: "test".into(),
-            call_id: crate::ids::ToolCallId::new_v7(),
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
             output_tx: None,
             scan_snapshots: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -189,7 +189,7 @@ mod tests {
 /// P4-06：canonical output 截断有界（不伪装完整）。
 #[test]
 fn canonical_output_truncates_and_marks() {
-    use crate::outcome::{ModelPayload, ToolStatus};
+    use tpi_core::outcome::{ModelPayload, ToolStatus};
     let big = "x".repeat(100);
     let mut outcome = ToolOutcome::failed(
         "echo",
@@ -219,7 +219,7 @@ fn canonical_output_truncates_and_marks() {
 /// P4-06：小输出不截断（投影等价）。
 #[test]
 fn canonical_output_keeps_small_unchanged() {
-    use crate::outcome::{ModelPayload, ToolStatus};
+    use tpi_core::outcome::{ModelPayload, ToolStatus};
     let outcome = ToolOutcome::failed(
         "echo",
         ModelPayload {

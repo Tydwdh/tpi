@@ -9,8 +9,8 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::outcome::ToolOutcome;
 use crate::tool::ToolContext;
+use tpi_core::outcome::ToolOutcome;
 
 /// `runtime_inspect` 参数（无）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -21,7 +21,7 @@ pub async fn runtime_inspect(_args: InspectArgs, ctx: &ToolContext) -> ToolOutco
     // 1. 工具目录（含 origin：builtin / mcp::server）。
     let mut tool_lines: Vec<String> = Vec::new();
     {
-        let registry = crate::util::lock_mutex(&ctx.registry, "registry");
+        let registry = tpi_core::util::lock_mutex(&ctx.registry, "registry");
         let mut descriptors = registry.descriptors();
         descriptors.sort_by(|a, b| a.name.cmp(&b.name));
         for descriptor in descriptors {
@@ -38,7 +38,7 @@ pub async fn runtime_inspect(_args: InspectArgs, ctx: &ToolContext) -> ToolOutco
     // 2. Skills（进程级 SkillManager；只列已发现，不激活）。
     let skill_lines: Vec<String> = {
         let manager = crate::skills::manager::SkillManager::global();
-        let guard = crate::util::lock_mutex(&manager, "skill_manager");
+        let guard = tpi_core::util::lock_mutex(&manager, "skill_manager");
         guard
             .available_names()
             .into_iter()
@@ -48,7 +48,7 @@ pub async fn runtime_inspect(_args: InspectArgs, ctx: &ToolContext) -> ToolOutco
 
     // 3. Workspace（kind + identity：local:path / ssh:host:root）。
     let (ws_kind, ws_identity) = {
-        let ws = crate::util::lock_mutex(&ctx.workspace, "workspace");
+        let ws = tpi_core::util::lock_mutex(&ctx.workspace, "workspace");
         let kind = match ws.kind() {
             crate::workspace::WorkspaceKind::Local => "local".to_string(),
             crate::workspace::WorkspaceKind::Remote => "remote".to_string(),
@@ -59,7 +59,7 @@ pub async fn runtime_inspect(_args: InspectArgs, ctx: &ToolContext) -> ToolOutco
 
     // 4. Managed processes（数量 + active 行）。
     let process_lines: Vec<String> = {
-        let reg = crate::util::lock_mutex(&ctx.processes, "process_registry");
+        let reg = tpi_core::util::lock_mutex(&ctx.processes, "process_registry");
         reg.snapshot_lines(&[])
     };
 

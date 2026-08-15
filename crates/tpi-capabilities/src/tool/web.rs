@@ -15,8 +15,8 @@ use reqwest::Url;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::outcome::{ArtifactRef, ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::tool::ToolContext;
+use tpi_core::outcome::{ArtifactRef, ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 
 /// 把抓取正文按 `FETCH_BODY_BUDGET` 有界化。
 ///
@@ -29,7 +29,7 @@ fn bounded_body(text: &str) -> (String, bool) {
         return (text.to_string(), false);
     }
     let mut body = text.to_string();
-    crate::util::truncate_to_char_boundary(&mut body, FETCH_BODY_BUDGET);
+    tpi_core::util::truncate_to_char_boundary(&mut body, FETCH_BODY_BUDGET);
     (body, true)
 }
 pub const FETCH_BODY_BUDGET: usize = 48 * 1024;
@@ -1123,7 +1123,7 @@ async fn web_fetch_with_policy(
     } else {
         &content_type
     };
-    let mut writer = match crate::session::artifact::ArtifactWriter::create(
+    let mut writer = match tpi_session::artifact::ArtifactWriter::create(
         &ctx.artifacts_root,
         &ctx.session_id,
         "web_fetch",
@@ -1334,8 +1334,9 @@ mod tests {
     // ---- DDG 免费端点解析（§17 无 key 方案）----
 
     /// 真实端点 fixture：6 个块（1 广告 + 5 普通），5 个 snippet，含 uddg 链接。
+    /// P7-02 拆 crate：crate 在 crates/tpi-capabilities，fixture 在仓库根 tests。
     fn fixture() -> String {
-        include_str!("../../tests/fixtures/ddg_results.html").to_string()
+        include_str!("../../../../tests/fixtures/ddg_results.html").to_string()
     }
 
     #[test]
@@ -1460,7 +1461,7 @@ mod tests {
 
     /// 真实端点 fixture：3 个 dd algo 结果块（含 r.search.yahoo.com 重定向）。
     fn yahoo_fixture() -> String {
-        include_str!("../../tests/fixtures/yahoo_results.html").to_string()
+        include_str!("../../../../tests/fixtures/yahoo_results.html").to_string()
     }
 
     #[test]

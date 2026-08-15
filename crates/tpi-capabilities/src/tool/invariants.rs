@@ -114,7 +114,7 @@ mod tests {
                 &self,
                 _args: &str,
                 _ctx: &crate::tool::ToolContext,
-            ) -> crate::outcome::ToolOutcome {
+            ) -> tpi_core::outcome::ToolOutcome {
                 unreachable!()
             }
         }
@@ -122,7 +122,7 @@ mod tests {
         // 直接插入（绕过 register 验证，模拟非法来源——不变量检查必须定位）。
         registry.insert_raw(
             "bad",
-            crate::ids::RegistrationId::new_v7(),
+            tpi_core::ids::RegistrationId::new_v7(),
             std::sync::Arc::new(BadSchema),
         );
         let violations = check_registry_invariants(&registry);

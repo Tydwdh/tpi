@@ -1,0 +1,49 @@
+[package]
+name = "tpi-capabilities"
+version = "0.1.0"
+edition = "2024"
+description = "TPI capabilities layer: tool registry/pipeline, shell, workspace, managed process, MCP"
+
+[dependencies]
+tpi-core = { path = "../tpi-core" }
+tpi-session = { path = "../tpi-session" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "signal", "sync", "time", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+blake3 = "1"
+camino = { version = "1", features = ["serde1"] }
+uuid = { version = "1", features = ["v7"] }
+thiserror = "2"
+async-trait = "0.1.92"
+ratatui = { version = "0.30", features = ["scrolling-regions"] }
+regex = "1"
+schemars = { version = "1.2", features = ["derive"] }
+html2text = "0.17"
+pulldown-cmark = "0.13"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+unicode-width = "0.2"
+unicode-segmentation = "1"
+russh = "0.62.6"
+russh-config = "0.58.0"
+russh-sftp = "2.4.0"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "system-proxy", "charset", "http2", "json", "stream"] }
+eventsource-stream = "0.2"
+similar = "2"
+ignore = "0.4"
+grep = "0.3"
+globset = "0.4"
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading",
+  "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_IO",
+  "Win32_Security", "Win32_System_SystemServices", "Win32_System_ProcessStatus",
+  "Win32_System_Diagnostics_ToolHelp", "Win32_Networking_WinSock", "Win32_System_Pipes",
+  "Win32_System_SystemInformation", "Win32_System_Memory", "Win32_System_LibraryLoader"
+] }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"

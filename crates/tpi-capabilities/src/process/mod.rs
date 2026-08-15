@@ -109,7 +109,7 @@ pub struct HostRunRequest<'a> {
     pub timeout: std::time::Duration,
     /// stdout/stderr 各自保留的 tail 预算；完整输出仍可选写入 artifact。
     pub output_budget: usize,
-    pub artifact: Option<&'a mut crate::session::artifact::ArtifactWriter>,
+    pub artifact: Option<&'a mut tpi_session::artifact::ArtifactWriter>,
     pub stream_sink: Option<&'a StreamSink>,
     /// 可选：状态捕获 nonce（§22）。设置后从 stdout 剥离 BEGIN/END 包裹的
     /// 捕获段到 [`HostRunOutput::capture`]，不进模型输出/artifact/UI。

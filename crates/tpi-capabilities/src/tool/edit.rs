@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use camino::Utf8PathBuf;
 use serde::Deserialize;
 
-pub use crate::outcome::Effect;
+pub use tpi_core::outcome::Effect;
 
 /// edit 工具参数（§10.3）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
@@ -459,7 +459,7 @@ pub fn unified_diff(result: &EditResult) -> String {
         .header("before", "after")
         .to_string();
     if out.len() > MAX_DIFF_OUTPUT_BYTES {
-        crate::util::truncate_to_char_boundary(&mut out, MAX_DIFF_OUTPUT_BYTES);
+        tpi_core::util::truncate_to_char_boundary(&mut out, MAX_DIFF_OUTPUT_BYTES);
         out.push_str("\n[diff truncated]\n");
     }
     out

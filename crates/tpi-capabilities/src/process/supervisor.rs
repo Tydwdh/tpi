@@ -13,12 +13,16 @@
 //!   → flush durable data   // 调用方（owner）负责
 //! ```
 //!
-//! 使用：
-//! ```rust
+//! 使用（`no_run`：需要 runtime；doc-test 不执行）：
+//! ```rust,no_run
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() {
+//! use tpi_capabilities::process::supervisor::Supervisor;
 //! let mut sup = Supervisor::new();
-//! sup.spawn("task-name", |cancel| async move { ... });
+//! sup.spawn("task-name", |cancel| async move { let _ = cancel; });
 //! let result = sup.shutdown().await;
 //! assert!(result.is_ok());
+//! # }
 //! ```
 //!
 //! 禁止：detached `tokio::spawn`（无 owner）、只 abort 不 join、锁内 await、

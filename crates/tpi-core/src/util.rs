@@ -48,6 +48,21 @@ pub fn validate_artifact_component(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// P7-02 拆 crate：`TPI_HOME` 解析（原 `crate::config::tpi_home`）。纯函数，
+/// core 层提供；capabilities（mcp）、skills、config、app 共用。
+pub fn tpi_home() -> std::path::PathBuf {
+    std::env::var_os("TPI_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .filter(|value| !value.is_empty())
+                .map(|home| std::path::PathBuf::from(home).join(".tpi"))
+                .unwrap_or_else(|| std::path::PathBuf::from(".tpi"))
+        })
+}
+
 /// UTF-8 安全截断：把 `String` 截断到不超过 `max_bytes` 的最大字符边界。
 ///
 /// `String::truncate` 在非 char boundary 处直接 panic；所有按字节预算截断

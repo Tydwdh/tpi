@@ -10,10 +10,10 @@
 
 use camino::Utf8PathBuf;
 
-use crate::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::remote::ssh::SshClient;
 use crate::tool::ToolContext;
 use crate::tool::edit::{self, FileSnapshot};
+use tpi_core::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 
 /// 远端 read 窗口参数。
 #[derive(Debug, Clone)]
@@ -105,7 +105,7 @@ pub async fn remote_read(
     let mut text = window.text;
     let mut truncated = window.truncated;
     if text.len() > crate::tool::files::DEFAULT_READ_MAX_BYTES {
-        crate::util::truncate_to_char_boundary(
+        tpi_core::util::truncate_to_char_boundary(
             &mut text,
             crate::tool::files::DEFAULT_READ_MAX_BYTES,
         );
@@ -357,7 +357,9 @@ fn resolve_remote_path(ctx: &ToolContext, path: &str) -> Result<String, String> 
     if trimmed.starts_with('/') {
         Ok(trimmed.to_string())
     } else {
-        let cwd = crate::util::lock_mutex(&ctx.shell, "shell").cwd.to_string();
+        let cwd = tpi_core::util::lock_mutex(&ctx.shell, "shell")
+            .cwd
+            .to_string();
         Ok(format!("{}/{}", cwd.trim_end_matches('/'), trimmed))
     }
 }

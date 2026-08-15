@@ -4,7 +4,6 @@
 //! 和正文（§10.2）。正文统一 LF，因此模型复制出的 `old_text` 与匹配空间一致；
 //! 每行带 `{n}: ` 行号前缀（§read 精度：模型可精确引用单行）。
 
-use crate::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::tool::edit::{self, EditError};
 use crate::tool::{
     ToolContext, path_rejected_outcome, resolve_tool_path, validate_artifact_component,
@@ -12,6 +11,7 @@ use crate::tool::{
 use camino::Utf8PathBuf;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tpi_core::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 
 /// `read` 默认模型预算（§8.4：200 行，最多 32 KiB）。
 pub const DEFAULT_READ_LINES: usize = 200;
@@ -128,11 +128,11 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
             //（复制即精确），不引入不可逆的视觉字符。须在 snapshot 移动前分析。
             let ws = crate::tool::edit::analyze_whitespace(&snapshot);
             let window = edit::read_window_from_snapshot(&snapshot, args.start_line, line_count);
-            crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
+            tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
             let mut text = window.text;
             let mut truncated = window.truncated;
             if text.len() > DEFAULT_READ_MAX_BYTES {
-                crate::util::truncate_to_char_boundary(&mut text, DEFAULT_READ_MAX_BYTES);
+                tpi_core::util::truncate_to_char_boundary(&mut text, DEFAULT_READ_MAX_BYTES);
                 truncated = true;
             }
             let revision_header = edit::format_revision_header(&window.revision);
@@ -206,7 +206,7 @@ fn read_artifact(
     line_count: usize,
 ) -> ToolOutcome {
     const MAX_ARTIFACT_READ_BYTES: usize = 48 * 1024;
-    let Some(record) = crate::session::artifact::find(&ctx.artifacts_root, session_id, id) else {
+    let Some(record) = tpi_session::artifact::find(&ctx.artifacts_root, session_id, id) else {
         return ToolOutcome::failed(
             "read",
             ModelPayload {
@@ -223,7 +223,7 @@ fn read_artifact(
         );
     };
     let line_count = line_count.clamp(1, DEFAULT_READ_LINES);
-    let window = match crate::session::artifact::read_line_window(
+    let window = match tpi_session::artifact::read_line_window(
         &record,
         start_line,
         line_count,
@@ -301,7 +301,7 @@ pub fn edit(
             if let Ok(snapshot) =
                 crate::tool::edit::build_snapshot(path.clone(), result.new_raw.clone())
             {
-                crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
+                tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
             }
             Ok(result)
         },
@@ -323,7 +323,7 @@ pub fn edit(
             let mut outcome = ToolOutcome::succeeded("edit", output);
             outcome
                 .observed_resources
-                .push(crate::outcome::ResourceVersion {
+                .push(tpi_core::outcome::ResourceVersion {
                     path: display_path(&ctx.workspace_root, &path),
                     revision: result.current_revision,
                 });
@@ -440,11 +440,11 @@ pub fn write(
             let mut outcome = ToolOutcome::succeeded("write", output);
             let new_raw = args.content.into_bytes();
             if let Ok(snapshot) = crate::tool::edit::build_snapshot(path.clone(), new_raw.clone()) {
-                crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
+                tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
             }
             outcome
                 .observed_resources
-                .push(crate::outcome::ResourceVersion {
+                .push(tpi_core::outcome::ResourceVersion {
                     path: display_path(&ctx.workspace_root, &path),
                     revision: revision.clone(),
                 });
@@ -519,11 +519,11 @@ fn rewrite_with_revision(
             if let Ok(snapshot) =
                 crate::tool::edit::build_snapshot(path.clone(), result.new_raw.clone())
             {
-                crate::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
+                tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
             }
             outcome
                 .observed_resources
-                .push(crate::outcome::ResourceVersion {
+                .push(tpi_core::outcome::ResourceVersion {
                     path: display_path.to_string(),
                     revision: result.current_revision.clone(),
                 });
@@ -614,8 +614,8 @@ pub fn display_path(workspace_root: &Utf8PathBuf, path: &Utf8PathBuf) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::outcome::ToolStatus;
     use tokio_util::sync::CancellationToken;
+    use tpi_core::outcome::ToolStatus;
 
     /// BUG-001 回归：读取超过 32 KiB 且截断点落在多字节字符中间的中文文件
     /// 不得 panic（此前 `String::truncate` 按裸字节截断）。
@@ -642,7 +642,7 @@ mod tests {
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),
             session_id: "test-session".into(),
-            call_id: crate::ids::ToolCallId::new_v7(),
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
             output_tx: None,
             scan_snapshots: Default::default(),
             shell_path: None,
@@ -707,7 +707,7 @@ mod tests {
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),
             session_id: "test-session".into(),
-            call_id: crate::ids::ToolCallId::new_v7(),
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
             output_tx: None,
             scan_snapshots: Default::default(),
             shell_path: None,
@@ -767,7 +767,7 @@ mod tests {
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),
             session_id: "test-session".into(),
-            call_id: crate::ids::ToolCallId::new_v7(),
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
             output_tx: None,
             scan_snapshots: Default::default(),
             shell_path: None,
@@ -832,7 +832,7 @@ mod tests {
             cancel: CancellationToken::new(),
             artifacts_root: dir.path().join("artifacts"),
             session_id: "test-session".into(),
-            call_id: crate::ids::ToolCallId::new_v7(),
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
             output_tx: None,
             scan_snapshots: Default::default(),
             shell_path: None,

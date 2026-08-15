@@ -7,8 +7,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::outcome::ToolOutcome;
 use crate::tool::ToolContext;
+use tpi_core::outcome::ToolOutcome;
+
+/// 子代理只读能力白名单（P7-02 拆 crate：从 subagent 下沉到 capabilities——
+/// 它本就是"只读调查工具白名单"，属 capabilities 概念；subagent crate
+/// re-export 保持 `tpi::subagent::ReadOnlyCapability` 路径兼容）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOnlyCapability {
+    Read,
+    List,
+    Search,
+    Glob,
+}
 
 /// 工具来源（README2 §2.1：只能作为 metadata，Agent Loop 不据此分支执行）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,9 +108,9 @@ pub struct ToolDescriptor {
 #[derive(Default)]
 pub struct ToolRegistry {
     /// root 层（进程级/内置；composition root 注册）。
-    tools: HashMap<String, (crate::ids::RegistrationId, Arc<dyn Tool>)>,
+    tools: HashMap<String, (tpi_core::ids::RegistrationId, Arc<dyn Tool>)>,
     /// P4-08：session/agent 层 overlay（scope 覆盖 root；lookup 先查 overlay）。
-    overlay: HashMap<String, (crate::ids::RegistrationId, Arc<dyn Tool>)>,
+    overlay: HashMap<String, (tpi_core::ids::RegistrationId, Arc<dyn Tool>)>,
 }
 
 impl ToolRegistry {
@@ -112,7 +123,7 @@ impl ToolRegistry {
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(
             tool.name().to_string(),
-            (crate::ids::RegistrationId::new_v7(), tool),
+            (tpi_core::ids::RegistrationId::new_v7(), tool),
         );
     }
 
@@ -129,7 +140,7 @@ impl ToolRegistry {
     ) -> Result<ToolRegistration, String> {
         tool.validate_definition()?;
         let name = tool.name().to_string();
-        let id = crate::ids::RegistrationId::new_v7();
+        let id = tpi_core::ids::RegistrationId::new_v7();
         registry
             .lock()
             .unwrap()
@@ -158,14 +169,14 @@ impl ToolRegistry {
     pub(crate) fn insert_raw(
         &mut self,
         name: &str,
-        id: crate::ids::RegistrationId,
+        id: tpi_core::ids::RegistrationId,
         tool: Arc<dyn Tool>,
     ) {
         self.tools.insert(name.to_string(), (id, tool));
     }
 
     /// P4-01：`(name, id)` 同时匹配才删除——old disposer 绝不删除 replacement。
-    pub fn unregister_entry(&mut self, name: &str, id: crate::ids::RegistrationId) {
+    pub fn unregister_entry(&mut self, name: &str, id: tpi_core::ids::RegistrationId) {
         if let Some((existing, _)) = self.tools.get(name)
             && *existing == id
         {
@@ -182,7 +193,7 @@ impl ToolRegistry {
     ) -> Result<OverlayRegistration, String> {
         tool.validate_definition()?;
         let name = tool.name().to_string();
-        let id = crate::ids::RegistrationId::new_v7();
+        let id = tpi_core::ids::RegistrationId::new_v7();
         registry
             .lock()
             .unwrap()
@@ -196,7 +207,7 @@ impl ToolRegistry {
     }
 
     /// overlay 层按 `(name, id)` 注销（ABA 安全）。
-    pub fn unregister_overlay(&mut self, name: &str, id: crate::ids::RegistrationId) {
+    pub fn unregister_overlay(&mut self, name: &str, id: tpi_core::ids::RegistrationId) {
         if let Some((existing, _)) = self.overlay.get(name)
             && *existing == id
         {
@@ -324,10 +335,10 @@ impl Tool for BuiltinToolAdapter {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
         match self.tool.parse_args(args) {
             Ok(validated) => crate::tool::execute(self.tool, validated, ctx, None).await,
-            Err(error) => crate::outcome::ToolOutcome::failed(
+            Err(error) => tpi_core::outcome::ToolOutcome::failed(
                 self.tool.name(),
-                crate::outcome::ModelPayload {
-                    status: crate::outcome::ToolStatus::Rejected,
+                tpi_core::outcome::ModelPayload {
+                    status: tpi_core::outcome::ToolStatus::Rejected,
                     program: None,
                     exit_code: None,
                     duration_ms: 0,
@@ -358,7 +369,7 @@ pub fn builtin_registry() -> ToolRegistry {
 pub struct OverlayRegistration {
     registry: std::sync::Arc<std::sync::Mutex<ToolRegistry>>,
     name: String,
-    id: crate::ids::RegistrationId,
+    id: tpi_core::ids::RegistrationId,
 }
 
 impl OverlayRegistration {
@@ -384,7 +395,7 @@ pub struct ToolRegistration {
     registry: Option<Arc<std::sync::Mutex<ToolRegistry>>>,
     name: String,
     /// P4-01：注册时的唯一 id；注销按 `(name, id)` 匹配（ABA 修复）。
-    id: crate::ids::RegistrationId,
+    id: tpi_core::ids::RegistrationId,
 }
 
 impl ToolRegistration {
@@ -431,7 +442,7 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             artifacts_root: std::path::PathBuf::from("/tmp/art"),
             session_id: "test".into(),
-            call_id: crate::ids::ToolCallId::new_v7(),
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
             output_tx: None,
             scan_snapshots: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             shell_path: None,
@@ -458,7 +469,7 @@ mod tests {
         };
         // 非法参数 → rejected（不 panic）。
         let outcome = adapter.execute("{", &ctx).await;
-        assert_eq!(outcome.status, crate::outcome::ToolStatus::Rejected);
+        assert_eq!(outcome.status, tpi_core::outcome::ToolStatus::Rejected);
         assert!(outcome.model_payload.output.contains("invalid_arguments"));
     }
 }
@@ -680,14 +691,14 @@ async fn setup_transaction_rolls_back_on_fault() {
 
 /// P8-04：只读 registry——只注册只读调查工具（read/list/search/glob）。
 /// child subagent 用它限制能力（写/进程/网络工具不存在于 registry → 不可调用）。
-pub fn read_only_registry(caps: &[crate::subagent::ReadOnlyCapability]) -> ToolRegistry {
+pub fn read_only_registry(caps: &[ReadOnlyCapability]) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     for tool in crate::tool::implemented_tools() {
         let allowed = match tool.name() {
-            "read" => caps.contains(&crate::subagent::ReadOnlyCapability::Read),
-            "list" => caps.contains(&crate::subagent::ReadOnlyCapability::List),
-            "search" => caps.contains(&crate::subagent::ReadOnlyCapability::Search),
-            "glob" => caps.contains(&crate::subagent::ReadOnlyCapability::Glob),
+            "read" => caps.contains(&ReadOnlyCapability::Read),
+            "list" => caps.contains(&ReadOnlyCapability::List),
+            "search" => caps.contains(&ReadOnlyCapability::Search),
+            "glob" => caps.contains(&ReadOnlyCapability::Glob),
             _ => false,
         };
         if allowed {

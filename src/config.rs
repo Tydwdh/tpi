@@ -48,18 +48,9 @@ pub(crate) fn set_ui_theme_at(
 }
 
 /// 配置根目录（~/.tpi，§14.1）。
-pub fn tpi_home() -> std::path::PathBuf {
-    std::env::var_os("TPI_HOME")
-        .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("USERPROFILE")
-                .or_else(|| std::env::var_os("HOME"))
-                .filter(|value| !value.is_empty())
-                .map(|home| std::path::PathBuf::from(home).join(".tpi"))
-                .unwrap_or_else(|| std::path::PathBuf::from(".tpi"))
-        })
-}
+/// P7-02 拆 crate：实现下沉 tpi-core（crate::util::tpi_home）；此处 re-export
+/// 保持 `crate::config::tpi_home` 路径兼容。
+pub use crate::util::tpi_home;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]

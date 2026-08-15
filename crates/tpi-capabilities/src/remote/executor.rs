@@ -19,10 +19,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use crate::remote::ssh::{ConnectionState, SshClient, SshError};
 use crate::tool::ToolContext;
 use crate::tool::command::BashArgs;
+use tpi_core::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 
 /// Remote bash 入口（§35：SshShellExecutor）。
 pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
@@ -40,7 +40,7 @@ pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
     }
     // 从 ActiveWorkspace 取 RemoteWorkspace（bash 分发已确认是 Remote）。
     let (shell, client) = {
-        let ws = crate::util::lock_mutex(&ctx.workspace, "workspace");
+        let ws = tpi_core::util::lock_mutex(&ctx.workspace, "workspace");
         match &ws.workspace {
             crate::workspace::Workspace::Remote(remote) => {
                 (remote.shell.clone(), remote.client.clone())
@@ -51,7 +51,7 @@ pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
 
     // 状态注入（§36：与本地同一语义）。
     let (session_cwd, overlay_set, overlay_unset) = {
-        let state = crate::util::lock_mutex(&shell, "shell");
+        let state = tpi_core::util::lock_mutex(&shell, "shell");
         (
             state.cwd.to_string(),
             state.env_overlay.set.clone(),
@@ -86,7 +86,7 @@ pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
     // baseline 只存内存（可能含 secret，不落盘 §21）。
     {
         let need_baseline = {
-            let state = crate::util::lock_mutex(&shell, "shell");
+            let state = tpi_core::util::lock_mutex(&shell, "shell");
             state.baseline.is_none()
         };
         if need_baseline {
@@ -202,7 +202,7 @@ pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
     // 事务 commit（§12-§14 同本地语义）：cwd 或 env 任一变化才递增 version。
     // 远端 cwd 无沙箱边界（ssh 目标即用户自己的机器，§17 不适用）。
     if let Some(new_cwd) = captured_cwd {
-        let mut state = crate::util::lock_mutex(&shell, "shell");
+        let mut state = tpi_core::util::lock_mutex(&shell, "shell");
         let mut changed = false;
         if new_cwd != exec_cwd {
             state.cwd = camino::Utf8PathBuf::from(new_cwd);
@@ -326,7 +326,7 @@ async fn capture_remote_baseline(
         return;
     };
     let (_, env) = parse_capture(&capture_bytes);
-    let mut state = crate::util::lock_mutex(shell, "shell");
+    let mut state = tpi_core::util::lock_mutex(shell, "shell");
     state.baseline = Some(env);
 }
 

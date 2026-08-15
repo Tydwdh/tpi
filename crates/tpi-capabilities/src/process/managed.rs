@@ -21,8 +21,8 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::Job;
-use crate::session::artifact::ArtifactWriter;
 use crate::tool::command::RunArgs;
+use tpi_session::artifact::ArtifactWriter;
 
 /// live tail 预算（任务书 §16：第一层 bounded ring/tail，建议 64 KiB）。
 pub const LIVE_TAIL_BUDGET: usize = 64 * 1024;
@@ -428,7 +428,7 @@ pub async fn start_background(request: BackgroundStartRequest) -> Result<Process
     let id = ProcessId::next();
     let process = ManagedProcess::new(id, workspace, command, args.cwd.clone(), args.env.clone());
     {
-        let mut reg = crate::util::lock_mutex(&registry, "process_registry");
+        let mut reg = tpi_core::util::lock_mutex(&registry, "process_registry");
         reg.insert(process).map_err(|error| {
             format!("status: failed\nprocess: {id}\nerror: process_limit\n\n{error}")
         })?;
@@ -483,12 +483,12 @@ fn spawn_drain(
         {
             tracing::error!(process = %id, %error, "managed process drain failed");
             {
-                let mut reg = crate::util::lock_mutex(&registry, "process_registry");
+                let mut reg = tpi_core::util::lock_mutex(&registry, "process_registry");
                 reg.transition(id, ManagedProcessState::Failed, None);
                 reg.notify.notify_waiters();
             }
         }
-        crate::util::lock_mutex(&registry, "process_registry").remove_cancel(id);
+        tpi_core::util::lock_mutex(&registry, "process_registry").remove_cancel(id);
     });
 }
 
@@ -506,7 +506,7 @@ async fn drain_loop(
     session_id: &str,
 ) -> Result<(), String> {
     let cancel = {
-        let reg = crate::util::lock_mutex(registry, "process_registry");
+        let reg = tpi_core::util::lock_mutex(registry, "process_registry");
         reg.cancels
             .get(&id)
             .cloned()
@@ -604,7 +604,7 @@ async fn drain_loop(
                             None
                         };
                         {
-                            let mut reg = crate::util::lock_mutex(registry, "process_registry");
+                            let mut reg = tpi_core::util::lock_mutex(registry, "process_registry");
                             reg.set_runtime(id, pid, None);
                             reg.transition(id, ManagedProcessState::Running, None);
                         }
@@ -620,7 +620,7 @@ async fn drain_loop(
                                     bytes,
                                 )
                                 .map_err(|error| format!("write artifact: {error}"))?;
-                            crate::util::lock_mutex(registry, "process_registry")
+                            tpi_core::util::lock_mutex(registry, "process_registry")
                                 .append_output(id, bytes);
                         }
                     }
@@ -628,7 +628,7 @@ async fn drain_loop(
                         let code = i32::from_le_bytes(payload[..4].try_into().expect("len=4"));
                         let spawn_failed = code == -2;
                         {
-                            let mut reg = crate::util::lock_mutex(registry, "process_registry");
+                            let mut reg = tpi_core::util::lock_mutex(registry, "process_registry");
                             if spawn_failed {
                                 reg.transition(id, ManagedProcessState::Failed, None);
                             } else {
@@ -660,7 +660,7 @@ async fn drain_loop(
     let _ = host.wait().await;
     // 循环外终态补丁：取消 → Cancelled；host 异常退出（无 Exit）→ Failed。
     {
-        let mut reg = crate::util::lock_mutex(registry, "process_registry");
+        let mut reg = tpi_core::util::lock_mutex(registry, "process_registry");
         if !reg.get(id).is_some_and(|p| p.state.is_terminal()) {
             reg.transition(
                 id,
@@ -678,14 +678,14 @@ async fn drain_loop(
         .ok()
         .map(|record| format!("@artifact/{session_id}/{}", record.id));
     if let Some(reference) = artifact_ref {
-        crate::util::lock_mutex(registry, "process_registry").set_runtime(
+        tpi_core::util::lock_mutex(registry, "process_registry").set_runtime(
             id,
             None,
             Some(reference),
         );
     }
     // 唤醒 process wait（§20）。
-    crate::util::lock_mutex(registry, "process_registry")
+    tpi_core::util::lock_mutex(registry, "process_registry")
         .notify
         .notify_waiters();
     Ok(())
@@ -702,7 +702,7 @@ pub async fn wait_process(
     let deadline = Instant::now() + timeout;
     loop {
         let notify = {
-            let reg = crate::util::lock_mutex(registry, "process_registry");
+            let reg = tpi_core::util::lock_mutex(registry, "process_registry");
             match reg.get(id) {
                 Some(process) if process.state.is_terminal() => return Some(process.state),
                 Some(_) => reg.notify.clone(),
@@ -711,7 +711,7 @@ pub async fn wait_process(
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return crate::util::lock_mutex(registry, "process_registry")
+            return tpi_core::util::lock_mutex(registry, "process_registry")
                 .get(id)
                 .map(|p| p.state);
         }

@@ -12,8 +12,8 @@ use camino::Utf8PathBuf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::tool::{ToolContext, path_rejected_outcome, resolve_tool_path};
+use tpi_core::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 
 /// 路径不存在或非目录的统一诊断（§P0：区分「不存在」与「存在但非目录」，
 /// 避免对文件路径误报 not_found 误导调用方）。
@@ -665,9 +665,9 @@ fn finish_scan(
         elapsed_ms,
         stop_reason: stop_reason.as_str().to_string(),
     };
-    let cursor = crate::ids::EventId::new_v7().to_string();
+    let cursor = tpi_core::ids::EventId::new_v7().to_string();
     {
-        let mut store = crate::util::lock_mutex(&ctx.scan_snapshots, "scan_snapshots");
+        let mut store = tpi_core::util::lock_mutex(&ctx.scan_snapshots, "scan_snapshots");
         // 有界：最多保留 16 个 snapshot（P1-6：按 cursor 有序淘汰最旧，
         // 此前 HashMap keys().next() 顺序不可预测，cursor 可能意外失效）。
         evict_oldest_snapshot(&mut store);
@@ -730,7 +730,7 @@ fn page(cursor: &str, ctx: &ToolContext) -> ToolOutcome {
         Some(_) => return invalid_cursor_outcome(),
         None => (cursor.to_string(), 0),
     };
-    let store = crate::util::lock_mutex(&ctx.scan_snapshots, "scan_snapshots");
+    let store = tpi_core::util::lock_mutex(&ctx.scan_snapshots, "scan_snapshots");
     let Some(snapshot) = store.get(&snapshot_id) else {
         return ToolOutcome::failed(
             "page",
@@ -918,7 +918,7 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             artifacts_root: root.join(".artifacts").into(),
             session_id: "test".into(),
-            call_id: crate::ids::ToolCallId::new_v7(),
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
             output_tx: None,
             scan_snapshots: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),

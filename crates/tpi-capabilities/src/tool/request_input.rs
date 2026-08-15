@@ -14,8 +14,8 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 use crate::tool::ToolContext;
+use tpi_core::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 
 /// `request_input` 参数。
 ///

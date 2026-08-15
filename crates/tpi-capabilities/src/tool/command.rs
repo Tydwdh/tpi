@@ -7,10 +7,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 use crate::tool::ToolContext;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tpi_core::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
 
 /// 命令输出的模型预算（§8.4：24 KiB，保留错误相关 tail）。
 pub const DEFAULT_RUN_MAX_BYTES: usize = 24 * 1024;
@@ -84,7 +84,7 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
     // §35：bash 按 ActiveWorkspace 分发。当前只有 Local（R1 加 Remote 分支
     // → SshShellExecutor）。
     let kind = {
-        let ws = crate::util::lock_mutex(&ctx.workspace, "workspace");
+        let ws = tpi_core::util::lock_mutex(&ctx.workspace, "workspace");
         ws.kind()
     };
     match kind {
@@ -170,7 +170,7 @@ exit $__tpi_status",
     );
     // 执行起点（任务书 §15/§16）：未传 cwd → 逻辑 shell cwd；显式 → 本次 override。
     let session_cwd = {
-        let state = crate::util::lock_mutex(&ctx.shell, "shell");
+        let state = tpi_core::util::lock_mutex(&ctx.shell, "shell");
         state.cwd.clone()
     };
     let exec_cwd = match &args.cwd {
@@ -185,14 +185,14 @@ exit $__tpi_status",
     // 不落盘 §21）；捕获失败则跳过 env 跟踪（cwd 仍工作），下次重试。
     {
         let need_baseline = {
-            let state = crate::util::lock_mutex(&ctx.shell, "shell");
+            let state = tpi_core::util::lock_mutex(&ctx.shell, "shell");
             state.baseline.is_none()
         };
         if need_baseline {
             capture_baseline(ctx, &bash_exe, &exec_cwd).await;
         }
     }
-    let mut artifact = match crate::session::artifact::ArtifactWriter::create(
+    let mut artifact = match tpi_session::artifact::ArtifactWriter::create(
         &ctx.artifacts_root,
         &ctx.session_id,
         "bash",
@@ -218,7 +218,7 @@ exit $__tpi_status",
     };
     // overlay 注入（§S3）：set → env，unset → env_remove（process-host 移除）。
     let (overlay_set, overlay_unset) = {
-        let state = crate::util::lock_mutex(&ctx.shell, "shell");
+        let state = tpi_core::util::lock_mutex(&ctx.shell, "shell");
         (
             state.env_overlay.set.clone(),
             state.env_overlay.unset.clone(),
@@ -295,7 +295,7 @@ error: process_execution_failed
         && let Some(capture) = result.capture.as_deref()
     {
         let (new_cwd, captured_env) = parse_capture(capture);
-        let mut state = crate::util::lock_mutex(&ctx.shell, "shell");
+        let mut state = tpi_core::util::lock_mutex(&ctx.shell, "shell");
         let mut changed = false;
         if let Some(new_cwd) = new_cwd {
             let changed_cwd = norm_path_for_compare(&new_cwd) != norm_path_for_compare(&exec_cwd);
@@ -348,7 +348,7 @@ error: process_execution_failed
         stderr_bytes: &result.stderr,
     });
     let artifact_ref = match artifact_result {
-        Ok(record) => Some(crate::outcome::ArtifactRef {
+        Ok(record) => Some(tpi_core::outcome::ArtifactRef {
             session: ctx.session_id.clone(),
             id: record.id,
         }),
@@ -429,7 +429,7 @@ async fn local_bash_background(args: BashArgs, ctx: &ToolContext) -> ToolOutcome
     };
     // 启动时快照（§9：process creation 时继承；之后 session 变化不影响已运行进程）。
     let session_cwd = {
-        let state = crate::util::lock_mutex(&ctx.shell, "shell");
+        let state = tpi_core::util::lock_mutex(&ctx.shell, "shell");
         state.cwd.clone()
     };
     let exec_cwd = match &args.cwd {
@@ -440,14 +440,14 @@ async fn local_bash_background(args: BashArgs, ctx: &ToolContext) -> ToolOutcome
         None => session_cwd.to_string(),
     };
     let (overlay_set, overlay_unset) = {
-        let state = crate::util::lock_mutex(&ctx.shell, "shell");
+        let state = tpi_core::util::lock_mutex(&ctx.shell, "shell");
         (
             state.env_overlay.set.clone(),
             state.env_overlay.unset.clone(),
         )
     };
     let workspace_id = {
-        let ws = crate::util::lock_mutex(&ctx.workspace, "workspace");
+        let ws = tpi_core::util::lock_mutex(&ctx.workspace, "workspace");
         ws.id().to_string()
     };
     // background 命令原样执行（无 capture wrapper：不捕获、不 commit §10）。
@@ -570,7 +570,7 @@ printf '__TPI_CAPTURE_END_{nonce}__\\n'"
         return;
     };
     let (_, env) = parse_capture(capture);
-    let mut state = crate::util::lock_mutex(&ctx.shell, "shell");
+    let mut state = tpi_core::util::lock_mutex(&ctx.shell, "shell");
     state.baseline = Some(env);
 }
 
@@ -774,7 +774,7 @@ fn outcome_for(input: OutcomeInput<'_>) -> ToolOutcome {
         evidence: Vec::new(),
         observed_resources: Vec::new(),
         artifacts: Vec::new(),
-        timing: crate::outcome::ToolTiming { duration_ms },
+        timing: tpi_core::outcome::ToolTiming { duration_ms },
     }
 }
 

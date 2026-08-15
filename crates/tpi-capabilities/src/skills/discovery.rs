@@ -37,12 +37,12 @@ pub const PROJECT_SKILLS_DIR: &str = ".agent/skills";
 
 /// 用户 skills 目录（~/.tpi/skills）。
 pub fn user_skills_dir() -> PathBuf {
-    crate::config::tpi_home().join("skills")
+    tpi_core::util::tpi_home().join("skills")
 }
 
 /// 内置 skills 目录（随包；当前无内置，占位）。
 pub fn builtin_skills_dir() -> PathBuf {
-    crate::config::tpi_home().join("skills").join(".builtin")
+    tpi_core::util::tpi_home().join("skills").join(".builtin")
 }
 
 /// 扫描一个目录下的 skills（每个子目录含 SKILL.md）。
