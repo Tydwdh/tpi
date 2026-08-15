@@ -179,11 +179,35 @@ impl AppServices<OpenAiCompatClient> {
         let provider = OpenAiCompatClient::new(
             config.model.base_url.clone(),
             config.model.name.clone(),
-            api_key,
+            api_key.clone(),
             config.model.reasoning.clone(),
             config.model.max_output_tokens,
             config.model.context_window,
         );
+        // P8-04 接线：把 `subagent` 工具注册进 registry（模型可发起只读调查）。
+        // 每个 child 独立 provider 实例（不与 parent 争用 &mut provider）。
+        {
+            let child_api_key = api_key.clone();
+            let model = config.model.clone();
+            let child_config = Arc::new(config.clone());
+            crate::subagent::tool::register_subagent_tool::<OpenAiCompatClient, _>(
+                &registry,
+                child_config,
+                move || {
+                    OpenAiCompatClient::new(
+                        model.base_url.clone(),
+                        model.name.clone(),
+                        child_api_key.clone(),
+                        model.reasoning.clone(),
+                        model.max_output_tokens,
+                        model.context_window,
+                    )
+                },
+                // P8-06：report 通道在 run 时按 run 注入（此处 None = 不投影
+                // TUI；run_turn 的 ui_tx 不在此作用域）。
+                None,
+            );
+        }
 
         // 共享的当前取消 token（Ctrl-C 第一次取消 run，空闲时退出）。
         let current_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));

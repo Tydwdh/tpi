@@ -76,7 +76,7 @@ fn evidence_from(text: &str) -> Vec<String> {
 }
 
 #[async_trait::async_trait]
-impl<P: Provider + Send, F: FnMut() -> P + Send> SubagentProvider for InProcessChildProvider<P, F> {
+impl<P: Provider + Send, F: Fn() -> P + Send> SubagentProvider for InProcessChildProvider<P, F> {
     async fn run_investigation(
         &mut self,
         request: SubagentRequest,

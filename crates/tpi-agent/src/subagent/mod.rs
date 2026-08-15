@@ -8,6 +8,7 @@
 
 pub mod child;
 pub mod parallel;
+pub mod tool;
 
 use tpi_core::ids::{SessionId, SpanId, TraceId};
 
