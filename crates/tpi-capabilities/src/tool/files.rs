@@ -380,50 +380,86 @@ pub fn edit(
             },
         );
     };
-    match crate::tool::edit::apply_edit(&path, &args.revision, &args.replacements).and_then(
-        |result| {
-            crate::tool::edit::commit_edit(&result, &path, plan)?;
-            // §10.1：记录提交后的 snapshot（后续 stale 诊断用）。
-            if let Ok(snapshot) =
-                crate::tool::edit::build_snapshot(path.clone(), result.new_raw.clone())
-            {
-                tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
-            }
-            Ok(result)
-        },
-    ) {
-        Ok(result) => {
-            // §10.3 第 10 条：返回 unified diff 与修改统计。
-            let diff = crate::tool::edit::unified_diff(&result);
-            let mut output = format!(
-                "status: succeeded\ntool: edit\npath: {}\napplied: {}\nprevious_revision: {}\ncurrent_revision: {}",
-                display_path(&ctx.workspace_root, &path),
-                result.applied,
-                result.previous_revision,
-                result.current_revision,
-            );
-            // §修复 #4：跳过的 no-op 条目数对模型可见（不静默）。
-            if result.skipped_noops > 0 {
-                output.push_str(&format!("\nskipped_noops: {}", result.skipped_noops));
-            }
-            let mut outcome = ToolOutcome::succeeded("edit", output);
-            outcome
-                .observed_resources
-                .push(tpi_core::outcome::ResourceVersion {
-                    path: display_path(&ctx.workspace_root, &path),
-                    revision: result.current_revision,
-                });
-            outcome.session_metadata = ToolMetadata {
-                tool: "edit".into(),
-                target: Some(display_path(&ctx.workspace_root, &path)),
-                // §用户诉求：diff 独立字段，TUI 默认展开显示红绿 diff。
-                diff: if diff.is_empty() { None } else { Some(diff) },
-                ..Default::default()
-            };
-            outcome
+    // Edit V2 两阶段：operations 主路径走 resolve（纯内存）→ commit（原子）。
+    // legacy replacements（无 operations）走旧 apply_edit（全文件唯一匹配
+    // + 宽松应用，保持旧语义）。
+    if !args.operations.is_empty() {
+        match crate::tool::edit::resolve_file_edit(&args)
+            .and_then(|prepared| crate::tool::edit::commit_file_edit(&prepared, plan))
+            .map(|committed| {
+                let result = crate::tool::edit::EditResult {
+                    previous_revision: committed.previous_revision,
+                    current_revision: committed.current_revision,
+                    applied: args.operations.len(),
+                    skipped_noops: 0,
+                    tier: crate::tool::edit::MatchTier::Exact,
+                    previous_raw: committed.previous_raw.clone(),
+                    new_raw: committed.new_raw.clone(),
+                };
+                // §10.1：记录提交后的 snapshot（后续 stale 诊断用）。
+                if let Ok(snapshot) =
+                    crate::tool::edit::build_snapshot(path.clone(), committed.new_raw.clone())
+                {
+                    tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store")
+                        .record(snapshot);
+                }
+                result
+            }) {
+            Ok(result) => edit_success_outcome(ctx, &path, result, "edit"),
+            Err(error) => failed_outcome("edit", error),
         }
-        Err(error) => failed_outcome("edit", error),
+    } else {
+        // legacy：replacements（旧协议）。
+        match crate::tool::edit::apply_edit(&path, &args.revision, &args.replacements).and_then(
+            |result| {
+                crate::tool::edit::commit_edit(&result, &path, plan)?;
+                if let Ok(snapshot) =
+                    crate::tool::edit::build_snapshot(path.clone(), result.new_raw.clone())
+                {
+                    tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store")
+                        .record(snapshot);
+                }
+                Ok(result)
+            },
+        ) {
+            Ok(result) => edit_success_outcome(ctx, &path, result, "edit"),
+            Err(error) => failed_outcome("edit", error),
+        }
     }
+}
+
+/// 编辑成功结果（edit / edit_range 共用）：unified diff + revision + resource。
+fn edit_success_outcome(
+    ctx: &ToolContext,
+    path: &Utf8PathBuf,
+    result: crate::tool::edit::EditResult,
+    tool: &'static str,
+) -> ToolOutcome {
+    let diff = crate::tool::edit::unified_diff(&result);
+    let mut output = format!(
+        "status: succeeded\ntool: {tool}\npath: {}\napplied: {}\nprevious_revision: {}\ncurrent_revision: {}",
+        display_path(&ctx.workspace_root, path),
+        result.applied,
+        result.previous_revision,
+        result.current_revision,
+    );
+    if result.skipped_noops > 0 {
+        output.push_str(&format!("\nskipped_noops: {}", result.skipped_noops));
+    }
+    let mut outcome = ToolOutcome::succeeded(tool, output);
+    outcome
+        .observed_resources
+        .push(tpi_core::outcome::ResourceVersion {
+            path: display_path(&ctx.workspace_root, path),
+            revision: result.current_revision,
+        });
+    outcome.session_metadata = ToolMetadata {
+        tool: tool.into(),
+        target: Some(display_path(&ctx.workspace_root, path)),
+        diff: if diff.is_empty() { None } else { Some(diff) },
+        ..Default::default()
+    };
+    outcome
 }
 
 /// `edit_range` 工具：按行范围编辑（§anchor）。
@@ -1330,5 +1366,290 @@ mod tests {
                 "{start}..{end}"
             );
         }
+    }
+
+    // ---- Edit V2：operations（§edit v2）----
+
+    /// 读文件拿 revision（并 record snapshot）。
+    fn read_revision(path: &Utf8PathBuf, ctx: &ToolContext) -> String {
+        let outcome = read(
+            ReadArgs {
+                path: path.to_string(),
+                start_line: 1,
+                line_count: 10,
+                depth: None,
+            },
+            ctx,
+        );
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        crate::tool::edit::parse_revision_token(
+            outcome
+                .model_payload
+                .output
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("[revision=")
+                        .map(|r| r.strip_suffix(']').unwrap())
+                })
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// replace_lines：行级替换 + 删除（空 new_text）+ 多行替换。
+    #[test]
+    fn edit_operations_replace_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("op.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "a\nb\nc\nd\n").unwrap();
+        let revision = read_revision(&path, &ctx);
+        let plan = crate::tool::edit::prepare_commit(&path);
+
+        // batch：replace 2..=2（b→B），replace 4..=4（d→D），insert_after 4（D 后插 d1）。
+        // insert_after(4) 锚点在行 4 末尾（文件末尾），在 replace(4) 的 span 外——不冲突。
+        let outcome = edit(
+            crate::tool::edit::EditArgs {
+                path: path.to_string(),
+                revision,
+                operations: vec![
+                    crate::tool::edit::EditOperation::ReplaceLines {
+                        start_line: 2,
+                        end_line: 2,
+                        new_text: "B".into(),
+                    },
+                    crate::tool::edit::EditOperation::ReplaceLines {
+                        start_line: 4,
+                        end_line: 4,
+                        new_text: "D".into(),
+                    },
+                    crate::tool::edit::EditOperation::InsertAfter {
+                        line: 4,
+                        new_text: "d1".into(),
+                    },
+                ],
+                replacements: Vec::new(),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(
+            outcome.status,
+            ToolStatus::Succeeded,
+            "{} ",
+            outcome.model_payload.output
+        );
+        let content = std::fs::read_to_string(path.as_std_path()).unwrap();
+        assert_eq!(
+            content, "a\nB\nc\nD\nd1",
+            "insert_after 是零宽，new_text 原样插入"
+        );
+    }
+
+    /// replace_text：行范围内 exact selector（含跨行 selector）。
+    #[test]
+    fn edit_operations_replace_text_scoped_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("sel.rs")).unwrap();
+        std::fs::write(
+            path.as_std_path(),
+            "fn f() {\n    timeout = 1000;\n    retry = 3;\n}\n",
+        )
+        .unwrap();
+        let revision = read_revision(&path, &ctx);
+        let plan = crate::tool::edit::prepare_commit(&path);
+
+        // 只在第 2 行内找 "1000"（行内 selector）。
+        let outcome = edit(
+            crate::tool::edit::EditArgs {
+                path: path.to_string(),
+                revision,
+                operations: vec![crate::tool::edit::EditOperation::ReplaceText {
+                    start_line: 2,
+                    end_line: 2,
+                    old_text: "1000".into(),
+                    new_text: "2000".into(),
+                }],
+                replacements: Vec::new(),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(
+            outcome.status,
+            ToolStatus::Succeeded,
+            "{} ",
+            outcome.model_payload.output
+        );
+        let content = std::fs::read_to_string(path.as_std_path()).unwrap();
+        assert_eq!(
+            content,
+            "fn f() {\n    timeout = 2000;\n    retry = 3;\n}\n"
+        );
+    }
+
+    /// replace_text 越界：old_text 在指定范围外 → 拒绝（不扩大到全文件）。
+    #[test]
+    fn edit_operations_replace_text_never_escapes_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("esc.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "foo\nbar\nfoo\n").unwrap();
+        let revision = read_revision(&path, &ctx);
+        let plan = crate::tool::edit::prepare_commit(&path);
+
+        // "foo" 在第 1、3 行都有，但只在第 3 行范围内搜 → 唯一（不逃逸到行 1）。
+        let outcome = edit(
+            crate::tool::edit::EditArgs {
+                path: path.to_string(),
+                revision,
+                operations: vec![crate::tool::edit::EditOperation::ReplaceText {
+                    start_line: 3,
+                    end_line: 3,
+                    old_text: "foo".into(),
+                    new_text: "FOO".into(),
+                }],
+                replacements: Vec::new(),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(
+            outcome.status,
+            ToolStatus::Succeeded,
+            "{} ",
+            outcome.model_payload.output
+        );
+        let content = std::fs::read_to_string(path.as_std_path()).unwrap();
+        assert_eq!(content, "foo\nbar\nFOO\n", "只改第 3 行，不逃逸");
+
+        // 范围外不存在 → 拒绝（no_match），绝不回退到全文件。
+        let revision2 = read_revision(&path, &ctx);
+        let plan2 = crate::tool::edit::prepare_commit(&path);
+        let outcome2 = edit(
+            crate::tool::edit::EditArgs {
+                path: path.to_string(),
+                revision: revision2,
+                operations: vec![crate::tool::edit::EditOperation::ReplaceText {
+                    start_line: 2,
+                    end_line: 2,
+                    old_text: "foo".into(), // 第 2 行是 bar，无 foo
+                    new_text: "X".into(),
+                }],
+                replacements: Vec::new(),
+            },
+            &ctx,
+            Some(&plan2),
+        );
+        assert_eq!(outcome2.status, ToolStatus::Failed);
+        assert!(outcome2.model_payload.output.contains("no_match"));
+    }
+
+    /// batch overlap：两个 replace 范围相交 → 整批拒绝，文件不变。
+    #[test]
+    fn edit_operations_batch_overlap_rejects_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("ov.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "a\nb\nc\nd\n").unwrap();
+        let revision = read_revision(&path, &ctx);
+        let plan = crate::tool::edit::prepare_commit(&path);
+
+        let outcome = edit(
+            crate::tool::edit::EditArgs {
+                path: path.to_string(),
+                revision,
+                operations: vec![
+                    crate::tool::edit::EditOperation::ReplaceLines {
+                        start_line: 2,
+                        end_line: 3,
+                        new_text: "X".into(),
+                    },
+                    crate::tool::edit::EditOperation::ReplaceLines {
+                        start_line: 3,
+                        end_line: 4,
+                        new_text: "Y".into(),
+                    },
+                ],
+                replacements: Vec::new(),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(outcome.status, ToolStatus::Failed);
+        assert!(outcome.model_payload.output.contains("overlap"));
+        // 文件必须完全不变（all-or-nothing）。
+        let content = std::fs::read_to_string(path.as_std_path()).unwrap();
+        assert_eq!(content, "a\nb\nc\nd\n");
+    }
+
+    /// legacy：只传 replacements（无 operations）仍走旧路径（兼容）。
+    #[test]
+    fn edit_operations_legacy_replacements_still_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("leg.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "foo bar baz\n").unwrap();
+        let revision = read_revision(&path, &ctx);
+        let plan = crate::tool::edit::prepare_commit(&path);
+
+        let outcome = edit(
+            crate::tool::edit::EditArgs {
+                path: path.to_string(),
+                revision,
+                operations: Vec::new(),
+                replacements: vec![crate::tool::edit::Replacement {
+                    old_text: "bar".into(),
+                    new_text: "BAR".into(),
+                }],
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(
+            outcome.status,
+            ToolStatus::Succeeded,
+            "{} ",
+            outcome.model_payload.output
+        );
+        let content = std::fs::read_to_string(path.as_std_path()).unwrap();
+        assert_eq!(content, "foo BAR baz\n");
+    }
+
+    /// operations + replacements 都有 → 拒绝（互斥）。
+    #[test]
+    fn edit_operations_mutually_exclusive_with_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("mut.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "a\n").unwrap();
+        let revision = read_revision(&path, &ctx);
+        let plan = crate::tool::edit::prepare_commit(&path);
+
+        let outcome = edit(
+            crate::tool::edit::EditArgs {
+                path: path.to_string(),
+                revision,
+                operations: vec![crate::tool::edit::EditOperation::ReplaceLines {
+                    start_line: 1,
+                    end_line: 1,
+                    new_text: "x".into(),
+                }],
+                replacements: vec![crate::tool::edit::Replacement {
+                    old_text: "a".into(),
+                    new_text: "b".into(),
+                }],
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(outcome.status, ToolStatus::Failed);
+        assert!(
+            outcome
+                .model_payload
+                .output
+                .contains("both_operations_and_replacements")
+        );
     }
 }

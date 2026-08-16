@@ -147,6 +147,7 @@ fn file_write(index: usize, path: &str) -> PreparedCall {
                 path: path.into(),
                 revision: "b3:0000000000000000000000000000000000000000000000000000000000000000"
                     .into(),
+                operations: Vec::new(),
                 replacements: vec![tpi::tool::edit::Replacement {
                     old_text: "x".into(),
                     new_text: "y".into(),

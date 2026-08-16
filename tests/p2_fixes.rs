@@ -122,6 +122,7 @@ fn p2_edit_failure_includes_next_action_hint() {
         tpi::tool::edit::EditArgs {
             path: "hint.txt".into(),
             revision: revision.clone(),
+            operations: Vec::new(),
             replacements: vec![tpi::tool::edit::Replacement {
                 old_text: "line one".into(),
                 new_text: "line two".into(),

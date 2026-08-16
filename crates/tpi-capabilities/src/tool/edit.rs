@@ -22,17 +22,23 @@ use serde::Deserialize;
 
 pub use tpi_core::outcome::Effect;
 
-/// edit 工具参数（§10.3）。
+/// edit 工具参数（§10.3；Edit V2：operations 主路径，replacements legacy）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 pub struct EditArgs {
     /// 目标文件路径（workspace 内相对路径或绝对路径）。
     pub path: String,
-    /// `read` 输出的 `[revision=...]` 或裸 `b3:<64-hex>`——必须是文件当前 revision，
-    /// 否则 stale_revision 拒绝。
+    /// `read`/`search` 输出的 `[revision=...]` 或裸 `b3:<64-hex>`——目标
+    /// 快照 identity（§anchor：所有操作坐标属于此 revision）。
     pub revision: String,
-    /// 批量替换（§10.3：逐条校验；任一条不匹配则整体拒绝）。
-    /// §修复：no-op（old_text == new_text）项自动跳过；stale 时若所有非 no-op
-    /// 项在当前文件仍唯一匹配，允许宽松应用（见 [`apply_edit`]）。
+    /// 编辑操作列表（Edit V2 主路径）。batch 语义：全部 operation 先 resolve
+    /// 到 base revision 坐标，任一个失败/重叠则整批拒绝，文件不变。
+    #[serde(default)]
+    pub operations: Vec<EditOperation>,
+    /// legacy：精确文本替换（§10.3 旧协议）。已被 operations 取代，仅兼容
+    /// 保留——模型 schema 不暴露此字段（schemars skip），旧调用仍可解析。
+    /// 与 operations 二选一（都有 → 拒绝）。
+    #[serde(default)]
+    #[schemars(skip)]
     pub replacements: Vec<Replacement>,
 }
 
@@ -344,6 +350,8 @@ pub enum EditError {
     EmptyOldText { path: Utf8PathBuf },
     #[error("too many replacements in {path}: {count} (max {MAX_REPLACEMENTS})")]
     TooManyReplacements { path: Utf8PathBuf, count: usize },
+    #[error("both operations and legacy replacements provided for {path} (choose one)")]
+    BothOperationsAndReplacements { path: Utf8PathBuf },
     #[error("no match for replacements[{index}] in {path}")]
     NoMatch {
         path: Utf8PathBuf,
@@ -392,6 +400,7 @@ impl EditError {
             EditError::InvalidRange { .. } => "invalid_range",
             EditError::EmptyOldText { .. } => "empty_old_text",
             EditError::TooManyReplacements { .. } => "too_many_replacements",
+            EditError::BothOperationsAndReplacements { .. } => "both_operations_and_replacements",
             EditError::NoMatch { .. } => "no_match",
             EditError::MultipleMatches { .. } => "multiple_matches",
             EditError::Overlap { .. } => "overlap",
@@ -406,11 +415,228 @@ impl EditError {
     }
 }
 
-/// 一次 replacement（§10.3）。
+/// 一次 replacement（§10.3；legacy：被 [`EditOperation`] 取代，仅兼容保留）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 pub struct Replacement {
     pub old_text: String,
     pub new_text: String,
+}
+
+/// 编辑操作（Edit V2，§edit v2：模型侧唯一编辑协议的 operations）。
+///
+/// 所有坐标都属于 `(path, revision)` 指向的 base snapshot（§anchor：
+/// location 由已观察快照 + 坐标确定，文本只作局部 selector）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EditOperation {
+    /// 替换 `start_line..=end_line`（inclusive）整行。行级语义：整行含换行
+    /// 被替换，new_text 自动补换行；空 new_text 删整段行（不残留空行）。
+    ReplaceLines {
+        start_line: usize,
+        end_line: usize,
+        new_text: String,
+    },
+    /// 在 `start_line..=end_line` 这个已锚定区域内做 substring 精确选择。
+    /// `old_text` 是 selector 不是 address：只在给定行范围内 exact 唯一匹配，
+    /// **禁止**扩大到整个文件寻找（protocol invariant）。允许跨行。
+    ReplaceText {
+        start_line: usize,
+        end_line: usize,
+        old_text: String,
+        new_text: String,
+    },
+    /// 在第 `line` 行开始处插入（零宽 anchor；`line=1` = 文件头）。
+    InsertBefore { line: usize, new_text: String },
+    /// 在第 `line` 行完整结束之后插入（零宽 anchor；含行尾换行之后）。
+    InsertAfter { line: usize, new_text: String },
+}
+
+/// 解析后的编辑片段（内部统一 primitive；全部坐标是 base snapshot 的
+/// **逻辑字节**偏移，`apply_edit_to_snapshot` 消费）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSplice {
+    pub start: usize,
+    pub end: usize,
+    pub replacement: String,
+}
+
+/// 由 [`EditOperation`] 解析为 [`ResolvedSplice`]（base snapshot 坐标）。
+///
+/// 所有 operation 先 resolve 到 base revision 的字节区间，再统一做
+/// 重叠检查与逆序 apply（§edit v2：batch 确定性）。
+fn resolve_operation(
+    op: &EditOperation,
+    snapshot: &FileSnapshot,
+) -> Result<ResolvedSplice, EditError> {
+    let text = &snapshot.logical_lf_text;
+    match op {
+        EditOperation::ReplaceLines {
+            start_line,
+            end_line,
+            new_text,
+        } => {
+            validate_range(*start_line, *end_line, &snapshot.path)?;
+            // 整行（含换行）替换：extract_lines 得 old_text，行级语义补换行。
+            let old_text = extract_lines(text, *start_line, *end_line);
+            let start = text.find(&old_text).ok_or_else(|| EditError::NoMatch {
+                path: snapshot.path.clone(),
+                index: 0,
+                context: Some("行范围越界或文件为空".into()),
+                diagnostic: None,
+            })?;
+            let mut replacement = new_text.clone();
+            if !replacement.is_empty() && old_text.ends_with('\n') && !replacement.ends_with('\n') {
+                replacement.push('\n');
+            }
+            Ok(ResolvedSplice {
+                start,
+                end: start + old_text.len(),
+                replacement,
+            })
+        }
+        EditOperation::ReplaceText {
+            start_line,
+            end_line,
+            old_text,
+            new_text,
+        } => {
+            validate_range(*start_line, *end_line, &snapshot.path)?;
+            // region 从 start_line 行首开始取（不能用 text.find(&region)——
+            // region 可能在文件更早处重复出现，会定位到错误的行）。
+            let region_start =
+                line_start_offset(text, *start_line).ok_or_else(|| EditError::NoMatch {
+                    path: snapshot.path.clone(),
+                    index: 0,
+                    context: Some(format!(
+                        "行 {start_line} 不存在（文件 {} 行）",
+                        line_count(text)
+                    )),
+                    diagnostic: None,
+                })?;
+            let region_end = line_end_offset(text, *end_line).unwrap_or(text.len());
+            let region = &text[region_start..region_end];
+            // selector：只在锚定区域内 exact 唯一匹配（protocol invariant）。
+            let occurrences = region.match_indices(old_text).count();
+            let found = match occurrences {
+                0 => {
+                    return Err(EditError::NoMatch {
+                        path: snapshot.path.clone(),
+                        index: 0,
+                        context: Some(format!("行 {start_line}..={end_line} 内未找到 old_text")),
+                        diagnostic: None,
+                    });
+                }
+                1 => region.find(old_text).unwrap(),
+                _ => {
+                    return Err(EditError::MultipleMatches {
+                        path: snapshot.path.clone(),
+                        index: 0,
+                    });
+                }
+            };
+            let start = region_start + found;
+            Ok(ResolvedSplice {
+                start,
+                end: start + old_text.len(),
+                replacement: new_text.clone(),
+            })
+        }
+        EditOperation::InsertBefore { line, new_text } => {
+            if *line == 0 {
+                return Err(EditError::InvalidRange {
+                    path: snapshot.path.clone(),
+                    start_line: *line,
+                    end_line: *line,
+                });
+            }
+            let start = line_start_offset(text, *line).ok_or_else(|| EditError::NoMatch {
+                path: snapshot.path.clone(),
+                index: 0,
+                context: Some(format!("行 {line} 不存在（文件 {} 行）", line_count(text))),
+                diagnostic: None,
+            })?;
+            Ok(ResolvedSplice {
+                start,
+                end: start,
+                replacement: new_text.clone(),
+            })
+        }
+        EditOperation::InsertAfter { line, new_text } => {
+            if *line == 0 {
+                return Err(EditError::InvalidRange {
+                    path: snapshot.path.clone(),
+                    start_line: *line,
+                    end_line: *line,
+                });
+            }
+            // 第 line 行完整结束之后：行内容 + 行尾换行。
+            let start = line_end_offset(text, *line).ok_or_else(|| EditError::NoMatch {
+                path: snapshot.path.clone(),
+                index: 0,
+                context: Some(format!("行 {line} 不存在（文件 {} 行）", line_count(text))),
+                diagnostic: None,
+            })?;
+            Ok(ResolvedSplice {
+                start,
+                end: start,
+                replacement: new_text.clone(),
+            })
+        }
+    }
+}
+
+fn validate_range(start_line: usize, end_line: usize, path: &Utf8PathBuf) -> Result<(), EditError> {
+    if start_line == 0 || end_line == 0 || end_line < start_line {
+        return Err(EditError::InvalidRange {
+            path: path.clone(),
+            start_line,
+            end_line,
+        });
+    }
+    Ok(())
+}
+
+/// 第 `line` 行起始的字节偏移（1-indexed；文件头 = 0）。
+fn line_start_offset(text: &str, line: usize) -> Option<usize> {
+    if line == 1 {
+        return Some(0);
+    }
+    let mut current = 1usize;
+    for (offset, ch) in text.char_indices() {
+        if ch == '\n' {
+            current += 1;
+            if current == line {
+                return Some(offset + 1);
+            }
+        }
+    }
+    None
+}
+
+/// 第 `line` 行完整结束（含行尾换行）后的字节偏移。
+fn line_end_offset(text: &str, line: usize) -> Option<usize> {
+    if line == 0 {
+        return None;
+    }
+    let mut current = 1usize;
+    for (offset, ch) in text.char_indices() {
+        if ch == '\n' {
+            if current == line {
+                return Some(offset + 1);
+            }
+            current += 1;
+        }
+    }
+    // 最后一行无换行：文件末尾。
+    if current == line {
+        Some(text.len())
+    } else {
+        None
+    }
+}
+
+fn line_count(text: &str) -> usize {
+    text.lines().count()
 }
 
 /// 预检通过的 replacement（逻辑坐标已解析）。
@@ -1050,6 +1276,188 @@ fn extract_lines(text: &str, start_line: usize, end_line: usize) -> String {
         }
     }
     out
+}
+
+/// 编辑计划（Edit V2 两阶段：resolve 纯内存，commit 落盘）。
+///
+/// 为 Workspace Transaction（多文件）留边界：B 阶段可以先 resolve 多个
+/// 文件的 PreparedFileEdit 全部成功，再统一 commit（§edit v2 分层）。
+#[derive(Debug, Clone)]
+pub struct PreparedFileEdit {
+    pub path: Utf8PathBuf,
+    /// base revision（operations 坐标所属）。
+    pub revision: String,
+    /// 原始编辑操作（resolve 阶段校验，commit 阶段 resolve 成 splice）。
+    pub operations: Vec<EditOperation>,
+}
+
+/// 已提交的编辑结果（revision 演进 + 原始字节供 diff/快照）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedFileEdit {
+    pub previous_revision: String,
+    pub current_revision: String,
+    pub previous_raw: Vec<u8>,
+    pub new_raw: Vec<u8>,
+}
+
+/// 两阶段之 resolve：把 `EditArgs`（operations 或 legacy replacements）
+/// 解析为 [`PreparedFileEdit`]。**纯内存**（不读文件、不落盘）——
+/// 只做 operation 校验与坐标语义检查，为多文件 batch 留边界。
+pub fn resolve_file_edit(args: &EditArgs) -> Result<PreparedFileEdit, EditError> {
+    let Some(revision) = parse_revision_token(&args.revision) else {
+        return Err(EditError::InvalidRevision {
+            value: args.revision.clone(),
+        });
+    };
+    let path = Utf8PathBuf::from(args.path.clone());
+    // operations 与 legacy replacements 互斥（都有 → 拒绝）。
+    if !args.operations.is_empty() && !args.replacements.is_empty() {
+        return Err(EditError::BothOperationsAndReplacements { path: path.clone() });
+    }
+    if !args.operations.is_empty() {
+        if args.operations.len() > MAX_REPLACEMENTS {
+            return Err(EditError::TooManyReplacements {
+                path: path.clone(),
+                count: args.operations.len(),
+            });
+        }
+        validate_operations(&args.operations, &path)?;
+        Ok(PreparedFileEdit {
+            path,
+            revision,
+            operations: args.operations.clone(),
+        })
+    } else {
+        // legacy replacements：直接走旧路径（files.rs 入口处理），
+        // 不进入 operations 两阶段（保持旧语义：全文件唯一匹配 + 宽松应用）。
+        Ok(PreparedFileEdit {
+            path,
+            revision,
+            operations: Vec::new(),
+        })
+    }
+}
+
+/// operation 级校验（不依赖 snapshot 即可做的部分）。
+fn validate_operations(ops: &[EditOperation], path: &Utf8PathBuf) -> Result<(), EditError> {
+    for op in ops {
+        match op {
+            EditOperation::ReplaceLines {
+                start_line,
+                end_line,
+                ..
+            }
+            | EditOperation::ReplaceText {
+                start_line,
+                end_line,
+                ..
+            } => validate_range(*start_line, *end_line, path)?,
+            EditOperation::InsertBefore { line, .. } | EditOperation::InsertAfter { line, .. } => {
+                if *line == 0 {
+                    return Err(EditError::InvalidRange {
+                        path: path.clone(),
+                        start_line: *line,
+                        end_line: *line,
+                    });
+                }
+            }
+        }
+        if let EditOperation::ReplaceText { old_text, .. } = op
+            && old_text.is_empty()
+        {
+            return Err(EditError::EmptyOldText { path: path.clone() });
+        }
+    }
+    Ok(())
+}
+
+/// 两阶段之 commit：读 snapshot → 逐 op resolve 成 splice → 排序/重叠检查
+/// → 逆序应用 → 原子提交（temp + sync + ReplaceFileW）。
+pub fn commit_file_edit(
+    prepared: &PreparedFileEdit,
+    plan: &CommitPlan,
+) -> Result<CommittedFileEdit, EditError> {
+    let snapshot = snapshot_file(&prepared.path)?;
+    // 逐 op resolve（需要 snapshot 的行结构）。
+    let mut splices: Vec<ResolvedSplice> = Vec::with_capacity(prepared.operations.len());
+    for op in &prepared.operations {
+        splices.push(resolve_operation(op, &snapshot)?);
+    }
+    // 排序 + 重叠检查 + 逆序应用 + 原子提交。
+    let result = apply_splices(&snapshot, &prepared.revision, &splices)?;
+    commit_edit(&result, &prepared.path, plan)?;
+    Ok(CommittedFileEdit {
+        previous_revision: result.previous_revision,
+        current_revision: result.current_revision,
+        previous_raw: result.previous_raw,
+        new_raw: result.new_raw,
+    })
+}
+
+/// 应用 splices：排序 + 重叠检查 + 逆序直接 splice（零宽天然支持）。
+/// 复用 [`encode_replacement`]（CRLF/BOM 编码）与 [`FileSnapshot::raw_offset`]
+/// （逻辑坐标 → 原始字节坐标）。不经过 Replacement 管线——operations 的
+/// 坐标在 resolve_operation 已确定，这里只做确定性应用。
+fn apply_splices(
+    snapshot: &FileSnapshot,
+    expected_revision: &str,
+    splices: &[ResolvedSplice],
+) -> Result<EditResult, EditError> {
+    if splices.is_empty() {
+        return Err(EditError::EmptyOldText {
+            path: snapshot.path.clone(),
+        });
+    }
+    // 排序（base 坐标升序）。
+    let mut sorted = splices.to_vec();
+    sorted.sort_by_key(|s| s.start);
+    // 重叠检查（§edit v2：相交即拒绝整批；零宽与零宽同点也拒绝）。
+    for pair in sorted.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        // a 的结束 > b 的开始 → 相交（含零宽 a.end==b.start 时：零宽与
+        // 其后非零宽相邻是允许的，只有真正 overlap 才拒绝）。
+        // 但两个零宽同点（a.start==a.end==b.start==b.end）→ 拒绝。
+        if a.end > b.start || (a.start == a.end && b.start == b.end && a.start == b.start) {
+            return Err(EditError::Overlap {
+                path: snapshot.path.clone(),
+                a: 0,
+                b: 1,
+            });
+        }
+    }
+    // revision 判定：base != current 时，splices 坐标是 base 的，不能直接用
+    // 当前文件——这里要求 base == current（fresh），stale 由上层处理。
+    // （Edit V2 fresh 路径；stale 宽松应用见 apply_edit 旧路径。）
+    if snapshot.revision != expected_revision {
+        return Err(EditError::StaleRevision {
+            path: snapshot.path.clone(),
+            current: snapshot.revision.clone(),
+            expected: expected_revision.to_string(),
+            context: None,
+        });
+    }
+    // 一次性应用：从后往前替换（保持前缀偏移有效）。
+    let mut new_raw = snapshot.raw.to_vec();
+    let has_bom = snapshot.has_bom;
+    let line_ending = snapshot.line_ending;
+    for r in sorted.iter().rev() {
+        let raw_start = snapshot.raw_offset(r.start);
+        let raw_end = snapshot.raw_offset(r.end);
+        let new_bytes =
+            encode_replacement(&r.replacement, raw_start, &new_raw, line_ending, has_bom);
+        new_raw.splice(raw_start..raw_end, new_bytes);
+    }
+    let previous_revision = snapshot.revision.clone();
+    let current_revision = revision_of(&new_raw);
+    Ok(EditResult {
+        previous_revision,
+        current_revision,
+        applied: sorted.len(),
+        skipped_noops: 0,
+        tier: MatchTier::Exact,
+        previous_raw: snapshot.raw.to_vec(),
+        new_raw,
+    })
 }
 
 /// 流程：读快照 → revision 校验 → 全部 replacements 预检（存在/唯一/不重叠/no-op）

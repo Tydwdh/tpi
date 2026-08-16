@@ -300,24 +300,25 @@ when the match is on file names, not contents. \
 Example: glob pattern=\"**/*test*.rs\""
             }
             BuiltinTool::Edit => {
-                "Atomically edit one file using revision-bound exact text replacement. \
-Only the explicit old_text is replaced; adjacent content is never implicitly deleted; \
-the whole batch applies or nothing does. \
-You must pass the file's current revision (from read output) — stale revisions are rejected. \
+                "Atomically edit one file with revision-bound operations (Edit V2). \
+Operations are resolved against the referenced revision's snapshot coordinates; \
+any failure or overlap rejects the whole batch — the file stays unchanged. \
+operations kinds: \
+  replace_lines {start_line, end_line, new_text}: replace inclusive line span \
+    (line-level; empty new_text deletes the span); \
+  replace_text {start_line, end_line, old_text, new_text}: exact substring \
+    selector within the anchored line span only (never searched outside); \
+  insert_before {line, new_text} / insert_after {line, new_text}: zero-width \
+    insert at line start / after line end. \
+All line numbers are 1-indexed coordinates in the referenced revision. \
 Output: unified diff + applied count + previous/current revision. \
-Prefer edit over write for localized changes (smaller, safer diffs). \
-Example: edit path=src/main.rs revision=b3:<hex> replacements=[{old_text, new_text}]"
+Prefer edit over write for localized changes. \
+Example: edit path=src/main.rs revision=b3:<hex> operations=[{kind: \"replace_lines\", start_line: 118, end_line: 120, new_text: \"...\"}]"
             }
             BuiltinTool::EditRange => {
-                "Edit a line range by revision + line numbers (preferred when line anchors \
-are available from read/search). \
-start_line/end_line are 1-indexed inclusive coordinates in the referenced revision's file. \
-When revision == current: direct replace by line span (deterministic, no text recall needed). \
-When revision is stale: recovers from the stored snapshot if the target text still matches \
-(fmt/whitespace changes tolerated); otherwise rejected with guidance. \
-new_text with multiple lines replaces the range; empty new_text deletes it. \
-Prefer edit_range over edit when you have line numbers from read/search; use edit when you \
-only have an exact text fragment. \
+                "Edit a line range by revision + line numbers. DEPRECATED — use edit with \
+operations=[{kind: \"replace_lines\", start_line, end_line, new_text}] instead. \
+Kept for compatibility; new code should call edit. \
 Example: edit_range path=src/main.rs revision=b3:<hex> start_line=118 end_line=120 new_text=\"...\""
             }
             BuiltinTool::Write => {
@@ -1041,7 +1042,7 @@ mod tests {
             ("web_fetch", "SSRF"),
             ("web_search", "discovery only"),
             ("search", "Use when"),
-            ("edit", "stale revisions are rejected"),
+            ("edit", "revision-bound"),
         ] {
             let tool = BuiltinTool::from_name(name).unwrap();
             assert!(
@@ -1160,8 +1161,8 @@ mod tests {
             "expected shape 必须含 revision: {msg}"
         );
         assert!(
-            msg.contains("replacements"),
-            "expected shape 必须含 replacements: {msg}"
+            msg.contains("operations"),
+            "expected shape 必须含 operations（Edit V2）: {msg}"
         );
 
         let err = BuiltinTool::Write.parse_args("{}").unwrap_err();
