@@ -772,6 +772,10 @@ async fn text_only_interrupt_auto_continues_and_merges() {
     );
 }
 
+/// §4.3 更新：已收内容后的**协议错误**（坏 chunk）与连接断流同等对待——
+/// 自动续写（新语义，§用户诉求：出问题不应逼用户手动 /retry）。
+/// 此处 provider 第一次返回 Protocol 错误（已收 partial），第二次续写成功：
+/// 断言自动续写发生（calls == 2）且 run 正常完成。
 struct ProtocolAfterDeltaProvider {
     calls: usize,
 }
@@ -788,16 +792,30 @@ impl Provider for ProtocolAfterDeltaProvider {
         _cancel: CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
         self.calls += 1;
-        events
-            .send(ProviderEvent::TextDelta("partial".into()))
-            .await
-            .map_err(|_| ProviderError::Protocol("closed".into()))?;
-        Err(ProviderError::Protocol("malformed SSE payload".into()))
+        if self.calls == 1 {
+            // 第一次：已产出 partial 后协议错误（真实场景 = 流中途坏 chunk）。
+            events
+                .send(ProviderEvent::TextDelta("partial".into()))
+                .await
+                .map_err(|_| ProviderError::Protocol("closed".into()))?;
+            Err(ProviderError::Protocol("malformed SSE payload".into()))
+        } else {
+            // 第二次：续写成功（服务端瞬时异常恢复）。
+            events
+                .send(ProviderEvent::TextDelta(" 续写完成".into()))
+                .await
+                .map_err(|_| ProviderError::Protocol("closed".into()))?;
+            Ok(ProviderResponse {
+                finish_reason: FinishReason::Stop,
+                tool_calls: Vec::new(),
+                usage: tpi_session::Usage::default(),
+            })
+        }
     }
 }
 
 #[tokio::test]
-async fn protocol_error_after_delta_is_recorded_without_automatic_retry() {
+async fn protocol_error_after_delta_auto_recovers_with_resume() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let config = test_config(&workspace);
@@ -830,8 +848,15 @@ async fn protocol_error_after_delta_is_recorded_without_automatic_retry() {
     .await
     .unwrap();
 
-    assert_eq!(outcome.reason, CompletionReason::ProviderInterrupted);
-    assert_eq!(provider.calls, 1, "协议错误不得按连接中断自动续写");
+    assert_eq!(
+        provider.calls, 2,
+        "协议错误（已收内容后）必须自动续写一次"
+    );
+    assert_eq!(
+        outcome.reason,
+        CompletionReason::Stop,
+        "续写成功后 run 正常完成"
+    );
     let events = tpi::session::read_events(session.path()).unwrap();
     assert!(events.iter().any(|event| matches!(
         event,

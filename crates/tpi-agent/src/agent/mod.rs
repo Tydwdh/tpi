@@ -845,9 +845,14 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                                     })
                                     .await;
                                 stream_recoveries += 1;
-                                // 续写请求（content 已累积 partial，recovery instruction
-                                // 在下一个 attempt 循环开头注入 request）。
-                                continue 'attempt;
+                                // §bug 修复：退避后再续写（此前零退避，服务端持续
+                                // 故障时额度瞬间耗尽）；等待期间取消 → 不续写，
+                                // fall through 到一般错误处理。
+                                if wait_retry_backoff(&cancel, stream_recoveries).await {
+                                    // 续写请求（content 已累积 partial，recovery
+                                    // instruction 在下一个 attempt 循环开头注入）。
+                                    continue 'attempt;
+                                }
                             }
                             // §4.3 第三阶段：partial tool-call 后断联 → 整个 turn 重新生成。
                             // 条件：已出现 tool delta（saw_tool_calls=true）、流截断
@@ -871,12 +876,16 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                                     })
                                     .await;
                                 turn_restarts += 1;
-                                // 清空本 attempt 的 partial（UI 已 discard；content 重置），
-                                // 下一个 attempt 以原始 request 重新生成整个 turn。
-                                content.clear();
-                                saw_any_semantic = false;
-                                saw_tool_calls = false;
-                                continue 'attempt;
+                                // §bug 修复：退避后再重启（同续写）；等待期间取消 →
+                                // 不重启，fall through 到一般错误处理（不 continue）。
+                                if wait_retry_backoff(&cancel, turn_restarts).await {
+                                    // 清空本 attempt 的 partial（UI 已 discard；content
+                                    // 重置），下一个 attempt 以原始 request 重新生成。
+                                    content.clear();
+                                    saw_any_semantic = false;
+                                    saw_tool_calls = false;
+                                    continue 'attempt;
+                                }
                             }
                             // §4.3 第四阶段：无任何语义内容的**瞬时传输类失败**
                             // （Connection/Http/RateLimited）→ 自动重启整个 turn。
@@ -887,7 +896,13 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                             // 不应让整个任务失败、逼用户盯着重来（§用户诉求：
                             // 任何失败都应自动重试）。
                             if !saw_any_semantic
-                                && is_transient_transport_error(&e)
+                                && (is_transient_transport_error(&e)
+                                    // §bug 修复：流开头的 Protocol 错误（坏 chunk/格式
+                                    // 异常，如本次 invalid chunk）也自动重启——未收到任何
+                                    // 语义内容，重发不重复内容，服务端瞬时异常往往一次
+                                    // 重试即成功；已收内容后的 Protocol 错误不受影响
+                                    //（!saw_any_semantic 已排除，避免重复内容）。
+                                    || matches!(e, crate::provider::ProviderError::Protocol(_)))
                                 && turn_restarts < MAX_TURN_RESTARTS
                             {
                                 let _ = ui
@@ -896,7 +911,10 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                                     })
                                     .await;
                                 turn_restarts += 1;
-                                continue 'attempt;
+                                // §bug 修复：退避后再重启（同前）；取消则不重启。
+                                if wait_retry_backoff(&cancel, turn_restarts).await {
+                                    continue 'attempt;
+                                }
                             }
                                 // §4.3：区分"未收到任何语义事件"（连接不可用）与
                                 // "已收到部分内容后断联"（记录 interrupted attempt）。
@@ -1266,6 +1284,19 @@ async fn forward_provider_event(
 }
 
 /// 把 provider 错误分类为会话中断原因（§4.3）。
+/// §bug 修复：续写/重启之间的指数退避（此前零退避——服务端持续故障时
+/// MAX_STREAM_RECOVERIES/MAX_TURN_RESTARTS 次尝试瞬间耗尽，用户看不到
+/// 重试过程，等于没重试）。`500ms * 2^attempt`，封顶 8s；等待期间用户
+/// 取消返回 false（不重发请求）。
+async fn wait_retry_backoff(cancel: &CancellationToken, attempt: u32) -> bool {
+    let shift = attempt.min(4); // 2^4 = 16 → 500ms*16 = 8s 封顶
+    let delay = std::time::Duration::from_millis(500).saturating_mul(1u32 << shift);
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
 fn interrupt_cause(error: &crate::provider::ProviderError) -> tpi_session::InterruptCause {
     use crate::provider::ProviderError;
     use tpi_session::InterruptCause;
@@ -1283,15 +1314,25 @@ fn interrupt_cause(error: &crate::provider::ProviderError) -> tpi_session::Inter
 
 /// §4.3：流中断是否值得自动恢复（续写/重生成）。
 ///
-/// 只有连接层面已建立、已收到部分内容后才断流（`StreamInterrupted`）才恢复：
+/// 已收到部分内容后才断流的场景（`StreamInterrupted` 截断 / `Protocol` 格式
+/// 异常，如中途 invalid chunk）都恢复：
 /// - 已产生文本但未出 tool delta → 续写（新请求带 recovery instruction）；
 /// - 已出 tool delta → 整个 turn 重新生成。
 ///
 /// `Connection`（未收到任何内容的传输失败）不恢复——provider 内部已按退避
 /// 重试 `MAX_ATTEMPTS` 次仍失败，agent 再续写大概率同样失败，只增加网络请求
 /// 与 UI 噪音（§用户诉求：修复"大量 run 失败"刷屏）。
+///
+/// §bug 修复：Protocol 错误（坏 chunk）在**已收内容后**同样自动恢复——此前
+/// 只有 StreamInterrupted 恢复，模型输出中途遇 invalid chunk 直接失败等手动
+/// retry；自动续写/重生成有 recovery overlap 去重（文本）与 turn 重建（tool），
+/// 且有额度与退避，失败最终仍会落到一般错误处理（不会无限重试）。
 fn recoverable_stream_interrupt(error: &crate::provider::ProviderError) -> bool {
-    matches!(error, crate::provider::ProviderError::StreamInterrupted(_))
+    matches!(
+        error,
+        crate::provider::ProviderError::StreamInterrupted(_)
+            | crate::provider::ProviderError::Protocol(_)
+    )
 }
 
 /// §4.3：瞬时传输类失败（网络抖动/服务端瞬时错误/限流）——重试可能成功，
@@ -1646,10 +1687,11 @@ mod tests {
     }
 
     use super::{
-        build_context, ensure_plan_state_messages, recoverable_stream_interrupt,
-        recovery_overlap_bytes,
+        build_context, ensure_plan_state_messages, is_transient_transport_error,
+        recoverable_stream_interrupt, recovery_overlap_bytes, wait_retry_backoff,
     };
     use crate::provider::ChatMessage;
+    use tokio_util::sync::CancellationToken;
     use tpi_core::plan::{Plan, PlanItem, PlanStatus};
 
     /// 最小可用 Config（build_context 只读 system_prompt_extra 等字段）。
@@ -1845,9 +1887,58 @@ mod tests {
             "未收内容的连接失败不得自动续写（provider 已重试耗尽）"
         );
         assert!(
-            !recoverable_stream_interrupt(&ProviderError::Protocol("x".into())),
-            "协议错误不可恢复"
+            recoverable_stream_interrupt(&ProviderError::Protocol(
+                "invalid chunk: null, expected a sequence".into()
+            )),
+            "已收内容后的协议错误（坏 chunk）必须可恢复（自动续写/重生成）"
         );
+    }
+
+    /// §bug 修复：流开头的 Protocol 错误（坏 chunk，未收任何语义内容）纳入
+    /// 自动重启——重发不重复内容，服务端瞬时异常一次重试即成功；已收内容后
+    /// 的 Protocol 错误不在此列（由 is_transient_transport_error 排除）。
+    #[test]
+    fn pre_semantic_protocol_error_is_auto_retried() {
+        use crate::provider::ProviderError;
+        // Protocol 错误本身不是 transport transient，但作为"未收内容"的
+        // 流开头失败，agent 第四阶段会自动重启（条件在 run 循环内联，这里
+        // 验证判定函数语义：is_transient_transport_error 仍排除 Protocol，
+        // 避免已收内容后的协议错误被误重启）。
+        assert!(!is_transient_transport_error(&ProviderError::Protocol(
+            "invalid chunk: null, expected a sequence".into()
+        )));
+        // 但 Connection/Http/RateLimited 仍是可重启的瞬时错误。
+        assert!(is_transient_transport_error(&ProviderError::Connection(
+            "connect timeout".into()
+        )));
+        assert!(is_transient_transport_error(&ProviderError::Http(
+            "500".into()
+        )));
+        assert!(is_transient_transport_error(&ProviderError::RateLimited(
+            "429".into()
+        )));
+    }
+
+    /// §bug 修复：退避等待——未取消时返回 true；取消时立即返回 false。
+    #[tokio::test]
+    async fn retry_backoff_respects_cancel() {
+        // 未取消：attempt=0 → 500ms，应正常返回 true。
+        let cancel = CancellationToken::new();
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_retry_backoff(&cancel, 0),
+        )
+        .await;
+        assert_eq!(ok, Ok(true), "未取消应等到退避结束返回 true");
+        // 取消：立即返回 false。
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            wait_retry_backoff(&cancel, 5),
+        )
+        .await;
+        assert_eq!(ok, Ok(false), "取消应立即返回 false");
     }
 
     #[test]

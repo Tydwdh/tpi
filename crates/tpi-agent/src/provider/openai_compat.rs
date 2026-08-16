@@ -150,9 +150,22 @@ fn message_to_json(message: &ChatMessage) -> serde_json::Value {
     }
 }
 
+/// 容忍数组字段为 `null`（视为空数组）：`#[serde(default)]` 只处理字段缺失，
+/// 不处理显式 `null`——真实 OpenAI 兼容服务（DeepSeek/网关等）在纯 usage
+/// chunk 或推理帧会发 `"choices": null` / `"delta.tool_calls": null`，
+/// 直接反序列化会报 `invalid type: null, expected a sequence`。
+/// 空数组语义与缺失一致（调用方已有 `is_empty()` 处理），null → 空是安全降级。
+fn deserialize_null_vec<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 struct SseChunk {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
     choices: Vec<SseChoice>,
     #[serde(default)]
     usage: Option<SseUsage>,
@@ -174,7 +187,7 @@ struct SseDelta {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
     tool_calls: Vec<SseToolCallDelta>,
 }
 
@@ -1098,6 +1111,32 @@ fn parse_finish_reason(reason: &str) -> FinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §bug 修复：`choices` / `delta.tool_calls` 为 `null` 时视为空数组
+    ///（此前 serde 报 `invalid type: null, expected a sequence`，整轮 run
+    /// 失败——真实 OpenAI 兼容服务在 usage chunk / 推理帧会发 null）。
+    #[test]
+    fn sse_chunk_tolerates_null_sequence_fields() {
+        // choices: null（usage-only chunk）。
+        let chunk: SseChunk =
+            serde_json::from_str(r#"{"choices": null, "usage": {"prompt_tokens": 1}}"#)
+                .expect("choices null 应解析为空数组");
+        assert!(chunk.choices.is_empty());
+        assert_eq!(chunk.usage.as_ref().unwrap().prompt_tokens, Some(1));
+
+        // delta.tool_calls: null（推理/工具帧）。
+        let chunk: SseChunk = serde_json::from_str(
+            r#"{"choices": [{"index": 0, "delta": {"content": "hi", "tool_calls": null}}]}"#,
+        )
+        .expect("delta.tool_calls null 应解析为空数组");
+        assert_eq!(chunk.choices.len(), 1);
+        assert!(chunk.choices[0].delta.tool_calls.is_empty());
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+
+        // 字段完全缺失仍默认空（原有行为不回退）。
+        let chunk: SseChunk = serde_json::from_str(r#"{}"#).expect("缺字段默认");
+        assert!(chunk.choices.is_empty());
+    }
 
     #[test]
     fn finish_reason_mapping() {
