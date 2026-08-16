@@ -986,11 +986,16 @@ fn write_tool_plan(
     allow_outside_workspace: bool,
 ) -> Option<tool::edit::CommitPlan> {
     match tool {
-        BuiltinTool::Edit | BuiltinTool::Write => {
+        BuiltinTool::Edit | BuiltinTool::EditRange | BuiltinTool::Write => {
             let target = match tool {
                 BuiltinTool::Edit => {
                     let parsed =
                         serde_json::from_str::<tool::edit::EditArgs>(&call.arguments).ok()?;
+                    parsed.path
+                }
+                BuiltinTool::EditRange => {
+                    let parsed =
+                        serde_json::from_str::<tool::edit::EditRangeArgs>(&call.arguments).ok()?;
                     parsed.path
                 }
                 _ => {
@@ -1071,6 +1076,28 @@ fn recovery_metadata(
                     .and_then(tool::edit::parse_revision_token)
                     .unwrap_or_default(),
                 candidate_revision: Some(tool::edit::revision_of(parsed.content.as_bytes())),
+                temp_path: temp,
+                backup_path: backup,
+            })
+        }
+        (BuiltinTool::EditRange, arguments) => {
+            let parsed = serde_json::from_str::<tool::edit::EditRangeArgs>(arguments).ok()?;
+            let (temp, backup) = plan_paths(plan?);
+            let target = tpi_capabilities::tool::resolve_write_path(
+                workspace_root,
+                &parsed.path,
+                allow_outside_workspace,
+            )
+            .ok()?;
+            let expected_revision = tool::edit::parse_revision_token(&parsed.revision)
+                .unwrap_or_else(|| parsed.revision.clone());
+            // 不预演 candidate（apply_edit_range 需要 snapshot_store 做 stale
+            // 恢复，recovery 阶段无 ctx；candidate 由实际执行时计算）。
+            Some(RecoveryMetadata {
+                tool: "edit_range".into(),
+                target_path: target.to_string(),
+                expected_revision,
+                candidate_revision: None,
                 temp_path: temp,
                 backup_path: backup,
             })
@@ -1256,5 +1283,39 @@ mod tests {
         assert!(out.contains("@artifact/s/id"), "保留 artifact 引用: {out}");
         assert!(!out.contains("页面正文……"), "原文不应再进上下文: {out}");
         assert_eq!(usage.input_tokens, 10, "摘要 usage 必须累计");
+    }
+
+    /// edit_range 必须像 edit/write 一样获得提交计划（§10.7：写工具
+    /// 预检时生成 plan），否则执行时 missing_commit_plan 拒绝。
+    #[test]
+    fn write_tool_plan_covers_edit_range() {
+        let call = tpi_core::message::ToolCall {
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
+            provider_id: "p1".into(),
+            name: "edit_range".into(),
+            arguments: serde_json::json!({
+                "path": "src/main.rs",
+                "revision": "b3:".to_string() + &"a".repeat(64),
+                "start_line": 1,
+                "end_line": 2,
+                "new_text": "x",
+            })
+            .to_string(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let plan = write_tool_plan(BuiltinTool::EditRange, &call, &root, false);
+        assert!(plan.is_some(), "edit_range 必须生成提交计划");
+        // 解析失败（缺字段）→ None（与其他写工具一致）。
+        let bad = tpi_core::message::ToolCall {
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
+            provider_id: "p1".into(),
+            name: "edit_range".into(),
+            arguments: "{}".into(),
+        };
+        assert!(
+            write_tool_plan(BuiltinTool::EditRange, &bad, &root, false).is_none(),
+            "非法参数不生成 plan"
+        );
     }
 }
