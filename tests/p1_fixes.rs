@@ -848,10 +848,7 @@ async fn protocol_error_after_delta_auto_recovers_with_resume() {
     .await
     .unwrap();
 
-    assert_eq!(
-        provider.calls, 2,
-        "协议错误（已收内容后）必须自动续写一次"
-    );
+    assert_eq!(provider.calls, 2, "协议错误（已收内容后）必须自动续写一次");
     assert_eq!(
         outcome.reason,
         CompletionReason::Stop,

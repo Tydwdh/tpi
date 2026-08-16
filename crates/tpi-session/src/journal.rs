@@ -118,6 +118,92 @@ pub fn undo_all(
     Ok(restored)
 }
 
+/// undo 最近一条 mutation（最后一个提交的编辑）：恢复到它的 before 内容。
+/// 返回实际恢复的文件数；journal 为空时返回 Err(NotFound)。
+pub fn undo_last(
+    mutations: &[JournalMutation],
+    workspace_root: &std::path::Path,
+) -> std::io::Result<usize> {
+    let Some(last) = mutations.last() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "journal is empty: no mutation to undo",
+        ));
+    };
+    undo_mutation(mutations, &last.mutation_id, workspace_root)
+}
+
+/// redo 单条 mutation：把每个文件恢复到 after_content（撤销 undo）。
+/// 返回实际恢复的文件数；文件当前内容已与 after 一致时跳过（幂等）。
+pub fn redo_mutation(
+    mutations: &[JournalMutation],
+    mutation_id: &str,
+    workspace_root: &std::path::Path,
+) -> std::io::Result<usize> {
+    let Some(mutation) = mutations.iter().find(|m| m.mutation_id == mutation_id) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("mutation not found: {mutation_id}"),
+        ));
+    };
+    let mut restored = 0usize;
+    for file in &mutation.files {
+        let target = resolve_target(&file.path, workspace_root);
+        let after = &file.after_content;
+        match std::fs::read(&target) {
+            Ok(current) if current == *after => {}
+            _ => {
+                write_atomic(&target, after)?;
+                restored += 1;
+            }
+        }
+    }
+    Ok(restored)
+}
+
+/// redo 最近一条 mutation（最后一个提交的编辑的 after 内容）。
+/// journal 为空时返回 Err(NotFound)。
+pub fn redo_last(
+    mutations: &[JournalMutation],
+    workspace_root: &std::path::Path,
+) -> std::io::Result<usize> {
+    let Some(last) = mutations.last() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "journal is empty: no mutation to redo",
+        ));
+    };
+    redo_mutation(mutations, &last.mutation_id, workspace_root)
+}
+
+/// redo 全部 mutations：把每个文件恢复到**最后一次**变更后的内容。
+/// 与 undo_all 镜像（undo_all 恢复最早 before；redo_all 恢复最晚 after）。
+pub fn redo_all(
+    mutations: &[JournalMutation],
+    workspace_root: &std::path::Path,
+) -> std::io::Result<usize> {
+    let mut latest: std::collections::HashMap<String, &crate::protocol::MutationFile> =
+        std::collections::HashMap::new();
+    for mutation in mutations {
+        for file in &mutation.files {
+            latest.insert(file.path.clone(), file);
+        }
+    }
+    let mut restored = 0usize;
+    for (path, file) in latest {
+        let target = resolve_target(&path, workspace_root);
+        let after = &file.after_content;
+        if std::fs::read(&target)
+            .map(|cur| cur != *after)
+            .unwrap_or(true)
+        {
+            write_atomic(&target, after)?;
+            restored += 1;
+        }
+    }
+    Ok(restored)
+}
+
 /// 恢复单个文件到 before 内容。幂等：当前内容已等于 before 时跳过。
 fn restore_file(
     file: &crate::protocol::MutationFile,
@@ -241,6 +327,47 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "v0\n");
     }
 
+    #[test]
+    fn redo_all_restores_latest_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("b.rs");
+        std::fs::write(&target, "v0\n").unwrap();
+        let m1 = mutation("m1", &target.to_string_lossy(), b"v0\n", b"v1\n");
+        let m2 = mutation("m2", &target.to_string_lossy(), b"v1\n", b"v2\n");
+        // 两次 mutation：v0→v1→v2。redo_all 应恢复到最后的 v2。
+        let mutations = vec![m1, m2];
+        let restored = redo_all(&mutations, dir.path()).unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2\n");
+    }
+
+    #[test]
+    fn undo_last_and_redo_last_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("c.rs");
+        std::fs::write(&target, "v2\n").unwrap();
+        let m1 = mutation("m1", &target.to_string_lossy(), b"v0\n", b"v1\n");
+        let m2 = mutation("m2", &target.to_string_lossy(), b"v1\n", b"v2\n");
+        let mutations = vec![m1, m2];
+        // undo_last：撤掉最近一条（m2），文件回到 v1。
+        let restored = undo_last(&mutations, dir.path()).unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1\n");
+
+        // redo_last：重做最近一条（m2），文件回到 v2。
+        let restored = redo_last(&mutations, dir.path()).unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2\n");
+    }
+
+    #[test]
+    fn undo_last_empty_journal_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(undo_last(&[], dir.path()).is_err());
+        assert!(redo_last(&[], dir.path()).is_err());
+    }
+
+    #[test]
     #[test]
     fn undo_unknown_mutation_errors() {
         let dir = tempfile::tempdir().unwrap();

@@ -1747,4 +1747,56 @@ mod tests {
             "line1\nline2\nline3\n"
         );
     }
+
+    /// §V2 修复：replace_lines 恢复内容锚定校验——行内容在文件中重复时拒绝
+    /// （MultipleMatches），防止行号错位时静默改错行（V1 的保护链曾丢失）。
+    #[test]
+    fn edit_operations_replace_lines_rejects_ambiguous_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("dup.rs")).unwrap();
+        // 第 1、3 行内容相同：replace_lines 1..=1 时 old_text="a\n" 在文件中出现 2 次。
+        std::fs::write(path.as_std_path(), "a\nb\na\n").unwrap();
+        let revision = read_revision(&path, &ctx);
+        let plan = crate::tool::edit::prepare_commit(&path);
+
+        let outcome = edit(
+            crate::tool::edit::EditArgs {
+                path: path.to_string(),
+                revision,
+                operations: vec![crate::tool::edit::EditOperation::ReplaceLines {
+                    start_line: 1,
+                    end_line: 1,
+                    new_text: "A".into(),
+                }],
+                replacements: Vec::new(),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(outcome.status, ToolStatus::Failed, "歧义行必须拒绝");
+        assert!(
+            outcome.model_payload.output.contains("multiple_matches"),
+            "错误应为 multiple_matches: {}",
+            outcome.model_payload.output
+        );
+
+        // 唯一内容行仍可正常替换（不破坏正常场景）。
+        let revision2 = read_revision(&path, &ctx);
+        let outcome2 = edit(
+            crate::tool::edit::EditArgs {
+                path: path.to_string(),
+                revision: revision2,
+                operations: vec![crate::tool::edit::EditOperation::ReplaceLines {
+                    start_line: 2,
+                    end_line: 2,
+                    new_text: "B".into(),
+                }],
+                replacements: Vec::new(),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(outcome2.status, ToolStatus::Succeeded);
+    }
 }

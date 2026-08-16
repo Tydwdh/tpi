@@ -674,9 +674,10 @@ where
     // §用户诉求：--continue/--resume 恢复后明确显示当前会话（首条消息预览 +
     // 短 id），避免“恢复后不知道是哪一个会话”。
     if conversation.log().is_some() {
-        ui_state
-            .view
-            .push_line(LineKind::System, session_resume_label(conversation.log()));
+        ui_state.view.push_line(
+            LineKind::System,
+            session_resume_label(conversation.log(), &config.artifacts_root),
+        );
     }
     // 排队语义（§12 稳定化任务书）：运行中输入先存 ui_state.pending_message，
     // 当前 run 完成后由主循环作为下一条消息提交——不是 run 内的
@@ -1266,7 +1267,8 @@ where
                                             })
                                         })
                                 });
-                            let label = session_resume_label(conversation.log());
+                            let label =
+                                session_resume_label(conversation.log(), &config.artifacts_root);
                             ui_state.view.push_line(LineKind::System, label);
                             if let Some(_prompt) = resumed_pending_input {
                                 ui_state.view.push_line(
@@ -2913,18 +2915,32 @@ pub fn list_sessions(
 
 /// §用户诉求（恢复会话可判断）：恢复时显示人类可读标识——首条用户消息
 /// 预览 + 短 id，而不是让用户面对完整 UUID 哈希。
-fn session_resume_label(log: Option<&SessionLog>) -> String {
+fn session_resume_label(log: Option<&SessionLog>, artifacts_root: &std::path::Path) -> String {
     let Some(log) = log else {
         return "已恢复会话".to_string();
     };
     let id = log.session_id().to_string();
     let short: String = id.chars().take(13).collect(); // 019feea2-e01d
     let preview = first_user_preview(log.path());
-    if preview.is_empty() {
+    let mut label = if preview.is_empty() {
         format!("已恢复会话（{short}…）")
     } else {
         format!("已恢复会话「{preview}」（{short}…）")
+    };
+    // §B：崩溃恢复提示——该会话有已记录的文件变更时，提示可回滚。
+    // journal 数据在，编辑是已提交事实；恢复后模型/用户可 `tpi undo` 回滚。
+    let jpath = crate::session::journal::journal_path(artifacts_root, &id);
+    if jpath.exists() {
+        if let Ok(mutations) = crate::session::journal::load_journal(&jpath)
+            && !mutations.is_empty()
+        {
+            label.push_str(&format!(
+                "（{} 条文件变更，`tpi undo` 可回滚）",
+                mutations.len()
+            ));
+        }
     }
+    label
 }
 
 /// P2：从 session 文件提取首条用户消息摘要（≤40 字符，单行）。

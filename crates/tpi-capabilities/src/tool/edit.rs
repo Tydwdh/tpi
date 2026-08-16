@@ -495,6 +495,28 @@ fn resolve_operation(
                     end_line: *end_line,
                 });
             }
+            // 内容锚定校验（恢复 V1 edit_range 的保护链，V2 引入时曾丢失）：
+            // 行号必须与实际内容一致。行号错位时，提取的 old_text（错行内容）
+            // 要么在文件中重复（歧义 → 拒绝），要么唯一但位于其他位置（→ 拒绝）。
+            // 安全失败优先于模糊命中的“危险成功”（V1 设计原则）。
+            let old_text = extract_lines(text, *start_line, *end_line);
+            let occurrences = count_occurrences(text, &old_text);
+            if occurrences > 1 {
+                return Err(EditError::MultipleMatches {
+                    path: snapshot.path.clone(),
+                    index: 0,
+                });
+            }
+            if occurrences == 1 && text.find(&old_text) != Some(start) {
+                return Err(EditError::NoMatch {
+                    path: snapshot.path.clone(),
+                    index: 0,
+                    context: Some(format!(
+                        "行 {start_line}..={end_line} 的内容在文件中位于其他位置（行号错位；请用 replace_text 或 read 确认实际内容）"
+                    )),
+                    diagnostic: None,
+                });
+            }
             // 行级替换语义：new_text 由工具补换行（空 new_text 删整段行）。
             let mut replacement = new_text.clone();
             if !replacement.is_empty()

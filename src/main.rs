@@ -84,6 +84,24 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// 撤销文件变更（Mutation Journal）：恢复编辑前的内容。
+    Undo {
+        /// 会话 id（默认：当前 workspace 最近有变更的会话）。
+        #[arg(long)]
+        session: Option<String>,
+        /// 撤销到最早（整个会话所有变更）；否则只撤销最近一条。
+        #[arg(long)]
+        all: bool,
+    },
+    /// 重做已撤销的文件变更（Mutation Journal 的 after 内容）。
+    Redo {
+        /// 会话 id（默认：当前 workspace 最近有变更的会话）。
+        #[arg(long)]
+        session: Option<String>,
+        /// 重做到最后（整个会话所有变更的最终状态）；否则只重做最近一条。
+        #[arg(long)]
+        all: bool,
+    },
     /// 局域网网页接口（粗糙版）：手机发送/接收消息，不用守在电脑前。
     /// 无 TLS；同一时刻只处理一条消息；可选 --token 做简单访问控制。
     Serve {
@@ -459,6 +477,80 @@ fn repair_sessions(
     }
     Ok(())
 }
+/// `tpi undo` / `tpi redo`：基于 Mutation Journal 撤销/重做文件变更。
+///
+/// - 默认操作最近一次编辑（undo_last/redo_last）；`--all` 时整体回滚/重放。
+/// - `--session <id>` 指定会话；默认当前 workspace 最近有 journal 的会话。
+/// - journal 在 `~/.tpi/artifacts/<session>/journal.jsonl`（§B1）。
+fn run_journal_cmd(action: &str, session: Option<&str>, all: bool) -> Result<(), String> {
+    let home = tpi::config::tpi_home();
+    let artifacts_root = home.join("artifacts");
+    let workspace_root = current_workspace_root(None)?;
+
+    // 选择会话：显式指定，或当前 workspace 最近有 journal 的会话。
+    let session_id = match session {
+        Some(id) => id.to_string(),
+        None => {
+            let sessions = tpi::app::list_sessions(&home.join("sessions"), &workspace_root)
+                .map_err(|e| e.to_string())?;
+            let mut candidate: Option<String> = None;
+            let mut latest: Option<std::time::SystemTime> = None;
+            for (id, modified, _, _) in &sessions {
+                let jpath = tpi::session::journal::journal_path(&artifacts_root, &id.to_string());
+                if jpath.exists() {
+                    match latest {
+                        Some(prev) if prev >= *modified => {}
+                        _ => {
+                            candidate = Some(id.to_string());
+                            latest = Some(*modified);
+                        }
+                    }
+                }
+            }
+            match candidate {
+                Some(id) => id,
+                None => {
+                    println!("当前 workspace 没有可撤销的会话（无 journal 变更记录）");
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    let jpath = tpi::session::journal::journal_path(&artifacts_root, &session_id);
+    let mutations = tpi::session::journal::load_journal(&jpath).map_err(|e| e.to_string())?;
+    if mutations.is_empty() {
+        println!(
+            "会话 {} 的 journal 为空（没有已记录的文件变更）",
+            session_id
+        );
+        return Ok(());
+    }
+    println!(
+        "会话 {}：journal 共 {} 条变更{}，执行 {}……",
+        session_id,
+        mutations.len(),
+        if all {
+            "（全量）"
+        } else {
+            "（最近一条）"
+        },
+        action
+    );
+
+    let ws = workspace_root.as_std_path();
+    let restored = match (action, all) {
+        ("undo", true) => tpi::session::journal::undo_all(&mutations, ws),
+        ("undo", false) => tpi::session::journal::undo_last(&mutations, ws),
+        ("redo", true) => tpi::session::journal::redo_all(&mutations, ws),
+        ("redo", false) => tpi::session::journal::redo_last(&mutations, ws),
+        _ => unreachable!("run_journal_cmd 只接受 undo/redo"),
+    }
+    .map_err(|e| format!("{} 失败: {e}", action))?;
+
+    println!("{} 完成：{} 个文件已恢复", action, restored);
+    Ok(())
+}
 
 fn active_session_ids(
     sessions_root: &std::path::Path,
@@ -790,6 +882,14 @@ fn run(cli: Cli) -> Result<(), String> {
                 return repair_sessions(&sessions_root, &workspace_root, *dry_run);
             }
         }
+    }
+
+    // §B：`tpi undo` / `tpi redo`——基于 Mutation Journal 撤销/重做文件变更。
+    if let Some(Command::Undo { session, all }) = &cli.command {
+        return run_journal_cmd("undo", session.as_deref(), *all);
+    }
+    if let Some(Command::Redo { session, all }) = &cli.command {
+        return run_journal_cmd("redo", session.as_deref(), *all);
     }
 
     // P2：`tpi prune`——清理过期 session/artifact（~/.tpi/sessions 与 artifacts）。
