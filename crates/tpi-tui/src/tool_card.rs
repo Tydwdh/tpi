@@ -232,6 +232,8 @@ fn visible_window(card: &ToolCard, total: usize) -> (usize, usize, Option<String
         ToolCardState::Done { status, .. } if *status != tpi_core::outcome::ToolStatus::Succeeded
     );
     let is_running = matches!(&card.state, ToolCardState::Running);
+    // §子代理卡片：折叠态预览最新 2 行 child 活动（实时观察的卡片级呈现）。
+    let is_subagent = card.name == "subagent";
     // 折叠态：collapsed_lines==0 → 只显示主行，不显示任何正文（overflow=true）；
     // 否则正文超折叠线才折叠。空正文（total==0）不折叠、不显示提示行。
     let overflow = total > 0 && (collapsed == 0 || total > collapsed);
@@ -243,6 +245,9 @@ fn visible_window(card: &ToolCard, total: usize) -> (usize, usize, Option<String
     } else if is_failed {
         // §PointerHit：失败显示错误尾部（tail 末尾，诊断优先）。
         (total.saturating_sub(FAILED_LINES), total)
+    } else if is_subagent {
+        // §子代理卡片：折叠预览显示最新 2 行 child 活动（与运行中尾部同语义）。
+        (total.saturating_sub(2), total)
     } else {
         (0, collapsed.min(total))
     };

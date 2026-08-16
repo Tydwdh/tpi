@@ -143,6 +143,31 @@ impl UiState {
         item
     }
 
+    /// 查看队首待提交消息（不移除；§run 中 /命令：reducer 提交后 app 层
+    /// 需要知道队首是不是 slash 命令，以便立即取消 run 执行它）。
+    pub fn peek_pending(&self) -> Option<&str> {
+        self.pending_messages.front().map(String::as_str)
+    }
+
+    /// 队列中是否存在 `/` 命令（任意位置）——run 中提交的 / 命令必须立即
+    /// 取消 run 执行（不被前面排队的普通消息挡住）。
+    pub fn has_pending_slash(&self) -> bool {
+        self.pending_messages.iter().any(|m| m.starts_with('/'))
+    }
+
+    /// 把队列中第一个 `/` 命令提到队首（app 消费时优先执行——/ 命令是本地
+    /// 即时操作，不应被排队中的普通 agent 消息阻塞）。
+    pub fn promote_pending_slash(&mut self) {
+        if let Some(idx) = self
+            .pending_messages
+            .iter()
+            .position(|m| m.starts_with('/'))
+            && let Some(cmd) = self.pending_messages.remove(idx)
+        {
+            self.pending_messages.push_front(cmd);
+        }
+    }
+
     /// 把队列长度同步到视图（footer“已排队 N”提示）。
     fn sync_pending_len(&mut self) {
         self.view.pending_queue_len = self.pending_messages.len();

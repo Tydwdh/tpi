@@ -18,7 +18,6 @@ use tpi_core::outcome::ToolOutcome;
 use crate::agent::LiveEvent;
 use crate::provider::Provider;
 use crate::subagent::child::InProcessChildProvider;
-use crate::subagent::parallel::BoundedChildRunner;
 use crate::subagent::{ReadOnlyCapability, SubagentProvider, SubagentRequest};
 
 /// `subagent` 工具：发起只读调查（parent 侧接线）。
@@ -61,13 +60,10 @@ where
 #[derive(Debug, serde::Deserialize)]
 struct SubagentArgs {
     /// 调查指令（child 的 user message；只读调查，不修改 workspace）。
-    /// 与 `instructions` 二选一：传 `instructions` 数组时并行执行多条调查。
+    /// §去重（A/B 单选）：一次调用 = 一个 child = 一张 TUI 卡片；并行调查
+    /// 由模型在同一 wave 发多个 `subagent` 调用（ReadOnly 类别批内并行）。
     #[serde(default)]
     instruction: String,
-    /// 并行执行多条只读调查（P8-10）：每条独立 child session，并发受
-    /// `limits.max_parallel_tools` 限流，结果按数组顺序返回。
-    #[serde(default)]
-    instructions: Option<Vec<String>>,
     /// 只读能力白名单（默认 read/list/search/glob；显式传则覆盖）。
     #[serde(default)]
     capabilities: Option<Vec<String>>,
@@ -116,7 +112,8 @@ where
     fn description(&self) -> &str {
         "发起一次只读子代理调查：child 拥有独立 session/trace，只能调用只读工具 \
          (read/list/search/glob)，返回结构化报告（summary + 证据引用）。适合并行 \
-         独立调查、问题定位、代码审计。depth=1（child 不再发起 child）。"
+         独立调查、问题定位、代码审计：一次调用 = 一个 child；需要并行时在同一 \
+         wave 发起多个 subagent 调用（每个独立卡片、独立观察）。depth=1（child 不再发起 child）。"
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -125,12 +122,7 @@ where
             "properties": {
                 "instruction": {
                     "type": "string",
-                    "description": "单条调查指令（与 instructions 二选一）"
-                },
-                "instructions": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "多条调查指令：并行执行，每条独立 child session，结果按数组顺序返回（适合一次性并行审计多个文件/问题）"
+                    "description": "单条调查指令（child 的 user message；只读调查，不修改 workspace）"
                 },
                 "capabilities": {
                     "type": "array",
@@ -138,7 +130,7 @@ where
                     "description": "只读能力白名单（默认全部四项）"
                 }
             },
-            "description": "发起只读子代理调查：child 独立 session/trace，只能调用只读工具 (read/list/search/glob)，返回结构化报告。instruction 与 instructions 至少提供一个。depth=1（child 不再发起 child）。"
+            "description": "发起一次只读子代理调查：child 拥有独立 session/trace，只能调用只读工具 (read/list/search/glob)，返回结构化报告（summary + 证据引用）。适合并行独立调查、问题定位、代码审计：一次调用 = 一个 child；需要并行时在同一 wave 发起多个 subagent 调用（每个独立卡片、独立观察）。depth=1（child 不再发起 child）。"
         })
     }
 
@@ -171,12 +163,7 @@ where
                 );
             }
         };
-        if parsed.instruction.trim().is_empty()
-            && parsed
-                .instructions
-                .as_deref()
-                .is_none_or(|list| list.is_empty())
-        {
+        if parsed.instruction.trim().is_empty() {
             return ToolOutcome::failed(
                 self.name(),
                 tpi_core::outcome::ModelPayload {
@@ -184,24 +171,7 @@ where
                     program: None,
                     exit_code: Some(2),
                     duration_ms: 0,
-                    output: "subagent 需要非空 instruction 或非空 instructions 数组".into(),
-                    effect: None,
-                    artifact: None,
-                },
-            );
-        }
-        // instructions 数组为空条目拒绝（避免静默跳过）。
-        if let Some(list) = &parsed.instructions
-            && list.iter().any(|i| i.trim().is_empty())
-        {
-            return ToolOutcome::failed(
-                self.name(),
-                tpi_core::outcome::ModelPayload {
-                    status: tpi_core::outcome::ToolStatus::Failed,
-                    program: None,
-                    exit_code: Some(2),
-                    duration_ms: 0,
-                    output: "subagent instructions 数组不能含空条目".into(),
+                    output: "subagent 需要非空 instruction".into(),
                     effect: None,
                     artifact: None,
                 },
@@ -239,11 +209,11 @@ where
             );
         }
 
-        // P8-10：多指令并行——每个 child 独立 session/trace/provider 实例，
-        // 并发受 limits.max_parallel_tools 限流（BoundedChildRunner + semaphore），
-        // 结果按数组顺序返回；取消用 ctx.cancel（= 当前 run 的 token），
-        // 用户 Esc / Ctrl-C / watchdog 超时能中止全部 child。
-        let max_concurrent = self.config.limits.max_parallel_tools.max(1) as usize;
+        // §去重（A/B 单选）：一次调用 = 一个 child。child 独立 session/trace/
+        // provider 实例；取消用 ctx.cancel（= 当前 run 的 token），用户 Esc /
+        // Ctrl-C / watchdog 超时能中止 child。child 活动事件（assistant 文本 /
+        // 工具调用）经 ctx.output_tx 以 ToolOutputDelta 转发——TUI 卡片运行中
+        // 实时可见、可进入内部视图观察。
         let child_workspace = tpi_capabilities::workspace::ActiveWorkspace::local(
             tpi_capabilities::workspace::LocalWorkspace::new(
                 self.config.workspace_root.clone(),
@@ -251,97 +221,63 @@ where
             ),
         );
         let report_tx = self.report_tx.clone();
-        let make_child = {
-            let make_provider = self.make_provider.clone();
-            let config = self.config.clone();
-            let workspace = child_workspace.clone();
-            move || {
-                Box::new(
-                    InProcessChildProvider::<P, _>::new(
-                        {
-                            let make_provider = make_provider.clone();
-                            move || (make_provider)()
-                        },
-                        config.clone(),
-                        workspace.clone(),
-                    )
-                    .with_report_tx(report_tx.clone()),
-                ) as Box<dyn SubagentProvider + Send>
-            }
+        let output_tx = ctx.output_tx.clone();
+        let parent_call_id = ctx.call_id;
+        let mut child = InProcessChildProvider::<P, _>::new(
+            {
+                let make_provider = self.make_provider.clone();
+                move || (make_provider)()
+            },
+            self.config.clone(),
+            child_workspace,
+        )
+        .with_report_tx(report_tx)
+        .with_output_tx(output_tx, parent_call_id);
+        let request = SubagentRequest {
+            instruction: parsed.instruction.clone(),
+            child_session: SessionId::new_v7(),
+            capabilities,
+            parent: None, // 工具路径无 parent trace（child 自己起新 trace）
         };
+        // §bug 修复：测量 child 全部完成的实际耗时并写入结果——此前直接
+        // ToolOutcome::succeeded/failed（duration_ms 默认 0），TUI 工具卡片
+        // 显示耗时恒为 0。
+        let started = std::time::Instant::now();
+        let result = child.run_investigation(request, ctx.cancel.clone()).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
 
-        let mut runner = BoundedChildRunner::new(make_child, max_concurrent, MAX_REPORT_BYTES);
-        let cancel = ctx.cancel.clone();
-        // 单条 vs 多条：统一走 run_parallel（单条 = 数组长度 1）。
-        let instructions: Vec<String> = if parsed.instruction.trim().is_empty() {
-            parsed.instructions.clone().unwrap_or_default()
-        } else {
-            vec![parsed.instruction.clone()]
-        };
-        let requests: Vec<SubagentRequest> = instructions
-            .into_iter()
-            .map(|instruction| SubagentRequest {
-                instruction,
-                child_session: SessionId::new_v7(),
-                capabilities: capabilities.clone(),
-                parent: None, // 工具路径无 parent trace（child 自己起新 trace）
-            })
-            .collect();
-        let results = runner.run_parallel(requests, cancel).await;
-
-        // 汇总：全部成功 → succeeded（每条一个标题块）；任一条失败 → Failed
-        //（已成功的保留在输出中，模型能看到部分结论）。
-        let mut parts: Vec<String> = Vec::with_capacity(results.len());
-        let mut any_failed = false;
-        for (i, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(report) => {
-                    let mut block = format!(
-                        "[{}] 子代理调查完成（session {}）\n{}",
-                        i + 1,
-                        report.child_session,
-                        report.summary
-                    );
-                    if !report.evidence.is_empty() {
-                        block.push_str("\n证据:\n");
-                        for e in &report.evidence {
-                            block.push_str(&format!("  {e}\n"));
-                        }
+        match result {
+            Ok(report) => {
+                let mut output = format!(
+                    "子代理调查完成（session {}）\n{}",
+                    report.child_session, report.summary
+                );
+                if !report.evidence.is_empty() {
+                    output.push_str("\n证据:\n");
+                    for e in &report.evidence {
+                        output.push_str(&format!("  {e}\n"));
                     }
-                    if let Some(trace_id) = report.trace_id {
-                        block.push_str(&format!("trace: {trace_id}\n"));
-                    }
-                    parts.push(block);
                 }
-                Err(e) => {
-                    any_failed = true;
-                    parts.push(format!("[{}] 子代理调查失败: {e}", i + 1));
+                if let Some(trace_id) = report.trace_id {
+                    output.push_str(&format!("trace: {trace_id}\n"));
                 }
+                ToolOutcome::succeeded(self.name(), output).with_timing(duration_ms)
             }
-        }
-        let output = parts.join("\n---\n");
-        if any_failed {
-            ToolOutcome::failed(
+            Err(e) => ToolOutcome::failed(
                 self.name(),
                 tpi_core::outcome::ModelPayload {
                     status: tpi_core::outcome::ToolStatus::Failed,
                     program: None,
                     exit_code: None,
-                    duration_ms: 0,
-                    output,
+                    duration_ms,
+                    output: format!("子代理调查失败: {e}"),
                     effect: None,
                     artifact: None,
                 },
-            )
-        } else {
-            ToolOutcome::succeeded(self.name(), output)
+            ),
         }
     }
 }
-
-/// report summary 截断上限（单个 child 的 summary；parallel runner 内同样
-/// 有 cap_report 兜底，此处定义工具级常量供 runner 使用）。
-const MAX_REPORT_BYTES: usize = 4096;
 
 /// 供 registry 注册使用的类型擦除构造（composition root 调用）。
 /// P8-04：parent 侧把 `subagent` 工具注入 registry，模型即可发起只读调查。
@@ -482,11 +418,11 @@ mod tool_tests {
         let tool = SubagentTool::new(test_config(), || ChildFake, None);
         assert_eq!(tool.name(), "subagent");
         let schema = tool.input_schema();
-        // instruction 与 instructions 二选一（无 required；execute 校验非空）。
+        // §去重（A/B 单选）：一次调用 = 一个 child；schema 只有 instruction。
         assert_eq!(schema["properties"]["instruction"]["type"], "string");
-        assert_eq!(
-            schema["properties"]["instructions"]["items"]["type"], "string",
-            "schema 暴露 instructions 数组"
+        assert!(
+            schema["properties"].get("instructions").is_none(),
+            "instructions 数组已移除（一次调用 = 一个 child）"
         );
         assert_eq!(
             schema["properties"]["capabilities"]["items"]["enum"][0],
@@ -494,47 +430,27 @@ mod tool_tests {
         );
     }
 
-    /// P8-10：空 instructions 数组拒绝；多指令并行返回逐条结果块。
+    /// §去重（A/B 单选）：instructions 数组已移除——传它应失败（未知参数
+    /// 容忍或按指令非空处理；此处验证不产生多 child 行为）。
     #[tokio::test]
-    async fn subagent_tool_rejects_empty_instructions_array() {
+    async fn subagent_tool_ignores_instructions_array() {
         let tool = SubagentTool::new(test_config(), || ChildFake, None);
         let ctx = minimal_ctx();
-        let outcome = tool.execute(r#"{"instructions": []}"#, &ctx).await;
+        // instruction 缺失：必须失败（不再有 instructions 兜底）。
+        let outcome = tool.execute(r#"{"instructions": ["a", "b"]}"#, &ctx).await;
         assert_eq!(outcome.status, tpi_core::outcome::ToolStatus::Failed);
         assert!(outcome.model_text().contains("非空 instruction"));
     }
 
+    /// §bug 修复：结果携带真实耗时——此前 duration_ms 恒为 0，TUI 工具卡片
+    /// 显示耗时 0。SlowChildFake sleep 150ms（单 child）。
     #[tokio::test]
-    async fn subagent_tool_parallel_instructions_returns_all_blocks() {
-        let tool = SubagentTool::new(test_config(), || ChildFake, None);
-        let ctx = minimal_ctx();
-        let outcome = tool
-            .execute(
-                r#"{"instructions": ["调查 a.rs", "调查 b.rs", "调查 c.rs"]}"#,
-                &ctx,
-            )
-            .await;
-        assert_eq!(outcome.status, tpi_core::outcome::ToolStatus::Succeeded);
-        let text = outcome.model_text();
-        for i in 1..=3 {
-            assert!(
-                text.contains(&format!("[{i}] 子代理调查完成")),
-                "第 {i} 条结果块必须存在（source order）: {text}"
-            );
-        }
-        assert!(text.contains("child 调查完成"), "summary 合并: {text}");
-    }
-    /// P8-10：多指令**真实并行**——fake provider 记录并发峰值，
-    /// 3 条指令（每条 child 内 sleep）并行执行（峰值 > 1），串行实现
-    /// 会得到峰值 1。
-    #[tokio::test]
-    async fn subagent_parallel_instructions_actually_run_concurrently() {
+    async fn subagent_result_reports_real_duration() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::AtomicUsize;
 
         struct SlowChildFake {
-            active: Arc<AtomicUsize>,
-            peak: Arc<AtomicUsize>,
+            _active: Arc<AtomicUsize>,
         }
         impl Provider for SlowChildFake {
             fn model_name(&self) -> &str {
@@ -549,13 +465,8 @@ mod tool_tests {
                 if cancel.is_cancelled() {
                     return Err(crate::provider::ProviderError::Cancelled);
                 }
-                let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-                self.peak.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                self.active.fetch_sub(1, Ordering::SeqCst);
-                let _ = events
-                    .send(ProviderEvent::TextDelta("child 调查完成".into()))
-                    .await;
+                let _ = events.send(ProviderEvent::TextDelta("child 调查完成".into())).await;
                 Ok(ProviderResponse {
                     finish_reason: FinishReason::Stop,
                     tool_calls: Vec::new(),
@@ -564,30 +475,26 @@ mod tool_tests {
             }
         }
 
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let active2 = active.clone();
-        let peak2 = peak.clone();
         let tool = SubagentTool::new(
             test_config(),
-            move || SlowChildFake {
-                active: active2.clone(),
-                peak: peak2.clone(),
+            || SlowChildFake {
+                _active: Arc::new(AtomicUsize::new(0)),
             },
             None,
         );
         let ctx = minimal_ctx();
         let outcome = tool
-            .execute(
-                r#"{"instructions": ["调查 a.rs", "调查 b.rs", "调查 c.rs"]}"#,
-                &ctx,
-            )
+            .execute(r#"{"instruction": "调查 a.rs"}"#, &ctx)
             .await;
         assert_eq!(outcome.status, tpi_core::outcome::ToolStatus::Succeeded);
-        let concurrent = peak.load(Ordering::SeqCst);
+        let duration = outcome.model_payload.duration_ms;
         assert!(
-            concurrent > 1,
-            "3 条指令必须并行执行（峰值并发 > 1，实际 {concurrent}）"
+            duration >= 100,
+            "duration_ms 必须反映真实耗时（>=100ms，实际 {duration}）"
+        );
+        assert_eq!(
+            outcome.timing.duration_ms, duration,
+            "timing 与 model_payload 一致"
         );
     }
 }

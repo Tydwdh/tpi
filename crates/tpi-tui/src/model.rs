@@ -205,6 +205,17 @@ pub enum ToolCardState {
     },
 }
 
+/// §子代理内部视图（opencode 形态）：点击 subagent 卡进入，实时观察 child
+/// 内部活动（经 ToolOutputDelta 流入卡片 output 的文本流）；←/→ 在多个
+/// subagent 卡间切换，Esc/Backspace 返回父代理视图。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubagentViewState {
+    /// 当前打开的 subagent 卡片 id（None = 关闭，显示父代理）。
+    pub active: Option<String>,
+    /// 内部视图滚动（行；向上为正）。
+    pub scroll: usize,
+}
+
 /// 转录搜索（TUI v2 §14）：Ctrl+F 打开；命中 → Locked 锚定 + 循环跳转。
 /// 搜索范围：User/Assistant/Reasoning/System 消息文本、工具 target/name/tail。
 #[derive(Debug, Clone, Default)]
@@ -602,6 +613,10 @@ pub fn preview_lines_to_body(lines: &[MenuPreviewLine]) -> String {
 }
 
 /// 斜杠命令补全菜单（输入以 `/` 开头时弹出，§16.2 信息层级之外的小浮层）。
+///
+/// §oh-my-pi（type-to-filter）：Modal 型菜单（Session/Theme/Model）支持菜单内
+/// 直接打字过滤——字符键进 `filter`（不落 composer）、Backspace 删除、
+/// Esc 先清空再关闭。命令/文件菜单由输入框驱动（天然过滤），filter 恒空。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuView {
     /// 与输入前缀匹配的项（label, 中文说明）。
@@ -611,6 +626,88 @@ pub struct MenuView {
     /// Session 菜单：每项对应的对话预览（与 items 等长；其他菜单为空）。
     /// 渲染时跟随选中项显示，帮助用户分辨会话内容。
     pub session_previews: Vec<Vec<MenuPreviewLine>>,
+    /// 菜单内过滤词（Modal 型菜单 type-to-filter；大小写不敏感 contains）。
+    pub filter: String,
+}
+
+impl MenuView {
+    /// 过滤后项数（filter 为空 = items.len()）。
+    pub fn filtered_len(&self) -> usize {
+        if self.filter.is_empty() {
+            return self.items.len();
+        }
+        let q = self.filter.to_lowercase();
+        self.items
+            .iter()
+            .filter(|(label, desc)| {
+                label.to_lowercase().contains(&q) || desc.to_lowercase().contains(&q)
+            })
+            .count()
+    }
+
+    /// 过滤后的第 `index` 项（label, desc）；越界 None。
+    pub fn filtered_item(&self, index: usize) -> Option<(&str, &str)> {
+        if self.filter.is_empty() {
+            return self.items.get(index).map(|(l, d)| (l.as_str(), d.as_str()));
+        }
+        let q = self.filter.to_lowercase();
+        self.items
+            .iter()
+            .filter(|(label, desc)| {
+                label.to_lowercase().contains(&q) || desc.to_lowercase().contains(&q)
+            })
+            .nth(index)
+            .map(|(l, d)| (l.as_str(), d.as_str()))
+    }
+
+    /// 过滤后的第 `index` 项对应 preview（Session 菜单；越界 None）。
+    pub fn filtered_preview(&self, index: usize) -> Option<&[MenuPreviewLine]> {
+        if self.filter.is_empty() {
+            return self.session_previews.get(index).map(Vec::as_slice);
+        }
+        let q = self.filter.to_lowercase();
+        self.items
+            .iter()
+            .zip(&self.session_previews)
+            .filter(|((label, desc), _)| {
+                label.to_lowercase().contains(&q) || desc.to_lowercase().contains(&q)
+            })
+            .nth(index)
+            .map(|(_, preview)| preview.as_slice())
+    }
+
+    /// filter 变化后把 selected clamp 到过滤后范围（防止越界）。
+    pub fn clamp_selected(&mut self) {
+        let len = self.filtered_len();
+        if len == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(len - 1);
+        }
+    }
+
+    /// 菜单内输入字符（type-to-filter）：追加到 filter 并 clamp 选中项。
+    pub fn filter_push(&mut self, c: char) {
+        if self.filter.len() < 64 {
+            self.filter.push(c);
+            self.clamp_selected();
+        }
+    }
+
+    /// 菜单内 Backspace：删除 filter 末字符并 clamp 选中项。
+    pub fn filter_backspace(&mut self) {
+        self.filter.pop();
+        self.clamp_selected();
+    }
+
+    /// 菜单是否 Modal 型（Session/Theme/Model）——type-to-filter 只对这些
+    /// 生效（命令/文件菜单由输入框驱动，filter 恒空）。
+    pub fn is_browser_menu(&self) -> bool {
+        matches!(
+            self.kind,
+            MenuKind::Session | MenuKind::Theme | MenuKind::Model
+        )
+    }
 }
 
 /// 菜单种类（决定 Enter/Tab 的插入行为）。
@@ -709,6 +806,9 @@ pub struct ViewModel {
     /// 无全局 fallback，点击即切换，最终化后状态延续）。
     /// 该 entry 的 thinking 折叠态显示一行，展开态显示全文。
     pub reasoning_expanded: std::collections::HashSet<EntryId>,
+    /// §子代理内部视图（opencode 形态）：点击 subagent 卡进入，实时观察
+    /// child 内部活动；←/→ 切换、Esc/Backspace 返回父代理。
+    pub subagent: SubagentViewState,
     /// 鼠标点击命中的目标（工具卡片/reasoning 行；§24 高亮反馈）。
     /// Overlay 打开期间该行高亮；关闭 Overlay 后清除。
     pub active_hit: Option<crate::HitTarget>,
@@ -795,6 +895,7 @@ impl Default for ViewModel {
             question: None,
             search: None,
             sidebar: SidebarState::default(),
+            subagent: SubagentViewState::default(),
             next_version: 1,
             next_entry_id: 1,
             transcript_revision: 0,
@@ -1508,6 +1609,94 @@ impl ViewModel {
         }
     }
 
+    /// §子代理：收集所有 subagent 卡片 id（live 运行中优先，其次 transcript
+    /// 按出现顺序）——内部视图 ←/→ 切换的候选列表。
+    pub fn subagent_card_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .live
+            .tool_order
+            .iter()
+            .filter(|id| {
+                self.live
+                    .tools
+                    .get(*id)
+                    .is_some_and(|t| t.card.name == "subagent")
+            })
+            .cloned()
+            .collect();
+        for entry in &self.transcript {
+            if let Entry::Tool { card, .. } = entry
+                && card.name == "subagent"
+                && !ids.contains(&card.id)
+            {
+                ids.push(card.id.clone());
+            }
+        }
+        ids
+    }
+
+    /// §子代理：按 id 查找卡片（live 优先，其次 transcript）。
+    pub fn find_subagent_card(&self, id: &str) -> Option<&ToolCard> {
+        if let Some(tool) = self.live.tools.get(id) {
+            return Some(&tool.card);
+        }
+        self.transcript.iter().rev().find_map(|entry| match entry {
+            Entry::Tool { card, .. } if card.id == id => Some(card),
+            _ => None,
+        })
+    }
+
+    /// §子代理：指定 id 是否为 subagent 卡片。
+    pub fn is_subagent_card(&self, id: &str) -> bool {
+        self.find_subagent_card(id)
+            .is_some_and(|card| card.name == "subagent")
+    }
+
+    /// §子代理：打开内部视图（重置滚动；无 subagent 卡时不动作）。
+    pub fn open_subagent(&mut self, id: String) {
+        if !self.is_subagent_card(&id) {
+            return;
+        }
+        self.subagent.active = Some(id);
+        self.subagent.scroll = 0;
+    }
+
+    /// §子代理：关闭内部视图（返回父代理）。
+    pub fn close_subagent(&mut self) {
+        self.subagent.active = None;
+        self.subagent.scroll = 0;
+    }
+
+    /// §子代理：在 subagent 卡片之间切换（dir = ±1；循环）。
+    pub fn cycle_subagent(&mut self, dir: i32) {
+        let ids = self.subagent_card_ids();
+        if ids.is_empty() {
+            self.close_subagent();
+            return;
+        }
+        let current = self.subagent.active.as_deref().and_then(|a| ids.iter().position(|i| i == a));
+        let next = match current {
+            Some(i) => (i as i64 + dir as i64).rem_euclid(ids.len() as i64) as usize,
+            None => 0,
+        };
+        self.subagent.active = Some(ids[next].clone());
+        self.subagent.scroll = 0;
+    }
+
+    /// §子代理：滚动内部视图（delta 行；clamp 到内容总行数）。
+    pub fn scroll_subagent(&mut self, delta: i64) {
+        let Some(active) = self.subagent.active.as_ref() else {
+            return;
+        };
+        let total = self
+            .find_subagent_card(active)
+            .and_then(|c| c.output.as_deref())
+            .map(|o| o.lines().count())
+            .unwrap_or(0);
+        let scroll = self.subagent.scroll as i64 + delta;
+        self.subagent.scroll = scroll.clamp(0, total.saturating_sub(1) as i64) as usize;
+    }
+
     /// 切换某张卡片展开/折叠（显示完整输出正文）。
     pub fn toggle_expand(&mut self, id: impl Into<String>) {
         let id = id.into();
@@ -2030,6 +2219,7 @@ impl ViewModel {
             items,
             kind: MenuKind::SlashCommand,
             session_previews: Vec::new(),
+            filter: String::new(),
         });
     }
 
@@ -2064,6 +2254,7 @@ impl ViewModel {
             items,
             kind: MenuKind::File,
             session_previews: Vec::new(),
+            filter: String::new(),
         });
     }
 
@@ -2072,7 +2263,7 @@ impl ViewModel {
         let Some(menu) = self.menu.as_ref() else {
             return;
         };
-        let Some((name, _)) = menu.items.get(menu.selected) else {
+        let Some((name, _)) = menu.filtered_item(menu.selected) else {
             return;
         };
         match menu.kind {
@@ -2083,9 +2274,8 @@ impl ViewModel {
             }
             MenuKind::File => {
                 // 替换光标前最后一个 `@` token 为选中路径。
-                let path = name.clone();
                 if let Some((start, _)) = at_token(&self.input) {
-                    self.input.replace_range(start.., &path);
+                    self.input.replace_range(start.., name);
                     self.input_cursor = self.input.len();
                 }
                 self.menu = None;
@@ -2105,11 +2295,11 @@ impl ViewModel {
         }
     }
 
-    /// 返回选中的菜单项（app 层处理 Session 恢复时用）。
+    /// 返回选中的菜单项（app 层处理 Session 恢复时用；按过滤后列表）。
     pub fn selected_menu_item(&self) -> Option<(String, MenuKind)> {
         let menu = self.menu.as_ref()?;
-        let (label, _) = menu.items.get(menu.selected)?;
-        Some((label.clone(), menu.kind))
+        let (label, _) = menu.filtered_item(menu.selected)?;
+        Some((label.to_string(), menu.kind))
     }
 }
 

@@ -997,6 +997,7 @@ fn sessions_menu_enter_still_works_with_modal_open() {
         selected: 0,
         kind: tpi::tui::model::MenuKind::Session,
         session_previews: Vec::new(),
+        filter: String::new(),
     });
     reducer::update(&mut s, key(KeyCode::Enter));
     assert_eq!(s.pending_session.as_deref(), Some("sess-1"));
@@ -1016,6 +1017,7 @@ fn esc_closes_sessions_browser_in_one_press() {
         selected: 0,
         kind: tpi::tui::model::MenuKind::Session,
         session_previews: Vec::new(),
+        filter: String::new(),
     });
     reducer::update(&mut s, key(KeyCode::Esc));
     assert!(
@@ -1038,6 +1040,7 @@ fn theme_menu_enter_sets_pending_theme() {
         selected: 1,
         kind: tpi::tui::model::MenuKind::Theme,
         session_previews: Vec::new(),
+        filter: String::new(),
     });
     reducer::update(&mut s, key(KeyCode::Enter));
     assert_eq!(s.pending_theme.as_deref(), Some("onedarkpro"));
@@ -1057,6 +1060,7 @@ fn esc_closes_theme_browser_in_one_press() {
         selected: 0,
         kind: tpi::tui::model::MenuKind::Theme,
         session_previews: Vec::new(),
+        filter: String::new(),
     });
     reducer::update(&mut s, key(KeyCode::Esc));
     assert!(
@@ -1080,6 +1084,7 @@ fn theme_menu_survives_up_down_navigation() {
         selected: 0,
         kind: tpi::tui::model::MenuKind::Theme,
         session_previews: Vec::new(),
+        filter: String::new(),
     });
     reducer::update(&mut s, key(KeyCode::Down));
     assert_eq!(s.view.menu.as_ref().map(|m| m.selected), Some(1));
@@ -1114,6 +1119,7 @@ fn sessions_menu_survives_up_down_navigation() {
                 }]
             })
             .collect(),
+        filter: String::new(),
     });
     // ↓ 两次：选中 0 → 1 → 2；菜单必须始终存在，selected 跟随。
     reducer::update(&mut s, key(KeyCode::Down));

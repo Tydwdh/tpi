@@ -38,7 +38,7 @@ fn sync_session_preview(state: &mut UiState) {
     if menu.kind != MenuKind::Session {
         return;
     }
-    let Some(preview) = menu.session_previews.get(menu.selected) else {
+    let Some(preview) = menu.filtered_preview(menu.selected) else {
         return;
     };
     let body = crate::model::preview_lines_to_body(preview);
@@ -228,16 +228,26 @@ fn handle_question_key(state: &mut UiState, key: KeyEvent, effects: &mut Vec<UiE
                     } else {
                         advance_tab(q);
                     }
+                } else if q.mode == QuestionMode::Review {
+                    // §bug 修复：多问题 multiple 完成项被数字快选选中时，
+                    // select_current_option 已把 mode 置为 Review——与单选
+                    // 一致应进下一 tab（最后一题才进 Review），而非停在
+                    // Review 把未答问题一并展示。
+                    advance_tab(q);
                 }
             }
         }
         KeyCode::Enter => {
             select_current_option(q);
-            // multiple 的“完成”项/Review：直接提交（不再走单选提交逻辑）。
+            // multiple 的“完成”项：单问题直接提交；多问题进下一 tab
+            //（与单选一致），最后一题的完成项才进 Review。
             if q.mode == QuestionMode::Done && !multi_q {
                 effects.push(UiEffect::QuestionSubmitted(q.answers_text()));
             } else if q.mode == QuestionMode::Review {
-                // 多问题 multiple 完成项 → Review（用户 Enter 提交）。
+                // §bug 修复：多问题 multiple 完成项——此前直接停在 Review
+                //（未答问题显示“（未回答）”，用户以为要全部提交）；
+                // 改为进下一 tab（advance_tab 在最后一题自然进 Review）。
+                advance_tab(q);
             } else if !q.questions[q.tab].multiple {
                 if !multi_q {
                     submit_single(q, effects);
@@ -318,10 +328,15 @@ fn submit_single(q: &mut crate::model::QuestionModalState, effects: &mut Vec<UiE
 }
 
 /// 多问题：前进到下一 tab 或 Review。
+///
+/// §bug 修复：多选完成项路径调用时 mode 已被 `select_current_option` 置为
+/// Review——前进到下一题必须回到 Selecting，否则渲染仍停在 Review 页。
+/// 单选路径调用时 mode 本就是 Selecting，重置无副作用。
 fn advance_tab(q: &mut crate::model::QuestionModalState) {
     if q.tab + 1 < q.questions.len() {
         q.tab += 1;
         q.selected = 0;
+        q.mode = QuestionMode::Selecting;
     } else {
         q.mode = QuestionMode::Review;
     }
@@ -416,6 +431,23 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
         return effects;
     }
 
+    // §子代理内部视图（opencode 形态）：打开时拦截导航键——←/→ 在多个
+    // subagent 卡间切换、↑↓/PgUp/PgDn 滚动内部文本流、Esc/Backspace 返回
+    // 父代理；其余按键不透传（浏览模式，不落 composer）。
+    if state.view.subagent.active.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => state.view.close_subagent(),
+            KeyCode::Left | KeyCode::Char('h') => state.view.cycle_subagent(-1),
+            KeyCode::Right | KeyCode::Char('l') => state.view.cycle_subagent(1),
+            KeyCode::Up | KeyCode::Char('k') => state.view.scroll_subagent(-1),
+            KeyCode::Down | KeyCode::Char('j') => state.view.scroll_subagent(1),
+            KeyCode::PageUp => state.view.scroll_subagent(-10),
+            KeyCode::PageDown => state.view.scroll_subagent(10),
+            _ => {}
+        }
+        return effects;
+    }
+
     // Ctrl+C 语义（§用户诉求）：只用于复制——Windows Terminal 选中文本后
     // Ctrl+C 由终端优先复制（不传给应用）；未选中时到达应用的 Ctrl+C 静默忽略，
     // 不取消/退出（取消用 Esc、退出用 Ctrl+D）。
@@ -448,6 +480,30 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             KeyCode::Esc | KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
         ) || (key.code == KeyCode::Enter && state.view.menu.is_some());
         if !allowed {
+            // §oh-my-pi（type-to-filter）：Modal 型菜单（/sessions /theme /model）
+            // 打开时，字符键进菜单过滤（不落 composer）、Backspace 删过滤词。
+            if let Some(menu) = state.view.menu.as_mut()
+                && menu.is_browser_menu()
+            {
+                match key.code {
+                    KeyCode::Char(c)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                            && !c.is_ascii_control() =>
+                    {
+                        menu.filter_push(c);
+                        sync_session_preview(state);
+                        state.view.transient_hint = None;
+                    }
+                    KeyCode::Backspace => {
+                        menu.filter_backspace();
+                        sync_session_preview(state);
+                        state.view.transient_hint = None;
+                    }
+                    _ => {}
+                }
+            }
             return effects;
         }
     }
@@ -531,10 +587,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
         }
         KeyAction::MenuNext => {
             if state.view.menu.is_some() {
-                if let Some(menu) = state.view.menu.as_mut()
-                    && menu.items.len() > 1
-                {
-                    menu.selected = (menu.selected + 1) % menu.items.len();
+                if let Some(menu) = state.view.menu.as_mut() {
+                    let len = menu.filtered_len();
+                    if len > 1 {
+                        menu.selected = (menu.selected + 1) % len;
+                    }
                 }
                 state.view.complete_menu_command();
                 // P0-5：补全结果写回 editor（它是输入事实源）。
@@ -545,6 +602,19 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
         }
         KeyAction::Escape => {
             // §49：Esc 优先级 = overlay > modal > menu > run 取消。
+            // §oh-my-pi：Modal 型菜单过滤词非空时，Esc 先清空过滤词（回到全列表），
+            // 再按一次才关闭菜单——避免误关（与搜索 Esc 语义一致）。
+            if state.view.menu.is_some()
+                && state.view.menu.as_ref().is_some_and(|m| m.is_browser_menu())
+                && state.view.menu.as_ref().is_some_and(|m| !m.filter.is_empty())
+            {
+                if let Some(menu) = state.view.menu.as_mut() {
+                    menu.filter.clear();
+                    menu.clamp_selected();
+                }
+                sync_session_preview(state);
+                return effects;
+            }
             if state.view.overlay.is_some() {
                 state.view.close_overlay();
             } else if state.view.modal.is_some() {
@@ -626,9 +696,10 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
         KeyAction::MoveUp => {
             if state.view.menu.is_some() {
                 if let Some(menu) = state.view.menu.as_mut()
-                    && !menu.items.is_empty()
+                    && menu.filtered_len() > 0
                 {
-                    menu.selected = (menu.selected + menu.items.len() - 1) % menu.items.len();
+                    let len = menu.filtered_len();
+                    menu.selected = (menu.selected + len - 1) % len;
                 }
                 sync_session_preview(state);
             } else if let Some(modal) = &mut state.view.modal {
@@ -647,9 +718,10 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
         KeyAction::MoveDown => {
             if state.view.menu.is_some() {
                 if let Some(menu) = state.view.menu.as_mut()
-                    && !menu.items.is_empty()
+                    && menu.filtered_len() > 0
                 {
-                    menu.selected = (menu.selected + 1) % menu.items.len();
+                    let len = menu.filtered_len();
+                    menu.selected = (menu.selected + 1) % len;
                 }
                 sync_session_preview(state);
             } else if let Some(modal) = &mut state.view.modal {
@@ -666,7 +738,17 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             refresh_menus(state);
         }
         KeyAction::PageUp => {
-            if let Some(modal) = &mut state.view.modal {
+            if state.view.menu.is_some() {
+                // §oh-my-pi：长菜单 PgUp/PgDn 翻页（一页 = 可视行数）。
+                if let Some(menu) = state.view.menu.as_mut()
+                    && menu.filtered_len() > 0
+                {
+                    let len = menu.filtered_len();
+                    menu.selected = menu.selected.saturating_sub(8);
+                    menu.selected = menu.selected.min(len - 1);
+                }
+                sync_session_preview(state);
+            } else if let Some(modal) = &mut state.view.modal {
                 modal.scroll = modal.scroll.saturating_sub(10);
             } else if let Some(overlay) = &mut state.view.overlay {
                 overlay.scroll = overlay.scroll.saturating_sub(10);
@@ -675,7 +757,16 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             }
         }
         KeyAction::PageDown => {
-            if let Some(modal) = &mut state.view.modal {
+            if state.view.menu.is_some() {
+                // §oh-my-pi：长菜单 PgUp/PgDn 翻页。
+                if let Some(menu) = state.view.menu.as_mut()
+                    && menu.filtered_len() > 0
+                {
+                    let len = menu.filtered_len();
+                    menu.selected = (menu.selected + 8).min(len - 1);
+                }
+                sync_session_preview(state);
+            } else if let Some(modal) = &mut state.view.modal {
                 modal.scroll = modal.scroll.saturating_add(10);
             } else if let Some(overlay) = &mut state.view.overlay {
                 overlay.scroll = overlay.scroll.saturating_add(10);
@@ -835,7 +926,13 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
             // 刷屏防护：恢复是过程性事件，只对第一次（attempt == 1）追加提示行，
             // 后续同轮恢复静默（status/footer spinner 仍在运行）；最终失败另有
             // 总结提示（ProviderInterrupted），连续断联不再每次弹一行。
+            // §bug 修复：每次恢复都在 footer 显示进度（transient_hint），否则
+            // 用户看不到重试在发生（只提示第一次 + 静默，误以为没有自动重试）。
             view.reconnect_count = view.reconnect_count.saturating_add(1);
+            view.transient_hint = Some(format!(
+                "⟳ 连接中断，自动续写中（第 {attempt}/{max} 次）…",
+                max = tpi_agent::agent::MAX_STREAM_RECOVERIES
+            ));
             if attempt == 1 {
                 view.push_line(
                     LineKind::System,
@@ -853,6 +950,11 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
             view.discard_live_turn();
             view.reconnect_count = view.reconnect_count.saturating_add(1);
             // 刷屏防护：同 StreamRecovering，只对第一次追加提示行。
+            // §bug 修复：每次重启都在 footer 显示进度（同续写）。
+            view.transient_hint = Some(format!(
+                "⟳ 连接中断，自动重试中（第 {attempt}/{max} 次）…",
+                max = tpi_agent::agent::MAX_TURN_RESTARTS
+            ));
             if attempt == 1 {
                 view.push_line(
                     LineKind::System,
@@ -1049,6 +1151,12 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<UiEffect> {
         UiEvent::ClickTool(id) => {
             if state.view.modal.is_some() || state.view.overlay.is_some() {
                 return Vec::new(); // 弹层打开时鼠标点击不得打开后台 overlay
+            }
+            // §子代理：点击 subagent 卡 → 打开内部视图（实时观察 child），
+            // 而非普通展开（展开仍可从内部视图内看到全部活动文本流）。
+            if state.view.is_subagent_card(&id) {
+                state.view.open_subagent(id);
+                return Vec::new();
             }
             state.view.toggle_expand(id);
             Vec::new()

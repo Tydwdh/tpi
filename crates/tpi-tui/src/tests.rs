@@ -7,6 +7,106 @@ use crate::model::ToolCardState;
 use crate::reducer;
 use crate::state::UiState;
 use crate::tool_card::{render_diff_lines, tool_name_style};
+use ratatui::crossterm::event::KeyCode;
+
+/// §bug 修复：每次自动恢复（续写/重生成）都在 footer 显示进度——此前只提示
+/// 第一次 + 静默，用户误以为没有自动重试。
+#[test]
+fn auto_recovery_shows_footer_progress_every_attempt() {
+    let mut state = UiState::new(ViewModel::default());
+    // 第一次续写：footer 提示。
+    reducer::update(
+        &mut state,
+        UiEvent::Agent(tpi_agent::agent::RuntimeEvent::StreamRecovering { attempt: 1 }),
+    );
+    let hint1 = state.view.transient_hint.clone();
+    assert!(
+        hint1.as_deref().is_some_and(|h| h.contains("自动续写") && h.contains("1/10")),
+        "第一次续写 footer 提示: {hint1:?}"
+    );
+    // 第二次续写：footer 提示更新（不追加新系统行——刷屏防护保留）。
+    reducer::update(
+        &mut state,
+        UiEvent::Agent(tpi_agent::agent::RuntimeEvent::StreamRecovering { attempt: 2 }),
+    );
+    let hint2 = state.view.transient_hint.clone();
+    assert!(
+        hint2.as_deref().is_some_and(|h| h.contains("2/10")),
+        "第二次续写 footer 提示更新: {hint2:?}"
+    );
+    // TurnRestarting 同理。
+    reducer::update(
+        &mut state,
+        UiEvent::Agent(tpi_agent::agent::RuntimeEvent::TurnRestarting { attempt: 3 }),
+    );
+    let hint3 = state.view.transient_hint.clone();
+    assert!(
+        hint3.as_deref().is_some_and(|h| h.contains("自动重试") && h.contains("3/10")),
+        "重生成 footer 提示: {hint3:?}"
+    );
+}
+
+/// §bug 修复：idle 时输入 `/quit` 按 Enter 一次即入队（app 主循环立即消费
+/// → 退出）——不应需要额外按键。菜单开着（/ 前缀弹出）也不阻塞提交。
+#[test]
+fn idle_submit_slash_queues_immediately() {
+    let mut state = UiState::new(ViewModel::default());
+    state.running = false;
+    // 模拟输入 /quit（输入以 / 开头 → 斜杠菜单会弹出；用完整输入 + Enter）。
+    for c in "/quit".chars() {
+        reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Char(c))));
+    }
+    assert!(state.view.menu.is_some(), "/ 前缀菜单弹出");
+    let effects = reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Enter)));
+    assert_eq!(state.pop_pending().as_deref(), Some("/quit"), "一次 Enter 即入队");
+    assert!(effects.is_empty());
+}
+
+/// §bug 修复：run 中提交 `/` 命令——reducer 入队（peek 可见），app 层据此
+/// 立即取消 run 执行命令（不再排队等 run 结束）。普通消息不触发取消。
+#[test]
+fn running_slash_submit_is_peekable() {
+    let mut state = UiState::new(ViewModel::default());
+    state.running = true;
+    // run 中提交 /quit。
+    for c in "/quit".chars() {
+        reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Char(c))));
+    }
+    reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Enter)));
+    assert_eq!(
+        state.peek_pending(),
+        Some("/quit"),
+        "run 中 / 命令入队且队首可见（app 据此取消 run）"
+    );
+    assert!(state.view.transient_hint.is_some(), "有排队提示");
+    // 清空后再提交普通消息：也入队，但队首不是 /（app 不取消 run）。
+    state.pop_pending();
+    for c in "继续干活".chars() {
+        reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Char(c))));
+    }
+    reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Enter)));
+    assert_eq!(
+        state.peek_pending(),
+        Some("继续干活"),
+        "普通消息入队但非 / 开头"
+    );
+}
+
+/// §bug 修复：队列中任意位置的 / 命令被提升到队首（app 消费时优先执行），
+/// 不被前面排队的普通消息阻塞。
+#[test]
+fn pending_slash_promoted_over_queued_messages() {
+    let mut state = UiState::new(ViewModel::default());
+    state.push_pending("继续干活".into());
+    state.push_pending("/quit".into());
+    state.push_pending("第三条".into());
+    assert!(state.has_pending_slash(), "队列中存在 / 命令");
+    state.promote_pending_slash();
+    assert_eq!(state.pop_pending().as_deref(), Some("/quit"), "/ 命令优先");
+    assert_eq!(state.pop_pending().as_deref(), Some("继续干活"), "原顺序保持");
+    assert_eq!(state.pop_pending().as_deref(), Some("第三条"));
+    assert!(!state.has_pending_slash(), "无 / 命令时 false");
+}
 
 /// §修复：UsageUpdated 事件实时累加到累计字段（不等 run 结束）——
 /// footer 的 ↑↓⇄ 与缓存命中率因此同口径（累计 cache_read / 累计 input），
@@ -1361,6 +1461,7 @@ fn session_modal_and_menu_stay_within_main_area_when_sidebar_open() {
             is_user: true,
             text: "你好".into(),
         }]],
+        filter: String::new(),
     });
     view.open_modal("/sessions", "你 你好\nAI 你好");
     let buf = draw_to_test_backend(&mut view, 80, 24);
@@ -3358,6 +3459,7 @@ fn model_menu_enter_sets_pending_model() {
         selected: 1,
         kind: crate::model::MenuKind::Model,
         session_previews: Vec::new(),
+            filter: String::new(),
     });
     state.view.modal = Some(crate::model::ModalState::new(
         "/model",
@@ -3390,6 +3492,7 @@ fn model_menu_navigation_keeps_menu() {
         selected: 0,
         kind: crate::model::MenuKind::Model,
         session_previews: Vec::new(),
+            filter: String::new(),
     });
     let _ = reducer::update(
         &mut state,
@@ -3397,6 +3500,111 @@ fn model_menu_navigation_keeps_menu() {
     );
     assert!(state.view.menu.is_some(), "模型菜单导航后保持");
     assert_eq!(state.view.menu.as_ref().unwrap().selected, 1);
+}
+
+/// §oh-my-pi（type-to-filter）：Modal 型菜单（/model）打开时，字符键进菜单
+/// 过滤（不落 composer）、Backspace 删除过滤词、过滤后导航用过滤列表。
+#[test]
+fn browser_menu_type_to_filter() {
+    let mut state = UiState::new(ViewModel::default());
+    state.view.menu = Some(crate::model::MenuView {
+        items: vec![
+            ("gpt-4o".to_string(), "openai".to_string()),
+            ("claude-sonnet".to_string(), "anthropic".to_string()),
+            ("deepseek-v3".to_string(), "deepseek".to_string()),
+        ],
+        selected: 0,
+        kind: crate::model::MenuKind::Model,
+        session_previews: Vec::new(),
+        filter: String::new(),
+    });
+    // 字符键 → 进 filter（不落 composer）。
+    // Modal 型菜单在真实路径与 modal 同开（/model 的 open_modal）→ blocking。
+    state.view.modal = Some(crate::model::ModalState::new("/model", String::from("x")));
+    reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Char('c'))));
+    let menu = state.view.menu.as_ref().unwrap();
+    assert_eq!(menu.filter, "c", "字符进过滤词");
+    assert_eq!(menu.filtered_len(), 1, "过滤后只剩 claude");
+    assert!(state.view.input.is_empty(), "不落 composer");
+    // 过滤后 Enter → 选中过滤后的项。
+    let effects = reducer::update(
+        &mut state,
+        UiEvent::Key(key_event(KeyCode::Enter)),
+    );
+    assert_eq!(state.pending_model.as_deref(), Some("claude-sonnet"));
+    assert!(effects.is_empty());
+}
+
+/// §oh-my-pi（type-to-filter）：Backspace 删除过滤词；Esc 先清空过滤词（不关
+/// 菜单），再按 Esc 才关闭菜单。
+#[test]
+fn browser_menu_filter_backspace_and_esc_clears_first() {
+    let mut state = UiState::new(ViewModel::default());
+    state.view.menu = Some(crate::model::MenuView {
+        items: vec![("gpt-4o".to_string(), "openai".to_string())],
+        selected: 0,
+        kind: crate::model::MenuKind::Model,
+        session_previews: Vec::new(),
+        filter: String::new(),
+    });
+    state.view.modal = Some(crate::model::ModalState::new("/model", String::from("x")));
+    reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Char('g'))));
+    reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Char('p'))));
+    assert_eq!(state.view.menu.as_ref().unwrap().filter, "gp");
+    // Backspace 删除末字符。
+    reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Backspace)));
+    assert_eq!(state.view.menu.as_ref().unwrap().filter, "g");
+    // Esc：过滤词非空 → 先清空，菜单保持。
+    reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Esc)));
+    assert!(state.view.menu.is_some(), "Esc 先清过滤词不关菜单");
+    assert!(state.view.menu.as_ref().unwrap().filter.is_empty());
+    // 再 Esc：过滤已空 → 关闭菜单。
+    reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Esc)));
+    assert!(state.view.menu.is_none(), "二次 Esc 关闭菜单");
+}
+
+/// §oh-my-pi（type-to-filter）：命令/文件菜单（非 Modal 型）字符键仍走
+/// composer（过滤由输入框驱动），filter 保持为空。
+#[test]
+fn command_menu_typing_goes_to_composer() {
+    let mut state = UiState::new(ViewModel::default());
+    state.view.menu = Some(crate::model::MenuView {
+        items: vec![("help".to_string(), "帮助".to_string())],
+        selected: 0,
+        kind: crate::model::MenuKind::SlashCommand,
+        session_previews: Vec::new(),
+        filter: String::new(),
+    });
+    // 命令菜单没有 modal → 不 blocking → 字符键落 composer（走 TypedChar）。
+    // 输入 'x'（无 / 前缀）后 refresh_command_menu 会关闭菜单（既有行为：
+    // 命令菜单由输入驱动）——这正说明命令菜单不走内部 filter。
+    reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Char('x'))));
+    assert_eq!(state.view.input, "x", "字符进输入框（composer 过滤）");
+    assert!(
+        state.view.menu.as_ref().is_none_or(|m| m.filter.is_empty()),
+        "命令菜单 filter 恒空（输入驱动，无内部过滤）"
+    );
+}
+
+/// §oh-my-pi（type-to-filter）：过滤无匹配时 Enter 不提交（selected_menu_item
+/// 返回 None）；菜单保持打开，用户可清过滤或改词。
+#[test]
+fn browser_menu_no_match_enter_does_nothing() {
+    let mut state = UiState::new(ViewModel::default());
+    state.view.menu = Some(crate::model::MenuView {
+        items: vec![("gpt-4o".to_string(), "openai".to_string())],
+        selected: 0,
+        kind: crate::model::MenuKind::Model,
+        session_previews: Vec::new(),
+        filter: String::new(),
+    });
+    state.view.modal = Some(crate::model::ModalState::new("/model", String::from("x")));
+    reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Char('z')))); // 无匹配
+    assert_eq!(state.view.menu.as_ref().unwrap().filtered_len(), 0);
+    let effects = reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Enter)));
+    assert!(state.pending_model.is_none(), "无匹配不提交");
+    assert!(state.view.menu.is_some(), "菜单保持打开");
+    assert!(effects.is_empty());
 }
 
 /// 构造简单 Key 事件（reducer 不检查 kind；app 层已过滤）。
@@ -3849,8 +4057,9 @@ mod question_modal_tests {
         }
     }
 
-    /// 多问题 + multiple + custom：最后一题的完成项进 Review（不直接提交），
-    /// Review Enter 提交全部（未答时拦截、补答后可提交）。
+    /// §bug 修复：多问题 + multiple + custom——非最后一题的完成项进下一 tab
+    ///（此前误进 Review 把未答问题一并展示，用户以为要“全部提交”）；
+    /// 最后一题的完成项才进 Review，Review Enter 提交全部。
     #[test]
     fn multi_question_multiple_done_goes_review_then_submits() {
         let mk = |q: &str, h: &str| QuestionView {
@@ -3867,25 +4076,19 @@ mod question_modal_tests {
         reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // Q1 选 a
         reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down))); // Q1 自定义
         reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down))); // Q1 完成项
-        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // → Review
-        assert_eq!(
-            state.view.question.as_ref().unwrap().mode,
-            QuestionMode::Review,
-            "完成项进 Review（Q2 未答）"
-        );
-        // §askuser 修复：Review Enter 未全答 → 自动跳到第一个未答问题 Q2
-        //（不再停留在 Review，也不需要 Tab 导航）。
-        let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
-        assert!(effects.is_empty(), "未全答时不得提交: {effects:?}");
-        assert_eq!(
-            state.view.question.as_ref().unwrap().tab,
-            1,
-            "Enter 自动跳到 Q2"
-        );
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // 完成项
+        let q = state.view.question.as_ref().unwrap();
+        assert_eq!(q.tab, 1, "非最后一题完成项应进下一 tab Q2");
+        assert_eq!(q.mode, QuestionMode::Selecting, "Q2 处于选择态而非 Review");
         reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // Q2 选 a
         reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down))); // Q2 自定义
         reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down))); // Q2 完成项
-        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // → Review
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter))); // 最后一题 → Review
+        assert_eq!(
+            state.view.question.as_ref().unwrap().mode,
+            QuestionMode::Review,
+            "最后一题完成项进 Review"
+        );
         let effects = reducer::update(&mut state, UiEvent::Key(key(KeyCode::Enter)));
         match &effects[0] {
             UiEffect::QuestionSubmitted(text) => {
@@ -3893,6 +4096,210 @@ mod question_modal_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// §bug 修复：多问题 multiple 完成项被数字快选选中（选项数 + 完成项 ≤ 9）
+    /// 也必须进下一 tab，而不是停在 Review（与 Enter 路径一致）。
+    #[test]
+    fn multi_question_multiple_digit_done_advances_tab() {
+        let mk = |q: &str, h: &str| QuestionView {
+            question: q.into(),
+            header: Some(h.into()),
+            options: vec![QuestionOptionView {
+                label: "a".into(),
+                description: String::new(),
+            }],
+            multiple: true,
+            custom: false,
+        };
+        let mut state = state_with(vec![mk("Q1", "一"), mk("Q2", "二")]);
+        // Q1：1 个选项 + 完成项（custom=false，option_count = 2）。
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Char('1')))); // 选 a（toggle 停留）
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Char('2')))); // 完成项
+        let q = state.view.question.as_ref().unwrap();
+        assert_eq!(q.tab, 1, "数字快选完成项应进下一 tab");
+        assert_eq!(q.mode, QuestionMode::Selecting, "Q2 处于选择态而非 Review");
+    }
+}
+
+/// §子代理内部视图（opencode 形态）：点击 subagent 卡进入实时观察、←/→
+/// 切换、Esc/Backspace 返回、↑↓ 滚动；普通工具卡点击仍展开；折叠预览显示
+/// 最新 child 活动。
+mod subagent_view_tests {
+    use super::*;
+    use crate::model::ViewModel;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn subagent_state(ids: &[&str]) -> UiState {
+        let mut state = UiState::new(ViewModel::default());
+        for id in ids {
+            state
+                .view
+                .begin_tool(*id, "subagent", Some("调查 src/main.rs".into()), None);
+        }
+        state
+    }
+
+    #[test]
+    fn click_subagent_card_opens_internal_view() {
+        let mut state = subagent_state(&["c1"]);
+        reducer::update(&mut state, UiEvent::ClickTool("c1".into()));
+        assert_eq!(
+            state.view.subagent.active.as_deref(),
+            Some("c1"),
+            "点击 subagent 卡打开内部视图"
+        );
+    }
+
+    #[test]
+    fn click_normal_tool_still_toggles_expand() {
+        let mut state = UiState::new(ViewModel::default());
+        state.view.begin_tool("c1", "bash", Some("echo hi".into()), None);
+        reducer::update(&mut state, UiEvent::ClickTool("c1".into()));
+        assert!(
+            state.view.subagent.active.is_none(),
+            "普通工具卡点击不打开内部视图"
+        );
+        assert!(
+            state.view.live.tools.get("c1").unwrap().card.expanded,
+            "普通工具卡点击仍展开"
+        );
+    }
+
+    #[test]
+    fn left_right_cycles_between_subagents() {
+        let mut state = subagent_state(&["c1", "c2"]);
+        state.view.open_subagent("c1".into());
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Right)));
+        assert_eq!(state.view.subagent.active.as_deref(), Some("c2"));
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Left)));
+        assert_eq!(state.view.subagent.active.as_deref(), Some("c1"));
+        // 循环：c1 向左 → c2。
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Left)));
+        assert_eq!(state.view.subagent.active.as_deref(), Some("c2"));
+    }
+
+    #[test]
+    fn esc_or_backspace_closes_view() {
+        let mut state = subagent_state(&["c1"]);
+        state.view.open_subagent("c1".into());
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Esc)));
+        assert!(state.view.subagent.active.is_none(), "Esc 返回父代理");
+        // Backspace 同样关闭。
+        state.view.open_subagent("c1".into());
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Backspace)));
+        assert!(state.view.subagent.active.is_none(), "Backspace 返回父代理");
+    }
+
+    #[test]
+    fn view_scroll_clamps_to_content() {
+        let mut state = subagent_state(&["c1"]);
+        state.view.open_subagent("c1".into());
+        // 多行内容（4 行正文）。
+        state
+            .view
+            .append_tool_output("c1", "第 0 行\n第 1 行\n第 2 行\n第 3 行");
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down)));
+        assert_eq!(state.view.subagent.scroll, 1);
+        // 大量 Down 不越界（4 行 → 最大 scroll 3）。
+        for _ in 0..10 {
+            reducer::update(&mut state, UiEvent::Key(key(KeyCode::Down)));
+        }
+        assert_eq!(state.view.subagent.scroll, 3, "滚动 clamp 到内容尾部");
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Up)));
+        assert_eq!(state.view.subagent.scroll, 2);
+    }
+
+    #[test]
+    fn keys_blocked_while_view_open() {
+        let mut state = subagent_state(&["c1"]);
+        state.view.open_subagent("c1".into());
+        // 打字应被拦截（浏览模式，不落 composer）。
+        reducer::update(&mut state, UiEvent::Key(key(KeyCode::Char('x'))));
+        assert!(state.view.input.is_empty(), "内部视图打开时按键不落 composer");
+    }
+
+    /// §子代理：subagent 卡永不紧凑——两张 subagent 卡之间保持 1 行空行
+    ///（多个并行子代理之间分隔清晰；普通紧凑工具卡之间无间隔）。
+    #[test]
+    fn subagent_cards_keep_gap_between() {
+        let mut view = ViewModel::default();
+        // 两张折叠的 subagent 卡（带 output → 若按普通工具卡规则会紧凑）。
+        view.begin_tool("c1", "subagent", Some("调查 a".into()), None);
+        view.append_tool_output("c1", "活动行 1\n活动行 2");
+        view.finish_tool(
+            ("c1", "subagent"),
+            tpi_core::outcome::ToolStatus::Succeeded,
+            500,
+            None,
+            "子代理调查完成",
+            None,
+        );
+        view.begin_tool("c2", "subagent", Some("调查 b".into()), None);
+        view.append_tool_output("c2", "活动行 3");
+        view.finish_tool(
+            ("c2", "subagent"),
+            tpi_core::outcome::ToolStatus::Succeeded,
+            300,
+            None,
+            "子代理调查完成",
+            None,
+        );
+        let mut cache = HashMap::new();
+        let plan = plan_window_simple(&mut view, crate::theme::Theme::omp(), 80, 30, 0, false, &mut cache);
+        let texts: Vec<String> = plan
+            .window
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        // 两个子代理卡之间必须有空行（间隔）。
+        let pos1 = texts.iter().position(|t| t.contains("调查 a")).unwrap_or(0);
+        let pos2 = texts.iter().position(|t| t.contains("调查 b")).unwrap_or(0);
+        assert!(
+            pos2 > pos1 && texts[pos1 + 1..pos2].iter().any(|t| t.is_empty()),
+            "两张 subagent 卡之间必须保留 1 行空行: {texts:?}"
+        );
+    }
+
+    /// 卡片折叠预览：subagent 卡折叠态显示最新 2 行 child 活动。
+    #[test]
+    fn subagent_card_collapsed_preview_shows_latest_two_lines() {
+        let theme = crate::theme::Theme::omp();
+        let card = crate::model::ToolCard {
+            id: "c1".into(),
+            name: "subagent".into(),
+            target: Some("调查 src".into()),command: None,
+            state: ToolCardState::Done {
+                status: tpi_core::outcome::ToolStatus::Succeeded,
+                duration_ms: 1200,
+                exit_code: None,
+            },
+            output: Some("第 0 行\n第 1 行\n第 2 行\n第 3 行\n第 4 行".into()),
+            diff: None,
+            output_truncated: false,
+            expanded: false,
+            tail: None,
+            line_number_start: None,
+            collapsed_lines: 0,
+            started_at_ms: None,
+        };
+        let lines = crate::tool_card::tool_card_lines(&card, 0, theme, 100);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            text.contains("第 3 行") && text.contains("第 4 行"),
+            "折叠预览显示最新 2 行: {text:?}"
+        );
+        assert!(
+            !text.contains("第 0 行") && !text.contains("第 1 行") && !text.contains("第 2 行"),
+            "折叠预览不含旧行: {text:?}"
+        );
     }
 }
 

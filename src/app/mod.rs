@@ -1388,6 +1388,10 @@ where
             continue;
         }
 
+        // §bug 修复：/ 命令优先于排队的普通消息——队列中任意位置有 / 命令
+        // 就提到队首（本地即时操作，不被 agent 消息阻塞；如 /quit 不排队）。
+        ui_state.promote_pending_slash();
+
         // 有提交的消息：运行。
         if let Some(message) = ui_state.pop_pending() {
             match handle_slash_command(
@@ -1760,6 +1764,7 @@ web_search: DuckDuckGo（免费，无需 API key）
                     .unwrap_or(0),
                 kind: crate::tui::model::MenuKind::Model,
                 session_previews: Vec::new(),
+                filter: String::new(),
             });
             ui_state.view.open_modal(
                 "/model",
@@ -1882,6 +1887,7 @@ workspace: {}
                 selected: 0,
                 kind: crate::tui::model::MenuKind::Session,
                 session_previews,
+                filter: String::new(),
             });
             ui_state.view.open_modal("/sessions", preview_body);
             renderer
@@ -1908,6 +1914,7 @@ workspace: {}
                 selected: 0,
                 kind: crate::tui::model::MenuKind::Theme,
                 session_previews: Vec::new(),
+                filter: String::new(),
             });
             ui_state.view.open_modal(
                 "/theme",
@@ -2441,6 +2448,16 @@ async fn run_interactive<P: Provider>(
                                     // 上述效果 run 中不会产生（reducer 仅空闲时产生）。
                                 }
                             }
+                        }
+                        // §bug 修复：run 中提交 `/` 命令 → 立即取消 run，命令在
+                        // run 结束后执行（/命令与 agent 消息不冲突，不应排队等
+                        // run 结束——否则 /quit 必须等模型跑完才能退出）。
+                        // 队列任意位置（前面可能有 run 中排队的普通消息）。
+                        if ui_state.has_pending_slash() {
+                            cancel.cancel();
+                            ui_state.view.transient_hint = Some(
+                                "已取消当前 run 以执行 /命令".into(),
+                            );
                         }
                         renderer.draw(&mut ui_state.view).map_err(|e| e.to_string())?;
                     }

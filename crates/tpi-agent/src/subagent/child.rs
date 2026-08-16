@@ -10,12 +10,13 @@ use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{self, RunInput};
+use crate::agent::{self, LiveEvent, RunInput};
 use crate::provider::Provider;
 use crate::subagent::{SubagentProvider, SubagentReport, SubagentRequest};
 use tpi_capabilities::tool::registry::{ToolRegistry, read_only_registry};
+use tpi_capabilities::tool::ToolStreamEvent;
 use tpi_capabilities::workspace::ActiveWorkspace;
-use tpi_core::ids::RunId;
+use tpi_core::ids::{RunId, ToolCallId};
 use tpi_session::store::SessionLog;
 
 /// in-process child provider（P8-04）。
@@ -28,6 +29,12 @@ pub struct InProcessChildProvider<P, F> {
     workspace: ActiveWorkspace,
     /// P8-06：child 完成后发出 SubagentReported 的通道（None = 不投影 TUI）。
     report_tx: Option<tokio::sync::mpsc::Sender<crate::agent::LiveEvent>>,
+    /// §子代理实时观察：child 活动事件（assistant 文本/工具调用）经此通道
+    /// 以 ToolOutputDelta 转发到 parent 的 TUI（None = 不转发）。
+    output_tx: Option<tokio::sync::mpsc::Sender<ToolStreamEvent>>,
+    /// parent 视角的调用 id：转发 ToolStreamEvent 时用它匹配 parent 的卡片
+    ///（child 内部事件的 call_id 是 child 命名空间，TUI 无法匹配）。
+    parent_call_id: Option<ToolCallId>,
     _provider: std::marker::PhantomData<P>,
 }
 
@@ -42,6 +49,8 @@ impl<P, F> InProcessChildProvider<P, F> {
             config,
             workspace,
             report_tx: None,
+            output_tx: None,
+            parent_call_id: None,
             _provider: std::marker::PhantomData,
         }
     }
@@ -53,6 +62,18 @@ impl<P, F> InProcessChildProvider<P, F> {
         report_tx: Option<tokio::sync::mpsc::Sender<crate::agent::LiveEvent>>,
     ) -> Self {
         self.report_tx = report_tx;
+        self
+    }
+
+    /// §子代理实时观察：绑定 parent 的流式输出通道 + 本调用在 parent 侧的
+    /// call id（child 活动 → ToolOutputDelta → parent TUI 卡片实时可见）。
+    pub fn with_output_tx(
+        mut self,
+        output_tx: Option<tokio::sync::mpsc::Sender<ToolStreamEvent>>,
+        parent_call_id: ToolCallId,
+    ) -> Self {
+        self.output_tx = output_tx;
+        self.parent_call_id = Some(parent_call_id);
         self
     }
 }
@@ -73,6 +94,37 @@ fn evidence_from(text: &str) -> Vec<String> {
         rest = &tail[end..];
     }
     out
+}
+
+/// 把 child 的 LiveEvent 映射为 TUI 可见的文本行（None = 不转发）。
+///
+/// §子代理实时观察：转发对观察 child 有意义的语义事件（assistant 文本增量、
+/// 工具启动/完成、工具实时输出），忽略过程性事件（context/usage/恢复等）
+/// 避免噪音。文本行直接拼接进 subagent 卡片 output（append_tool_output），
+/// TUI 内部视图按原文渲染。
+fn child_event_to_text(event: &LiveEvent) -> Option<String> {
+    match event {
+        LiveEvent::AssistantDelta { text, .. } if !text.is_empty() => Some(text.clone()),
+        LiveEvent::ToolStarted { name, arguments, .. } => {
+            let summary = arguments.trim();
+            let summary = if summary.len() > 100 {
+                let mut s: String = summary.chars().take(97).collect();
+                s.push('…');
+                s
+            } else {
+                summary.to_string()
+            };
+            Some(format!("\n▸ {name} {summary}\n"))
+        }
+        LiveEvent::ToolCompleted {
+            name,
+            status,
+            duration_ms,
+            ..
+        } => Some(format!("  ✓ {name} · {status:?} · {duration_ms}ms\n")),
+        LiveEvent::ToolOutputDelta { text, .. } if !text.is_empty() => Some(text.clone()),
+        _ => None,
+    }
 }
 
 #[async_trait::async_trait]
@@ -104,9 +156,32 @@ impl<P: Provider + Send, F: Fn() -> P + Send> SubagentProvider for InProcessChil
         let registry: Arc<Mutex<ToolRegistry>> =
             Arc::new(Mutex::new(read_only_registry(&request.capabilities)));
 
-        // child 的 LiveEvent 不投影 TUI（P8-06 之前 drain 丢弃）。
+        // §子代理实时观察：child 的 LiveEvent 转发为文本行经 output_tx 送出
+        //（ToolOutputDelta，call_id 换成 parent 视角）——TUI 的 subagent 卡片
+        // 运行中实时显示 child 内部活动；无 output_tx 时退化为丢弃（drain）。
         let (ui_tx, mut ui_rx) = tokio::sync::mpsc::channel::<crate::agent::LiveEvent>(64);
-        let drain = tokio::spawn(async move { while ui_rx.recv().await.is_some() {} });
+        let forward_tx = self.output_tx.clone();
+        let forward_call_id = self.parent_call_id;
+        let forward = tokio::spawn(async move {
+            let Some(tx) = forward_tx else {
+                while ui_rx.recv().await.is_some() {}
+                return;
+            };
+            let call_id = forward_call_id.unwrap_or_else(ToolCallId::new_v7);
+            while let Some(event) = ui_rx.recv().await {
+                let Some(text) = child_event_to_text(&event) else {
+                    continue;
+                };
+                // channel 满/关闭时丢弃（实时观察是尽力而为，不阻塞 child）。
+                let _ = tx
+                    .send(ToolStreamEvent {
+                        call_id,
+                        stream: 1,
+                        text,
+                    })
+                    .await;
+            }
+        });
 
         let outcome = agent::run(
             &mut child_provider,
@@ -124,7 +199,8 @@ impl<P: Provider + Send, F: Fn() -> P + Send> SubagentProvider for InProcessChil
             },
         )
         .await;
-        drain.abort();
+        // child run 结束 → child 的 ui sender 已 drop → 转发任务 flush 后退出。
+        let _ = forward.await;
 
         let outcome = outcome.map_err(|e| format!("child run 失败: {e}"))?;
 
@@ -183,10 +259,76 @@ impl<P: Provider + Send, F: Fn() -> P + Send> SubagentProvider for InProcessChil
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::LiveEvent;
     use crate::provider::{Provider, ProviderResponse};
     use crate::subagent::ReadOnlyCapability;
     use tpi_capabilities::workspace::LocalWorkspace;
     use tpi_config::config::Config;
+    use tpi_core::ids::RequestId;
+    use tpi_core::outcome::ToolStatus;
+
+    /// §子代理实时观察：child 事件 → 文本行的映射——有意义的语义事件转发、
+    /// 过程性事件忽略；空文本不转发。
+    #[test]
+    fn child_event_to_text_maps_semantic_events() {
+        let rid = RequestId::new_v7();
+        let text = child_event_to_text(&LiveEvent::AssistantDelta {
+            request_id: rid,
+            kind: crate::agent::DeltaKind::Text,
+            text: "正在阅读 src/main.rs".into(),
+        });
+        assert_eq!(text.as_deref(), Some("正在阅读 src/main.rs"));
+
+        let text = child_event_to_text(&LiveEvent::ToolStarted {
+            call_id: ToolCallId::new_v7(),
+            name: "read".into(),
+            arguments: r#"{"path": "src/main.rs"}"#.into(),
+        });
+        assert!(
+            text.as_deref()
+                .is_some_and(|t| t.contains("▸ read") && t.contains("src/main.rs")),
+            "工具启动行: {text:?}"
+        );
+
+        let text = child_event_to_text(&LiveEvent::ToolCompleted {
+            call_id: ToolCallId::new_v7(),
+            name: "read".into(),
+            status: ToolStatus::Succeeded,
+            duration_ms: 12,
+            exit_code: None,
+            output: String::new(),
+            diff: None,
+        });
+        assert!(
+            text.as_deref()
+                .is_some_and(|t| t.contains("✓ read") && t.contains("12ms")),
+            "工具完成行: {text:?}"
+        );
+
+        // 实时输出增量直接转发。
+        let text = child_event_to_text(&LiveEvent::ToolOutputDelta {
+            call_id: ToolCallId::new_v7(),
+            stream: 1,
+            text: "progress…".into(),
+        });
+        assert_eq!(text.as_deref(), Some("progress…"));
+
+        // 过程性事件忽略。
+        let text = child_event_to_text(&LiveEvent::ContextUsage {
+            projected: 10,
+            usable: 100,
+        });
+        assert_eq!(text, None, "ContextUsage 不转发");
+        let text = child_event_to_text(&LiveEvent::StepStarted { step: 1 });
+        assert_eq!(text, None, "StepStarted 不转发");
+        // 空文本不转发。
+        let text = child_event_to_text(&LiveEvent::AssistantDelta {
+            request_id: rid,
+            kind: crate::agent::DeltaKind::Text,
+            text: String::new(),
+        });
+        assert_eq!(text, None, "空 assistant 增量不转发");
+    }
 
     /// 脚本化 fake provider（实现 Provider；测试专用）。
     pub(crate) struct ChildFake;

@@ -542,8 +542,14 @@ fn render_frame(
     );
     *committed = plan.committed_after;
     let overflow = plan.overflow;
-    // 窗口已按宽度折行，无需再次 wrap。
-    frame.render_widget(Paragraph::new(plan.window), trans_area);
+    // §子代理内部视图（opencode 形态）：打开时覆盖转录区，实时显示 child
+    // 内部活动文本流；关闭后恢复正常 transcript 渲染。
+    if view.subagent.active.is_some() {
+        draw_subagent_view(frame, trans_area, view, theme);
+    } else {
+        // 窗口已按宽度折行，无需再次 wrap。
+        frame.render_widget(Paragraph::new(plan.window), trans_area);
+    }
 
     // §24：全屏历史垂直 scrollbar（1 列；比例按 visual 行数）。
     let scrollbar_rect = if scrollbar_enabled {
@@ -1413,8 +1419,12 @@ fn full_line_hit(target: HitTarget, width: u16) -> Option<HitRange> {
 
 /// 工具卡片是否"紧凑"：collapsed_lines==0 且未展开且带内容——只显示主行，
 /// 卡片之间取消间隔（§用户诉求：紧凑）。
+///
+/// §子代理：subagent 卡永不紧凑——它带 child 活动预览且是独立调查单元，
+/// 与相邻卡片必须保持 1 行间隔（多个并行子代理之间分隔清晰）。
 fn tool_card_compact(card: &ToolCard) -> bool {
-    card.collapsed_lines == 0
+    card.name != "subagent"
+        && card.collapsed_lines == 0
         && !card.expanded
         && (card.diff.is_some() || card.output.is_some() || card.tail.is_some())
 }
@@ -2814,6 +2824,125 @@ fn draw_modal(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: t
     frame.render_widget(Paragraph::new(window).scroll((0, 0)), inner);
 }
 
+/// §子代理内部视图渲染（opencode 形态，主窗口式）：点击 subagent 卡后
+/// **主窗口**切换为子代理视图——不另起悬浮窗，直接在转录区以消息流形态
+/// 渲染 child 内部活动（rail + panel 底，与 assistant 消息同视觉语言）；
+/// 输入框/footer 布局保持（父代理的主布局不变）。
+///
+/// 头部 = 子代理序号/总数 + 状态 + 键位提示；正文 = child 活动文本流
+/// （来自卡片 output，经 ToolOutputDelta 实时追加）。滚动由
+/// `view.subagent.scroll` 控制（reducer 的 ↑↓/PgUp/PgDn 更新）。
+fn draw_subagent_view(
+    frame: &mut ratatui::Frame,
+    rect: Rect,
+    view: &ViewModel,
+    theme: theme::Theme,
+) {
+    let Some(active) = &view.subagent.active else {
+        return;
+    };
+    let ids = view.subagent_card_ids();
+    let total = ids.len();
+    let index = ids.iter().position(|i| i == active).unwrap_or(0);
+    let Some(card) = view.find_subagent_card(active) else {
+        return;
+    };
+    let inner_w = rect.width.max(1) as usize;
+    let inner_h = rect.height.max(1) as usize;
+    let status_word = match &card.state {
+        crate::model::ToolCardState::Running => "运行中",
+        crate::model::ToolCardState::Done { status, .. } => match status {
+            tpi_core::outcome::ToolStatus::Succeeded => "完成",
+            tpi_core::outcome::ToolStatus::Failed => "失败",
+            tpi_core::outcome::ToolStatus::TimedOut => "超时",
+            tpi_core::outcome::ToolStatus::Cancelled => "已取消",
+            tpi_core::outcome::ToolStatus::Interrupted => "中断",
+            tpi_core::outcome::ToolStatus::Rejected => "已拒绝",
+        },
+    };
+    // rail（左侧竖线；与 assistant 消息同语言，区分于父代理普通内容）。
+    let rail_style = Style::default()
+        .fg(theme.primary)
+        .bg(theme.panel)
+        .add_modifier(Modifier::BOLD);
+    let panel_style = |s: Style| -> Style { if s.bg.is_some() { s } else { s.bg(theme.panel) } };
+    let mut content: Vec<Line<'static>> = Vec::new();
+    // 头部：🔍 子代理 i/n · 状态 + 键位提示（一行内）。
+    content.push(Line::from(vec![
+        Span::styled("┃ ", rail_style),
+        Span::styled(
+            "🔍 子代理",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD)
+                .bg(theme.panel),
+        ),
+        Span::styled(
+            format!(" {}/{} · {status_word}", index + 1, total),
+            Style::default().fg(theme.muted).bg(theme.panel),
+        ),
+        Span::styled(
+            "     ←→ 切换 · ↑↓ 滚动 · Esc 返回",
+            Style::default().fg(theme.muted).bg(theme.panel),
+        ),
+    ]));
+    // 指令（target）摘要。
+    if let Some(target) = card.target.as_deref() {
+        content.push(Line::from(vec![
+            Span::styled("┃ ", rail_style),
+            Span::styled(
+                target.to_string(),
+                Style::default()
+                    .fg(theme.text)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(theme.panel),
+            ),
+        ]));
+    }
+    content.push(Line::from(vec![Span::styled("┃", rail_style)]));
+    // child 活动文本流（卡片 output；实时追加的 ToolOutputDelta）。
+    let body = card.output.as_deref().unwrap_or("");
+    for (i, line) in body.lines().enumerate() {
+        // 首行带 ▶ 前缀（活动起点），续行 4 格对齐——与 reasoning 卡同构。
+        let prefix = if i == 0 { "▶ " } else { "   " };
+        let mut spans = vec![Span::styled("┃ ", rail_style)];
+        if i == 0 {
+            spans.push(Span::styled(
+                prefix,
+                Style::default()
+                    .fg(theme.muted)
+                    .bg(theme.panel)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        } else {
+            spans.push(Span::styled(
+                prefix,
+                Style::default().fg(theme.muted).bg(theme.panel),
+            ));
+        }
+        spans.push(Span::styled(line.to_string(), panel_style(Style::default().fg(theme.text))));
+        content.push(Line::from(spans));
+    }
+    if body.is_empty() {
+        content.push(Line::from(vec![
+            Span::styled("┃ ", rail_style),
+            Span::styled(
+                "（子代理尚未产生活动输出）",
+                Style::default().fg(theme.muted).bg(theme.panel),
+            ),
+        ]));
+    }
+    let wrapped = wrap_lines(content, inner_w);
+    let total_rows = wrapped.len();
+    let scroll = view
+        .subagent
+        .scroll
+        .min(total_rows.saturating_sub(inner_h));
+    let window = wrapped[scroll..scroll + inner_h.min(total_rows)].to_vec();
+    // 主窗口式：直接渲染进转录区（无边框），输入框/footer 由主布局保留。
+    frame.render_widget(Paragraph::new(window).scroll((0, 0)), rect);
+}
+
 /// `request_input` 交互模态渲染（opencode 形态）：tab 栏（多问题）+
 /// 问题正文 + 选项列表（label + description 副行；multiple 勾选；custom 项）
 /// + Review 页 + footer 快捷键提示。
@@ -3322,22 +3451,27 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
     let Some(menu) = &view.menu else {
         return;
     };
-    let total = menu.items.len();
-    // §防御：空菜单（会话被删光/过滤后）直接不画——selected 已 clamp，
-    // 避免窗口计算对 total=0 越界导致屏幕空白。
-    if total == 0 {
-        return;
-    }
-    let selected = menu.selected.min(total - 1);
-    // 边框内宽（左右各 1 列）与内容高（上下边框 + 底部 hint）。
+    // §oh-my-pi（type-to-filter）：Modal 型菜单（/sessions /theme /model）渲染
+    // 过滤后的列表；过滤状态行占 1 行。无匹配时显示明确提示（而非空白）。
+    let is_browser = menu.is_browser_menu();
+    let total = menu.filtered_len();
+    let filter_row = is_browser; // 过滤状态行（含空过滤时的提示）
+    // 边框内宽（左右各 1 列）与内容高（上下边框 + 底部 hint [+ 过滤行]）。
     let inner_w = rect.width.saturating_sub(2).max(1) as usize;
-    let inner_h = rect.height.saturating_sub(3).max(1) as usize; // 2 边框 + 1 hint
+    let inner_h = rect
+        .height
+        .saturating_sub(3)
+        .saturating_sub(if filter_row { 1 } else { 0 })
+        .max(1) as usize;
 
     // 两列内容宽度（用于对齐：主列 label 左对齐，辅助列从同一列开始）。
     let mut label_w = 0usize;
     let mut sub_w = 0usize;
     let mut texts: Vec<(String, String)> = Vec::with_capacity(total);
-    for (name, desc) in &menu.items {
+    for i in 0..total {
+        let Some((name, desc)) = menu.filtered_item(i) else {
+            break;
+        };
         let (label, sub) = menu_item_texts(menu, name, desc);
         label_w = label_w.max(crate::text::display_width(&label));
         sub_w = sub_w.max(crate::text::display_width(&sub));
@@ -3349,6 +3483,77 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
         .saturating_add(sub_w)
         .saturating_add(4);
     let inner_w = inner_w.min(content_w.max(2)); // 窄屏不溢出（内容超宽时截断）
+
+    let selected = menu.selected.min(total.saturating_sub(1));
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h + 2);
+    // 过滤状态行（Modal 型菜单顶部）。
+    if filter_row {
+        let filter_text = if menu.filter.is_empty() {
+            "🔍 输入以过滤…".to_string()
+        } else {
+            format!("🔍 {}", menu.filter)
+        };
+        let mut spans = vec![Span::styled(
+            filter_text,
+            Style::default()
+                .fg(if menu.filter.is_empty() {
+                    theme.muted
+                } else {
+                    theme.primary
+                })
+                .add_modifier(Modifier::BOLD)
+                .bg(theme.surface_subtle),
+        )];
+        // 补白到内宽（过滤行整行背景连续）。
+        let cur = crate::text::display_width(spans[0].content.as_ref());
+        if cur < inner_w {
+            spans.push(Span::styled(
+                " ".repeat(inner_w - cur),
+                Style::default().bg(theme.surface_subtle),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    // 无匹配：明确提示（oh-my-pi "No matching items"）。
+    if total == 0 {
+        let mut spans = vec![Span::styled(
+            if is_browser {
+                format!("（无匹配项：{}）", menu.filter)
+            } else {
+                "（无匹配项）".to_string()
+            },
+            Style::default().fg(theme.warning).bg(theme.surface_subtle),
+        )];
+        let cur = crate::text::display_width(spans[0].content.as_ref());
+        if cur < inner_w {
+            spans.push(Span::styled(
+                " ".repeat(inner_w - cur),
+                Style::default().bg(theme.surface_subtle),
+            ));
+        }
+        lines.push(Line::from(spans));
+        // 边框 + hint（复用尾部公共路径）。
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(theme.border).bg(theme.surface_subtle))
+            .title(menu_title(menu.kind))
+            .style(Style::default().bg(theme.surface_subtle));
+        lines.push(Line::styled(
+            format!("  {}", menu_hint(menu.kind)),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::DIM)
+                .bg(theme.surface_subtle),
+        ));
+        let content = Text::from(lines);
+        let styled = Paragraph::new(content)
+            .block(block)
+            .scroll((0, 0))
+            .style(Style::default().bg(theme.surface_subtle));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(styled, rect);
+        return;
+    }
 
     // 长菜单：可视窗口跟随选中项。
     // §用户诉求（菜单滚动）：`…` 只在对应方向**确实有未显示项**时出现——
@@ -3376,7 +3581,6 @@ fn draw_menu(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: th
 
     // 行样式：未选中行整行 surface_subtle 底色（菜单浮层面），选中行提亮为
     // surface + primary 加粗（§用户诉求：菜单选中清晰可见）。
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(window_rows + 2);
     if top_ellipsis {
         lines.push(Line::styled(
             "…",

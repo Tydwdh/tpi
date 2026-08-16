@@ -356,6 +356,7 @@ fn sessions_menu_shows_name_first_short_id_second() {
         selected: 0,
         kind: tpi::tui::model::MenuKind::Session,
         session_previews: Vec::new(),
+        filter: String::new(),
     });
     // 宽屏：完整布局——名字主列 + 短 id 辅助列，完整 UUID 不再出现。
     let buf = draw_to_test_backend_mode(&mut view, 160, 24, ViewMode::Fullscreen);
@@ -392,6 +393,7 @@ fn long_menu_window_follows_selection() {
         selected: 15,
         kind: tpi::tui::model::MenuKind::Session,
         session_previews: Vec::new(),
+        filter: String::new(),
     });
     let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Fullscreen);
     let all: String = row_texts(&buf).join("\n");
@@ -423,6 +425,7 @@ fn session_preview_renders_in_modal_float() {
             selected: 1,
             kind: tpi::tui::model::MenuKind::Session,
             session_previews: vec![Vec::new(), preview.clone()],
+            filter: String::new(),
         }),
         modal: Some(tpi::tui::model::ModalState::new(
             "/sessions",
