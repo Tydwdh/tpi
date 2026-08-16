@@ -11,6 +11,7 @@
 pub mod artifact;
 pub mod conversation;
 pub mod inbox;
+pub mod journal;
 pub mod projector;
 pub mod protocol;
 pub mod recovery;

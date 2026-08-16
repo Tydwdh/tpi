@@ -435,6 +435,18 @@ fn edit_success_outcome(
     result: crate::tool::edit::EditResult,
     tool: &'static str,
 ) -> ToolOutcome {
+    // §B1：记录 Mutation Journal（before/after 快照；undo 与崩溃恢复数据源）。
+    let payload = tpi_session::protocol::MutationCommittedPayload {
+        mutation_id: tpi_core::ids::EventId::new_v7().to_string(),
+        files: vec![tpi_session::protocol::MutationFile {
+            path: path.as_std_path().to_string_lossy().to_string(),
+            before_revision: result.previous_revision.clone(),
+            after_revision: result.current_revision.clone(),
+            before_content: result.previous_raw.clone(),
+            after_content: result.new_raw.clone(),
+        }],
+    };
+    let _ = tpi_session::journal::append_mutation(&ctx.artifacts_root, &ctx.session_id, &payload);
     let diff = crate::tool::edit::unified_diff(&result);
     let mut output = format!(
         "status: succeeded\ntool: {tool}\npath: {}\napplied: {}\nprevious_revision: {}\ncurrent_revision: {}",
@@ -643,6 +655,22 @@ pub fn write(
             if let Ok(snapshot) = crate::tool::edit::build_snapshot(path.clone(), new_raw.clone()) {
                 tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
             }
+            // §B1：新建文件记录 journal（before = 空）。
+            let payload = tpi_session::protocol::MutationCommittedPayload {
+                mutation_id: tpi_core::ids::EventId::new_v7().to_string(),
+                files: vec![tpi_session::protocol::MutationFile {
+                    path: path.as_std_path().to_string_lossy().to_string(),
+                    before_revision: crate::tool::edit::revision_of(&[]),
+                    after_revision: revision.clone(),
+                    before_content: Vec::new(),
+                    after_content: new_raw.clone(),
+                }],
+            };
+            let _ = tpi_session::journal::append_mutation(
+                &ctx.artifacts_root,
+                &ctx.session_id,
+                &payload,
+            );
             outcome
                 .observed_resources
                 .push(tpi_core::outcome::ResourceVersion {
@@ -722,6 +750,22 @@ fn rewrite_with_revision(
             {
                 tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
             }
+            // §B1：重写已有文件记录 journal（before = 旧内容）。
+            let payload = tpi_session::protocol::MutationCommittedPayload {
+                mutation_id: tpi_core::ids::EventId::new_v7().to_string(),
+                files: vec![tpi_session::protocol::MutationFile {
+                    path: path.as_std_path().to_string_lossy().to_string(),
+                    before_revision: result.previous_revision.clone(),
+                    after_revision: result.current_revision.clone(),
+                    before_content: result.previous_raw.clone(),
+                    after_content: result.new_raw.clone(),
+                }],
+            };
+            let _ = tpi_session::journal::append_mutation(
+                &ctx.artifacts_root,
+                &ctx.session_id,
+                &payload,
+            );
             outcome
                 .observed_resources
                 .push(tpi_core::outcome::ResourceVersion {
@@ -1650,6 +1694,57 @@ mod tests {
                 .model_payload
                 .output
                 .contains("both_operations_and_replacements")
+        );
+    }
+
+    /// §B1 端到端：edit 成功后 journal 文件生成，undo_mutation 恢复 before。
+    #[test]
+    fn edit_writes_journal_and_undo_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("j.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "line1\nline2\nline3\n").unwrap();
+        let revision = read_revision(&path, &ctx);
+        let plan = crate::tool::edit::prepare_commit(&path);
+
+        // edit：把第 2 行改成新内容。
+        let outcome = edit(
+            crate::tool::edit::EditArgs {
+                path: path.to_string(),
+                revision,
+                operations: vec![crate::tool::edit::EditOperation::ReplaceLines {
+                    start_line: 2,
+                    end_line: 2,
+                    new_text: "CHANGED".into(),
+                }],
+                replacements: Vec::new(),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        assert_eq!(
+            std::fs::read_to_string(path.as_std_path()).unwrap(),
+            "line1\nCHANGED\nline3\n"
+        );
+
+        // journal 文件已生成且含 1 条 mutation。
+        let journal_path = tpi_session::journal::journal_path(&ctx.artifacts_root, &ctx.session_id);
+        let mutations = tpi_session::journal::load_journal(&journal_path).unwrap();
+        assert_eq!(mutations.len(), 1, "journal 必须有 1 条 mutation");
+        assert_eq!(
+            mutations[0].files[0].before_content,
+            b"line1\nline2\nline3\n"
+        );
+
+        // undo：恢复 before 内容。
+        let restored =
+            tpi_session::journal::undo_mutation(&mutations, &mutations[0].mutation_id, dir.path())
+                .unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(
+            std::fs::read_to_string(path.as_std_path()).unwrap(),
+            "line1\nline2\nline3\n"
         );
     }
 }

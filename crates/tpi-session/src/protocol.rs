@@ -104,6 +104,22 @@ pub struct RecoveryMetadata {
     pub backup_path: Option<String>,
 }
 
+/// 单文件变更（Mutation Journal，§B1）。
+///
+/// before/after 全量内容供 undo/redo 与崩溃恢复（不依赖 temp/backup，
+/// 那些在提交成功后即删除）。content 是文件原始字节（含 BOM/CRLF）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationFile {
+    /// 目标文件绝对路径（内部事实源；恢复器据此定位文件）。
+    pub path: String,
+    pub before_revision: String,
+    pub after_revision: String,
+    /// before 内容（undo 恢复用）。
+    pub before_content: Vec<u8>,
+    /// after 内容（redo 用；未来）。
+    pub after_content: Vec<u8>,
+}
+
 /// 会话中断原因（§4.3：provider 断联是记录型事实，不伪装成已提交内容）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InterruptCause {
@@ -173,6 +189,12 @@ pub enum SessionEvent {
         covered: EventRange,
         summary: CompactSummary,
     },
+    /// 文件变更已提交（Mutation Journal，§B1：每次 edit/write 成功后记录
+    /// before/after 快照；undo 与崩溃恢复的数据源）。
+    MutationCommitted {
+        mutation_id: String,
+        files: Vec<MutationFile>,
+    },
     RunCompleted {
         reason: CompletionReason,
         usage: Usage,
@@ -194,6 +216,7 @@ impl SessionEvent {
             SessionEvent::ToolCompleted { .. } => "tool_completed",
             SessionEvent::PlanReplaced { .. } => "plan_replaced",
             SessionEvent::CompactionCommitted { .. } => "compaction_committed",
+            SessionEvent::MutationCommitted { .. } => "mutation_committed",
             SessionEvent::RunCompleted { .. } => "run_completed",
         }
     }
@@ -248,6 +271,9 @@ pub enum EventBody {
     },
     CompactionCommitted {
         payload: CompactionCommittedPayload,
+    },
+    MutationCommitted {
+        payload: MutationCommittedPayload,
     },
     RunCompleted {
         payload: RunCompletedPayload,
@@ -314,6 +340,12 @@ pub struct PlanReplacedPayload {
 pub struct CompactionCommittedPayload {
     pub covered: EventRange,
     pub summary: CompactSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationCommittedPayload {
+    pub mutation_id: String,
+    pub files: Vec<MutationFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,6 +421,14 @@ impl Envelope {
                     payload: CompactionCommittedPayload {
                         covered: *covered,
                         summary: summary.clone(),
+                    },
+                }
+            }
+            SessionEvent::MutationCommitted { mutation_id, files } => {
+                EventBody::MutationCommitted {
+                    payload: MutationCommittedPayload {
+                        mutation_id: mutation_id.clone(),
+                        files: files.clone(),
                     },
                 }
             }
@@ -468,6 +508,10 @@ impl Envelope {
             EventBody::CompactionCommitted { payload } => SessionEvent::CompactionCommitted {
                 covered: payload.covered,
                 summary: payload.summary.clone(),
+            },
+            EventBody::MutationCommitted { payload } => SessionEvent::MutationCommitted {
+                mutation_id: payload.mutation_id.clone(),
+                files: payload.files.clone(),
             },
             EventBody::RunCompleted { payload } => SessionEvent::RunCompleted {
                 reason: payload.reason,

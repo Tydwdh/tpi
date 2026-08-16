@@ -476,21 +476,37 @@ fn resolve_operation(
             new_text,
         } => {
             validate_range(*start_line, *end_line, &snapshot.path)?;
-            // 整行（含换行）替换：extract_lines 得 old_text，行级语义补换行。
-            let old_text = extract_lines(text, *start_line, *end_line);
-            let start = text.find(&old_text).ok_or_else(|| EditError::NoMatch {
+            // 行级定位（§anchor：行号是 base 坐标，不用 text.find——
+            // old_text 在文件中可能不唯一，find 会锚定到第一个出现处）。
+            let start = line_start_offset(text, *start_line).ok_or_else(|| EditError::NoMatch {
                 path: snapshot.path.clone(),
                 index: 0,
-                context: Some("行范围越界或文件为空".into()),
+                context: Some(format!(
+                    "行 {start_line} 不存在（文件 {} 行）",
+                    line_count(text)
+                )),
                 diagnostic: None,
             })?;
+            let end = line_end_offset(text, *end_line).unwrap_or(text.len());
+            if end < start {
+                return Err(EditError::InvalidRange {
+                    path: snapshot.path.clone(),
+                    start_line: *start_line,
+                    end_line: *end_line,
+                });
+            }
+            // 行级替换语义：new_text 由工具补换行（空 new_text 删整段行）。
             let mut replacement = new_text.clone();
-            if !replacement.is_empty() && old_text.ends_with('\n') && !replacement.ends_with('\n') {
+            if !replacement.is_empty()
+                && end > start
+                && text.as_bytes()[end.saturating_sub(1)] == b'\n'
+                && !replacement.ends_with('\n')
+            {
                 replacement.push('\n');
             }
             Ok(ResolvedSplice {
                 start,
-                end: start + old_text.len(),
+                end,
                 replacement,
             })
         }
