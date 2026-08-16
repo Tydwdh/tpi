@@ -682,10 +682,10 @@ async fn search_exa(
         "livecrawl": "fallback",
         "contextMaxCharacters": EXA_CONTEXT_MAX_CHARS,
     });
-    if let (Some(fresh), Some(days)) = (freshness, exa_freshness_days(freshness.unwrap_or(""))) {
-        if fresh == "pd_1d" || fresh == "pd_1w" || fresh == "pd_1m" || fresh == "pd_1y" {
-            args["startPublishedDate"] = serde_json::json!(days_ago_iso(days));
-        }
+    if let (Some(fresh), Some(days)) = (freshness, exa_freshness_days(freshness.unwrap_or("")))
+        && (fresh == "pd_1d" || fresh == "pd_1w" || fresh == "pd_1m" || fresh == "pd_1y")
+    {
+        args["startPublishedDate"] = serde_json::json!(days_ago_iso(days));
     }
     let body = serde_json::to_string(&serde_json::json!({
         "jsonrpc": "2.0",
@@ -812,10 +812,10 @@ fn extract_json_payloads(body: &str) -> Vec<serde_json::Value> {
     }
     for line in body.lines() {
         let line = line.trim_start();
-        if let Some(data) = line.strip_prefix("data: ") {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                payloads.push(v);
-            }
+        if let Some(data) = line.strip_prefix("data: ")
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(data)
+        {
+            payloads.push(v);
         }
     }
     payloads

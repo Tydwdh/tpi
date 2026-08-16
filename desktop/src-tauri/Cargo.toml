@@ -1,0 +1,32 @@
+[package]
+name = "tpi-desktop"
+version = "0.1.0"
+description = "TPI Desktop: Tauri shell reusing the Web frontend + embedded TPI server"
+edition = "2024"
+
+# 独立 workspace：不并入主 workspace（tauri 依赖树重，避免污染主 lockfile）。
+[workspace]
+
+[lib]
+name = "tpi_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+camino = { version = "1", features = ["serde1"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# 复用 TPI 的 runtime/server（embedded 模式）。
+tpi-runtime = { path = "../../crates/tpi-runtime" }
+tpi-server = { path = "../../crates/tpi-server" }
+tpi-config = { path = "../../crates/tpi-config" }
+tpi-agent = { path = "../../crates/tpi-agent" }
+tpi-capabilities = { path = "../../crates/tpi-capabilities" }
+tpi-core = { path = "../../crates/tpi-core" }
+tpi-session = { path = "../../crates/tpi-session" }

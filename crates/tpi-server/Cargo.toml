@@ -1,0 +1,29 @@
+[package]
+name = "tpi-server"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "TPI network adapter: Axum HTTP + WebSocket exposing the Application API (tpi-runtime)"
+
+[dependencies]
+tpi-runtime = { path = "../tpi-runtime" }
+tpi-protocol = { path = "../tpi-protocol" }
+tpi-config = { path = "../tpi-config" }
+tpi-agent = { path = "../tpi-agent" }
+tpi-capabilities = { path = "../tpi-capabilities" }
+tpi-session = { path = "../tpi-session" }
+tpi-core = { path = "../tpi-core" }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "signal", "sync", "time", "fs", "io-util", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"
+camino = { version = "1", features = ["serde1"] }
+tokio-tungstenite = { version = "0.30", features = ["connect"] }
+tpi-ui-types = { path = "../tpi-ui-types" }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }

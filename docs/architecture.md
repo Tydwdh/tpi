@@ -171,6 +171,58 @@ TUI 可以从 session 重建（--continue/--resume 还原历史与运行状态�
 
 ---
 
+## 11. 多端架构（web_desktop.md：Backend Runtime + Protocol + Multiple Frontends）
+
+在保持 Agent Core 稳定的前提下，新增三个 crate 建立 **Application Boundary**：
+
+```text
+crates/tpi-protocol   —— 协议 DTO（Command/Event/View/Error/Envelope/Version），
+                        只依赖 tpi-core，禁止依赖任何 UI/transport。
+crates/tpi-runtime    —— 唯一业务入口（RuntimeHandle + ApplicationService）。
+crates/tpi-server     —— Application API 的 Network Adapter（Axum HTTP + WebSocket）。
+```
+
+所有前端（TUI / Web / Desktop / 未来 VSCode）都是 **Command producer + Event
+consumer**，经 `RuntimeHandle.command()/subscribe()` 交互，绝不直接调用
+AgentLoop / ToolExecutor / SessionStore / Provider。
+
+### 11.1 Runtime 状态模型（actor 风格）
+
+- `sessions: HashMap<SessionId, Arc<Mutex<Option<SessionRuntime>>>>`：
+  `None` = 正在 run（session 被 run task 独占）。
+- `runs: HashMap<SessionId, CancellationToken>`：进行中的 run 取消表（主循环独占）。
+- **run 执行在独立 tokio task**，主循环只派发命令——这是 CancelRun / AnswerInput
+  在 run 进行中仍能及时处理的必要条件（单任务串行会阻塞 cancel，Phase 3 修复）。
+
+### 11.2 协议要点
+
+- `EventEnvelope` 带稳定身份：protocol_version / seq（全局单调）/ timestamp_ms /
+  session_id / run_id。前端靠 Snapshot + Event 流构造状态，不推断隐式顺序。
+- 结构化错误 `AppError { code, message, retryable, details }`，UI 按 code 行为。
+- WebSocket 握手：ClientHello/ServerHello + 协议版本检查 + token 校验（消息层
+  强制；握手层可选，浏览器无法加自定义头）。
+- 断线重连：客户端保存 `last_seq`；`ResumeSession` 后服务端广播 `SessionHistory`
+  快照（页面刷新后重建 transcript），实时事件继续流式推送。
+- Backpressure：AssistantDelta / ToolOutputDelta 高频流发送前相邻合并；关键事件
+  （RunCompleted / InputRequested / ToolCompleted）绝不丢。
+
+### 11.3 安全
+
+- `tpi server` 默认监听 `127.0.0.1`（显式 `--listen 0.0.0.0` 才暴露局域网）。
+- 未指定 `--token` 时生成随机 per-launch token（Desktop 场景）；HTTP/WS 均校验。
+- CORS 默认只允许显式配置的 origin（禁止生产 `*`）。
+- 静态资源服务含路径穿越防护（percent-decode 后拒绝 `..` 段）。
+
+### 11.4 TUI 迁移取舍
+
+现有 TUI（app/mod.rs，14 个集成测试）已是 event consumer + command producer
+架构，直接经 app 层调用 agent。完整迁移到 RuntimeHandle 会破坏稳定基线，ROI
+低；Application API 的完备性已由 tpi-server + Web UI 两个真实前端验证，且
+`tpi-runtime/tests/runtime_contract.rs` 提供 TUI 交互生命周期契约
+（cancel / request_input 挂起恢复 / 重复回答拒绝）作为未来迁移验收基线。
+
+---
+
 ## 不吸收（明确不做）
 
 - **Everything is Plugin**：AgentLoop / Session / Context 不是插件；核心保持稳定。

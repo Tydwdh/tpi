@@ -25,6 +25,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use tpi::app::{self, SessionTarget};
 use tpi::config;
+use tpi::config::Config;
 
 const MAX_INTERACTIVE_INPUT_BYTES: usize = 16 * 1024;
 
@@ -117,6 +118,22 @@ enum Command {
         /// 访问 token（可选；设置后 API 需要 X-TPI-Token 或 ?token=）。
         #[arg(long)]
         token: Option<String>,
+    },
+    /// 多端 Server（web_desktop.md）：Axum HTTP + WebSocket，暴露统一
+    /// Application API（tpi-runtime）。Web UI 与 Desktop 共用此服务。
+    Server {
+        /// 监听地址（默认 127.0.0.1:8765；显式 --listen 0.0.0.0:8765 才暴露局域网）。
+        #[arg(long, default_value = "127.0.0.1:8765")]
+        listen: String,
+        /// 访问 token（可选；未设置时本地随机生成并打印一次）。
+        #[arg(long)]
+        token: Option<String>,
+        /// Web 前端静态资源目录（默认 apps/web/dist；不存在则不提供静态服务）。
+        #[arg(long)]
+        web_dist: Option<PathBuf>,
+        /// 允许的 CORS origin（默认不发送 CORS 头；开发时可用 http://localhost:5173）。
+        #[arg(long)]
+        cors_origin: Option<String>,
     },
     /// 自动评测（Eval Harness：真实 coding task + 可重置 repo + 验收断言）。
     ///
@@ -839,6 +856,95 @@ fn current_workspace_root(cwd: Option<&std::path::Path>) -> Result<Utf8PathBuf, 
         .map_err(|path| format!("路径不是 UTF-8: {}", path.display()))
 }
 
+/// `tpi server`：启动多端 Server（web_desktop.md Phase 4）。
+///
+/// 组装 tpi-runtime（真实 provider + builtin registry），然后由 tpi-server
+/// 暴露 HTTP + WebSocket。Ctrl-C 触发优雅关闭。
+async fn run_server(
+    config: Config,
+    listen: &str,
+    token: Option<String>,
+    web_dist: Option<std::path::PathBuf>,
+    cors_origin: Option<String>,
+) -> Result<(), String> {
+    let config = std::sync::Arc::new(config);
+
+    // composition root：builtin registry（与 app 层一致）。
+    let registry: std::sync::Arc<std::sync::Mutex<tpi::tool::registry::ToolRegistry>> =
+        std::sync::Arc::new(std::sync::Mutex::new(
+            tpi::tool::registry::builtin_registry(),
+        ));
+
+    // provider 重建闭包（session 创建/恢复时构造）。
+    let build_provider: Box<
+        dyn FnMut(
+                &tpi::config::ModelConfig,
+            ) -> Result<tpi::provider::openai_compat::OpenAiCompatClient, String>
+            + Send,
+    > = Box::new(|model: &tpi::config::ModelConfig| {
+        let api_key = tpi::config::read_api_key_for(model)?;
+        Ok(tpi::provider::openai_compat::OpenAiCompatClient::new(
+            model.base_url.clone(),
+            model.name.clone(),
+            api_key,
+            model.reasoning.clone(),
+            model.max_output_tokens,
+            model.context_window,
+        ))
+    });
+
+    let task = tpi_runtime::RuntimeTask::new(config.clone(), build_provider, registry);
+    let (handle, join) = tpi_runtime::RuntimeHandle::new(task);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    // Ctrl-C 优雅关闭。
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("收到 Ctrl-C，正在关闭 server");
+            shutdown.cancel();
+        });
+    }
+
+    let addr: std::net::SocketAddr = listen
+        .parse()
+        .map_err(|e| format!("监听地址无效 {listen:?}: {e}"))?;
+    let auth = match token {
+        Some(t) => tpi_server::auth::AuthConfig {
+            token: Some(t),
+            allowed_origin: cors_origin,
+        },
+        None => {
+            // 本地模式：随机 per-launch token（Desktop 场景；打印一次供连接）。
+            let auth = tpi_server::auth::AuthConfig::local_random();
+            if let Some(t) = &auth.token {
+                eprintln!("本地访问 token（Web/Desktop 连接用）: {t}");
+            }
+            auth
+        }
+    };
+
+    println!("TPI Server 已启动：http://{listen}");
+    println!("WebSocket: ws://{listen}/ws · HTTP: /api/health /api/version");
+    if let Some(dist) = &web_dist {
+        if dist.is_dir() {
+            println!("静态资源: {}", dist.display());
+        } else {
+            eprintln!(
+                "警告: web-dist 目录不存在（{}），不提供静态页面",
+                dist.display()
+            );
+        }
+    }
+
+    let result = tpi_server::serve(handle.clone(), addr, auth, web_dist, shutdown.clone()).await;
+    // 优雅关闭 runtime（取消所有会话 run）。
+    let _ = handle.shutdown().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), join).await;
+    result
+}
+
 fn run(cli: Cli) -> Result<(), String> {
     // auth 子命令不需要完整配置/日志。
     if let Some(Command::Auth { command }) = &cli.command {
@@ -1010,6 +1116,23 @@ fn run(cli: Cli) -> Result<(), String> {
     // 局域网网页接口：手机发送/接收消息（粗糙版，见 src/web.rs）。
     if let Some(Command::Serve { port, token }) = &cli.command {
         return runtime.block_on(tpi::web::serve(Arc::new(config), *port, token.clone()));
+    }
+
+    // 多端 Server（web_desktop.md Phase 4）：Axum + WebSocket，暴露统一 Application API。
+    if let Some(Command::Server {
+        listen,
+        token,
+        web_dist,
+        cors_origin,
+    }) = &cli.command
+    {
+        return runtime.block_on(run_server(
+            config,
+            listen,
+            token.clone(),
+            web_dist.clone(),
+            cors_origin.clone(),
+        ));
     }
 
     runtime.block_on(app::run(

@@ -35,7 +35,31 @@ tpi --model <name>           # 从配置的多个模型中选择（primary + pro
 tpi auth set <provider>      # 把 token 写入 Windows Credential Manager
 tpi init                     # 交互式生成配置
 tpi doctor                   # 环境检查（config/模型/API key/Git Bash/目录）
+tpi server                   # 多端 Server：HTTP + WebSocket（默认 127.0.0.1:8765）
 ```
+
+### 多端（Web / Desktop）
+
+```text
+tpi server --web-dist apps/web/dist
+# 然后浏览器打开 http://127.0.0.1:8765
+# （未指定 --token 时本地随机生成并打印一次；连接经 ?token= 注入）
+```
+
+开发模式（Vite HMR + 代理）：
+
+```text
+cd apps/web && npm install && npm run dev
+# 另一个终端：tpi server（Vite 代理 /api 与 /ws 到 127.0.0.1:8765）
+```
+
+Desktop（Tauri 复用同一前端 + embedded server）：
+
+```text
+cd desktop/src-tauri && cargo run
+```
+
+协议与多端架构见 `web_desktop.md` 与 `docs/architecture.md` §11。
 
 ## 模型配置（~/.tpi/config.toml 或 <workspace>/.tpi/config.toml）
 
@@ -75,16 +99,16 @@ base_url = "https://api.openai.com/v1"
 ## 目录
 
 ```text
-src/agent/      AgentLoop 与工具执行编排
-src/session/    durable 事件存储（source of truth）
-src/context/    model context 投影
-src/tool/       工具抽象、注册表、调度与内置工具
-src/tui/        ratatui 界面（纯 reducer + effect）
-src/provider/   模型适配（openai-compat 等）
-src/mcp/        MCP server 生命周期与工具适配
-src/skills/     SKILL.md 工作流
-src/process/    托管后台进程（process-host 单二进制模式）
-src/remote/     SSH remote workspace
-src/eval/       自动评测 harness（真实 provider，显式运行才产生费用）
-tests/          契约 / 属性（proptest）/ 集成测试
+crates/tpi-protocol/ 多端协议 DTO（Command/Event/View/Error/Envelope）
+crates/tpi-runtime/  唯一业务入口（RuntimeHandle + actor 风格 ApplicationService）
+crates/tpi-server/   Network Adapter（Axum HTTP + WebSocket + auth + embedded）
+apps/web/            React + Vite Web UI（复用 packages/tpi-client）
+packages/tpi-client/ TypeScript 协议客户端 SDK
+crates/tpi-core/     纯数据与工具层
+crates/tpi-session/  durable 事件存储（source of truth）
+crates/tpi-agent/    AgentLoop 与工具执行编排
+crates/tpi-tui/      ratatui 界面
+crates/tpi-capabilities/  MCP/Skills/process/remote/shell/tool/workspace
+src/                 CLI 入口、app 层、eval、web（旧版局域网接口）
+tests/               契约 / 属性（proptest）/ 集成测试
 ```

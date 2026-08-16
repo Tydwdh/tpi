@@ -17,6 +17,11 @@ macro_rules! id_type {
             pub fn from_u128(value: u128) -> Self {
                 Self(Uuid::from_u128(value))
             }
+
+            /// 从 UUID 字符串解析（失败返回 [`uuid::Error`]）。
+            pub fn parse_str(s: &str) -> Result<Self, uuid::Error> {
+                Uuid::parse_str(s).map(Self)
+            }
         }
 
         impl std::fmt::Display for $name {
