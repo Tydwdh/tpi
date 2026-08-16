@@ -6,6 +6,8 @@
 //! 第一版只有 OpenAI-compatible 一个实现 + 测试用 fake provider；
 //! 第二个真实 adapter 出现时再从已稳定的输入/事件类型提取边界（§7.1）。
 
+use std::time::{Duration, Instant};
+
 use tokio_util::sync::CancellationToken;
 use tpi_session::Usage;
 
@@ -119,6 +121,69 @@ pub enum ProviderError {
 /// 模型请求的流式通道容量。
 pub const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// 一个逻辑 provider 请求共享的重试预算。
+///
+/// 预算由 provider adapter 唯一拥有：上层 AgentLoop 不得为同一请求再做
+/// 自动重试，避免 HTTP/client/provider/agent 的乘法放大。`ModelRequest` 在
+/// budget 的整个生命周期内保持不变，因此每次 attempt 都是同一请求身份的重放。
+#[derive(Debug)]
+pub struct RetryBudget {
+    max_attempts: u32,
+    max_elapsed: Duration,
+    started_at: Instant,
+    attempts_started: u32,
+    waited: Duration,
+}
+
+impl RetryBudget {
+    pub fn new(max_attempts: u32, max_elapsed: Duration) -> Self {
+        Self {
+            max_attempts: max_attempts.max(1),
+            max_elapsed,
+            started_at: Instant::now(),
+            attempts_started: 0,
+            waited: Duration::ZERO,
+        }
+    }
+
+    /// 登记一次实际网络请求；超过 attempt 或 wall-clock 预算时拒绝启动。
+    pub fn begin_attempt(&mut self) -> bool {
+        if self.attempts_started >= self.max_attempts || self.elapsed() >= self.max_elapsed {
+            return false;
+        }
+        self.attempts_started += 1;
+        true
+    }
+
+    /// 本轮失败后是否还能等待 `delay` 再重试。
+    pub fn permits_retry_after(&self, delay: Duration) -> bool {
+        self.attempts_started < self.max_attempts
+            && self
+                .elapsed()
+                // 正常路径 elapsed 已包含真实 sleep；`waited` 让预算在可控
+                // 时间/测试环境下仍能精确记账，取较大者避免重复计算。
+                .max(self.waited)
+                .checked_add(delay)
+                .is_some_and(|total| total <= self.max_elapsed)
+    }
+
+    pub fn record_wait(&mut self, delay: Duration) {
+        self.waited = self.waited.saturating_add(delay);
+    }
+
+    pub fn attempts_started(&self) -> u32 {
+        self.attempts_started
+    }
+
+    pub fn waited(&self) -> Duration {
+        self.waited
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+}
+
 /// Provider 抽象。
 ///
 /// 真实实现是 [`OpenAiCompatClient`]；测试用 fake provider 也是真实消费者
@@ -139,4 +204,21 @@ pub trait Provider: Send {
         events: tokio::sync::mpsc::Sender<ProviderEvent>,
         cancel: CancellationToken,
     ) -> impl std::future::Future<Output = Result<ProviderResponse, ProviderError>> + Send;
+}
+
+#[cfg(test)]
+mod retry_budget_tests {
+    use super::RetryBudget;
+    use std::time::Duration;
+
+    #[test]
+    fn shared_budget_prevents_nested_attempt_amplification() {
+        let mut budget = RetryBudget::new(2, Duration::from_secs(30));
+        assert!(budget.begin_attempt());
+        assert!(budget.permits_retry_after(Duration::from_secs(1)));
+        budget.record_wait(Duration::from_secs(1));
+        assert!(budget.begin_attempt());
+        assert!(!budget.permits_retry_after(Duration::ZERO));
+        assert!(!budget.begin_attempt());
+    }
 }

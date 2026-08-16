@@ -244,8 +244,9 @@ pub enum ToolRecoveryPolicy {
 pub fn tool_recovery_policy(tool_name: &str) -> ToolRecoveryPolicy {
     match tool_name {
         "edit" | "edit_range" | "write" => ToolRecoveryPolicy::FileCommit,
-        // bash 任意副作用（WorkspaceUnknown）；其余工具无文件副作用。
-        "bash" => ToolRecoveryPolicy::Unknown,
+        // `bash` 与 persistent terminal 都可能产生任意工作区副作用。
+        "bash" | "terminal_open" | "terminal_write" | "terminal_read" | "terminal_resize"
+        | "terminal_signal" | "terminal_close" => ToolRecoveryPolicy::Unknown,
         _ => ToolRecoveryPolicy::NoEffect,
     }
 }

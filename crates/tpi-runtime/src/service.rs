@@ -74,10 +74,10 @@ impl Emitter {
     pub fn emit(&self, event: RuntimeEvent) -> u64 {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let envelope = EventEnvelope::new(seq, event);
-        if let Ok(mut last) = self.last_seq.lock() {
-            if envelope.seq > *last {
-                *last = envelope.seq;
-            }
+        if let Ok(mut last) = self.last_seq.lock()
+            && envelope.seq > *last
+        {
+            *last = envelope.seq;
         }
         let _ = self.tx.send(envelope);
         seq

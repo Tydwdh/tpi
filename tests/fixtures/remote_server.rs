@@ -86,7 +86,24 @@ impl russh::server::Handler for TestHandler {
     ) -> Result<(), Self::Error> {
         let cmd = String::from_utf8_lossy(data);
         // 在远端（测试 server 所在进程）执行；用 bash 支持管道等。
-        let output = tokio::process::Command::new("bash")
+        let shell = if cfg!(windows) {
+            std::env::var_os("TPI_TEST_BASH")
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_file())
+                .or_else(|| {
+                    [
+                        r"C:\Program Files\Git\bin\bash.exe",
+                        r"C:\Program Files\Git\usr\bin\bash.exe",
+                    ]
+                    .into_iter()
+                    .map(std::path::PathBuf::from)
+                    .find(|p| p.is_file())
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("bash"))
+        } else {
+            std::path::PathBuf::from("bash")
+        };
+        let output = tokio::process::Command::new(shell)
             .arg("-c")
             .arg(cmd.as_ref())
             .output()

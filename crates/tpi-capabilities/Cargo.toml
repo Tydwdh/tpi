@@ -30,6 +30,7 @@ similar = "2"
 ignore = "0.4"
 grep = "0.3"
 globset = "0.4"
+portable-pty = "0.9"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading",

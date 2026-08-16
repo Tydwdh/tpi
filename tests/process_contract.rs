@@ -220,6 +220,54 @@ async fn background_bash_completes_pipeline() {
     );
 }
 
+/// 工作区事务边界不能只覆盖 foreground：后台 Job 结束后也必须把实际
+/// 文件 delta 写入 session journal，供 undo/审计使用。
+#[tokio::test]
+#[serial]
+async fn background_bash_commits_workspace_delta_after_exit() {
+    fixtures::point_host_at_real_tpi();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let ctx = fixtures::test_tool_context(&workspace);
+    if tpi::tool::command::locate_git_bash(&ctx).is_none() {
+        return;
+    }
+    let outcome = bash(
+        BashArgs {
+            command: "printf tracked > generated-by-job.txt".into(),
+            cwd: None,
+            timeout_ms: 120_000,
+            background: true,
+        },
+        &ctx,
+    )
+    .await;
+    let id: ProcessId = outcome
+        .model_text()
+        .lines()
+        .find_map(|line| line.strip_prefix("process_id: "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        wait_process(&ctx.processes, id, std::time::Duration::from_secs(10)).await,
+        Some(ManagedProcessState::Exited { exit_code: 0 })
+    );
+    let journal = tpi::session::journal::load_journal(&tpi::session::journal::journal_path(
+        &ctx.artifacts_root,
+        &ctx.session_id,
+    ))
+    .unwrap();
+    assert!(journal.mutations.iter().any(|mutation| {
+        mutation.files.iter().any(|file| {
+            file.path.ends_with("generated-by-job.txt")
+                && !file.before_exists
+                && file.after_exists
+                && file.after_content == b"tracked"
+        })
+    }));
+}
+
 /// P4（任务书 §58）：process 工具 status/output 可查看后台进程状态与输出。
 #[tokio::test]
 #[serial]
@@ -257,6 +305,7 @@ async fn process_tool_reports_status_and_output() {
             action: tpi::tool::process::ProcessAction::Status,
             id: Some(pid_text.clone()),
             timeout_ms: 1000,
+            after: None,
         },
         &ctx,
     )
@@ -274,6 +323,7 @@ async fn process_tool_reports_status_and_output() {
             action: tpi::tool::process::ProcessAction::Output,
             id: Some(pid_text.clone()),
             timeout_ms: 1000,
+            after: None,
         },
         &ctx,
     )
@@ -283,6 +333,28 @@ async fn process_tool_reports_status_and_output() {
         output_text.contains("ready-line"),
         "output 必须包含已产生输出: {output_text}"
     );
+    let next_cursor: u64 = output_text
+        .lines()
+        .find_map(|line| line.strip_prefix("next_cursor: "))
+        .expect("output must return a cursor")
+        .parse()
+        .expect("cursor must be numeric");
+    let continued = tpi::tool::process::process(
+        tpi::tool::process::ProcessArgs {
+            action: tpi::tool::process::ProcessAction::Output,
+            id: Some(pid_text.clone()),
+            timeout_ms: 1000,
+            after: Some(next_cursor),
+        },
+        &ctx,
+    )
+    .await;
+    assert!(
+        continued.model_text().contains("after: ")
+            && continued.model_text().contains("next_cursor: "),
+        "cursor response must remain pageable: {}",
+        continued.model_text()
+    );
 
     // wait：等 4 秒 sleep 结束 → 返回 exited 0（任务书 §20：不是错误）。
     let waited = tpi::tool::process::process(
@@ -290,6 +362,7 @@ async fn process_tool_reports_status_and_output() {
             action: tpi::tool::process::ProcessAction::Wait,
             id: Some(pid_text.clone()),
             timeout_ms: 10_000,
+            after: None,
         },
         &ctx,
     )
@@ -340,6 +413,7 @@ async fn process_cancel_terminates_tree_and_marks_cancelled() {
             action: tpi::tool::process::ProcessAction::Cancel,
             id: Some(pid_text.clone()),
             timeout_ms: 1000,
+            after: None,
         },
         &ctx,
     )
@@ -367,6 +441,7 @@ async fn process_cancel_terminates_tree_and_marks_cancelled() {
             action: tpi::tool::process::ProcessAction::Cancel,
             id: Some(pid_text),
             timeout_ms: 1000,
+            after: None,
         },
         &ctx,
     )
@@ -421,6 +496,7 @@ async fn process_list_and_unknown_id() {
             action: tpi::tool::process::ProcessAction::List,
             id: None,
             timeout_ms: 1000,
+            after: None,
         },
         &ctx,
     )
@@ -441,6 +517,7 @@ async fn process_list_and_unknown_id() {
             action: tpi::tool::process::ProcessAction::Status,
             id: Some("p99999".into()),
             timeout_ms: 1000,
+            after: None,
         },
         &ctx,
     )
@@ -487,6 +564,7 @@ async fn process_wait_timeout_returns_running_not_error() {
             action: tpi::tool::process::ProcessAction::Wait,
             id: Some(pid_text.clone()),
             timeout_ms: 300,
+            after: None,
         },
         &ctx,
     )
@@ -504,6 +582,7 @@ async fn process_wait_timeout_returns_running_not_error() {
             action: tpi::tool::process::ProcessAction::Cancel,
             id: Some(pid_text),
             timeout_ms: 1000,
+            after: None,
         },
         &ctx,
     )
@@ -735,6 +814,7 @@ async fn web_server_background_lifecycle() {
             action: tpi::tool::process::ProcessAction::Cancel,
             id: Some(server_id.to_string()),
             timeout_ms: 1000,
+            after: None,
         },
         &ctx,
     )
@@ -794,6 +874,7 @@ async fn web_server_background_lifecycle() {
             action: tpi::tool::process::ProcessAction::Cancel,
             id: Some(server2.to_string()),
             timeout_ms: 1000,
+            after: None,
         },
         &ctx,
     )
@@ -859,6 +940,7 @@ async fn multiple_processes_are_isolated() {
             action: tpi::tool::process::ProcessAction::Cancel,
             id: Some(p2.to_string()),
             timeout_ms: 1000,
+            after: None,
         },
         &ctx,
     )
@@ -887,6 +969,7 @@ async fn multiple_processes_are_isolated() {
                 action: tpi::tool::process::ProcessAction::Cancel,
                 id: Some(id.to_string()),
                 timeout_ms: 1000,
+                after: None,
             },
             &ctx,
         )
@@ -981,6 +1064,7 @@ async fn hundred_spawn_cancel_cycles_leave_no_leak() {
                 action: tpi::tool::process::ProcessAction::Cancel,
                 id: Some(pid_text.clone()),
                 timeout_ms: 1000,
+                after: None,
             },
             &ctx,
         )

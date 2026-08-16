@@ -223,6 +223,7 @@ mod tests {
         assert_eq!(cjk, 4);
     }
 
+    #[test]
     fn prune_keeps_structured_key_lines() {
         // 构造 >800 token 的输出：artifact 引用在中间（不在尾部）。
         let mut content = String::from(

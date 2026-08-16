@@ -2526,15 +2526,15 @@ mod tests {
             elapsed.as_secs() < 5,
             "百万行级别诊断必须快速返回（窗口上限）: {elapsed:?}"
         );
-        if let Some(diag) = &d {
-            if let Some((provided, actual)) = &diag.first_difference {
-                assert!(
-                    provided.len() <= 220,
-                    "差异行必须截断: {} 字节",
-                    provided.len()
-                );
-                assert!(actual.len() <= 220, "差异行必须截断: {} 字节", actual.len());
-            }
+        if let Some(diag) = &d
+            && let Some((provided, actual)) = &diag.first_difference
+        {
+            assert!(
+                provided.len() <= 220,
+                "差异行必须截断: {} 字节",
+                provided.len()
+            );
+            assert!(actual.len() <= 220, "差异行必须截断: {} 字节", actual.len());
         }
     }
 

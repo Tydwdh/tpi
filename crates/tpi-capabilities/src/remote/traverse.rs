@@ -70,7 +70,7 @@ pub async fn remote_list(
             stop_reason = "deadline";
             break;
         }
-        let entries = match client.read_dir(&dir).await {
+        let entries = match crate::remote::run_with_budget(ctx, client.read_dir(&dir)).await {
             Ok(entries) => entries,
             Err(_) => continue, // 无权限目录跳过
         };
@@ -127,14 +127,16 @@ pub async fn remote_search(
     let started = Instant::now();
 
     // 1. capability detect：远端是否有 rg。
-    let has_rg = match client
-        .exec(
+    let has_rg = match crate::remote::run_with_budget(
+        ctx,
+        client.exec(
             "command -v rg >/dev/null 2>&1",
             None,
             &Default::default(),
             None,
-        )
-        .await
+        ),
+    )
+    .await
     {
         Ok(r) => r.exit_code == Some(0),
         Err(_) => false,
@@ -184,7 +186,10 @@ pub async fn remote_search(
     // 超时按失败返回（模型可缩小范围重试）。
     let exec_result = match tokio::time::timeout(
         SCAN_DEADLINE,
-        client.exec(&cmd, None, &Default::default(), Some(&ctx.cancel)),
+        crate::remote::run_with_budget(
+            ctx,
+            client.exec(&cmd, None, &Default::default(), Some(&ctx.cancel)),
+        ),
     )
     .await
     {
@@ -260,7 +265,7 @@ pub async fn remote_glob(
             stopped = "deadline";
             break;
         }
-        let entries = match client.read_dir(&dir).await {
+        let entries = match crate::remote::run_with_budget(ctx, client.read_dir(&dir)).await {
             Ok(entries) => entries,
             Err(_) => continue,
         };
@@ -277,7 +282,7 @@ pub async fn remote_glob(
                 break 'scan;
             }
             // mtime（glob 按最近修改降序，同本地语义）。
-            let mtime = match client.stat(&path).await {
+            let mtime = match crate::remote::run_with_budget(ctx, client.stat(&path)).await {
                 Ok(attrs) => attrs.mtime.unwrap_or(0) as u64,
                 Err(_) => 0,
             };

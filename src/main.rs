@@ -876,11 +876,8 @@ async fn run_server(
         ));
 
     // provider 重建闭包（session 创建/恢复时构造）。
-    let build_provider: Box<
-        dyn FnMut(
-                &tpi::config::ModelConfig,
-            ) -> Result<tpi::provider::openai_compat::OpenAiCompatClient, String>
-            + Send,
+    let build_provider: tpi_runtime::service::ProviderFactory<
+        tpi::provider::openai_compat::OpenAiCompatClient,
     > = Box::new(|model: &tpi::config::ModelConfig| {
         let api_key = tpi::config::read_api_key_for(model)?;
         Ok(tpi::provider::openai_compat::OpenAiCompatClient::new(

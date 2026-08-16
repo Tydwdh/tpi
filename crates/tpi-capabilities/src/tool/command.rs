@@ -105,7 +105,35 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
             if args.background {
                 local_bash_background(args, ctx).await
             } else {
-                local_bash(args, ctx).await
+                // Shell commands may legitimately mutate arbitrary workspace files
+                // (formatter/codegen/git). Capture the whole bounded workspace first;
+                // if it cannot be observed, fail closed instead of creating an
+                // un-auditable mutation.
+                let mut tracked = match crate::workspace::tracked::TrackedWorkspace::capture(
+                    ctx.workspace_root.clone(),
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return rejected_bash("workspace_tracking", error),
+                };
+                let outcome = local_bash(args, ctx).await;
+                // A non-zero command can still have changed files; journal its delta.
+                if let Err(error) = tracked.commit(&ctx.artifacts_root, &ctx.session_id) {
+                    return ToolOutcome::failed(
+                        "bash",
+                        ModelPayload {
+                            status: ToolStatus::Failed,
+                            program: Some("bash".into()),
+                            exit_code: None,
+                            duration_ms: outcome.model_payload.duration_ms,
+                            output: format!(
+                                "status: failed\ntool: bash\nerror: workspace_journal\n\n{error}"
+                            ),
+                            effect: None,
+                            artifact: None,
+                        },
+                    );
+                }
+                outcome
             }
         }
         crate::workspace::WorkspaceKind::Remote => {
@@ -577,6 +605,11 @@ async fn local_bash_background(args: BashArgs, ctx: &ToolContext) -> ToolOutcome
         let ws = tpi_core::util::lock_mutex(&ctx.workspace, "workspace");
         ws.id().to_string()
     };
+    let workspace_tracker =
+        match crate::workspace::tracked::TrackedWorkspace::capture(ctx.workspace_root.clone()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return rejected_bash("workspace_tracking", error),
+        };
     // background 命令原样执行（无 capture wrapper：不捕获、不 commit §10）。
     let run_args = RunArgs {
         program: bash_exe,
@@ -599,6 +632,7 @@ async fn local_bash_background(args: BashArgs, ctx: &ToolContext) -> ToolOutcome
         command: args.command.clone(),
         artifacts_root: ctx.artifacts_root.clone(),
         session_id: ctx.session_id.clone(),
+        workspace_tracker: Some(workspace_tracker),
         registry: ctx.processes.clone(),
     };
     match crate::process::managed::start_background(request).await {

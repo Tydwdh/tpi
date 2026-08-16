@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::provider::trace;
 use crate::provider::{
     ChatMessage, FinishReason, ModelRequest, Provider, ProviderError, ProviderEvent,
-    ProviderResponse,
+    ProviderResponse, RetryBudget,
 };
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -344,13 +344,24 @@ impl Provider for OpenAiCompatClient {
         // （consume_stream）的传输错误在未收到任何事件时同样可安全重试（网络抖动/
         // 连接中途断开），收到事件后失败则不可重试（避免事件重复/乱序）。
         //
-        // 退避策略（§7.3）：指数退避 + jitter；最多 `MAX_ATTEMPTS` 次尝试，
-        // 且「重试等待」累计不超过 `MAX_RETRY_WAIT`（防服务端持续 Retry-After
-        // 时无限重试）。单次请求耗时不计入预算（由 connect_timeout / cancel
-        // 约束；SSE 流读取无总超时）。
-        let mut attempt: u32 = 0;
-        let mut retry_wait = Duration::ZERO;
+        // 预算属于本次逻辑请求，而不是某个 HTTP attempt。请求 body 在循环外
+        // 构建且绝不修改，确保 retry 不会偷偷 compact、改 schema 或改参数。
+        let mut budget = RetryBudget::new(MAX_ATTEMPTS, MAX_RETRY_WAIT);
         loop {
+            if !budget.begin_attempt() {
+                return Err(ProviderError::Connection(format!(
+                    "retry budget exhausted after {} attempts / {}ms",
+                    budget.attempts_started(),
+                    budget.elapsed().as_millis()
+                )));
+            }
+            let attempt = budget.attempts_started() - 1;
+            if trace::enabled() {
+                let mut fields = serde_json::Map::new();
+                fields.insert("attempt".into(), json!(budget.attempts_started()));
+                fields.insert("waited_ms".into(), json!(budget.waited().as_millis()));
+                trace::log("request_attempt", fields);
+            }
             let response = match self.send_once(&url, &body, &cancel).await {
                 Ok(response) => response,
                 Err(error) => {
@@ -359,26 +370,24 @@ impl Provider for OpenAiCompatClient {
                     if error == "cancelled" {
                         return Err(ProviderError::Cancelled);
                     }
-                    // ISSUE-009：确定性错误不得重试——重试必然再次失败，
-                    // 只会浪费配额/请求并让用户误以为是瞬时故障：
-                    // - auth（401/403）：认证问题，改凭据前重试无意义；
-                    // - http 4xx（非 429，429 走 Retryable 分支）：请求格式/
-                    //   内容策略被 provider 拒绝，重发同样内容结果相同。
-                    // 此前这些被当传输错误指数退避重试，叠加 agent 层 turn
-                    // 级重启最多产生 ~100 次无效请求。
-                    if error.starts_with("auth") {
-                        return Err(ProviderError::Auth(error));
-                    }
-                    if error.starts_with("http ") && !error.starts_with("http 429") {
-                        return Err(ProviderError::Protocol(error));
+                    // OpenAI-compatible gateways occasionally surface proxy
+                    // failures as 4xx. Give such a result exactly one
+                    // defensive replay, then retain its precise error class;
+                    // this is deliberately not an unbounded "retry 4xx"
+                    // policy. 429 follows the normal bounded retry branch.
+                    let defensive_4xx = error.starts_with("auth")
+                        || (error.starts_with("http ") && !error.starts_with("http 429"));
+                    if defensive_4xx && !defensive_retry_allowed(attempt) {
+                        return Err(classify_error(error, attempt));
                     }
                     // 传输层失败（连接被拒/中断）：未收到任何事件，可安全重试。
-                    if attempt + 1 >= MAX_ATTEMPTS || retry_wait >= MAX_RETRY_WAIT {
+                    if !budget.permits_retry_after(Duration::ZERO) {
                         return Err(classify_error(error, attempt));
                     }
-                    let Some(delay) = retry_delay_within_budget(attempt, None, retry_wait) else {
+                    let delay = backoff_delay(attempt, None);
+                    if !budget.permits_retry_after(delay) {
                         return Err(classify_error(error, attempt));
-                    };
+                    }
                     tracing::warn!(
                         attempt,
                         error = %error,
@@ -388,8 +397,7 @@ impl Provider for OpenAiCompatClient {
                     if !wait_or_cancelled(&cancel, delay).await {
                         return Err(ProviderError::Cancelled);
                     }
-                    retry_wait += delay;
-                    attempt += 1;
+                    budget.record_wait(delay);
                     continue;
                 }
             };
@@ -407,14 +415,14 @@ impl Provider for OpenAiCompatClient {
                             if !retryable || matches!(error, ProviderError::Cancelled) {
                                 return Err(error);
                             }
-                            if attempt + 1 >= MAX_ATTEMPTS || retry_wait >= MAX_RETRY_WAIT {
+                            if !budget.permits_retry_after(Duration::ZERO) {
                                 return Err(error);
                             }
                             // 未收到任何事件：传输层失败，短暂等待后重发请求。
-                            let Some(delay) = retry_delay_within_budget(attempt, None, retry_wait)
-                            else {
+                            let delay = backoff_delay(attempt, None);
+                            if !budget.permits_retry_after(delay) {
                                 return Err(error);
-                            };
+                            }
                             tracing::warn!(
                                 attempt,
                                 error = %error,
@@ -424,8 +432,7 @@ impl Provider for OpenAiCompatClient {
                             if !wait_or_cancelled(&cancel, delay).await {
                                 return Err(ProviderError::Cancelled);
                             }
-                            retry_wait += delay;
-                            attempt += 1;
+                            budget.record_wait(delay);
                         }
                     }
                 }
@@ -441,13 +448,13 @@ impl Provider for OpenAiCompatClient {
                         );
                         trace::log("retryable", fields);
                     }
-                    if attempt + 1 >= MAX_ATTEMPTS || retry_wait >= MAX_RETRY_WAIT {
+                    if !budget.permits_retry_after(Duration::ZERO) {
                         return Err(retryable_status_error(status, attempt));
                     }
-                    let Some(delay) = retry_delay_within_budget(attempt, retry_after, retry_wait)
-                    else {
+                    let delay = backoff_delay(attempt, retry_after);
+                    if !budget.permits_retry_after(delay) {
                         return Err(retryable_status_error(status, attempt));
-                    };
+                    }
                     tracing::warn!(
                         attempt,
                         backoff_ms = delay.as_millis(),
@@ -456,12 +463,17 @@ impl Provider for OpenAiCompatClient {
                     if !wait_or_cancelled(&cancel, delay).await {
                         return Err(ProviderError::Cancelled);
                     }
-                    retry_wait += delay;
-                    attempt += 1;
+                    budget.record_wait(delay);
                 }
             }
         }
     }
+}
+
+/// A malformed request/auth result gets one replay for imperfect compatible
+/// gateways, while subsequent identical 4xx results remain terminal.
+fn defensive_retry_allowed(attempt: u32) -> bool {
+    attempt == 0
 }
 
 /// 计算本次重试的等待时长（§7.3）：
@@ -481,18 +493,6 @@ fn backoff_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
         Some(server) if server > local => server,
         _ => local,
     }
-}
-
-fn retry_delay_within_budget(
-    attempt: u32,
-    retry_after: Option<Duration>,
-    already_waited: Duration,
-) -> Option<Duration> {
-    let delay = backoff_delay(attempt, retry_after);
-    already_waited
-        .checked_add(delay)
-        .filter(|total| *total <= MAX_RETRY_WAIT)
-        .map(|_| delay)
 }
 
 /// 0..1 的伪随机比例（jitter 用；不用引全局 RNG 依赖）。
@@ -1305,26 +1305,14 @@ fn retry_after_respected_when_larger() {
 
 #[test]
 fn retry_after_cannot_exceed_total_wait_budget() {
+    let mut budget = RetryBudget::new(4, Duration::from_secs(360));
+    assert!(budget.begin_attempt());
     // 61s 在 360s 预算内：允许（区别于旧的 60s 预算）。
-    assert_eq!(
-        retry_delay_within_budget(0, Some(Duration::from_secs(61)), Duration::ZERO),
-        Some(Duration::from_secs(61))
-    );
-    // 累计已超预算：拒绝（30s 延迟 + 已等 331s > 360s）。
-    assert_eq!(
-        retry_delay_within_budget(0, Some(Duration::from_secs(30)), Duration::from_secs(331)),
-        None
-    );
-    // 累计恰好等于预算：允许。
-    assert_eq!(
-        retry_delay_within_budget(0, Some(Duration::from_secs(30)), Duration::from_secs(330)),
-        Some(Duration::from_secs(30))
-    );
-    // 超长 Retry-After（> 预算）直接拒绝。
-    assert_eq!(
-        retry_delay_within_budget(0, Some(Duration::from_secs(361)), Duration::ZERO),
-        None
-    );
+    assert!(budget.permits_retry_after(Duration::from_secs(61)));
+    budget.record_wait(Duration::from_secs(330));
+    // 累计恰好等于预算：允许；再多 1ms 即拒绝。
+    assert!(budget.permits_retry_after(Duration::from_secs(30)));
+    assert!(!budget.permits_retry_after(Duration::from_secs(31)));
 }
 
 #[test]
@@ -1337,6 +1325,13 @@ fn exhausted_retryable_status_keeps_error_class() {
         retryable_status_error(reqwest::StatusCode::BAD_GATEWAY, 3),
         ProviderError::Http(_)
     ));
+}
+
+#[test]
+fn defensive_4xx_retry_is_limited_to_one_replay() {
+    assert!(defensive_retry_allowed(0));
+    assert!(!defensive_retry_allowed(1));
+    assert!(!defensive_retry_allowed(3));
 }
 
 /// §16.2：缓存命中 token 解析——prompt_tokens_details.cached_tokens。

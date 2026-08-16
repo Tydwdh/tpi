@@ -662,11 +662,10 @@ async fn retry_respects_cancel_during_backoff() {
     assert!(matches!(result, Ok(Err(ProviderError::Cancelled))));
 }
 
-/// ISSUE-009：确定性 4xx（400 请求格式/内容策略）与认证错误不得重试——
-/// 此前被当传输错误指数退避重试（最多 ~100 次无效请求）。mock server 计数
-/// 收到的请求数，断言 400/auth 只触发一次请求。
+/// 兼容网关可能把短暂代理故障伪装成 4xx；400/auth 允许一次防御性重放，
+/// 但第二次同样失败必须保留精确错误类型并停止，不能指数退避放大。
 #[tokio::test]
-async fn deterministic_4xx_and_auth_do_not_retry() {
+async fn deterministic_4xx_and_auth_get_one_defensive_retry() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -711,15 +710,15 @@ async fn deterministic_4xx_and_auth_do_not_retry() {
         (error.unwrap_err(), hits.load(Ordering::SeqCst))
     }
 
-    // 400（确定性协议错误）：1 次请求，错误为 Protocol。
+    // 400：首次防御性重放后仍是 Protocol。
     let (error, hits) = run_with_status("400 Bad Request").await;
     assert!(matches!(error, ProviderError::Protocol(_)), "{error}");
-    assert_eq!(hits, 1, "400 不得重试（ISSUE-009）");
+    assert_eq!(hits, 2, "400 仅允许一次防御性重放");
 
-    // 401（认证）：1 次请求，错误为 Auth。
+    // 401：首次防御性重放后仍是 Auth。
     let (error, hits) = run_with_status("401 Unauthorized").await;
     assert!(matches!(error, ProviderError::Auth(_)), "{error}");
-    assert_eq!(hits, 1, "401 不得重试（ISSUE-009）");
+    assert_eq!(hits, 2, "401 仅允许一次防御性重放");
     // 注意：500 等瞬时错误的重试行为已由 retry_respects_cancel_during_backoff
     // 与 retryable_status_error 单测覆盖；此处不重复（完整退避 ~226s 太慢）。
 }

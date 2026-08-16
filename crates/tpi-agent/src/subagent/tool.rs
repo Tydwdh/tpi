@@ -366,6 +366,7 @@ mod tool_tests {
                 LocalWorkspace::new(camino::Utf8PathBuf::from("C:/proj"), false),
             ))),
             processes: Default::default(),
+            terminals: Default::default(),
             registry: Default::default(),
             interactive: false,
         }

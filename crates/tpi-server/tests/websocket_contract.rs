@@ -22,7 +22,8 @@ use tpi_agent::provider::{
     FinishReason, ModelRequest, Provider, ProviderError, ProviderEvent, ProviderResponse,
 };
 use tpi_config::config::{Config, LimitsConfig, ModelConfig};
-use tpi_protocol::{ClientCommand, PROTOCOL_VERSION};
+use tpi_protocol::PROTOCOL_VERSION;
+use tpi_runtime::service::ProviderFactory;
 use tpi_runtime::{RuntimeHandle, RuntimeTask};
 use tpi_server::auth::AuthConfig;
 use tpi_session::Usage;
@@ -104,12 +105,11 @@ async fn start_server(
     let registry: Arc<StdMutex<tpi_capabilities::tool::registry::ToolRegistry>> = Arc::new(
         StdMutex::new(tpi_capabilities::tool::registry::builtin_registry()),
     );
-    let build_provider: Box<dyn FnMut(&ModelConfig) -> Result<FakeProvider, String> + Send> =
-        Box::new(|_| {
-            Ok(FakeProvider {
-                script: VecDeque::from(["你好，这是测试回复".to_string()]),
-            })
-        });
+    let build_provider: ProviderFactory<FakeProvider> = Box::new(|_| {
+        Ok(FakeProvider {
+            script: VecDeque::from(["你好，这是测试回复".to_string()]),
+        })
+    });
     let task = RuntimeTask::new(Arc::new(config), build_provider, registry);
     let (handle, _join) = RuntimeHandle::new(task);
 

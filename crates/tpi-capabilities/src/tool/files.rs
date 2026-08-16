@@ -413,6 +413,8 @@ fn edit_success_outcome(
             path: path.as_std_path().to_string_lossy().to_string(),
             before_revision: result.previous_revision.clone(),
             after_revision: result.current_revision.clone(),
+            before_exists: true,
+            after_exists: true,
             before_content: result.previous_raw.clone(),
             after_content: result.new_raw.clone(),
         }],
@@ -554,6 +556,8 @@ pub fn write(
                     path: path.as_std_path().to_string_lossy().to_string(),
                     before_revision: crate::tool::edit::revision_of(&[]),
                     after_revision: revision.clone(),
+                    before_exists: false,
+                    after_exists: true,
                     before_content: Vec::new(),
                     after_content: new_raw.clone(),
                 }],
@@ -649,6 +653,8 @@ fn rewrite_with_revision(
                     path: path.as_std_path().to_string_lossy().to_string(),
                     before_revision: result.previous_revision.clone(),
                     after_revision: result.current_revision.clone(),
+                    before_exists: true,
+                    after_exists: true,
                     before_content: result.previous_raw.clone(),
                     after_content: result.new_raw.clone(),
                 }],
@@ -788,6 +794,7 @@ mod tests {
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),
+            terminals: Default::default(),
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::tool::registry::ToolRegistry::new(),
             )),
@@ -854,6 +861,7 @@ mod tests {
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),
+            terminals: Default::default(),
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::tool::registry::ToolRegistry::new(),
             )),
@@ -914,6 +922,7 @@ mod tests {
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),
+            terminals: Default::default(),
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::tool::registry::ToolRegistry::new(),
             )),
@@ -979,6 +988,7 @@ mod tests {
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),
+            terminals: Default::default(),
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::tool::registry::ToolRegistry::new(),
             )),
@@ -1046,6 +1056,7 @@ mod tests {
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),
+            terminals: Default::default(),
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::tool::registry::ToolRegistry::new(),
             )),

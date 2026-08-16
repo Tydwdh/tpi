@@ -20,10 +20,10 @@ use crate::auth::AuthConfig;
 
 /// 从请求提取 token：`X-TPI-Token` 头或 `?token=` 查询参数。
 pub(crate) fn extract_token(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
-    if let Some(value) = headers.get("x-tpi-token") {
-        if let Ok(s) = value.to_str() {
-            return Some(s.to_string());
-        }
+    if let Some(value) = headers.get("x-tpi-token")
+        && let Ok(s) = value.to_str()
+    {
+        return Some(s.to_string());
     }
     // 查询参数 `?token=...`（URL 参数里可能是 URL-encoded；此处做简单解码）。
     let query = query?;
@@ -134,10 +134,10 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     // 握手层：若有 token 则校验（浏览器无法加自定义头，走 ?token= 查询参数）；
     // 真正的强制校验在消息层 hello（websocket.rs），那里浏览器可带 token。
-    if let Some(token) = extract_token(&headers, None) {
-        if let Err(reason) = state.auth.verify(Some(&token)) {
-            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": reason }))).into_response();
-        }
+    if let Some(token) = extract_token(&headers, None)
+        && let Err(reason) = state.auth.verify(Some(&token))
+    {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": reason }))).into_response();
     }
     ws.on_upgrade(move |socket| crate::websocket::handle_socket(socket, state))
 }

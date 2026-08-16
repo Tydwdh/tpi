@@ -8,5 +8,6 @@ pub mod process;
 pub mod remote;
 pub mod shell;
 pub mod skills;
+pub mod terminal;
 pub mod tool;
 pub mod workspace;

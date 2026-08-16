@@ -114,10 +114,20 @@ pub struct MutationFile {
     pub path: String,
     pub before_revision: String,
     pub after_revision: String,
+    /// 变更前目标是否存在。旧 journal 缺失此字段时按 true 兼容读取。
+    #[serde(default = "default_file_exists")]
+    pub before_exists: bool,
+    /// 变更后目标是否存在。用于区分删除与写入空文件。
+    #[serde(default = "default_file_exists")]
+    pub after_exists: bool,
     /// before 内容（undo 恢复用）。
     pub before_content: Vec<u8>,
     /// after 内容（redo 用；未来）。
     pub after_content: Vec<u8>,
+}
+
+fn default_file_exists() -> bool {
+    true
 }
 
 /// 会话中断原因（§4.3：provider 断联是记录型事实，不伪装成已提交内容）。

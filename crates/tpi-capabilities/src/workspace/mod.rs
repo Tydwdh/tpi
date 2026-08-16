@@ -13,6 +13,8 @@
 
 use std::sync::{Arc, Mutex};
 
+pub mod tracked;
+
 use camino::Utf8PathBuf;
 
 use crate::shell::ShellSessionState;

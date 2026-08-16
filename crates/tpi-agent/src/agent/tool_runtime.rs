@@ -34,6 +34,7 @@ pub(super) struct ToolRuntime {
     workspace: Arc<Mutex<tpi_capabilities::workspace::ActiveWorkspace>>,
     /// ManagedProcess registry（session 级；background bash + process 工具共享）。
     processes: Arc<Mutex<tpi_capabilities::process::managed::ProcessRegistry>>,
+    terminals: Arc<Mutex<tpi_capabilities::terminal::TerminalRegistry>>,
     /// ToolRegistry（builtin + MCP；agent 工具目录，README2 Phase 5）。
     /// Mutex：Phase 3 的 McpManager 运行时注册 MCP 工具。
     registry: Arc<std::sync::Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
@@ -102,6 +103,9 @@ impl ToolRuntime {
             workspace,
             processes: Arc::new(Mutex::new(
                 tpi_capabilities::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: Arc::new(Mutex::new(
+                tpi_capabilities::terminal::TerminalRegistry::default(),
             )),
             registry,
         }
@@ -191,6 +195,7 @@ impl ToolRuntime {
             shell: self.shell.clone(),
             workspace: self.workspace.clone(),
             processes: self.processes.clone(),
+            terminals: self.terminals.clone(),
             registry: self.registry.clone(),
             interactive: self.interactive,
         }

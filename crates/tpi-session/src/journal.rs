@@ -162,10 +162,9 @@ pub fn undo_mutation(
     let mut verdicts = Vec::with_capacity(mutation.files.len());
     for file in &mutation.files {
         let target = resolve_target(&file.path, workspace_root);
-        let current = std::fs::read(&target).unwrap_or_default();
-        let verdict = if current == file.before_content {
+        let verdict = if matches_file_state(&target, file.before_exists, &file.before_content) {
             CasVerdict::AlreadyDone
-        } else if current == file.after_content {
+        } else if matches_file_state(&target, file.after_exists, &file.after_content) {
             CasVerdict::Applied // 待写入
         } else {
             CasVerdict::Conflict
@@ -179,7 +178,7 @@ pub fn undo_mutation(
     for (file, (_, verdict)) in mutation.files.iter().zip(&verdicts) {
         if *verdict == CasVerdict::Applied {
             let target = resolve_target(&file.path, workspace_root);
-            write_atomic(&target, &file.before_content)?;
+            apply_file_state(&target, file.before_exists, &file.before_content)?;
         }
     }
     Ok(verdicts)
@@ -206,10 +205,9 @@ pub fn redo_mutation(
     let mut verdicts = Vec::with_capacity(mutation.files.len());
     for file in &mutation.files {
         let target = resolve_target(&file.path, workspace_root);
-        let current = std::fs::read(&target).unwrap_or_default();
-        let verdict = if current == file.after_content {
+        let verdict = if matches_file_state(&target, file.after_exists, &file.after_content) {
             CasVerdict::AlreadyDone
-        } else if current == file.before_content {
+        } else if matches_file_state(&target, file.before_exists, &file.before_content) {
             CasVerdict::Applied // 待写入
         } else {
             CasVerdict::Conflict
@@ -222,7 +220,7 @@ pub fn redo_mutation(
     for (file, (_, verdict)) in mutation.files.iter().zip(&verdicts) {
         if *verdict == CasVerdict::Applied {
             let target = resolve_target(&file.path, workspace_root);
-            write_atomic(&target, &file.after_content)?;
+            apply_file_state(&target, file.after_exists, &file.after_content)?;
         }
     }
     Ok(verdicts)
@@ -293,14 +291,18 @@ pub fn undo_all(
     let mut conflicts = false;
     for (path, (earliest, latest_after)) in &agg {
         let target = resolve_target(path, workspace_root);
-        let current = std::fs::read(&target).unwrap_or_default();
-        let verdict = if current == earliest.before_content {
-            CasVerdict::AlreadyDone
-        } else if current == latest_after.after_content {
-            CasVerdict::Applied
-        } else {
-            CasVerdict::Conflict
-        };
+        let verdict =
+            if matches_file_state(&target, earliest.before_exists, &earliest.before_content) {
+                CasVerdict::AlreadyDone
+            } else if matches_file_state(
+                &target,
+                latest_after.after_exists,
+                &latest_after.after_content,
+            ) {
+                CasVerdict::Applied
+            } else {
+                CasVerdict::Conflict
+            };
         if verdict == CasVerdict::Conflict {
             conflicts = true;
         }
@@ -312,7 +314,7 @@ pub fn undo_all(
     for ((path, (earliest, _)), (_, verdict)) in agg.iter().zip(&verdicts) {
         if *verdict == CasVerdict::Applied {
             let target = resolve_target(path, workspace_root);
-            write_atomic(&target, &earliest.before_content)?;
+            apply_file_state(&target, earliest.before_exists, &earliest.before_content)?;
         }
     }
     Ok(verdicts)
@@ -349,10 +351,13 @@ pub fn redo_all(
     let mut conflicts = false;
     for (path, (earliest, latest_after)) in &agg {
         let target = resolve_target(path, workspace_root);
-        let current = std::fs::read(&target).unwrap_or_default();
-        let verdict = if current == latest_after.after_content {
+        let verdict = if matches_file_state(
+            &target,
+            latest_after.after_exists,
+            &latest_after.after_content,
+        ) {
             CasVerdict::AlreadyDone
-        } else if current == earliest.before_content {
+        } else if matches_file_state(&target, earliest.before_exists, &earliest.before_content) {
             CasVerdict::Applied
         } else {
             CasVerdict::Conflict
@@ -368,7 +373,11 @@ pub fn redo_all(
     for ((path, (_, latest_after)), (_, verdict)) in agg.iter().zip(&verdicts) {
         if *verdict == CasVerdict::Applied {
             let target = resolve_target(path, workspace_root);
-            write_atomic(&target, &latest_after.after_content)?;
+            apply_file_state(
+                &target,
+                latest_after.after_exists,
+                &latest_after.after_content,
+            )?;
         }
     }
     Ok(verdicts)
@@ -394,6 +403,28 @@ fn resolve_target(path: &str, workspace_root: &std::path::Path) -> std::path::Pa
         candidate
     } else {
         workspace_root.join(candidate)
+    }
+}
+
+/// CAS 比较的是完整文件状态，而不只是字节：不存在与空文件是不同状态。
+fn matches_file_state(target: &std::path::Path, exists: bool, content: &[u8]) -> bool {
+    match std::fs::read(target) {
+        Ok(current) => exists && current == content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => !exists,
+        Err(_) => false,
+    }
+}
+
+/// 应用 journal 中的完整文件状态；删除也保持与写入相同的 CAS 前置判定。
+fn apply_file_state(target: &std::path::Path, exists: bool, content: &[u8]) -> std::io::Result<()> {
+    if exists {
+        write_atomic(target, content)
+    } else {
+        match std::fs::remove_file(target) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -425,6 +456,8 @@ mod tests {
                 path: path.into(),
                 before_revision: "b3:b".into(),
                 after_revision: "b3:a".into(),
+                before_exists: true,
+                after_exists: true,
                 before_content: before.to_vec(),
                 after_content: after.to_vec(),
             }],
@@ -441,6 +474,8 @@ mod tests {
                 path: "/tmp/x.rs".into(),
                 before_revision: "b3:b".into(),
                 after_revision: "b3:a".into(),
+                before_exists: true,
+                after_exists: true,
                 before_content: b"old".to_vec(),
                 after_content: b"new".to_vec(),
             }],
@@ -515,6 +550,42 @@ mod tests {
         assert_eq!(verdicts(&result2), vec![CasVerdict::AlreadyDone]);
     }
 
+    /// 不存在与空文件必须是不同状态：tracked shell 删除文件后 undo 恢复，
+    /// redo 再次删除，绝不能把它错误地变成空文件。
+    #[test]
+    fn undo_redo_preserves_file_existence_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("deleted.rs");
+        let mutation = JournalMutation {
+            mutation_id: "delete".into(),
+            files: vec![MutationFile {
+                path: target.to_string_lossy().to_string(),
+                before_revision: "b3:before".into(),
+                after_revision: "b3:after".into(),
+                before_exists: true,
+                after_exists: false,
+                before_content: b"keep me\n".to_vec(),
+                after_content: Vec::new(),
+            }],
+        };
+
+        assert_eq!(
+            verdicts(
+                &undo_mutation(std::slice::from_ref(&mutation), "delete", dir.path()).unwrap()
+            ),
+            vec![CasVerdict::Applied]
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me\n");
+        assert_eq!(
+            verdicts(&redo_mutation(&[mutation], "delete", dir.path()).unwrap()),
+            vec![CasVerdict::Applied]
+        );
+        assert!(
+            !target.exists(),
+            "redo deletion must remove the file, not empty it"
+        );
+    }
+
     /// CAS：redo 遇到无关内容 → Conflict 不写文件。
     #[test]
     fn redo_conflicts_with_external_change() {
@@ -542,6 +613,8 @@ mod tests {
                     path: t1.to_string_lossy().to_string(),
                     before_revision: "b3:b".into(),
                     after_revision: "b3:a".into(),
+                    before_exists: true,
+                    after_exists: true,
                     before_content: b"old\n".to_vec(),
                     after_content: b"new\n".to_vec(),
                 },
@@ -549,6 +622,8 @@ mod tests {
                     path: t2.to_string_lossy().to_string(),
                     before_revision: "b3:b".into(),
                     after_revision: "b3:a".into(),
+                    before_exists: true,
+                    after_exists: true,
                     before_content: b"old2\n".to_vec(),
                     after_content: b"new2\n".to_vec(),
                 },
@@ -628,6 +703,8 @@ mod tests {
                 path: "/tmp/x.rs".into(),
                 before_revision: "b3:b".into(),
                 after_revision: "b3:a".into(),
+                before_exists: true,
+                after_exists: true,
                 before_content: b"old".to_vec(),
                 after_content: b"new".to_vec(),
             }],
@@ -663,6 +740,8 @@ mod tests {
                 path: "/tmp/x.rs".into(),
                 before_revision: "b3:b".into(),
                 after_revision: "b3:a".into(),
+                before_exists: true,
+                after_exists: true,
                 before_content: b"old".to_vec(),
                 after_content: b"new".to_vec(),
             }],

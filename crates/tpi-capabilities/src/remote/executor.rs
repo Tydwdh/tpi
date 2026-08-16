@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::remote::ssh::{ConnectionState, SshClient, SshError};
+use crate::remote::{IoBudget, IoError};
 use crate::tool::ToolContext;
 use crate::tool::command::BashArgs;
 use tpi_core::outcome::{ModelPayload, ToolOutcome, ToolStatus};
@@ -152,13 +153,16 @@ pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
             }
         }
         let empty_env: HashMap<String, String> = HashMap::new();
-        let timeout = tokio::time::timeout(
+        let budget = IoBudget::new(
             std::time::Duration::from_millis(args.timeout_ms),
-            client.exec(&full, None, &empty_env, Some(&ctx.cancel)),
-        )
-        .await;
-        match timeout {
-            Err(_) => {
+            crate::tool::command::DEFAULT_RUN_MAX_BYTES,
+            ctx.cancel.clone(),
+        );
+        match budget
+            .run(client.exec(&full, None, &empty_env, Some(&ctx.cancel)))
+            .await
+        {
+            Err(IoError::DeadlineExceeded) => {
                 return ToolOutcome::failed(
                     "bash",
                     ModelPayload {
@@ -172,7 +176,7 @@ pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
                     },
                 );
             }
-            Ok(Err(SshError::Exec(e))) if e == "cancelled" => {
+            Err(IoError::Cancelled) => {
                 return ToolOutcome::failed(
                     "bash",
                     ModelPayload {
@@ -186,7 +190,21 @@ pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
                     },
                 );
             }
-            Ok(Err(e)) => {
+            Err(IoError::Operation(SshError::Exec(e))) if e == "cancelled" => {
+                return ToolOutcome::failed(
+                    "bash",
+                    ModelPayload {
+                        status: ToolStatus::Cancelled,
+                        program: Some("ssh".into()),
+                        exit_code: None,
+                        duration_ms: 0,
+                        output: "status: cancelled\ntool: bash\nerror: remote_cancelled\n\n用户取消（best-effort：远端进程可能仍在运行，§39）。".into(),
+                        effect: None,
+                        artifact: None,
+                    },
+                );
+            }
+            Err(IoError::Operation(e)) => {
                 return ToolOutcome::failed(
                     "bash",
                     ModelPayload {
@@ -202,7 +220,7 @@ pub async fn remote_bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
                     },
                 );
             }
-            Ok(Ok(result)) => result,
+            Ok(result) => result,
         }
     };
 

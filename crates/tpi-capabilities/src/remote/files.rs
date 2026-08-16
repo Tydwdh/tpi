@@ -49,7 +49,7 @@ pub async fn remote_read(
         Err(e) => return path_rejected("read", e),
     };
     // 1. 读远端字节。
-    let raw = match client.read_file(&path).await {
+    let raw = match crate::remote::run_with_budget(ctx, client.read_file(&path)).await {
         Ok(raw) => raw,
         Err(e) if is_no_such_file(&e) => {
             return failed(
@@ -154,7 +154,7 @@ pub async fn remote_edit(
     };
     let pathbuf = Utf8PathBuf::from(&path);
     // 1. 读当前远端字节（stale 校验基础）。
-    let raw = match client.read_file(&path).await {
+    let raw = match crate::remote::run_with_budget(ctx, client.read_file(&path)).await {
         Ok(raw) => raw,
         Err(e) => {
             return failed(
@@ -191,7 +191,7 @@ pub async fn remote_edit(
         }
     };
     // 3. 提交前二次校验远端未变（§10.3 第 6 条语义：commit 阶段竞态窗口）。
-    let current = match client.read_file(&path).await {
+    let current = match crate::remote::run_with_budget(ctx, client.read_file(&path)).await {
         Ok(c) => edit::revision_of(&c),
         Err(e) => {
             return failed(
@@ -226,7 +226,9 @@ pub async fn remote_edit(
         );
     }
     // 4. 上传 temp + rename（§44）。
-    if let Err(e) = client.write_file(&path, &result.new_raw).await {
+    if let Err(e) =
+        crate::remote::run_with_budget(ctx, client.write_file(&path, &result.new_raw)).await
+    {
         return failed(
             "edit",
             ModelPayload {
@@ -271,7 +273,7 @@ pub async fn remote_write(
         Err(e) => return path_rejected("write", e),
     };
     // 1. 检查目标是否存在（区分新建/重写）。
-    let exists = match client.stat(&path).await {
+    let exists = match crate::remote::run_with_budget(ctx, client.stat(&path)).await {
         Ok(_) => true,
         Err(e) if is_no_such_file(&e) => false,
         Err(_) => true, // stat 失败保守视为存在（走重写校验）
@@ -279,7 +281,7 @@ pub async fn remote_write(
     let new_raw = args.content.as_bytes().to_vec();
     if exists {
         // 重写：必须提供当前 revision（§write revision-bound）。
-        let raw = match client.read_file(&path).await {
+        let raw = match crate::remote::run_with_budget(ctx, client.read_file(&path)).await {
             Ok(r) => r,
             Err(e) => {
                 return failed(
@@ -320,7 +322,7 @@ pub async fn remote_write(
         }
     }
     // 2. 上传 temp + rename（§44）。
-    if let Err(e) = client.write_file(&path, &new_raw).await {
+    if let Err(e) = crate::remote::run_with_budget(ctx, client.write_file(&path, &new_raw)).await {
         return failed(
             "write",
             ModelPayload {

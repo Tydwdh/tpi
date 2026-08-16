@@ -97,6 +97,7 @@ async fn cancellation_kills_entire_process_tree() {
         shell: ctx.shell.clone(),
         workspace: ctx.workspace.clone(),
         processes: ctx.processes.clone(),
+        terminals: Default::default(),
         registry: ctx.registry.clone(),
         interactive: true,
         allow_outside_workspace: ctx.allow_outside_workspace,

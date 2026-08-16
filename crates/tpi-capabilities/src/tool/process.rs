@@ -24,7 +24,7 @@ use tpi_core::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 5_000;
 /// status 摘要附带的 tail 预算（避免模型上下文爆炸，§18）。
 const STATUS_TAIL_BUDGET: usize = 4 * 1024;
-/// process output 返回的 tail 预算（第一版返回全部 live tail，其本身已 bounded）。
+/// process output 单次返回的最大字节数；cursor 让模型不会重复读取同一 tail。
 pub const OUTPUT_TAIL_BUDGET: usize = 64 * 1024;
 
 fn default_wait_timeout() -> u64 {
@@ -53,6 +53,10 @@ pub struct ProcessArgs {
     /// wait 的最长等待毫秒（默认 5000，最大 24h）。其余 action 忽略。
     #[serde(default = "default_wait_timeout")]
     pub timeout_ms: u64,
+    /// `output` 的排他字节 cursor。省略时从当前可保留 tail 的开始读取；
+    /// 响应中的 `next_cursor` 可直接用于下一次调用。
+    #[serde(default)]
+    pub after: Option<u64>,
 }
 
 /// 进程工具入口。
@@ -78,7 +82,7 @@ pub async fn process(args: ProcessArgs, ctx: &ToolContext) -> ToolOutcome {
             let Some(id) = parse_id(&args) else {
                 return rejected("missing_id", "process output 需要 id（如 p17）。");
             };
-            output_process(ctx, id)
+            output_process(ctx, id, args.after)
         }
         ProcessAction::Wait => {
             let Some(id) = parse_id(&args) else {
@@ -145,17 +149,36 @@ fn status_process(ctx: &ToolContext, id: ProcessId) -> ToolOutcome {
     ToolOutcome::succeeded("process", out)
 }
 
-fn output_process(ctx: &ToolContext, id: ProcessId) -> ToolOutcome {
+fn output_process(ctx: &ToolContext, id: ProcessId, after: Option<u64>) -> ToolOutcome {
     let reg = tpi_core::util::lock_mutex(&ctx.processes, "process_registry");
     let Some(process) = reg.get(id) else {
         return not_found(id);
     };
-    let tail = tail_text(&process.tail, OUTPUT_TAIL_BUDGET);
+    // tail 是有界环形缓冲；`total_bytes - tail.len()` 是仍可读取的最早 offset。
+    // 旧 cursor 不能伪装成完整历史，必须显式标出 truncated。
+    let retained_from = process
+        .total_bytes
+        .saturating_sub(process.tail.len() as u64);
+    let requested_after = after.unwrap_or(retained_from);
+    let truncated = requested_after < retained_from;
+    let start = requested_after.max(retained_from);
+    let relative = start.saturating_sub(retained_from) as usize;
+    let available = process.tail.get(relative..).unwrap_or_default();
+    let emitted = if available.len() > OUTPUT_TAIL_BUDGET {
+        &available[..OUTPUT_TAIL_BUDGET]
+    } else {
+        available
+    };
+    let next_cursor = start.saturating_add(emitted.len() as u64);
+    let tail = tail_text(emitted, OUTPUT_TAIL_BUDGET);
     let mut out = format!(
-        "status: {}\nprocess_id: {}\noutput: {} bytes (live tail of {})",
+        "status: {}\nprocess_id: {}\nafter: {}\nnext_cursor: {}\ntruncated: {}\noutput: {} bytes (live tail of {})",
         process.state.name(),
         process.id,
-        process.tail.len(),
+        requested_after,
+        next_cursor,
+        truncated,
+        emitted.len(),
         process.total_bytes,
     );
     if let Some(reference) = &process.artifact {

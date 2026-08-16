@@ -424,7 +424,6 @@ fn append_bounded(buffer: &mut Vec<u8>, bytes: &[u8], budget: usize) {
 }
 
 /// 后台启动请求（P2）：由 bash 工具 background 分支构造。
-#[derive(Clone)]
 pub struct BackgroundStartRequest {
     /// 启动规格（program/args/cwd/env/env_remove，与前台同一注入路径）。
     pub args: RunArgs,
@@ -436,6 +435,10 @@ pub struct BackgroundStartRequest {
     pub command: String,
     pub artifacts_root: std::path::PathBuf,
     pub session_id: String,
+    /// Optional workspace snapshot owned by the drain task. It is committed
+    /// only after the child reaches a terminal state, so long-running jobs do
+    /// not bypass the mutation journal.
+    pub workspace_tracker: Option<crate::workspace::tracked::TrackedWorkspace>,
     /// registry 由整个 session 共享（Arc<Mutex>）；drain task 与 process 工具
     /// 通过它更新/读取状态。
     pub registry: Arc<std::sync::Mutex<ProcessRegistry>>,
@@ -456,6 +459,7 @@ pub async fn start_background(request: BackgroundStartRequest) -> Result<Process
         command,
         artifacts_root,
         session_id,
+        workspace_tracker,
         registry,
     } = request;
     let id = ProcessId::next();
@@ -475,6 +479,7 @@ pub async fn start_background(request: BackgroundStartRequest) -> Result<Process
             command: String::new(),
             artifacts_root,
             session_id,
+            workspace_tracker,
             registry: registry.clone(),
         },
         id,
@@ -502,6 +507,7 @@ fn spawn_drain(
             command: _,
             artifacts_root,
             session_id,
+            workspace_tracker,
             registry,
         } = request;
         if let Err(error) = drain_loop(
@@ -511,6 +517,7 @@ fn spawn_drain(
             started_tx,
             &artifacts_root,
             &session_id,
+            workspace_tracker,
         )
         .await
         {
@@ -537,6 +544,7 @@ async fn drain_loop(
     started_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     artifacts_root: &std::path::Path,
     session_id: &str,
+    mut workspace_tracker: Option<crate::workspace::tracked::TrackedWorkspace>,
 ) -> Result<(), String> {
     let cancel = {
         let reg = tpi_core::util::lock_mutex(registry, "process_registry");
@@ -716,6 +724,14 @@ async fn drain_loop(
             None,
             Some(reference),
         );
+    }
+    if let Some(tracker) = workspace_tracker.as_mut()
+        && let Err(error) = tracker.commit(artifacts_root, session_id)
+    {
+        // The process is already terminal; preserve its real lifecycle state
+        // and record the journal failure as a high-severity diagnostic rather
+        // than silently pretending the workspace remained observable.
+        tracing::error!(process = %id, %error, "managed process workspace journal failed");
     }
     // 唤醒 process wait（§20）。
     tpi_core::util::lock_mutex(registry, "process_registry")

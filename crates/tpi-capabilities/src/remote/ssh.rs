@@ -549,6 +549,12 @@ impl SshClient {
 
     /// 写入远端文件（§44：temp + atomic rename；目标已存在则覆盖）。
     pub async fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), SshError> {
+        const REMOTE_FILE_LIMIT: usize = 64 * 1024 * 1024;
+        if bytes.len() > REMOTE_FILE_LIMIT {
+            return Err(SshError::Sftp(format!(
+                "远端写入超过 {REMOTE_FILE_LIMIT} 字节上限：{path}"
+            )));
+        }
         let sftp = self.sftp().await?;
         let tmp = format!("{path}.tpi-tmp-{}", uuid::Uuid::now_v7().simple());
         let mut file = sftp
@@ -578,9 +584,11 @@ impl SshClient {
 
     /// 列出远端目录（R3 list 用）：返回 (名称, 是否目录)。
     pub async fn read_dir(&mut self, path: &str) -> Result<Vec<(String, bool)>, SshError> {
+        const REMOTE_DIR_ENTRY_LIMIT: usize = 100_000;
         let sftp = self.sftp().await?;
         let entries = sftp.read_dir(path).await.map_err(sftp_error)?;
         Ok(entries
+            .take(REMOTE_DIR_ENTRY_LIMIT)
             .map(|entry| (entry.file_name(), entry.file_type().is_dir()))
             .collect())
     }

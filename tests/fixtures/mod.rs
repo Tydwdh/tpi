@@ -86,6 +86,7 @@ pub fn test_tool_context(workspace_root: &Utf8PathBuf) -> tpi::tool::ToolContext
         processes: std::sync::Arc::new(std::sync::Mutex::new(
             tpi::process::managed::ProcessRegistry::new(),
         )),
+        terminals: Default::default(),
         registry: std::sync::Arc::new(std::sync::Mutex::new(
             tpi::tool::registry::builtin_registry(),
         )),
