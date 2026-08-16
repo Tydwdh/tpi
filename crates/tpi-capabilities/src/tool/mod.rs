@@ -281,9 +281,13 @@ one line 300 chars). Follows .gitignore. \
 Output: matched lines with file paths; cursor pages without rescanning. \
 Path may be a directory (recursive) or a single file. \
 Use max_results to bound hits, include to filter by glob (e.g. `**/*.rs`), \
-exclude to skip path components (e.g. \"tests\", \"vendor\"). \
+exclude to skip path components (e.g. \"tests\", \"vendor\") or glob patterns \
+(e.g. `**/vendor/**`). \
+context=N shows N lines before/after each match (context lines use `path-N- text` \
+format and don't count toward max_results); literal=true treats pattern as plain \
+text instead of regex (`rg -F`). \
 Use when you know the text pattern but not which file. \
-Example: search pattern=\"fn estimate_request\" include=[\"**/*.rs\"]"
+Example: search pattern=\"fn estimate_request\" include=[\"**/*.rs\"] context=3"
             }
             BuiltinTool::Glob => {
                 "Find files by filename glob pattern (e.g. `**/*.rs`, `src/**/*.ts`, `Cargo.toml`). \

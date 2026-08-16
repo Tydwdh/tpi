@@ -190,6 +190,8 @@ async fn list_and_search_respect_budget_and_cursor() {
             exclude: Vec::new(),
             max_results: 100,
             include: Vec::new(),
+            context: 0,
+            literal: false,
         },
         &ctx,
     );

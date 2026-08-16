@@ -81,8 +81,9 @@ pub struct SearchArgs {
     /// 上一页返回的 cursor。
     #[serde(default)]
     pub cursor: Option<String>,
-    /// 排除的路径片段/子目录（任一组件命中即跳过该文件，如 "tests"、"vendor"）。
-    /// 用于过滤 test/fixture/vendor 等噪音，src 等目标目录结果优先。
+    /// 排除项：无 glob 元字符的条目按路径组件匹配（如 "tests"、"vendor"）；
+    /// 含 glob 元字符（`* ? [ {`）的条目按完整 glob 匹配相对路径
+    /// （如 `**/vendor/**`）。用于过滤 test/fixture/vendor 等噪音。
     #[serde(default)]
     pub exclude: Vec<String>,
     /// 结果条数上限（默认 100，最大 1000）。达到上限即停，可用 cursor 翻页继续。
@@ -92,6 +93,13 @@ pub struct SearchArgs {
     /// 单文件 path 时忽略。
     #[serde(default)]
     pub include: Vec<String>,
+    /// 匹配行前后各显示多少行上下文（默认 0；等价 `rg -C N`）。
+    /// >0 时输出上下文行（`path-N- content`），不计入 max_results。
+    #[serde(default)]
+    pub context: usize,
+    /// 把 pattern 当作字面量字符串而非正则（默认 false；等价 `rg -F`）。
+    #[serde(default)]
+    pub literal: bool,
 }
 
 /// search 结果条数上限硬顶（§P1：max_results 默认 100，最多 1000）。
@@ -302,6 +310,66 @@ pub fn glob(args: GlobArgs, ctx: &ToolContext) -> ToolOutcome {
     )
 }
 
+/// 构造正则 matcher：`literal=true` 时按字面量（`rg -F`），否则 rust regex。
+fn build_matcher(args: &SearchArgs) -> Result<grep::regex::RegexMatcher, String> {
+    let mut builder = grep::regex::RegexMatcherBuilder::new();
+    if args.literal {
+        builder.fixed_strings(true);
+    }
+    builder.build(&args.pattern).map_err(|e| e.to_string())
+}
+
+/// 构造 Searcher：`context>0` 时配置上下文行（前后各 N 行）。
+fn build_searcher(context: usize) -> grep::searcher::Searcher {
+    if context > 0 {
+        grep::searcher::SearcherBuilder::new()
+            .before_context(context)
+            .after_context(context)
+            .build()
+    } else {
+        grep::searcher::Searcher::new()
+    }
+}
+
+/// 把 exclude 条目分成「组件子串匹配」与「glob 匹配」两组：
+/// 含 glob 元字符（`* ? [ {`）→ 完整 glob 匹配相对路径（大小写不敏感）；
+/// 否则 → 路径组件子串匹配（向后兼容，如 `tests`、`vendor`）。
+/// 返回 (组件列表, glob set；glob 编译失败返回 Err)。
+fn build_exclude_filters(
+    exclude: &[String],
+) -> (Vec<String>, Result<Option<globset::GlobSet>, String>) {
+    let mut components = Vec::new();
+    let mut builder = globset::GlobSetBuilder::new();
+    let mut has_glob = false;
+    for s in exclude.iter().filter(|s| !s.trim().is_empty()) {
+        let trimmed = s.trim();
+        let has_meta = trimmed.contains(['*', '?', '[', '{']);
+        if has_meta {
+            match globset::GlobBuilder::new(trimmed)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(glob) => {
+                    builder.add(glob);
+                    has_glob = true;
+                }
+                Err(e) => return (components, Err(e.to_string())),
+            }
+        } else {
+            components.push(trimmed.to_ascii_lowercase());
+        }
+    }
+    let set = if has_glob {
+        match builder.build() {
+            Ok(set) => Some(set),
+            Err(e) => return (components, Err(e.to_string())),
+        }
+    } else {
+        None
+    };
+    (components, Ok(set))
+}
+
 pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
     if let Some(cursor) = &args.cursor {
         return page(cursor, ctx);
@@ -320,7 +388,7 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
             },
         );
     }
-    let matcher = match grep::regex::RegexMatcher::new(&args.pattern) {
+    let matcher = match build_matcher(&args) {
         Ok(matcher) => matcher,
         Err(error) => {
             return ToolOutcome::failed(
@@ -376,22 +444,39 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
     let mut scanned_files = 0u64;
     let mut scanned_bytes = 0u64;
     let mut stop_reason = StopReason::Complete;
-    // §工具改进：exclude 片段归一化（小写）——路径任一组件命中即排除。
-    let exclude: Vec<String> = args
-        .exclude
-        .iter()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().to_ascii_lowercase())
-        .collect();
+    // §exclude：无 glob 元字符 → 路径组件匹配（向后兼容）；含元字符 → glob。
+    let (component_excludes, glob_excludes) = build_exclude_filters(&args.exclude);
+    let glob_excludes = match glob_excludes {
+        Ok(set) => set,
+        Err(error) => {
+            return ToolOutcome::failed(
+                "search",
+                ModelPayload {
+                    status: ToolStatus::Rejected,
+                    program: None,
+                    exit_code: None,
+                    duration_ms: 0,
+                    output: format!(
+                        "status: rejected\ntool: search\nerror: invalid_exclude_glob\n\n{error}"
+                    ),
+                    effect: None,
+                    artifact: None,
+                },
+            );
+        }
+    };
 
     // 匹配预算（§8.4：max_results 条、单行 300 chars、最多 32 KiB）。
     let max_results = args.max_results.clamp(1, MAX_SEARCH_RESULTS);
     const MAX_LINE_CHARS: usize = 300;
     const MAX_OUTPUT_BYTES: usize = 32 * 1024;
     let mut output_bytes = 0usize;
+    // 跨文件累计匹配数（max_results 是全局上限，不是每文件上限）。
+    let mut match_count = 0usize;
 
     // ripgrep 内核：Searcher（memchr 加速逐行搜索 + 行号追踪）逐文件复用。
-    let mut searcher = grep::searcher::Searcher::new();
+    // context>0 时配置上下文行（Sink 的 context() 消费）。
+    let mut searcher = build_searcher(args.context);
     'scan: for entry in WalkBuilder::new(&root, None) {
         if ctx.cancel.is_cancelled() {
             stop_reason = StopReason::Cancelled;
@@ -406,10 +491,15 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
             continue;
         }
         let rel = relative(&root, entry.path());
-        // §工具改进：exclude 匹配（路径任一组件命中即跳过，如 tests/fixtures）。
-        if !exclude.is_empty() {
+        // §exclude：组件子串匹配（如 tests）或完整 glob（如 `**/vendor/**`）。
+        if let Some(set) = &glob_excludes
+            && set.is_match(rel.as_str())
+        {
+            continue;
+        }
+        if !component_excludes.is_empty() {
             let rel_lower = rel.as_str().to_ascii_lowercase();
-            let excluded = exclude.iter().any(|pattern| {
+            let excluded = component_excludes.iter().any(|pattern| {
                 rel_lower
                     .split(['/', '\\'])
                     .any(|component| component.contains(pattern.as_str()))
@@ -450,6 +540,7 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
             &limits,
             &mut items,
             &mut output_bytes,
+            &mut match_count,
         ) {
             stop_reason = StopReason::ResultLimit;
             break 'scan;
@@ -464,7 +555,9 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         started,
         stop_reason,
         "search",
-        true,
+        // context>0：保留 ripgrep 输出顺序（匹配行与上下文行交错），
+        // 不按噪音目录重排（否则上下文被拆散）。
+        args.context == 0,
     )
 }
 
@@ -486,7 +579,8 @@ fn search_single_file(
     let scanned_bytes = meta.len();
     if meta.len() > 0 && meta.len() <= MAX_FILE_BYTES {
         let rel = relative(&ctx.workspace_root, path.as_std_path());
-        let mut searcher = grep::searcher::Searcher::new();
+        let mut searcher = build_searcher(args.context);
+        let mut match_count = 0usize;
         let limits = SearchLimits {
             max_results: args.max_results.clamp(1, MAX_SEARCH_RESULTS),
             max_output_bytes: 32 * 1024,
@@ -500,6 +594,7 @@ fn search_single_file(
             &limits,
             &mut items,
             &mut output_bytes,
+            &mut match_count,
         ) {
             stop_reason = StopReason::ResultLimit;
         }
@@ -512,7 +607,7 @@ fn search_single_file(
         started,
         stop_reason,
         "search",
-        true,
+        args.context == 0,
     )
 }
 
@@ -525,6 +620,7 @@ struct SearchLimits {
 
 /// 用 ripgrep 内核搜索单个文件，匹配累积进 `items`。返回 true = 达上限。
 /// binary 预检（头 8 KiB 查 NUL）后由 Searcher 流式按行搜（不整读文件）。
+#[allow(clippy::too_many_arguments)] // 与 finish_scan 同：统计/预算参数多但语义单一。
 fn search_file_into(
     searcher: &mut grep::searcher::Searcher,
     matcher: &grep::regex::RegexMatcher,
@@ -533,6 +629,7 @@ fn search_file_into(
     limits: &SearchLimits,
     items: &mut Vec<String>,
     output_bytes: &mut usize,
+    match_count: &mut usize,
 ) -> bool {
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -562,6 +659,7 @@ fn search_file_into(
         max_results: limits.max_results,
         max_output_bytes: limits.max_output_bytes,
         max_line_chars: limits.max_line_chars,
+        match_count,
         limit_hit: false,
     };
     // 兜底：binary 检测（遇 NUL 停止该文件搜索）；默认 \n 行分隔，
@@ -571,7 +669,8 @@ fn search_file_into(
     sink.limit_hit
 }
 
-/// 搜索 sink：累积 `rel:line: content` 项，受条数/字节预算约束。
+/// 搜索 sink：累积 `rel:line: content` 项（匹配行）与 `rel-N- content`
+/// 项（context 上下文行），受条数/字节预算约束。
 /// 行号来自 ripgrep Searcher（1-based）。
 struct SearchSink<'a> {
     items: &'a mut Vec<String>,
@@ -580,6 +679,8 @@ struct SearchSink<'a> {
     max_results: usize,
     max_output_bytes: usize,
     max_line_chars: usize,
+    /// 跨文件累计匹配数（context 行不计入；max_results 是全局上限）。
+    match_count: &'a mut usize,
     limit_hit: bool,
 }
 
@@ -609,10 +710,40 @@ impl grep::searcher::Sink for SearchSink<'_> {
         }
         *self.output_bytes = self.output_bytes.saturating_add(item_len);
         self.items.push(item);
-        if self.items.len() >= self.max_results {
+        *self.match_count += 1;
+        if *self.match_count >= self.max_results {
             self.limit_hit = true;
             return Ok(false);
         }
+        Ok(true)
+    }
+
+    /// context 行（Before/After）：`rel-N- content` 格式（pi 同款），
+    /// 不计入 max_results，只受字节预算约束。Match 由默认实现转发到 matched。
+    fn context(
+        &mut self,
+        _searcher: &grep::searcher::Searcher,
+        context: &grep::searcher::SinkContext,
+    ) -> Result<bool, Self::Error> {
+        if matches!(context.kind(), grep::searcher::SinkContextKind::Other) {
+            return Ok(true); // 未知 context 类型跳过
+        }
+        let Some(line_number) = context.line_number() else {
+            return Ok(true);
+        };
+        let Ok(line) = std::str::from_utf8(context.bytes()) else {
+            return Ok(true);
+        };
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line = truncate_line(line, self.max_line_chars);
+        let item = format!("{}-{line_number}- {line}", self.rel);
+        let item_len = item.len();
+        if self.output_bytes.saturating_add(item_len) > self.max_output_bytes {
+            self.limit_hit = true;
+            return Ok(false);
+        }
+        *self.output_bytes = self.output_bytes.saturating_add(item_len);
+        self.items.push(item);
         Ok(true)
     }
 }
@@ -1083,6 +1214,8 @@ mod tests {
                 exclude: Vec::new(),
                 max_results: 100,
                 include: Vec::new(),
+                context: 0,
+                literal: false,
             },
             &ctx,
         );
@@ -1107,6 +1240,8 @@ mod tests {
                 exclude: Vec::new(),
                 max_results: 100,
                 include: Vec::new(),
+                context: 0,
+                literal: false,
             },
             &ctx,
         );
@@ -1134,6 +1269,8 @@ mod tests {
                 exclude: Vec::new(),
                 max_results: 100,
                 include: Vec::new(),
+                context: 0,
+                literal: false,
             },
             &ctx,
         );
@@ -1155,6 +1292,8 @@ mod tests {
                 exclude: Vec::new(),
                 max_results: 100,
                 include: Vec::new(),
+                context: 0,
+                literal: false,
             },
             &ctx,
         );
@@ -1181,6 +1320,8 @@ mod tests {
                 exclude: Vec::new(),
                 max_results: 100,
                 include: vec!["**/*.rs".into()],
+                context: 0,
+                literal: false,
             },
             &ctx,
         );
@@ -1206,6 +1347,8 @@ mod tests {
                 exclude: Vec::new(),
                 max_results: 2,
                 include: Vec::new(),
+                context: 0,
+                literal: false,
             },
             &ctx,
         );
@@ -1233,6 +1376,8 @@ mod tests {
                 exclude: Vec::new(),
                 max_results: 100,
                 include: Vec::new(),
+                context: 0,
+                literal: false,
             },
             &ctx,
         );
@@ -1307,5 +1452,115 @@ mod tests {
         );
         assert_eq!(outcome.status, ToolStatus::Rejected);
         assert!(outcome.model_payload.output.contains("invalid_glob"));
+    }
+
+    /// literal=true：pattern 按字面量匹配（`rg -F` 语义），正则元字符不再生效。
+    #[test]
+    fn literal_treats_pattern_as_fixed_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        // `a.b` 字面量只匹配含点号的；正则语义会匹配 axb。
+        std::fs::write(root.join("f.txt"), "axb\na.b\n").unwrap();
+        let ctx = test_ctx(&root);
+
+        let literal = search(
+            SearchArgs {
+                pattern: "a.b".into(),
+                path: ".".into(),
+                cursor: None,
+                exclude: Vec::new(),
+                max_results: 100,
+                include: Vec::new(),
+                context: 0,
+                literal: true,
+            },
+            &ctx,
+        );
+        let text = literal.model_payload.output;
+        assert!(text.contains("f.txt:2: a.b"), "字面量匹配点号行: {text}");
+        assert!(!text.contains("axb"), "literal 不把 . 当通配符: {text}");
+
+        // 对照：正则语义下 `a.b` 匹配 axb。
+        let regex = search(
+            SearchArgs {
+                pattern: "a.b".into(),
+                path: ".".into(),
+                cursor: None,
+                exclude: Vec::new(),
+                max_results: 100,
+                include: Vec::new(),
+                context: 0,
+                literal: false,
+            },
+            &ctx,
+        );
+        let text = regex.model_payload.output;
+        assert!(text.contains("axb"), "正则把 . 当通配符: {text}");
+    }
+
+    /// context=N：匹配行前后各 N 行以 `path-N- text` 输出，且保留 ripgrep 顺序。
+    #[test]
+    fn context_emits_before_after_lines_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::write(root.join("f.txt"), "one\ntwo\nMATCH\nfour\nfive\n").unwrap();
+        let ctx = test_ctx(&root);
+        let outcome = search(
+            SearchArgs {
+                pattern: "MATCH".into(),
+                path: ".".into(),
+                cursor: None,
+                exclude: Vec::new(),
+                max_results: 100,
+                include: Vec::new(),
+                context: 1,
+                literal: false,
+            },
+            &ctx,
+        );
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        let text = outcome.model_payload.output;
+        assert!(text.contains("f.txt:3: MATCH"), "匹配行: {text}");
+        assert!(text.contains("f.txt-2- two"), "前 1 行: {text}");
+        assert!(text.contains("f.txt-4- four"), "后 1 行: {text}");
+        // 顺序：before → match → after（context>0 不按噪音重排）。
+        let before = text.find("f.txt-2- two").unwrap();
+        let matched = text.find("f.txt:3: MATCH").unwrap();
+        let after = text.find("f.txt-4- four").unwrap();
+        assert!(before < matched && matched < after, "顺序: {text}");
+    }
+
+    /// exclude 含 glob 元字符：按完整 glob 排除（`**/vendor/**`），
+    /// 无元字符条目仍组件匹配（向后兼容）。
+    #[test]
+    fn exclude_supports_glob_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::create_dir_all(root.join("src/vendor")).unwrap();
+        std::fs::write(root.join("src/app.rs"), "needle\n").unwrap();
+        std::fs::write(root.join("src/vendor/lib.rs"), "needle\n").unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("tests/t.rs"), "needle\n").unwrap();
+        let ctx = test_ctx(&root);
+        let outcome = search(
+            SearchArgs {
+                pattern: "needle".into(),
+                path: ".".into(),
+                cursor: None,
+                exclude: vec!["**/vendor/**".into(), "tests".into()],
+                max_results: 100,
+                include: Vec::new(),
+                context: 0,
+                literal: false,
+            },
+            &ctx,
+        );
+        let text = outcome.model_payload.output;
+        assert!(text.contains("src/app.rs"), "src 内文件保留: {text}");
+        assert!(
+            !text.contains("src/vendor/lib.rs"),
+            "glob 排除 vendor 深层: {text}"
+        );
+        assert!(!text.contains("tests/t.rs"), "组件匹配排除 tests: {text}");
     }
 }
