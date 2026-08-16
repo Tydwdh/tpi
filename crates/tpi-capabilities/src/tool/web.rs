@@ -772,12 +772,35 @@ pub fn parse_exa_response(body: &str) -> Vec<DdgHit> {
             let Some(text) = item.get("text").and_then(|t| t.as_str()) else {
                 continue;
             };
-            if let Some(hit) = parse_exa_text_block(text) {
-                hits.push(hit);
+            // 一个 text 块可能拼接多个结果（Exa 实测：numResults=5 →
+            // 单个 content 块内含 5 个 "Title: ...\nURL: ..." 段）。
+            // 按 "Title: " 边界切分，每段独立解析。
+            for segment in split_exa_segments(text) {
+                if let Some(hit) = parse_exa_text_block(&segment) {
+                    hits.push(hit);
+                }
             }
         }
     }
     hits
+}
+
+/// 把 Exa text 块按结果切分：每个结果以 `Title: ` 开头。
+/// 保留首段的 `Title: ` 前缀（parse_exa_text_block 依赖它定位）。
+fn split_exa_segments(text: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        if line.starts_with("Title: ") && !current.is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.trim().is_empty() {
+        segments.push(current);
+    }
+    segments
 }
 
 /// 从 SSE/JSON 混合体中提取可解析的 JSON payload（`data: ` 行或整体）。
@@ -1820,5 +1843,43 @@ data: {"result":{"content":[{"type":"text","text":"Title: Select | Tokio\nURL: h
         assert!(parse_exa_response(malformed).is_empty());
         assert!(parse_exa_response("").is_empty());
         assert!(parse_exa_response("not json at all").is_empty());
+    }
+
+    /// §B-web 修复：Exa 单个 content 块含多个结果（按 `Title: ` 切分）。
+    #[test]
+    fn parse_exa_response_splits_multiple_results_in_one_block() {
+        // 模拟 Exa 实测：numResults=2 → 1 个 content 块内拼 2 个结果。
+        let text = "Title: First\nURL: https://first.example\nHighlights:\nfirst body\nTitle: Second\nURL: https://second.example\nHighlights:\nsecond body";
+        let json = format!(
+            r#"{{"result":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+            text.replace('\n', "\\n")
+        );
+        let hits = parse_exa_response(&json);
+        assert_eq!(hits.len(), 2, "1 个 content 块内 2 个结果都要解析出");
+        assert_eq!(hits[0].title, "First");
+        assert_eq!(hits[0].url, "https://first.example");
+        assert_eq!(hits[1].title, "Second");
+        assert_eq!(hits[1].url, "https://second.example");
+        assert!(hits[1].snippet.contains("second body"));
+    }
+
+    /// §B-web 集成：真实调用 Exa 端点（联网；验证多结果切分端到端）。
+    /// 失败时跳过（CI/离线环境不硬失败）。
+    #[tokio::test]
+    async fn exa_real_search_returns_multiple_hits() {
+        match search_exa("rust async", 5, None).await {
+            Ok(hits) => {
+                assert!(!hits.is_empty(), "Exa 应返回至少 1 条结果（实测 5 条）");
+                assert!(
+                    hits.len() >= 2,
+                    "Exa 多结果切分应生效，实际 {} 条",
+                    hits.len()
+                );
+                assert!(hits.iter().all(|h| !h.url.is_empty()));
+            }
+            Err(e) => {
+                eprintln!("Exa 不可达（跳过集成断言）: {e}");
+            }
+        }
     }
 }
