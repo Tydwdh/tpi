@@ -1,7 +1,9 @@
 //! 有界且默认拒绝私网目标的 Web 工具。
 //!
-//! - `web_search`：DuckDuckGo HTML 端点（免费、无需 API key，社区 skills 通用
-//!   方案，参考 pi-web-access 的无 key 思路）；结果只用于发现来源，
+//! - `web_search`：首选 Exa 免费 MCP 端点（`mcp.exa.ai`，无需 API key，返回
+//!   带正文片段的搜索结果；参考 opencode 的 Exa/Parallel MCP 方案）；失败时
+//!   降级 DuckDuckGo HTML 端点 → Bing → Yahoo（免费回退链，社区 skills 通用
+//!   方案，参考 pi-web-access 的无 key 思路）。结果只用于发现来源，
 //!   不调用 LLM/Answers endpoint，避免隐藏模型成本。
 //! - `web_fetch`：reqwest 限制 redirect、响应体大小和 timeout；HTML 用
 //!   html2text 转换；正文上限为 48 KiB。
@@ -47,6 +49,36 @@ AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const DDG_HTML_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 /// Bing HTML 端点（免费回退引擎；可能对异常流量返回人机验证页）。
 const BING_ENDPOINT: &str = "https://www.bing.com/search";
+
+/// Exa 免费 MCP 端点（§B-web：无需 API key；参考 opencode `EXA_URL`）。
+/// 带 key 时 URL 追加 `?exaApiKey=<key>`（同 opencode）。
+const EXA_MCP_ENDPOINT: &str = "https://mcp.exa.ai/mcp";
+/// Exa MCP 调用的工具名（`tools/call` method 的 name）。
+const EXA_TOOL: &str = "web_search_exa";
+/// Exa 返回的正文片段预算（上下文窗口控制，参考 opencode contextMaxCharacters）。
+const EXA_CONTEXT_MAX_CHARS: u32 = 6000;
+/// 可选环境变量：Exa API key（无 key 用免费公共端点；同 opencode EXA_API_KEY）。
+const EXA_API_KEY_ENV: &str = "EXA_API_KEY";
+
+/// 浏览器指纹请求头（§B-web：减少 HTML 引擎反爬命中；参考 oh-my-pi
+/// browser-headers 思路——UA + Accept-Language + Referer 等）。
+fn browser_headers() -> Vec<(reqwest::header::HeaderName, String)> {
+    vec![
+        (reqwest::header::USER_AGENT, DDG_USER_AGENT.to_string()),
+        (
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".into(),
+        ),
+        (
+            reqwest::header::ACCEPT_LANGUAGE,
+            "zh-CN,zh;q=0.9,en;q=0.8".into(),
+        ),
+        (reqwest::header::ACCEPT_ENCODING, "gzip, deflate, br".into()),
+        (reqwest::header::CONNECTION, "keep-alive".into()),
+        (reqwest::header::REFERER, "https://www.google.com/".into()),
+        (reqwest::header::CACHE_CONTROL, "no-cache".into()),
+    ]
+}
 /// Yahoo HTML 端点（免费第三回退引擎；对异常流量容忍度较高）。
 const YAHOO_ENDPOINT: &str = "https://search.yahoo.com/search";
 
@@ -305,6 +337,20 @@ pub async fn web_search(args: WebSearchArgs, ctx: &ToolContext) -> ToolOutcome {
     if ctx.cancel.is_cancelled() {
         return cancelled_outcome("web_search");
     }
+    // §B-web：首选 Exa 免费 MCP（带正文片段，质量远高于 HTML 抓取）。
+    // 成功直接返回；失败记日志后继续原 DDG→Bing→Yahoo 降级链。
+    if !ctx.cancel.is_cancelled() {
+        let exa = tokio::select! {
+            _ = ctx.cancel.cancelled() => return cancelled_outcome("web_search"),
+            result = search_exa(&query, count, freshness) => result,
+        };
+        match exa {
+            Ok(hits) => return search_succeeded(&args, hits, count),
+            Err(exa_error) => {
+                tracing::warn!(error = %exa_error, "web_search: Exa 失败，回退 DDG");
+            }
+        }
+    }
     let ddg = tokio::select! {
         _ = ctx.cancel.cancelled() => return cancelled_outcome("web_search"),
         result = search_ddg(&query, freshness) => result,
@@ -503,14 +549,13 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 /// 通用 HTML GET：浏览器 UA + timeout + 有界读取 + HTTP 状态检查。
 async fn fetch_search_html(url: &str) -> Result<String, String> {
     let client = reqwest::Client::new();
-    let response = match client
-        .get(url)
-        .header(reqwest::header::USER_AGENT, DDG_USER_AGENT)
-        .header(reqwest::header::ACCEPT, "text/html")
-        .timeout(FETCH_TIMEOUT)
-        .send()
-        .await
-    {
+    // §B-web：浏览器指纹头（UA + Accept-Language + Referer 等）减少 HTML
+    // 引擎反爬命中（参考 oh-my-pi browser-headers）。
+    let mut request = client.get(url).timeout(FETCH_TIMEOUT);
+    for (name, value) in browser_headers() {
+        request = request.header(name, value);
+    }
+    let response = match request.send().await {
         Ok(response) => response,
         Err(error) => return Err(format!("request_failed: {error}")),
     };
@@ -613,6 +658,182 @@ fn yahoo_freshness(value: &str) -> Option<&'static str> {
         "pd_1y" => Some("1y"),
         _ => None,
     }
+}
+
+/// Exa 引擎：免费 MCP 端点（`mcp.exa.ai`，无 key；带 key 时 URL 追加
+/// `?exaApiKey=...`）。返回带正文片段的结构化结果，质量远高于 HTML 抓取。
+/// 无结果/网络错误/解析失败时返回 Err（触发 DDG 降级）。
+async fn search_exa(
+    query: &str,
+    count: u32,
+    freshness: Option<&str>,
+) -> Result<Vec<DdgHit>, String> {
+    let mut endpoint = EXA_MCP_ENDPOINT.to_string();
+    if let Ok(key) = std::env::var(EXA_API_KEY_ENV)
+        && !key.trim().is_empty()
+    {
+        endpoint.push_str(&format!("?exaApiKey={}", urlencode(&key)));
+    }
+    // MCP JSON-RPC：tools/call → web_search_exa（参考 opencode）。
+    let mut args = serde_json::json!({
+        "query": query,
+        "type": "auto",
+        "numResults": count as u32,
+        "livecrawl": "fallback",
+        "contextMaxCharacters": EXA_CONTEXT_MAX_CHARS,
+    });
+    if let (Some(fresh), Some(days)) = (freshness, exa_freshness_days(freshness.unwrap_or(""))) {
+        if fresh == "pd_1d" || fresh == "pd_1w" || fresh == "pd_1m" || fresh == "pd_1y" {
+            args["startPublishedDate"] = serde_json::json!(days_ago_iso(days));
+        }
+    }
+    let body = serde_json::to_string(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": EXA_TOOL, "arguments": args},
+    }))
+    .map_err(|e| format!("exa_serialize: {e}"))?;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .header(reqwest::header::USER_AGENT, DDG_USER_AGENT)
+        .timeout(FETCH_TIMEOUT)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("exa_request: {e}"))?;
+    let status = response.status();
+    let bytes = read_bounded_bytes(response, SEARCH_RAW_LIMIT)
+        .await
+        .map_err(|e| format!("exa_read: {e}"))?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    if !status.is_success() {
+        return Err(format!("exa_http_{status}: {}", truncate_chars(&body, 200)));
+    }
+    let hits = parse_exa_response(&body);
+    if hits.is_empty() {
+        return Err("exa_no_results: Exa 无结果（或响应结构变化）".into());
+    }
+    Ok(hits)
+}
+
+/// Exa freshness → 天数映射（用于 startPublishedDate）。
+fn exa_freshness_days(freshness: &str) -> Option<u32> {
+    match freshness {
+        "pd_1d" => Some(1),
+        "pd_1w" => Some(7),
+        "pd_1m" => Some(30),
+        "pd_1y" => Some(365),
+        _ => None,
+    }
+}
+
+/// N 天前的 ISO 8601 日期（`2024-01-01`；用于 Exa startPublishedDate）。
+fn days_ago_iso(days: u32) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs().saturating_sub((days as u64) * 86400);
+    let days_epoch = secs / 86400;
+    let days_since_civil = days_epoch + 719_468;
+    let era = days_since_civil / 146_097;
+    let doe = days_since_civil - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// 解析 Exa MCP 响应（SSE 或纯 JSON）：提取 `result.content[].text`，
+/// 每段 text 是一串 "Title: ...\nURL: ...\nPublished: ...\nHighlights:\n..."。
+/// 纯函数（§B-web：便于离线测试）。
+pub fn parse_exa_response(body: &str) -> Vec<DdgHit> {
+    let mut hits = Vec::new();
+    for payload in extract_json_payloads(body) {
+        let Some(content) = payload
+            .get("result")
+            .and_then(|r| r.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for item in content {
+            let Some(text) = item.get("text").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            if let Some(hit) = parse_exa_text_block(text) {
+                hits.push(hit);
+            }
+        }
+    }
+    hits
+}
+
+/// 从 SSE/JSON 混合体中提取可解析的 JSON payload（`data: ` 行或整体）。
+fn extract_json_payloads(body: &str) -> Vec<serde_json::Value> {
+    let mut payloads = Vec::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) {
+        payloads.push(v);
+        return payloads;
+    }
+    for line in body.lines() {
+        let line = line.trim_start();
+        if let Some(data) = line.strip_prefix("data: ") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                payloads.push(v);
+            }
+        }
+    }
+    payloads
+}
+
+/// 解析单个 Exa text block（"Title: ...\nURL: ...\nPublished: ...\nHighlights:\n..."）。
+fn parse_exa_text_block(text: &str) -> Option<DdgHit> {
+    let mut title = String::new();
+    let mut url = String::new();
+    let mut snippet = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Title: ") {
+            title = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("URL: ") {
+            url = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("Published: ") {
+            snippet.push_str(&format!("[{}] ", rest.trim()));
+        } else if line.starts_with("Highlights:") {
+            snippet.push_str("Highlights: ");
+        } else if !snippet.is_empty() && line.starts_with("# ") {
+            snippet.push_str(line);
+            snippet.push(' ');
+        } else if !snippet.is_empty() && !line.trim().is_empty() {
+            snippet.push_str(line.trim());
+            snippet.push(' ');
+        }
+    }
+    if url.is_empty() {
+        return None;
+    }
+    let title = if title.is_empty() { url.clone() } else { title };
+    let snippet = snippet.trim().to_string();
+    Some(DdgHit {
+        title,
+        url,
+        snippet: if snippet.is_empty() {
+            "(Exa 无正文片段)".into()
+        } else {
+            snippet
+        },
+    })
 }
 
 /// DDG HTML 端点的人机验证页特征（anomaly challenge / bot challenge）。
@@ -1567,5 +1788,37 @@ mod tests {
         let (body, truncated) = bounded_body("你好 world");
         assert!(!truncated);
         assert_eq!(body, "你好 world");
+    }
+
+    /// §B-web：Exa MCP SSE 响应解析（Title/URL/Published/Highlights 块）。
+    #[test]
+    fn parse_exa_response_extracts_sse_blocks() {
+        let sse = r#"event: message
+data: {"result":{"content":[{"type":"text","text":"Title: Select | Tokio\nURL: https://tokio.rs/tokio/tutorial/select\nPublished: 2026-07-22T16:10:23.000Z\nHighlights:\n# Select\ntokio::select! allows waiting on multiple async computations."}]}}"#;
+        let hits = parse_exa_response(sse);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Select | Tokio");
+        assert_eq!(hits[0].url, "https://tokio.rs/tokio/tutorial/select");
+        assert!(hits[0].snippet.contains("tokio::select! allows"));
+        assert!(hits[0].snippet.contains("[2026-07-22T16:10:23.000Z]"));
+    }
+
+    /// §B-web：Exa 纯 JSON 响应（无 SSE）解析。
+    #[test]
+    fn parse_exa_response_handles_plain_json() {
+        let json = r#"{"result":{"content":[{"type":"text","text":"Title: Foo\nURL: https://foo.example\nHighlights:\nFoo content"}]}}"#;
+        let hits = parse_exa_response(json);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://foo.example");
+        assert!(hits[0].snippet.contains("Foo content"));
+    }
+
+    /// §B-web：Exa 无 URL 的块被跳过；空响应返回空。
+    #[test]
+    fn parse_exa_response_skips_malformed_and_empty() {
+        let malformed = r#"{"result":{"content":[{"type":"text","text":"Title: No URL here\nHighlights:\nbody"}]}}"#;
+        assert!(parse_exa_response(malformed).is_empty());
+        assert!(parse_exa_response("").is_empty());
+        assert!(parse_exa_response("not json at all").is_empty());
     }
 }
