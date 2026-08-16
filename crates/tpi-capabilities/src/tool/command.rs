@@ -27,6 +27,8 @@ pub const STDERR_MIN_BUDGET: usize = 4 * 1024;
 pub struct BashArgs {
     /// Bash 命令（Bash 语法；wrapper 统一启用 `set -o pipefail`）。
     /// 示例："cargo test"、"git status"、"python -c \"print(1)\""。
+    /// 注意：`sed -i` / `perl -i` 等就地修改会被拦截（改用 edit/write）；
+    /// 流处理 sed（无 -i）与重定向写（> file）不受影响。
     pub command: String,
     /// 工作目录（可选，任务书 §15/§16）：未传 → 使用当前逻辑 shell cwd
     /// （`cd` 跨调用保持）；显式传入 → 仅本次 invocation 生效的 override，
@@ -79,6 +81,17 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
         return rejected_bash(
             "invalid_timeout",
             format!("timeout_ms 必须在 1..={MAX_TIMEOUT_MS} 范围内。"),
+        );
+    }
+    // 就地修改拦截（in-place edit guard）：`sed -i` / `perl -i` 等与 edit/write
+    // 职责重叠却绕过 revision 校验与 diff 记录，统一在入口拒绝（覆盖
+    // foreground/background/remote 全部路径，无需在各执行器重复）。
+    if let Some(match_text) = find_in_place_edit(&args.command) {
+        return rejected_bash(
+            "in_place_edit",
+            format!(
+                "命令包含就地修改（{match_text}），这类操作会绕过 edit/write 的 revision 校验与 diff 记录，已被拦截。\n请改用 edit（局部替换）或 write（整文件重写）；需要查看内容用 read。\n如需无副作用的流处理（如 `sed -n '1,5p' file` 只读输出），去掉 -i 即可正常执行。"
+            ),
         );
     }
     // §35：bash 按 ActiveWorkspace 分发。当前只有 Local（R1 加 Remote 分支
@@ -388,6 +401,120 @@ fn rejected_bash(code: &str, detail: impl std::fmt::Display) -> ToolOutcome {
             artifact: None,
         },
     )
+}
+
+/// 检测命令中的「就地修改」（in-place edit）模式：`sed -i` / `perl -i` 等。
+///
+/// 这类操作与 `edit`/`write` 的职责完全重叠，却绕过 revision 校验与 diff
+/// 记录（§10.3 写路径一致性），因此静态拦截并引导改用专用工具。
+/// 只拦截「就地修改已存在文件」：无 `-i` 的流处理 sed（只读管道）与
+/// 重定向写（`> file`，有合法用途）不受影响。
+fn find_in_place_edit(command: &str) -> Option<String> {
+    for segment in split_command_segments(command) {
+        let Some(program) = segment.first() else {
+            continue;
+        };
+        // 兼容路径形式（/usr/bin/sed）与 Windows 扩展名（sed.exe）。
+        let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+        let base = name.strip_suffix(".exe").unwrap_or(name);
+        if base != "sed" && base != "perl" {
+            continue;
+        }
+        for arg in segment.iter().skip(1) {
+            if arg == "--" {
+                // `--` 之后是文件名而非选项（GNU 约定）。
+                break;
+            }
+            if is_in_place_flag(arg, base) {
+                return Some(format!("{base} {arg}"));
+            }
+        }
+    }
+    None
+}
+
+/// 判定单个参数是否为就地修改 flag。
+/// - sed：`-i`、`-i<后缀>`、`--in-place`、`--in-place=<后缀>`（GNU sed）。
+/// - perl：`-i`、`-i<后缀>`，以及组合选项 `-p`/`-n` + `i`（`-pi`、`-npi.bak`）。
+///   `-I`（大写，perl 库路径）与 grep 的 `-i`（ignore case）不受影响——
+///   程序名白名单已限定只有 sed/perl 进入此判定。
+fn is_in_place_flag(arg: &str, program: &str) -> bool {
+    match program {
+        "sed" => {
+            arg == "-i"
+                || arg.starts_with("-i.")
+                || arg == "--in-place"
+                || arg.starts_with("--in-place=")
+        }
+        "perl" => {
+            let Some(rest) = arg.strip_prefix('-') else {
+                return false;
+            };
+            let rest = rest.trim_start_matches(['p', 'n']);
+            rest == "i" || rest.starts_with("i.")
+        }
+        _ => false,
+    }
+}
+
+/// 把命令静态切分为「命令段」：每个段 = 程序名 + 其参数。
+///
+/// 分隔符：`;` `&&` `||` `|` `&` `(` `)` 换行——管道/顺序/后台/子 shell
+/// 连接的每个程序独立成段，因此 `cat f | sed -i ...` 这类管道内的就地
+/// 修改也能命中。引号（`'`/`"`）与反斜杠转义内的内容作为整体 token 保留，
+/// 不会被误判为命令名（`echo "sed -i"` 不命中）。
+fn split_command_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut token = String::new();
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    token.push(c);
+                }
+            }
+            '"' => {
+                for c in chars.by_ref() {
+                    if c == '"' {
+                        break;
+                    }
+                    token.push(c);
+                }
+            }
+            '\\' => {
+                token.push('\\');
+                if let Some(next) = chars.next() {
+                    token.push(next);
+                }
+            }
+            ';' | '|' | '&' | '(' | ')' | '\n' => {
+                flush_token(&mut token, &mut current);
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+            }
+            c if c.is_whitespace() => {
+                flush_token(&mut token, &mut current);
+            }
+            _ => token.push(ch),
+        }
+    }
+    flush_token(&mut token, &mut current);
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn flush_token(token: &mut String, current: &mut Vec<String>) {
+    if !token.is_empty() {
+        current.push(std::mem::take(token));
+    }
 }
 
 /// 本地后台执行器（P2，任务书 §56）：`bash(background=true)`。
@@ -916,5 +1043,88 @@ mod tests {
         assert!(tail.len() <= 59_998);
         assert!(std::str::from_utf8(tail).is_ok(), "窗口必须是合法 UTF-8");
         assert!(!String::from_utf8_lossy(tail).contains('\u{FFFD}'));
+    }
+
+    // ---- 就地修改拦截（in-place edit guard）----
+
+    #[test]
+    fn in_place_edit_detects_sed_forms() {
+        for (cmd, expected) in [
+            ("sed -i 's/a/b/' file", "sed -i"),
+            ("sed -i.bak 's/a/b/' file", "sed -i.bak"),
+            ("sed --in-place 's/a/b/' file", "sed --in-place"),
+            ("sed --in-place=.bak 's/a/b/' file", "sed --in-place=.bak"),
+        ] {
+            assert_eq!(
+                find_in_place_edit(cmd).as_deref(),
+                Some(expected),
+                "应拦截并报告: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_place_edit_detects_perl_forms() {
+        for cmd in [
+            "perl -i -pe 's/a/b/' file",
+            "perl -pi -e 's/a/b/' file",
+            "perl -npi.bak -e 's/a/b/' file",
+            "perl -i.bak -pe 's/a/b/' file",
+        ] {
+            assert!(find_in_place_edit(cmd).is_some(), "应拦截: {cmd}");
+        }
+    }
+
+    #[test]
+    fn in_place_edit_detects_path_and_exe_forms() {
+        assert!(find_in_place_edit("/usr/bin/sed -i 's/a/b/' file").is_some());
+        assert!(find_in_place_edit("sed.exe -i 's/a/b/' file").is_some());
+    }
+
+    #[test]
+    fn in_place_edit_detects_in_pipeline_and_sequence() {
+        assert!(find_in_place_edit("cat f | sed -i 's/a/b/' f").is_some());
+        assert!(find_in_place_edit("cmd1 && perl -i -pe 's/a/b/' f").is_some());
+        assert!(find_in_place_edit("(sed -i 's/a/b/' f)").is_some());
+    }
+
+    #[test]
+    fn in_place_edit_allows_stream_sed() {
+        for cmd in [
+            "sed -n '1,5p' file",
+            "sed 's/a/b/' file > out",
+            "sed -n 's/x/y/p' file | grep y",
+            "sed -n '1,5p' file | head",
+            "sed -- -i", // `--` 之后是文件名，不是就地修改 flag
+        ] {
+            assert!(find_in_place_edit(cmd).is_none(), "不应拦截: {cmd}");
+        }
+    }
+
+    #[test]
+    fn in_place_edit_ignores_other_commands_and_quotes() {
+        for cmd in [
+            "grep -i pattern file",
+            "rg -i pattern",
+            "echo \"sed -i is bad\"",
+            "git commit -m \"perl -i\"",
+            "awk '{print $1}' file",
+            "sed_cmd -i file", // 程序名不是 sed
+        ] {
+            assert!(find_in_place_edit(cmd).is_none(), "不应拦截: {cmd}");
+        }
+    }
+
+    /// 入口集成：拦截返回 Rejected，引导 edit/write（不经过真实执行）。
+    #[test]
+    fn bash_entry_rejects_in_place_edit_without_running() {
+        // find_in_place_edit 是 bash() 入口的唯一判定源；入口逻辑为
+        // `if let Some(...) => rejected_bash(...)`。此处验证返回值形态。
+        let cmd = "sed -i 's/a/b/' file";
+        let matched = find_in_place_edit(cmd).expect("应命中就地修改");
+        let outcome = rejected_bash("in_place_edit", matched);
+        assert_eq!(outcome.model_payload.status, ToolStatus::Rejected);
+        assert!(outcome.model_payload.output.contains("in_place_edit"));
+        assert!(outcome.model_payload.output.contains("edit"));
     }
 }
