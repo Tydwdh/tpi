@@ -161,7 +161,6 @@ fn render_schema_node(node: &serde_json::Value, definitions: &serde_json::Value)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinTool {
     Read,
-    List,
     Search,
     Glob,
     Edit,
@@ -203,7 +202,6 @@ impl BuiltinTool {
     pub fn name(&self) -> &'static str {
         match self {
             BuiltinTool::Read => "read",
-            BuiltinTool::List => "list",
             BuiltinTool::Search => "search",
             BuiltinTool::Glob => "glob",
             BuiltinTool::Edit => "edit",
@@ -223,7 +221,6 @@ impl BuiltinTool {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "read" => Some(Self::Read),
-            "list" => Some(Self::List),
             "search" => Some(Self::Search),
             "glob" => Some(Self::Glob),
             "edit" => Some(Self::Edit),
@@ -244,7 +241,7 @@ impl BuiltinTool {
     pub(crate) fn execution_class(self) -> ToolExecutionClass {
         match self {
             Self::Read => ToolExecutionClass::FileReadExact,
-            Self::List | Self::Search | Self::Glob => ToolExecutionClass::FileReadRecursive,
+            Self::Search | Self::Glob => ToolExecutionClass::FileReadRecursive,
             Self::Edit | Self::Write => ToolExecutionClass::FileWriteExact,
             Self::Bash => ToolExecutionClass::WorkspaceUnknown,
             // §5：process 工具读 registry / 控制 managed process，无文件副作用。
@@ -267,20 +264,16 @@ impl BuiltinTool {
     pub fn description(&self) -> &'static str {
         match self {
             BuiltinTool::Read => {
-                "Read the contents of a file (or an @artifact/... reference) as text. \
-Output: `[revision=HASH]` header (pass to edit as revision) + `lines: X-Y of N` range + \
+                "Read the contents of a file (or an @artifact/... reference) as text, \
+or list a directory's entries when path is a directory. \
+File mode: `[revision=HASH]` header (pass to edit as revision) + `lines: X-Y of N` range + \
 numbered lines `N: text` (precise single-line references). Truncated at 200 lines or 32KiB; \
 use start_line/line_count to page, and follow the returned 续读 hint. \
-Use to inspect files before editing; no cost beyond local I/O. \
-Example: read src/main.rs"
-            }
-            BuiltinTool::List => {
-                "List files and directories under a path (bounded: 200 items, depth 2). \
+Directory mode: entries with relative paths + scan report (scanned_files/scanned_bytes/elapsed_ms/stop_reason); \
+default depth=1 (direct children), pass depth for recursion; start_line/line_count page entries. \
 Follows .gitignore, skips symlinks, binaries and files over 2MiB. \
-Output: items with relative paths + report (scanned_files/scanned_bytes/elapsed_ms/stop_reason); \
-use returned cursor for the next page without rescanning. \
-Use for a directory overview before searching/editing. \
-Example: list path=src depth=2"
+Use to inspect files before editing, or for a directory overview before searching. \
+Example: read src/main.rs; read src depth=2"
             }
             BuiltinTool::Search => {
                 "Search file contents with a rust regex (ripgrep kernel; 100 matches max, \
@@ -415,7 +408,6 @@ Example: activate_skill name=\"rust-review\""
     pub fn schema(&self) -> ToolDef {
         let parameters = match self {
             BuiltinTool::Read => schema_value::<files::ReadArgs>("read"),
-            BuiltinTool::List => schema_value::<search::ListArgs>("list"),
             BuiltinTool::Search => schema_value::<search::SearchArgs>("search"),
             BuiltinTool::Glob => schema_value::<search::GlobArgs>("glob"),
             BuiltinTool::Edit => schema_value::<edit::EditArgs>("edit"),
@@ -446,7 +438,6 @@ Example: activate_skill name=\"rust-review\""
     pub fn parse_args(&self, arguments: &str) -> Result<ValidatedArgs, ArgsError> {
         match self {
             BuiltinTool::Read => parse_args_typed("read", arguments, ValidatedArgs::Read),
-            BuiltinTool::List => parse_args_typed("list", arguments, ValidatedArgs::List),
             BuiltinTool::Search => parse_args_typed("search", arguments, ValidatedArgs::Search),
             BuiltinTool::Glob => parse_args_typed("glob", arguments, ValidatedArgs::Glob),
             BuiltinTool::Edit => parse_args_typed("edit", arguments, ValidatedArgs::Edit),
@@ -479,7 +470,6 @@ Example: activate_skill name=\"rust-review\""
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidatedArgs {
     Read(files::ReadArgs),
-    List(search::ListArgs),
     Search(search::SearchArgs),
     Glob(search::GlobArgs),
     Edit(edit::EditArgs),
@@ -500,7 +490,6 @@ impl ValidatedArgs {
     pub(crate) fn tool(&self) -> BuiltinTool {
         match self {
             Self::Read(_) => BuiltinTool::Read,
-            Self::List(_) => BuiltinTool::List,
             Self::Search(_) => BuiltinTool::Search,
             Self::Glob(_) => BuiltinTool::Glob,
             Self::Edit(_) => BuiltinTool::Edit,
@@ -521,7 +510,6 @@ impl ValidatedArgs {
     pub(crate) fn path(&self) -> Option<&str> {
         match self {
             Self::Read(args) => Some(&args.path),
-            Self::List(args) => Some(&args.path),
             Self::Search(args) => Some(&args.path),
             Self::Glob(args) => Some(&args.path),
             Self::Edit(args) => Some(&args.path),
@@ -874,7 +862,6 @@ pub async fn execute(
             let plan = plan.cloned();
             tokio::task::spawn_blocking(move || match (tool, args) {
                 (BuiltinTool::Read, ValidatedArgs::Read(args)) => files::read(args, &ctx),
-                (BuiltinTool::List, ValidatedArgs::List(args)) => search::list(args, &ctx),
                 (BuiltinTool::Search, ValidatedArgs::Search(args)) => search::search(args, &ctx),
                 (BuiltinTool::Glob, ValidatedArgs::Glob(args)) => search::glob(args, &ctx),
                 (BuiltinTool::Edit, ValidatedArgs::Edit(args)) => files::edit(args, &ctx, plan.as_ref()),
@@ -928,7 +915,6 @@ pub async fn execute(
 pub fn implemented_tools() -> Vec<BuiltinTool> {
     vec![
         BuiltinTool::Read,
-        BuiltinTool::List,
         BuiltinTool::Search,
         BuiltinTool::Glob,
         BuiltinTool::Edit,
@@ -1118,6 +1104,7 @@ mod tests {
                 path: path.to_string(),
                 start_line: 1,
                 line_count: 200,
+                depth: None,
             }),
             &ctx,
             None,

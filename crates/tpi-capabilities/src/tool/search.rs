@@ -54,25 +54,8 @@ pub const MAX_RESULTS: usize = 1_000;
 pub const PAGE_SIZE: usize = 200;
 const MAX_RESULT_PATH_CHARS: usize = 2_048;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-pub struct ListArgs {
-    /// 相对路径或目录；默认 workspace root。
-    #[serde(default = "default_path")]
-    pub path: String,
-    /// 目录深度（默认 2）。
-    #[serde(default = "default_depth")]
-    pub depth: usize,
-    /// 上一页返回的 cursor（翻页不重新扫描）。
-    #[serde(default)]
-    pub cursor: Option<String>,
-}
-
 fn default_path() -> String {
     ".".to_string()
-}
-
-fn default_depth() -> usize {
-    2
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -152,24 +135,28 @@ impl StopReason {
     }
 }
 
-pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
-    if let Some(cursor) = &args.cursor {
-        return page(cursor, ctx);
-    }
-    let root = match resolve_tool_path(ctx, &args.path) {
-        Ok(path) => path,
-        Err(error) => return path_rejected_outcome("list", error),
-    };
-    if !root.is_dir() {
-        return not_directory_outcome("list", &root);
-    }
+/// 目录扫描结果（`read` 目录分支复用；§list 删除后由 read 承担目录浏览）。
+#[derive(Debug, Clone)]
+pub struct DirScan {
+    pub items: Vec<String>,
+    pub scanned_files: u64,
+    pub scanned_bytes: u64,
+    pub elapsed_ms: u64,
+    pub stop_reason: StopReason,
+}
+
+/// 有界目录扫描（§8.4：gitignore、不跟随 symlink、跳过 binary/超大文件、
+/// 深度限制、结果上限）。`read` 目录分支调用（原 list 工具的职责并入 read）。
+///
+/// 调用方负责 `resolve_tool_path` 与目录判定；这里只做扫描与统计。
+pub(crate) fn scan_dir(root: &Utf8PathBuf, depth: usize, ctx: &ToolContext) -> DirScan {
     let started = Instant::now();
     let mut items: Vec<String> = Vec::new();
     let mut scanned_files = 0u64;
     let mut scanned_bytes = 0u64;
     let mut stop_reason = StopReason::Complete;
 
-    'scan: for entry in WalkBuilder::new(&root, Some(args.depth)) {
+    'scan: for entry in WalkBuilder::new(root, Some(depth)) {
         if ctx.cancel.is_cancelled() {
             stop_reason = StopReason::Cancelled;
             break;
@@ -186,13 +173,13 @@ pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
         if entry.depth() == 0 {
             continue; // root 本身
         }
-        if entry.depth() > args.depth {
+        if entry.depth() > depth {
             continue;
         }
         if meta.is_dir() {
             items.push(format!(
                 "{}/",
-                truncate_line(&relative(&root, entry.path()), MAX_RESULT_PATH_CHARS)
+                truncate_line(&relative(root, entry.path()), MAX_RESULT_PATH_CHARS)
             ));
         } else {
             scanned_files = scanned_files.saturating_add(1);
@@ -205,7 +192,7 @@ pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
                 continue;
             }
             items.push(truncate_line(
-                &relative(&root, entry.path()),
+                &relative(root, entry.path()),
                 MAX_RESULT_PATH_CHARS,
             ));
         }
@@ -215,16 +202,13 @@ pub fn list(args: ListArgs, ctx: &ToolContext) -> ToolOutcome {
         }
     }
 
-    finish_scan(
-        ctx,
+    DirScan {
         items,
         scanned_files,
         scanned_bytes,
-        started,
+        elapsed_ms: started.elapsed().as_millis() as u64,
         stop_reason,
-        "list",
-        true,
-    )
+    }
 }
 
 /// glob：按文件名模式查找文件（§P1；opencode 同款语义）。
@@ -985,7 +969,7 @@ mod tests {
             store.insert(
                 format!("00000000-0000-7000-8000-{i:012}"),
                 ScanSnapshot {
-                    tool: "list".into(),
+                    tool: "search".into(),
                     items: vec![],
                     scanned_files: 0,
                     scanned_bytes: 0,
@@ -1034,28 +1018,21 @@ mod tests {
         );
     }
 
-    /// P0-13 行为面：list depth=2 不返回深层路径。
+    /// P0-13 行为面：scan_dir（read 目录分支）depth=2 不返回深层路径。
     #[test]
-    fn list_respects_depth_boundary() {
+    fn scan_dir_respects_depth_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
         std::fs::create_dir_all(root.join("a/b/c")).unwrap();
         std::fs::write(root.join("a/b/c/d.txt"), "x").unwrap();
         std::fs::write(root.join("a/top.txt"), "x").unwrap();
         let ctx = test_ctx(&root);
-        let outcome = list(
-            ListArgs {
-                path: ".".into(),
-                depth: 2,
-                cursor: None,
-            },
-            &ctx,
-        );
-        let output = outcome.model_payload.output;
-        assert!(output.contains("top.txt"), "depth 2 内文件应列出: {output}");
+        let scan = scan_dir(&root, 2, &ctx);
+        let items = scan.items.join("\n");
+        assert!(items.contains("top.txt"), "depth 2 内文件应列出: {items}");
         assert!(
-            !output.contains("d.txt"),
-            "depth 2 之外的路径不得出现: {output}"
+            !items.contains("d.txt"),
+            "depth 2 之外的路径不得出现: {items}"
         );
     }
 
@@ -1091,19 +1068,11 @@ mod tests {
         let ctx = test_ctx(&root);
         ctx.cancel.cancel();
 
-        let listed = list(
-            ListArgs {
-                path: ".".into(),
-                depth: 2,
-                cursor: None,
-            },
-            &ctx,
-        );
+        let scan = scan_dir(&root, 2, &ctx);
         assert!(
-            listed
-                .model_payload
-                .output
-                .contains("stop_reason: cancelled")
+            scan.stop_reason == StopReason::Cancelled,
+            "取消后必须停: {:?}",
+            scan.stop_reason
         );
 
         let searched = search(
@@ -1153,32 +1122,8 @@ mod tests {
         std::fs::write(root.join("a.txt"), "needle\n").unwrap();
         let ctx = test_ctx(&root);
 
-        // list 对文件路径：明确 not_a_directory，不是 not_found。
-        let listed = list(
-            ListArgs {
-                path: "a.txt".into(),
-                depth: 2,
-                cursor: None,
-            },
-            &ctx,
-        );
-        assert!(
-            listed.model_payload.output.contains("not_a_directory"),
-            "文件路径必须报 not_a_directory: {}",
-            listed.model_payload.output
-        );
-        assert!(!listed.model_payload.output.contains("not_found"));
-
-        // list 对不存在路径：not_found。
-        let missing = list(
-            ListArgs {
-                path: "nope".into(),
-                depth: 2,
-                cursor: None,
-            },
-            &ctx,
-        );
-        assert!(missing.model_payload.output.contains("not_found"));
+        // read 目录分支对不存在路径走文件读取的 NotFound（语义由 files.rs
+        // 覆盖）；此处仅保留 search 对不存在路径的 not_found 断言。
 
         // search 对不存在路径：not_found。
         let searched = search(

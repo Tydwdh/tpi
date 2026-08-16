@@ -187,6 +187,7 @@ fn mismatched_tool_and_args_never_default_to_pure() {
         path: "state.txt".into(),
         start_line: 1,
         line_count: 20,
+        depth: None,
     });
 
     let access = tool_access(BuiltinTool::Edit, &read_args, &workspace, false);

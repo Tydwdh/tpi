@@ -388,7 +388,6 @@ mod tests {
                     child_session: child,
                     capabilities: vec![
                         ReadOnlyCapability::Read,
-                        ReadOnlyCapability::List,
                         ReadOnlyCapability::Search,
                     ],
                     parent: None,

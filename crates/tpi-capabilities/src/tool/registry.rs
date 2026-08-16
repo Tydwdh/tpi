@@ -16,7 +16,6 @@ use tpi_core::outcome::ToolOutcome;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadOnlyCapability {
     Read,
-    List,
     Search,
     Glob,
 }
@@ -34,7 +33,7 @@ pub enum ToolOrigin {
 /// External 工具可声明的调度访问类别（P8-10 subagent 并行）。
 ///
 /// 默认 `WorkspaceUnknown`：批内串行执行（MCP 等未知副作用工具保持保守）。
-/// 只读工具（如 `subagent`：child 白名单仅 read/list/search/glob）可声明
+/// 只读工具（如 `subagent`：child 白名单仅 read/search/glob）可声明
 /// `ReadOnly`，与同批 read/search 进入同一 wave 并行执行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolAccessClass {
@@ -735,14 +734,14 @@ async fn setup_transaction_rolls_back_on_fault() {
     assert!(!reg.overlay_has("bash"), "事务失败后不得留下 bash overlay");
 }
 
-/// P8-04：只读 registry——只注册只读调查工具（read/list/search/glob）。
+/// P8-04：只读 registry——只注册只读调查工具（read/search/glob；
+/// §list 并入 read：目录浏览由 read 承担）。
 /// child subagent 用它限制能力（写/进程/网络工具不存在于 registry → 不可调用）。
 pub fn read_only_registry(caps: &[ReadOnlyCapability]) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     for tool in crate::tool::implemented_tools() {
         let allowed = match tool.name() {
             "read" => caps.contains(&ReadOnlyCapability::Read),
-            "list" => caps.contains(&ReadOnlyCapability::List),
             "search" => caps.contains(&ReadOnlyCapability::Search),
             "glob" => caps.contains(&ReadOnlyCapability::Glob),
             _ => false,

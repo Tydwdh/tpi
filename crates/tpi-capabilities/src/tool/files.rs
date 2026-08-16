@@ -28,8 +28,13 @@ pub struct ReadArgs {
     /// 最多返回行数（默认 200，最大 1000）。大文件用
     /// `start_line`/`line_count` 分段读取，例如
     /// `start_line=201 line_count=200` 读下一段。
+    /// 目录模式：条目序号（1-indexed），配合 `depth` 浏览目录。
     #[serde(default = "default_line_count")]
     pub line_count: usize,
+    /// 目录浏览深度（仅当 `path` 是目录时生效）：默认 1 = 只列直接子项；
+    /// 传更大值递归列出更深层级（复用 list 的目录扫描语义，§list 并入 read）。
+    #[serde(default)]
+    pub depth: Option<usize>,
 }
 
 fn default_start_line() -> usize {
@@ -138,6 +143,11 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
         Ok(path) => path,
         Err(error) => return path_rejected_outcome("read", error),
     };
+    // §list 并入 read：path 是目录 → 目录浏览（复用 list 的扫描语义，
+    // 默认单层 depth=1；start_line/line_count 作为条目窗口分页）。
+    if path.is_dir() {
+        return read_dir(&path, &args, ctx);
+    }
     let line_count = args.line_count.clamp(1, MAX_READ_LINES);
     match edit::snapshot_file(&path) {
         Ok(snapshot) => {
@@ -213,6 +223,64 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
         }
         Err(error) => failed_outcome("read", error),
     }
+}
+
+/// read 目录分支（§list 并入 read；opencode 同款语义：read 对目录返回条目）。
+///
+/// 默认单层（depth=1），`depth` 参数递归；条目窗口复用 `start_line`/`line_count`
+/// （1-indexed 条目序号），扫描统计与 stop_reason 一并返回。
+fn read_dir(path: &Utf8PathBuf, args: &ReadArgs, ctx: &ToolContext) -> ToolOutcome {
+    // §list 并入 read：start_line=0 是无效请求（与文件模式一致拒绝）。
+    if args.start_line == 0 {
+        return ToolOutcome::failed(
+            "read",
+            ModelPayload {
+                status: ToolStatus::Rejected,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output:
+                    "status: rejected\ntool: read\nerror: invalid_start_line\n\nstart_line 必须是 ≥1 的整数（条目序号 1-indexed）；从开头浏览请省略该参数或填 1。"
+                        .into(),
+                effect: None,
+                artifact: None,
+            },
+        );
+    }
+    let depth = args.depth.unwrap_or(1).max(1);
+    let scan = crate::tool::search::scan_dir(path, depth, ctx);
+    let total = scan.items.len();
+    let start = (args.start_line.saturating_sub(1)).min(total);
+    let count = args.line_count.clamp(1, MAX_READ_LINES);
+    let end = (start + count).min(total);
+    let shown = end - start;
+    let body = scan.items[start..end].join("\n");
+    let stop = scan.stop_reason.as_str();
+    let mut output = format!(
+        "path: {}\ntype: directory\ndepth: {depth}\nentries: {shown} shown of {total}\nscanned_files: {}\nscanned_bytes: {}\nelapsed_ms: {}\nstop_reason: {stop}\n\n{body}",
+        display_path(&ctx.workspace_root, path),
+        scan.scanned_files,
+        scan.scanned_bytes,
+        scan.elapsed_ms,
+    );
+    // 条目窗口截断：提示用 start_line 续读下一段（与文件模式一致的续读指引）。
+    if end < total {
+        output.push_str(&format!(
+            "\n\n续读: read {} start_line={} line_count={}",
+            display_path(&ctx.workspace_root, path),
+            end + 1,
+            (total - end).min(MAX_READ_LINES),
+        ));
+    }
+    // 结果达上限：引导收窄（与 list 的引导一致）。
+    if stop == "result_limit" {
+        output.push_str("\n\n结果达上限。可减小 depth 或收窄 path 后重新浏览。");
+    }
+    ToolOutcome::succeeded("read", output).with_metadata(ToolMetadata {
+        tool: "read".into(),
+        target: Some(display_path(&ctx.workspace_root, path)),
+        ..Default::default()
+    })
 }
 
 /// 有界读取 artifact（§8.4：模型使用 opaque 引用，不接触本机临时目录绝对路径）。
@@ -680,6 +748,7 @@ mod tests {
                 path: path.to_string(),
                 start_line: 1,
                 line_count: 200,
+                depth: None,
             },
             &ctx,
         );
@@ -870,6 +939,7 @@ mod tests {
                 path: path.to_string(),
                 start_line: 1,
                 line_count: 10,
+                depth: None,
             },
             &ctx,
         );
@@ -891,6 +961,7 @@ mod tests {
                 path: path2.to_string(),
                 start_line: 1,
                 line_count: 10,
+                depth: None,
             },
             &ctx,
         );

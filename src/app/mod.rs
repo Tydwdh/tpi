@@ -508,7 +508,7 @@ fn tool_target(name: &str, arguments: &str) -> (String, Option<String>) {
                 ("bash".into(), None)
             }
         }
-        name if matches!(name, "read" | "write" | "edit" | "list" | "search") => {
+        name if matches!(name, "read" | "write" | "edit" | "search") => {
             let target = parsed
                 .as_ref()
                 .and_then(|v| v.get("path"))

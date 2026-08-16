@@ -30,6 +30,7 @@ fn waves_parallelize_reads_and_serialize_writes() {
                 path: format!("f{index}.txt"),
                 start_line: 1,
                 line_count: 10,
+                depth: None,
             }),
         },
         access,
@@ -101,6 +102,7 @@ fn bash_serializes_all_following_tools() {
                 path: path.into(),
                 start_line: 1,
                 line_count: 10,
+                depth: None,
             }),
         },
         access: ToolAccess::Resources(vec![tpi::agent::scheduler::ResourceLock {
@@ -561,6 +563,7 @@ fn read_only_external_tools_share_wave_with_reads_but_not_writes() {
                 path: path.into(),
                 start_line: 1,
                 line_count: 10,
+                depth: None,
             }),
         },
         access: ToolAccess::Resources(vec![ResourceLock {

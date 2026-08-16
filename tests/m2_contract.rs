@@ -12,7 +12,7 @@ use fixtures::{point_host_at_real_tpi, test_config, test_tool_context};
 use tokio_util::sync::CancellationToken;
 use tpi::outcome::ToolStatus;
 use tpi::tool::command::{BashArgs, bash};
-use tpi::tool::search::{ListArgs, SearchArgs, list, search};
+use tpi::tool::search::{SearchArgs, search};
 use tpi::tool::{ToolContext, files};
 
 #[tokio::test]
@@ -164,12 +164,13 @@ async fn list_and_search_respect_budget_and_cursor() {
     std::fs::create_dir_all(workspace.join(".git")).unwrap();
     let ctx = test_tool_context(&workspace);
 
-    // list：遵循 .gitignore，报告扫描统计。
-    let outcome = list(
-        ListArgs {
+    // read 目录模式（§list 并入 read）：遵循 .gitignore，报告扫描统计。
+    let outcome = files::read(
+        files::ReadArgs {
             path: ".".into(),
-            depth: 2,
-            cursor: None,
+            start_line: 1,
+            line_count: 200,
+            depth: Some(2),
         },
         &ctx,
     );
@@ -197,45 +198,35 @@ async fn list_and_search_respect_budget_and_cursor() {
     assert!(text.contains("b.txt:1: needle-two"), "{text}");
     assert!(!text.contains("ignored.txt"), "{text}");
 
-    // cursor 翻页不重新扫描（§20.2 场景 22）：250 个文件 → 第一页 200 + cursor → 第二页 50。
+    // 目录条目窗口分页（§20.2 场景 22 的 list 语义并入 read）：
+    // 250 个文件 → 第一页 200 条 + 续读指引 → start_line 续读第二页 50 条。
     for i in 0..250 {
         std::fs::write(workspace.join(format!("f{i:03}.txt")), "x\n").unwrap();
     }
-    let outcome = list(
-        ListArgs {
+    let outcome = files::read(
+        files::ReadArgs {
             path: ".".into(),
-            depth: 1,
-            cursor: None,
+            start_line: 1,
+            line_count: 200,
+            depth: Some(1),
         },
         &ctx,
     );
     let text = outcome.model_text();
-    assert!(text.contains("items: 200 shown of"), "{text}");
-    // 提取 cursor。
-    let cursor = text
-        .lines()
-        .find_map(|line| line.strip_prefix("cursor: "))
-        .map(|c| c.to_string())
-        .expect("cursor in output");
-    let page2 = list(
-        ListArgs {
+    assert!(text.contains("entries: 200 shown of 253"), "{text}");
+    assert!(text.contains("续读: read"), "必须给出续读指引: {text}");
+    // 第二页：start_line=201 续读剩余 53 条（250 文件 + a.txt/b.txt/sub/）。
+    let page2 = files::read(
+        files::ReadArgs {
             path: ".".into(),
-            depth: 1,
-            cursor: Some(cursor),
+            start_line: 201,
+            line_count: 200,
+            depth: Some(1),
         },
         &ctx,
     );
     let text2 = page2.model_text();
-    assert!(text2.contains("items: "), "{text2}");
-    let shown: usize = text2
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("items: ")
-                .and_then(|rest| rest.split(' ').next())
-                .and_then(|n| n.parse().ok())
-        })
-        .expect("shown count");
-    assert!(shown > 0 && shown <= 200, "第二页窗口: {text2}");
+    assert!(text2.contains("entries: 53 shown of 253"), "{text2}");
 }
 
 #[tokio::test]
@@ -280,6 +271,7 @@ async fn bash_output_lands_in_artifact_and_readable_via_opaque_ref() {
         path: format!("@artifact/{}/{}", artifact.session, artifact.id),
         start_line: 1,
         line_count: 200,
+        depth: None,
     };
     let read_outcome = files::read(read_args, &ctx);
     assert_eq!(read_outcome.status, ToolStatus::Succeeded);

@@ -401,7 +401,7 @@ fn stats_from_events(events: &[(i128, SessionEvent)]) -> EvalStats {
                 match call.name.as_str() {
                     "bash" => stats.bash_calls += 1,
                     "read" => stats.read_calls += 1,
-                    "list" | "search" => stats.search_calls += 1,
+                    "search" => stats.search_calls += 1,
                     "edit" => stats.edit_calls += 1,
                     "write" => stats.write_calls += 1,
                     "web_search" => stats.web_search_calls += 1,

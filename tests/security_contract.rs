@@ -94,6 +94,7 @@ fn read_rejects_path_outside_workspace() {
             path: "../secret.txt".into(),
             start_line: 1,
             line_count: 10,
+            depth: None,
         },
         &ctx,
     );
@@ -111,6 +112,7 @@ fn read_rejects_artifact_path_traversal() {
             path: "@artifact/../evil/id".into(),
             start_line: 1,
             line_count: 10,
+            depth: None,
         },
         &ctx,
     );
@@ -280,6 +282,7 @@ fn read_allows_outside_absolute_path_when_freedom_enabled() {
             path: outside.to_string_lossy().into_owned(),
             start_line: 1,
             line_count: 10,
+            depth: None,
         },
         &ctx,
     );
