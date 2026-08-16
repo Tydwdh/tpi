@@ -426,6 +426,85 @@ pub fn edit(
     }
 }
 
+/// `edit_range` 工具：按行范围编辑（§anchor）。
+///
+/// - fresh（revision == current）：直接按行号替换（比 old_text 更可靠——
+///   revision 已证明文件字节未变，行号是确定性坐标，无需模型复述原文）。
+/// - stale（revision != current）：从 SnapshotStore 取 base 行 span 走
+///   [`crate::tool::edit::apply_edit`] 的宽松应用（fmt 等外部改动免重读）。
+pub fn edit_range(
+    args: crate::tool::edit::EditRangeArgs,
+    ctx: &ToolContext,
+    plan: Option<&crate::tool::edit::CommitPlan>,
+) -> ToolOutcome {
+    let path = match resolve_tool_path(ctx, &args.path) {
+        Ok(path) => path,
+        Err(error) => return path_rejected_outcome("edit_range", error),
+    };
+    let Some(plan) = plan else {
+        return ToolOutcome::failed(
+            "edit_range",
+            ModelPayload {
+                status: ToolStatus::Rejected,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: "status: rejected\ntool: edit_range\nerror: missing_commit_plan"
+                    .to_string(),
+                effect: None,
+                artifact: None,
+            },
+        );
+    };
+    match crate::tool::edit::apply_edit_range(
+        &path,
+        &args.revision,
+        args.start_line,
+        args.end_line,
+        &args.new_text,
+        ctx,
+    )
+    .and_then(|result| {
+        crate::tool::edit::commit_edit(&result, &path, plan)?;
+        // §10.1：记录提交后的 snapshot（后续 stale 诊断用）。
+        if let Ok(snapshot) =
+            crate::tool::edit::build_snapshot(path.clone(), result.new_raw.clone())
+        {
+            tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
+        }
+        Ok(result)
+    }) {
+        Ok(result) => {
+            let diff = crate::tool::edit::unified_diff(&result);
+            let mut output = format!(
+                "status: succeeded\ntool: edit_range\npath: {}\napplied: {}\nprevious_revision: {}\ncurrent_revision: {}",
+                display_path(&ctx.workspace_root, &path),
+                result.applied,
+                result.previous_revision,
+                result.current_revision,
+            );
+            if result.skipped_noops > 0 {
+                output.push_str(&format!("\nskipped_noops: {}", result.skipped_noops));
+            }
+            let mut outcome = ToolOutcome::succeeded("edit_range", output);
+            outcome
+                .observed_resources
+                .push(tpi_core::outcome::ResourceVersion {
+                    path: display_path(&ctx.workspace_root, &path),
+                    revision: result.current_revision,
+                });
+            outcome.session_metadata = ToolMetadata {
+                tool: "edit_range".into(),
+                target: Some(display_path(&ctx.workspace_root, &path)),
+                diff: if diff.is_empty() { None } else { Some(diff) },
+                ..Default::default()
+            };
+            outcome
+        }
+        Err(error) => failed_outcome("edit_range", error),
+    }
+}
+
 pub fn write(
     args: WriteArgs,
     ctx: &ToolContext,
@@ -969,5 +1048,287 @@ mod tests {
         assert!(out2.contains("indentation: spaces"), "{out2}");
         assert!(out2.contains("line_endings: LF"), "{out2}");
         assert!(out2.contains("trailing_whitespace: no"), "{out2}");
+    }
+
+    // ---- edit_range（§anchor）----
+
+    /// 构造带 snapshot_store 的 ToolContext（files 测试共用）。
+    fn range_ctx(dir: &tempfile::TempDir) -> (ToolContext, Utf8PathBuf) {
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let local = crate::workspace::LocalWorkspace::new(workspace.clone(), true);
+        let ctx = ToolContext {
+            workspace_root: workspace.clone(),
+            shell: local.shell.clone(),
+            workspace: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::workspace::ActiveWorkspace::local(local),
+            )),
+            cancel: CancellationToken::new(),
+            artifacts_root: dir.path().join("artifacts"),
+            session_id: "test-session".into(),
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
+            output_tx: None,
+            scan_snapshots: Default::default(),
+            shell_path: None,
+            snapshot_store: Default::default(),
+            current_plan: Default::default(),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::process::managed::ProcessRegistry::new(),
+            )),
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::tool::registry::ToolRegistry::new(),
+            )),
+            interactive: false,
+            allow_outside_workspace: true,
+        };
+        (ctx, workspace)
+    }
+
+    /// fresh：revision == current → 直接按行号替换（不依赖 old_text 复述）。
+    #[test]
+    fn edit_range_fresh_replaces_by_line_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "fn a() {\n    old();\n    keep();\n}\n").unwrap();
+        // 先 read 拿 revision（并 record snapshot）。
+        let read_outcome = read(
+            ReadArgs {
+                path: path.to_string(),
+                start_line: 1,
+                line_count: 10,
+                depth: None,
+            },
+            &ctx,
+        );
+        assert_eq!(read_outcome.status, ToolStatus::Succeeded);
+        let revision = crate::tool::edit::parse_revision_token(
+            read_outcome
+                .model_payload
+                .output
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("[revision=")
+                        .map(|r| r.strip_suffix(']').unwrap())
+                })
+                .unwrap(),
+        )
+        .unwrap();
+
+        // edit_range 替换第 2 行。
+        let plan = crate::tool::edit::prepare_commit(&path);
+        let outcome = edit_range(
+            crate::tool::edit::EditRangeArgs {
+                path: path.to_string(),
+                revision,
+                start_line: 2,
+                end_line: 2,
+                new_text: "    new();".into(),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        let content = std::fs::read_to_string(path.as_std_path()).unwrap();
+        assert_eq!(content, "fn a() {\n    new();\n    keep();\n}\n");
+    }
+
+    /// fresh + 多行 new_text（插入语义：replace 单行含多行新内容）。
+    #[test]
+    fn edit_range_fresh_replaces_with_multiline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("b.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "line1\nline2\nline3\n").unwrap();
+        let read_outcome = read(
+            ReadArgs {
+                path: path.to_string(),
+                start_line: 1,
+                line_count: 10,
+                depth: None,
+            },
+            &ctx,
+        );
+        let revision = crate::tool::edit::parse_revision_token(
+            read_outcome
+                .model_payload
+                .output
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("[revision=")
+                        .map(|r| r.strip_suffix(']').unwrap())
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        let plan = crate::tool::edit::prepare_commit(&path);
+        let outcome = edit_range(
+            crate::tool::edit::EditRangeArgs {
+                path: path.to_string(),
+                revision,
+                start_line: 2,
+                end_line: 2,
+                new_text: "inserted_a\ninserted_b".into(),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        let content = std::fs::read_to_string(path.as_std_path()).unwrap();
+        assert_eq!(content, "line1\ninserted_a\ninserted_b\nline3\n");
+    }
+
+    /// fresh + 空 new_text = 删除范围。
+    #[test]
+    fn edit_range_fresh_deletes_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("c.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "keep1\ndel1\ndel2\nkeep2\n").unwrap();
+        let read_outcome = read(
+            ReadArgs {
+                path: path.to_string(),
+                start_line: 1,
+                line_count: 10,
+                depth: None,
+            },
+            &ctx,
+        );
+        let revision = crate::tool::edit::parse_revision_token(
+            read_outcome
+                .model_payload
+                .output
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("[revision=")
+                        .map(|r| r.strip_suffix(']').unwrap())
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        let plan = crate::tool::edit::prepare_commit(&path);
+        let outcome = edit_range(
+            crate::tool::edit::EditRangeArgs {
+                path: path.to_string(),
+                revision,
+                start_line: 2,
+                end_line: 3,
+                new_text: "".into(),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        let content = std::fs::read_to_string(path.as_std_path()).unwrap();
+        assert_eq!(content, "keep1\nkeep2\n");
+    }
+
+    /// stale：外部改动（fmt 改空格）后 revision 过期，但目标行仍匹配 → 宽松应用。
+    #[test]
+    fn edit_range_stale_recovers_from_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("d.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "fn a() {\n    old();\n    keep();\n}\n").unwrap();
+        let read_outcome = read(
+            ReadArgs {
+                path: path.to_string(),
+                start_line: 1,
+                line_count: 10,
+                depth: None,
+            },
+            &ctx,
+        );
+        let revision = crate::tool::edit::parse_revision_token(
+            read_outcome
+                .model_payload
+                .output
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("[revision=")
+                        .map(|r| r.strip_suffix(']').unwrap())
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        // 外部 fmt：改第 1 行空白（revision 过期，但目标行 2 未变，行数不变）。
+        std::fs::write(
+            path.as_std_path(),
+            "fn a( ) {\n    old();\n    keep();\n}\n",
+        )
+        .unwrap();
+        let plan = crate::tool::edit::prepare_commit(&path);
+        let outcome = edit_range(
+            crate::tool::edit::EditRangeArgs {
+                path: path.to_string(),
+                revision,
+                start_line: 2,
+                end_line: 2,
+                new_text: "    new();".into(),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(
+            outcome.status,
+            ToolStatus::Succeeded,
+            "stale 但目标行匹配应恢复"
+        );
+        let content = std::fs::read_to_string(path.as_std_path()).unwrap();
+        assert_eq!(content, "fn a( ) {\n    new();\n    keep();\n}\n");
+    }
+
+    /// stale 但 snapshot 不在 store（没 read 过）→ 拒绝并报 stale_revision。
+    #[test]
+    fn edit_range_stale_without_snapshot_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("e.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "line1\nline2\n").unwrap();
+        // 构造一个未 record 的 revision（伪造 stale，snapshot 不在 store）。
+        let current = crate::tool::edit::snapshot_file(&path).unwrap();
+        let fake_revision = "b3:".to_string() + &"0".repeat(64);
+        assert_ne!(current.revision, fake_revision);
+        let plan = crate::tool::edit::prepare_commit(&path);
+        let outcome = edit_range(
+            crate::tool::edit::EditRangeArgs {
+                path: path.to_string(),
+                revision: fake_revision,
+                start_line: 1,
+                end_line: 1,
+                new_text: "x".into(),
+            },
+            &ctx,
+            Some(&plan),
+        );
+        assert_eq!(outcome.status, ToolStatus::Failed);
+        assert!(outcome.model_payload.output.contains("stale_revision"));
+    }
+
+    /// 行号非法（0 或 end < start）→ invalid_range。
+    #[test]
+    fn edit_range_rejects_invalid_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _) = range_ctx(&dir);
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("f.rs")).unwrap();
+        std::fs::write(path.as_std_path(), "line1\n").unwrap();
+        let plan = crate::tool::edit::prepare_commit(&path);
+        for (start, end) in [(0, 1), (2, 1)] {
+            let outcome = edit_range(
+                crate::tool::edit::EditRangeArgs {
+                    path: path.to_string(),
+                    revision: "b3:".to_string() + &"0".repeat(64),
+                    start_line: start,
+                    end_line: end,
+                    new_text: "x".into(),
+                },
+                &ctx,
+                Some(&plan),
+            );
+            assert_eq!(outcome.status, ToolStatus::Failed);
+            assert!(
+                outcome.model_payload.output.contains("invalid_range"),
+                "{start}..{end}"
+            );
+        }
     }
 }

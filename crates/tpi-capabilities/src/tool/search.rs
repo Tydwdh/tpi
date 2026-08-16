@@ -307,6 +307,7 @@ pub fn glob(args: GlobArgs, ctx: &ToolContext) -> ToolOutcome {
         stop_reason,
         "glob",
         false,
+        None,
     )
 }
 
@@ -440,7 +441,6 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         }
     };
     let started = Instant::now();
-    let mut items: Vec<String> = Vec::new();
     let mut scanned_files = 0u64;
     let mut scanned_bytes = 0u64;
     let mut stop_reason = StopReason::Complete;
@@ -477,6 +477,8 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
     // ripgrep 内核：Searcher（memchr 加速逐行搜索 + 行号追踪）逐文件复用。
     // context>0 时配置上下文行（Sink 的 context() 消费）。
     let mut searcher = build_searcher(args.context);
+    // 每文件匹配行（按文件分组，输出 [path#revision] header）。
+    let mut file_groups: Vec<(String, String, Vec<String>)> = Vec::new();
     'scan: for entry in WalkBuilder::new(&root, None) {
         if ctx.cancel.is_cancelled() {
             stop_reason = StopReason::Cancelled;
@@ -525,8 +527,21 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         if meta.len() > MAX_FILE_BYTES || meta.len() == 0 {
             continue;
         }
-        // ripgrep 内核逐文件搜索；binary 由 read_head 预检跳过，
-        // Searcher 设 quit(b'\0') 兜底。达上限 → 停止整个扫描。
+        // 整读 bytes（同一份：hash + record + 搜索；§anchor 不变量）。
+        let bytes = match std::fs::read(entry.path()) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        // 计算 revision 并注册 snapshot（edit_range stale 恢复用）。
+        let revision = crate::tool::edit::revision_of(&bytes);
+        if let Ok(snapshot) = crate::tool::edit::build_snapshot(
+            Utf8PathBuf::from_path_buf(entry.path().to_path_buf()).unwrap_or_default(),
+            bytes.clone(),
+        ) {
+            tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
+        }
+        // 该文件局部匹配行（跨文件分组，不直接塞全局 items）。
+        let mut file_items: Vec<String> = Vec::new();
         let limits = SearchLimits {
             max_results,
             max_output_bytes: MAX_OUTPUT_BYTES,
@@ -535,17 +550,40 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         if search_file_into(
             &mut searcher,
             &matcher,
-            entry.path(),
+            &bytes,
             &rel,
             &limits,
-            &mut items,
+            &mut file_items,
             &mut output_bytes,
             &mut match_count,
         ) {
             stop_reason = StopReason::ResultLimit;
+        }
+        if !file_items.is_empty() {
+            file_groups.push((rel.clone(), revision, file_items));
+        }
+        if stop_reason == StopReason::ResultLimit {
             break 'scan;
         }
     }
+
+    // 拼分组文本：每个文件一段，段首 [path#revision]（§anchor）。
+    // 同时把扁平 items 存进 snapshot（供 cursor 翻页，翻页不带 revision）。
+    let mut grouped_body = String::new();
+    for (rel, revision, file_items) in &file_groups {
+        if !grouped_body.is_empty() {
+            grouped_body.push('\n');
+        }
+        grouped_body.push_str(&format!("[{}#{revision}]", display_rel(rel)));
+        for item in file_items {
+            grouped_body.push('\n');
+            grouped_body.push_str(item);
+        }
+    }
+    let items: Vec<String> = file_groups
+        .into_iter()
+        .flat_map(|(_, _, items)| items)
+        .collect();
 
     finish_scan(
         ctx,
@@ -558,6 +596,8 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         // context>0：保留 ripgrep 输出顺序（匹配行与上下文行交错），
         // 不按噪音目录重排（否则上下文被拆散）。
         args.context == 0,
+        // 首屏用分组文本（[path#revision] + 行）；翻页仍走扁平 items。
+        Some(grouped_body),
     )
 }
 
@@ -579,6 +619,17 @@ fn search_single_file(
     let scanned_bytes = meta.len();
     if meta.len() > 0 && meta.len() <= MAX_FILE_BYTES {
         let rel = relative(&ctx.workspace_root, path.as_std_path());
+        // 整读 bytes（hash + record + 搜索同一份；§anchor 不变量）。
+        let bytes = match std::fs::read(path.as_std_path()) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return finish_scan(ctx, items, 1, 0, started, stop_reason, "search", true, None);
+            }
+        };
+        let revision = crate::tool::edit::revision_of(&bytes);
+        if let Ok(snapshot) = crate::tool::edit::build_snapshot(path.clone(), bytes.clone()) {
+            tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
+        }
         let mut searcher = build_searcher(args.context);
         let mut match_count = 0usize;
         let limits = SearchLimits {
@@ -589,7 +640,7 @@ fn search_single_file(
         if search_file_into(
             &mut searcher,
             matcher,
-            path.as_std_path(),
+            &bytes,
             &rel,
             &limits,
             &mut items,
@@ -598,17 +649,50 @@ fn search_single_file(
         ) {
             stop_reason = StopReason::ResultLimit;
         }
+        if !items.is_empty() {
+            // 单文件也输出 [path#revision] header（与其他路径一致）。
+            let mut grouped = format!("[{}#{revision}]", display_rel(&rel));
+            for item in &items {
+                grouped.push('\n');
+                grouped.push_str(item);
+            }
+            finish_scan(
+                ctx,
+                items.clone(),
+                scanned_files,
+                scanned_bytes,
+                started,
+                stop_reason,
+                "search",
+                args.context == 0,
+                Some(grouped),
+            )
+        } else {
+            finish_scan(
+                ctx,
+                items,
+                scanned_files,
+                scanned_bytes,
+                started,
+                stop_reason,
+                "search",
+                args.context == 0,
+                None,
+            )
+        }
+    } else {
+        finish_scan(
+            ctx,
+            items,
+            scanned_files,
+            scanned_bytes,
+            started,
+            stop_reason,
+            "search",
+            args.context == 0,
+            None,
+        )
     }
-    finish_scan(
-        ctx,
-        items,
-        scanned_files,
-        scanned_bytes,
-        started,
-        stop_reason,
-        "search",
-        args.context == 0,
-    )
 }
 
 /// 搜索单文件时的预算（§P1：max_results 条、单行 300 chars、最多 32 KiB）。
@@ -619,37 +703,21 @@ struct SearchLimits {
 }
 
 /// 用 ripgrep 内核搜索单个文件，匹配累积进 `items`。返回 true = 达上限。
-/// binary 预检（头 8 KiB 查 NUL）后由 Searcher 流式按行搜（不整读文件）。
+/// 整读 bytes（二进制预检 + 搜索同一份 bytes；供 revision/record 复用）。
 #[allow(clippy::too_many_arguments)] // 与 finish_scan 同：统计/预算参数多但语义单一。
 fn search_file_into(
     searcher: &mut grep::searcher::Searcher,
     matcher: &grep::regex::RegexMatcher,
-    path: &std::path::Path,
+    bytes: &[u8],
     rel: &str,
     limits: &SearchLimits,
     items: &mut Vec<String>,
     output_bytes: &mut usize,
     match_count: &mut usize,
 ) -> bool {
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-    {
-        use std::io::Read;
-        let mut head = [0u8; 8192];
-        let Ok(n) = file.read(&mut head) else {
-            return false;
-        };
-        if head[..n].contains(&0) {
-            return false; // binary：跳过（与目录模式一致）。
-        }
-    }
-    {
-        use std::io::{Seek, SeekFrom};
-        if file.seek(SeekFrom::Start(0)).is_err() {
-            return false;
-        }
+    // binary 预检（头 8 KiB 查 NUL；与目录模式一致）。
+    if bytes[..bytes.len().min(8192)].contains(&0) {
+        return false;
     }
     let rel = truncate_line(rel, MAX_RESULT_PATH_CHARS);
     let mut sink = SearchSink {
@@ -665,7 +733,7 @@ fn search_file_into(
     // 兜底：binary 检测（遇 NUL 停止该文件搜索）；默认 \n 行分隔，
     // CRLF 行的 \r 由 sink 剥离。
     searcher.set_binary_detection(grep::searcher::BinaryDetection::quit(b'\0'));
-    let _ = searcher.search_reader(matcher, file, &mut sink);
+    let _ = searcher.search_reader(matcher, bytes, &mut sink);
     sink.limit_hit
 }
 
@@ -757,6 +825,11 @@ fn build_glob_set(patterns: &[String]) -> Result<globset::GlobSet, String> {
     builder.build().map_err(|e| e.to_string())
 }
 
+/// 展示用路径（与 read 的 display_path 语义一致：相对路径原样，绝对转相对）。
+fn display_rel(rel: &str) -> String {
+    rel.to_string()
+}
+
 #[allow(clippy::too_many_arguments)] // §P1：统计字段 + resort 开关，参数多但语义单一。
 fn finish_scan(
     ctx: &ToolContext,
@@ -767,6 +840,8 @@ fn finish_scan(
     stop_reason: StopReason,
     tool: &'static str,
     resort: bool,
+    // 首屏自定义 body（如 search 的分组 [path#revision]）；None = 默认 page()。
+    first_page_body: Option<String>,
 ) -> ToolOutcome {
     // §工具改进：噪音目录后置排序——src/根目录源码优先露出，tests/fixtures/
     // vendor 等噪音结果沉底（各自组内保持字典序），避免 100 条上限被
@@ -791,7 +866,22 @@ fn finish_scan(
         evict_oldest_snapshot(&mut store);
         store.insert(cursor.clone(), snapshot);
     }
-    let mut outcome = page(&cursor, ctx);
+    let mut outcome = if let Some(body) = first_page_body {
+        // 首屏自定义 body（search 分组 [path#revision]）：拼接报告头 + body。
+        let total = 0; // body 已是完整分组文本，不显示 count（page() 会算）。
+        let _ = total;
+        let output = format!(
+            "status: succeeded\nscanned_files: {scanned_files}\nscanned_bytes: {scanned_bytes}\nelapsed_ms: {elapsed_ms}\nstop_reason: {}\n\n{body}",
+            stop_reason.as_str(),
+        );
+        ToolOutcome::succeeded(tool, output).with_metadata(ToolMetadata {
+            tool: tool.to_string(),
+            target: Some(cursor.clone()),
+            ..Default::default()
+        })
+    } else {
+        page(&cursor, ctx)
+    };
     // §工具改进：命中结果上限（ResultLimit）时给出排除/收窄指引——
     // 用户不必反复换 path 缩小范围。
     if stop_reason == StopReason::ResultLimit {

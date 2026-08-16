@@ -243,7 +243,7 @@ pub enum ToolRecoveryPolicy {
 /// 一致性由测试保证（tool 的 BuiltinTool::recovery_policy == 本函数）。
 pub fn tool_recovery_policy(tool_name: &str) -> ToolRecoveryPolicy {
     match tool_name {
-        "edit" | "write" => ToolRecoveryPolicy::FileCommit,
+        "edit" | "edit_range" | "write" => ToolRecoveryPolicy::FileCommit,
         // bash 任意副作用（WorkspaceUnknown）；其余工具无文件副作用。
         "bash" => ToolRecoveryPolicy::Unknown,
         _ => ToolRecoveryPolicy::NoEffect,

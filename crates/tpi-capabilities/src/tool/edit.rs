@@ -332,6 +332,14 @@ pub enum EditError {
     },
     #[error("invalid revision: {value}")]
     InvalidRevision { value: String },
+    #[error(
+        "invalid line range in {path}: {start_line}..={end_line} (must be 1-indexed, end >= start)"
+    )]
+    InvalidRange {
+        path: Utf8PathBuf,
+        start_line: usize,
+        end_line: usize,
+    },
     #[error("old_text must not be empty (path={path})")]
     EmptyOldText { path: Utf8PathBuf },
     #[error("too many replacements in {path}: {count} (max {MAX_REPLACEMENTS})")]
@@ -381,6 +389,7 @@ impl EditError {
             EditError::FileTooLarge { .. } => "file_too_large",
             EditError::StaleRevision { .. } => "stale_revision",
             EditError::InvalidRevision { .. } => "invalid_revision",
+            EditError::InvalidRange { .. } => "invalid_range",
             EditError::EmptyOldText { .. } => "empty_old_text",
             EditError::TooManyReplacements { .. } => "too_many_replacements",
             EditError::NoMatch { .. } => "no_match",
@@ -930,6 +939,119 @@ pub fn diagnose_no_match(text: &str, old_text: &str) -> Option<NoMatchDiagnostic
 
 /// 执行 revision-bound exact edit（§10.3）。
 ///
+/// 行范围编辑参数（§anchor：edit_range 工具）。
+///
+/// 语义：`start_line`/`end_line` 是 **base revision 中的坐标**（1-indexed
+/// inclusive），不是当前文件的绝对坐标——stale 时由 recovery 重映射。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+pub struct EditRangeArgs {
+    /// 目标文件路径（workspace 内相对路径或绝对路径）。
+    pub path: String,
+    /// `read`/`search` 输出的 `[revision=...]` 或裸 `b3:<64-hex>`——目标
+    /// 快照的 identity（§anchor：行号是此 revision 的坐标）。
+    pub revision: String,
+    /// 起始行号（1-indexed，inclusive）。
+    pub start_line: usize,
+    /// 结束行号（1-indexed，inclusive；≥ start_line）。
+    pub end_line: usize,
+    /// 替换内容（行数任意；空串 = 删除该范围）。
+    pub new_text: String,
+}
+
+/// 行范围编辑：把 base revision 的 `start_line..=end_line` 替换为 `new_text`。
+///
+/// - fresh（revision == current）：从当前文件提取行 span 文本作为 old_text，
+///   走 [`apply_edit`]（revision 匹配 + 唯一匹配 → 直接应用）。
+/// - stale（revision != current）：从 SnapshotStore 取 base snapshot，提取
+///   行 span 文本作为 old_text，走 [`apply_edit`]——其内部宽松应用（唯一匹配
+///   放行）自动处理 fmt 等外部改动。
+/// - snapshot 缺失（base 不在 store）：返回 [`EditError::StaleRevision`]
+///   提示重新 read。
+///
+/// 行号坐标语义：行号始终是 `revision` 所指向快照的坐标（§anchor），
+/// 不是当前文件的绝对坐标。
+pub fn apply_edit_range(
+    path: &Utf8PathBuf,
+    revision: &str,
+    start_line: usize,
+    end_line: usize,
+    new_text: &str,
+    ctx: &crate::tool::ToolContext,
+) -> Result<EditResult, EditError> {
+    if start_line == 0 || end_line == 0 || end_line < start_line {
+        return Err(EditError::InvalidRange {
+            path: path.clone(),
+            start_line,
+            end_line,
+        });
+    }
+    let Some(revision) = parse_revision_token(revision) else {
+        return Err(EditError::InvalidRevision {
+            value: revision.to_string(),
+        });
+    };
+    let current = snapshot_file(path)?;
+    // 提取行 span 的 old_text：fresh 用当前文件，stale 用 base snapshot。
+    let old_text = if current.revision == revision {
+        extract_lines(&current.logical_lf_text, start_line, end_line)
+    } else {
+        // stale：从 snapshot store 取 base（digest 自校验在 get 内）。
+        // 引用提取行文本后即释放锁（不 clone FileSnapshot）。
+        let store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+        let Some(base) = store.get(path, &revision) else {
+            drop(store);
+            return Err(EditError::StaleRevision {
+                path: path.clone(),
+                current: current.revision,
+                expected: revision,
+                // 无 base snapshot：无法提取行 span，回填 None。
+                context: None,
+            });
+        };
+        let extracted = extract_lines(&base.logical_lf_text, start_line, end_line);
+        drop(store);
+        extracted
+    };
+    // 行级替换语义：old_text 是整行（含换行），new_text 由工具补换行——
+    // 保证替换单行不吞换行；删除（空 new_text）不补，整段行连换行一起删。
+    let mut replacement_new = new_text.to_string();
+    if !replacement_new.is_empty() && old_text.ends_with('\n') && !replacement_new.ends_with('\n') {
+        replacement_new.push('\n');
+    }
+    let replacement = Replacement {
+        old_text,
+        new_text: replacement_new,
+    };
+    // 复用 apply_edit：fresh 直接应用；stale 走内部宽松应用（唯一匹配放行）。
+    apply_edit_to_snapshot(current, &revision, std::slice::from_ref(&replacement))
+}
+
+/// 从逻辑 LF 文本提取 `start_line..=end_line` 行（1-indexed inclusive）的
+/// **整行文本（含每行末尾换行）**——行级替换语义：old_text 必须覆盖
+/// 整行含换行，替换时才不会残留空行或吞掉相邻换行。
+fn extract_lines(text: &str, start_line: usize, end_line: usize) -> String {
+    let mut out = String::new();
+    let mut current: usize = 1;
+    // 逐行扫描到 start_line，然后收集到 end_line（含行尾 \n）。
+    let mut lines = text.split_inclusive('\n');
+    for _ in 0..start_line.saturating_sub(1) {
+        match lines.next() {
+            Some(_) => current += 1,
+            None => break,
+        }
+    }
+    while current <= end_line {
+        match lines.next() {
+            Some(line) => {
+                out.push_str(line);
+                current += 1;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
 /// 流程：读快照 → revision 校验 → 全部 replacements 预检（存在/唯一/不重叠/no-op）
 /// → 一次性应用 → temp + sync → 原子替换。
 pub fn apply_edit(

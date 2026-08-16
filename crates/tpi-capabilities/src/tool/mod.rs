@@ -164,6 +164,7 @@ pub enum BuiltinTool {
     Search,
     Glob,
     Edit,
+    EditRange,
     Write,
     Bash,
     Process,
@@ -205,6 +206,7 @@ impl BuiltinTool {
             BuiltinTool::Search => "search",
             BuiltinTool::Glob => "glob",
             BuiltinTool::Edit => "edit",
+            BuiltinTool::EditRange => "edit_range",
             BuiltinTool::Write => "write",
             BuiltinTool::Bash => "bash",
             BuiltinTool::Process => "process",
@@ -224,6 +226,7 @@ impl BuiltinTool {
             "search" => Some(Self::Search),
             "glob" => Some(Self::Glob),
             "edit" => Some(Self::Edit),
+            "edit_range" => Some(Self::EditRange),
             "write" => Some(Self::Write),
             "bash" => Some(Self::Bash),
             "process" => Some(Self::Process),
@@ -242,7 +245,7 @@ impl BuiltinTool {
         match self {
             Self::Read => ToolExecutionClass::FileReadExact,
             Self::Search | Self::Glob => ToolExecutionClass::FileReadRecursive,
-            Self::Edit | Self::Write => ToolExecutionClass::FileWriteExact,
+            Self::Edit | Self::EditRange | Self::Write => ToolExecutionClass::FileWriteExact,
             Self::Bash => ToolExecutionClass::WorkspaceUnknown,
             // §5：process 工具读 registry / 控制 managed process，无文件副作用。
             Self::Process => ToolExecutionClass::Pure,
@@ -304,6 +307,18 @@ You must pass the file's current revision (from read output) — stale revisions
 Output: unified diff + applied count + previous/current revision. \
 Prefer edit over write for localized changes (smaller, safer diffs). \
 Example: edit path=src/main.rs revision=b3:<hex> replacements=[{old_text, new_text}]"
+            }
+            BuiltinTool::EditRange => {
+                "Edit a line range by revision + line numbers (preferred when line anchors \
+are available from read/search). \
+start_line/end_line are 1-indexed inclusive coordinates in the referenced revision's file. \
+When revision == current: direct replace by line span (deterministic, no text recall needed). \
+When revision is stale: recovers from the stored snapshot if the target text still matches \
+(fmt/whitespace changes tolerated); otherwise rejected with guidance. \
+new_text with multiple lines replaces the range; empty new_text deletes it. \
+Prefer edit_range over edit when you have line numbers from read/search; use edit when you \
+only have an exact text fragment. \
+Example: edit_range path=src/main.rs revision=b3:<hex> start_line=118 end_line=120 new_text=\"...\""
             }
             BuiltinTool::Write => {
                 "Write an entire file (creates if missing; if it exists, `revision` must match \
@@ -415,6 +430,7 @@ Example: activate_skill name=\"rust-review\""
             BuiltinTool::Search => schema_value::<search::SearchArgs>("search"),
             BuiltinTool::Glob => schema_value::<search::GlobArgs>("glob"),
             BuiltinTool::Edit => schema_value::<edit::EditArgs>("edit"),
+            BuiltinTool::EditRange => schema_value::<edit::EditRangeArgs>("edit_range"),
             BuiltinTool::Write => schema_value::<files::WriteArgs>("write"),
             BuiltinTool::Bash => schema_value::<command::BashArgs>("bash"),
             BuiltinTool::Process => schema_value::<process::ProcessArgs>("process"),
@@ -445,6 +461,9 @@ Example: activate_skill name=\"rust-review\""
             BuiltinTool::Search => parse_args_typed("search", arguments, ValidatedArgs::Search),
             BuiltinTool::Glob => parse_args_typed("glob", arguments, ValidatedArgs::Glob),
             BuiltinTool::Edit => parse_args_typed("edit", arguments, ValidatedArgs::Edit),
+            BuiltinTool::EditRange => {
+                parse_args_typed("edit_range", arguments, ValidatedArgs::EditRange)
+            }
             BuiltinTool::Write => parse_args_typed("write", arguments, ValidatedArgs::Write),
             BuiltinTool::Bash => parse_args_typed("bash", arguments, ValidatedArgs::Bash),
             BuiltinTool::Process => parse_args_typed("process", arguments, ValidatedArgs::Process),
@@ -477,6 +496,7 @@ pub enum ValidatedArgs {
     Search(search::SearchArgs),
     Glob(search::GlobArgs),
     Edit(edit::EditArgs),
+    EditRange(edit::EditRangeArgs),
     Write(files::WriteArgs),
     Bash(command::BashArgs),
     Process(process::ProcessArgs),
@@ -497,6 +517,7 @@ impl ValidatedArgs {
             Self::Search(_) => BuiltinTool::Search,
             Self::Glob(_) => BuiltinTool::Glob,
             Self::Edit(_) => BuiltinTool::Edit,
+            Self::EditRange(_) => BuiltinTool::EditRange,
             Self::Write(_) => BuiltinTool::Write,
             Self::Bash(_) => BuiltinTool::Bash,
             Self::Process(_) => BuiltinTool::Process,
@@ -517,6 +538,7 @@ impl ValidatedArgs {
             Self::Search(args) => Some(&args.path),
             Self::Glob(args) => Some(&args.path),
             Self::Edit(args) => Some(&args.path),
+            Self::EditRange(args) => Some(&args.path),
             Self::Write(args) => Some(&args.path),
             Self::Bash(_)
             | Self::Process(_)
@@ -869,6 +891,9 @@ pub async fn execute(
                 (BuiltinTool::Search, ValidatedArgs::Search(args)) => search::search(args, &ctx),
                 (BuiltinTool::Glob, ValidatedArgs::Glob(args)) => search::glob(args, &ctx),
                 (BuiltinTool::Edit, ValidatedArgs::Edit(args)) => files::edit(args, &ctx, plan.as_ref()),
+                (BuiltinTool::EditRange, ValidatedArgs::EditRange(args)) => {
+                    files::edit_range(args, &ctx, plan.as_ref())
+                }
                 (BuiltinTool::Write, ValidatedArgs::Write(args)) => files::write(args, &ctx, plan.as_ref()),
                 // §13：update_plan 是原生同步控制操作。
                 (BuiltinTool::UpdatePlan, ValidatedArgs::UpdatePlan(args)) => plan_exec::update_plan(args, &ctx),
@@ -922,6 +947,7 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
         BuiltinTool::Search,
         BuiltinTool::Glob,
         BuiltinTool::Edit,
+        BuiltinTool::EditRange,
         BuiltinTool::Write,
         BuiltinTool::Bash,
         BuiltinTool::Process,
