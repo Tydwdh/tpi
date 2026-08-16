@@ -224,7 +224,6 @@ impl BuiltinTool {
             "search" => Some(Self::Search),
             "glob" => Some(Self::Glob),
             "edit" => Some(Self::Edit),
-            "edit" => Some(Self::Edit),
             "write" => Some(Self::Write),
             "bash" => Some(Self::Bash),
             "process" => Some(Self::Process),
@@ -451,7 +450,6 @@ Example: activate_skill name=\"rust-review\""
             BuiltinTool::Glob => parse_args_typed("glob", arguments, ValidatedArgs::Glob),
             BuiltinTool::Edit => parse_args_typed("edit", arguments, ValidatedArgs::Edit),
             BuiltinTool::Write => parse_args_typed("write", arguments, ValidatedArgs::Write),
-            BuiltinTool::Write => parse_args_typed("write", arguments, ValidatedArgs::Write),
             BuiltinTool::Bash => parse_args_typed("bash", arguments, ValidatedArgs::Bash),
             BuiltinTool::Process => parse_args_typed("process", arguments, ValidatedArgs::Process),
             BuiltinTool::RequestInput => {
@@ -503,7 +501,6 @@ impl ValidatedArgs {
             Self::Search(_) => BuiltinTool::Search,
             Self::Glob(_) => BuiltinTool::Glob,
             Self::Edit(_) => BuiltinTool::Edit,
-            Self::Write(_) => BuiltinTool::Write,
             Self::Write(_) => BuiltinTool::Write,
             Self::Bash(_) => BuiltinTool::Bash,
             Self::Process(_) => BuiltinTool::Process,
@@ -753,9 +750,27 @@ pub fn resolve_write_path(
     Utf8PathBuf::from_path_buf(normalized).map_err(|_| PathResolveError::Invalid)
 }
 
+/// 统一文件 identity（§B4）：Windows 大小写折叠，所有组件共用。
+///
+/// `src/Foo.rs` 与 `src/foo.rs` 是同一物理文件——调度锁、snapshot store、
+/// mutation journal 必须用同一 identity 判定，否则同一文件被当作两个资源
+/// 并行写（ISSUE-004 静默丢内容）或 undo 匹配失败。
+/// 非 Windows 大小写敏感文件系统原样返回。
+#[cfg(windows)]
+pub fn path_identity(path: &str) -> String {
+    path.to_lowercase()
+}
+
+#[cfg(not(windows))]
+pub fn path_identity(path: &str) -> String {
+    path.to_string()
+}
+
 /// 调度锁的路径标识（与工具实际解析一致，保证等价写法映射到同一锁）。
 ///
-/// 严格模式：`resolve_workspace_path`（外部路径本就不会真正执行）；
+/// 严格模式：`resolve_workspace_path`（外部路径本就不会真正执行）——
+/// 同样应用大小写折叠（§B4：Windows 严格模式下 `Foo.rs`/`foo.rs` 也要
+/// 收敛为同一把锁，否则 ISSUE-004 竞态在严格模式仍存在）。
 /// 自由模式：对路径做词法规范化，外部绝对路径的等价写法（`.\`、`..`、大小写之外的
 /// 词法差异）收敛为同一标识——否则同一外部文件可能被两个等价路径并行写入（竞态）。
 pub fn resolve_lock_path(
@@ -764,8 +779,9 @@ pub fn resolve_lock_path(
     allow_outside_workspace: bool,
 ) -> Utf8PathBuf {
     if !allow_outside_workspace {
-        return resolve_workspace_path(workspace_root, path)
+        let resolved = resolve_workspace_path(workspace_root, path)
             .unwrap_or_else(|_| Utf8PathBuf::from(path.trim()));
+        return Utf8PathBuf::from(path_identity(resolved.as_str()));
     }
     // 与 resolve_write_path 同一入口翻译（Unix 风格 → Windows），保证
     // 等价写法（`/tmp/x` vs `C:\Users\...\Temp\x`）映射到同一把锁。
@@ -876,7 +892,6 @@ pub async fn execute(
                 (BuiltinTool::Search, ValidatedArgs::Search(args)) => search::search(args, &ctx),
                 (BuiltinTool::Glob, ValidatedArgs::Glob(args)) => search::glob(args, &ctx),
                 (BuiltinTool::Edit, ValidatedArgs::Edit(args)) => files::edit(args, &ctx, plan.as_ref()),
-                (BuiltinTool::Write, ValidatedArgs::Write(args)) => files::write(args, &ctx, plan.as_ref()),
                 (BuiltinTool::Write, ValidatedArgs::Write(args)) => files::write(args, &ctx, plan.as_ref()),
                 // §13：update_plan 是原生同步控制操作。
                 (BuiltinTool::UpdatePlan, ValidatedArgs::UpdatePlan(args)) => plan_exec::update_plan(args, &ctx),
@@ -1237,6 +1252,39 @@ mod tests {
         #[cfg(not(windows))]
         {
             assert_ne!(lower, upper, "大小写敏感文件系统上不同大小写是不同文件");
+        }
+    }
+
+    /// §B4：严格模式锁也大小写折叠（此前只折叠自由模式，严格模式 ISSUE-004
+    /// 竞态仍存在）。`src/Foo.rs` 与 `src/foo.rs` 必须同一锁。
+    #[test]
+    fn lock_path_casefolded_in_strict_mode() {
+        let root = camino::Utf8PathBuf::from("C:\\ws");
+        let lower = resolve_lock_path(&root, "src/foo.rs", false);
+        let upper = resolve_lock_path(&root, "src/Foo.rs", false);
+        #[cfg(windows)]
+        {
+            assert_eq!(lower, upper, "严格模式大小写变体必须同一锁（§B4）");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_ne!(lower, upper);
+        }
+    }
+
+    /// §B4：path_identity 统一收敛（scheduler/snapshot/journal 共用）。
+    #[test]
+    fn path_identity_unifies_case_variants() {
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                path_identity("C:\\ws\\Main.rs"),
+                path_identity("c:\\ws\\main.RS")
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_ne!(path_identity("a/Main.rs"), path_identity("a/main.rs"));
         }
     }
 }

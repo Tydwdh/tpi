@@ -44,14 +44,48 @@ pub fn append_mutation(
     Ok(())
 }
 
-/// 从 journal 文件重建 mutation journal（提交顺序；文件不存在 = 空）。
-pub fn load_journal(path: &std::path::Path) -> std::io::Result<Vec<JournalMutation>> {
+/// Journal 完整性状态（§B3）：损坏行导致 destructive undo 被拒绝。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JournalIntegrity {
+    /// 全部行可解析，undo/redo 允许。
+    Clean,
+    /// 存在损坏行（无法解析），history 可看但 undo/redo 拒绝（除非 --force）。
+    Tainted,
+}
+
+/// 加载结果：mutations + 完整性标记。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalState {
+    pub mutations: Vec<JournalMutation>,
+    pub integrity: JournalIntegrity,
+    /// 损坏行数（integrity==Tainted 时 >0）。
+    pub corrupt_lines: usize,
+}
+
+impl JournalState {
+    pub fn is_tainted(&self) -> bool {
+        self.integrity == JournalIntegrity::Tainted
+    }
+}
+
+/// 从 journal 文件重建 mutation journal（提交顺序；文件不存在 = 空 + Clean）。
+///
+/// §B3：损坏行不再静默丢弃——计数并标记 [`JournalIntegrity::Tainted`]，
+/// 调用方（undo/redo）据此拒绝 destructive 操作。
+pub fn load_journal(path: &std::path::Path) -> std::io::Result<JournalState> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(JournalState {
+                mutations: Vec::new(),
+                integrity: JournalIntegrity::Clean,
+                corrupt_lines: 0,
+            });
+        }
         Err(e) => return Err(e),
     };
     let mut mutations = Vec::new();
+    let mut corrupt_lines = 0usize;
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -61,69 +95,145 @@ pub fn load_journal(path: &std::path::Path) -> std::io::Result<Vec<JournalMutati
                 mutation_id: payload.mutation_id,
                 files: payload.files,
             });
+        } else {
+            corrupt_lines += 1;
         }
-        // 损坏行跳过（best-effort；undo 数据源不因单行损坏整体失败）。
     }
-    Ok(mutations)
+    let integrity = if corrupt_lines > 0 {
+        JournalIntegrity::Tainted
+    } else {
+        JournalIntegrity::Clean
+    };
+    Ok(JournalState {
+        mutations,
+        integrity,
+        corrupt_lines,
+    })
 }
 
-/// undo 单条 mutation：把每个文件恢复到 before_content。
-/// 返回实际恢复的文件数；文件当前内容已与 before 一致时跳过（幂等）。
+/// 检查 journal 完整性：Tainted 时拒绝 destructive undo/redo。
+/// `force` 为 true（用户 `--force`）时放行。
+pub fn assert_can_mutate(state: &JournalState, force: bool) -> std::io::Result<()> {
+    if !force && state.is_tainted() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "journal 已损坏（{} 行无法解析），拒绝 destructive 操作；\n  history 可查看，但 undo/redo 需修复 journal 或显式 --force",
+                state.corrupt_lines
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 单文件 undo/redo 的 CAS 判定结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CasVerdict {
+    /// 应用成功（文件已写入目标内容）。
+    Applied,
+    /// 文件已是目标状态（幂等跳过）。
+    AlreadyDone,
+    /// 文件内容不是预期的 before/after（外部修改/分歧）——不写文件。
+    Conflict,
+}
+
+/// undo 单条 mutation（CAS）：
+///
+/// ```text
+/// current == mutation.after  -> 恢复 before（Applied）
+/// current == mutation.before -> AlreadyDone（幂等）
+/// otherwise                   -> Conflict，不写文件
+/// ```
+///
+/// 返回逐文件判定；任一文件 Conflict 时**不写任何文件**（原子性：
+/// 防部分应用——roadmap 示例禁止 `Agent A→B / User B→C / Undo -> C→A`）。
 pub fn undo_mutation(
     mutations: &[JournalMutation],
     mutation_id: &str,
     workspace_root: &std::path::Path,
-) -> std::io::Result<usize> {
+) -> std::io::Result<Vec<(String, CasVerdict)>> {
     let Some(mutation) = mutations.iter().find(|m| m.mutation_id == mutation_id) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("mutation not found: {mutation_id}"),
         ));
     };
-    let mut restored = 0usize;
+    // 先全部判定（不写文件）：任一 Conflict → 整体拒绝。
+    let mut verdicts = Vec::with_capacity(mutation.files.len());
     for file in &mutation.files {
-        if restore_file(file, workspace_root)? {
-            restored += 1;
+        let target = resolve_target(&file.path, workspace_root);
+        let current = std::fs::read(&target).unwrap_or_default();
+        let verdict = if current == file.before_content {
+            CasVerdict::AlreadyDone
+        } else if current == file.after_content {
+            CasVerdict::Applied // 待写入
+        } else {
+            CasVerdict::Conflict
+        };
+        verdicts.push((file.path.clone(), verdict));
+    }
+    if verdicts.iter().any(|(_, v)| *v == CasVerdict::Conflict) {
+        return Ok(verdicts); // 调用方见 Conflict 不写文件
+    }
+    // 无冲突：应用（只写 Applied 的文件）。
+    for (file, (_, verdict)) in mutation.files.iter().zip(&verdicts) {
+        if *verdict == CasVerdict::Applied {
+            let target = resolve_target(&file.path, workspace_root);
+            write_atomic(&target, &file.before_content)?;
         }
     }
-    Ok(restored)
+    Ok(verdicts)
 }
 
-/// undo 全部 mutations：把每个文件恢复到**最早一次**变更前的内容。
-/// 多文件序列整体回滚（§B1：agent 多次 edit 的隐式事务）。
-pub fn undo_all(
+/// redo 单条 mutation（CAS）：
+///
+/// ```text
+/// current == mutation.before -> 恢复 after（Applied）
+/// current == mutation.after  -> AlreadyRedone（幂等）
+/// otherwise                   -> Conflict，不写文件
+/// ```
+pub fn redo_mutation(
     mutations: &[JournalMutation],
+    mutation_id: &str,
     workspace_root: &std::path::Path,
-) -> std::io::Result<usize> {
-    // 按文件聚合：取该文件所有 mutation 中**最早**的 before_content。
-    let mut earliest: std::collections::HashMap<String, &crate::protocol::MutationFile> =
-        std::collections::HashMap::new();
-    for mutation in mutations {
-        for file in &mutation.files {
-            earliest.entry(file.path.clone()).or_insert(file);
+) -> std::io::Result<Vec<(String, CasVerdict)>> {
+    let Some(mutation) = mutations.iter().find(|m| m.mutation_id == mutation_id) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("mutation not found: {mutation_id}"),
+        ));
+    };
+    let mut verdicts = Vec::with_capacity(mutation.files.len());
+    for file in &mutation.files {
+        let target = resolve_target(&file.path, workspace_root);
+        let current = std::fs::read(&target).unwrap_or_default();
+        let verdict = if current == file.after_content {
+            CasVerdict::AlreadyDone
+        } else if current == file.before_content {
+            CasVerdict::Applied // 待写入
+        } else {
+            CasVerdict::Conflict
+        };
+        verdicts.push((file.path.clone(), verdict));
+    }
+    if verdicts.iter().any(|(_, v)| *v == CasVerdict::Conflict) {
+        return Ok(verdicts);
+    }
+    for (file, (_, verdict)) in mutation.files.iter().zip(&verdicts) {
+        if *verdict == CasVerdict::Applied {
+            let target = resolve_target(&file.path, workspace_root);
+            write_atomic(&target, &file.after_content)?;
         }
     }
-    let mut restored = 0usize;
-    for (path, file) in earliest {
-        let target = resolve_target(&path, workspace_root);
-        let before = &file.before_content;
-        if std::fs::read(&target)
-            .map(|cur| cur != *before)
-            .unwrap_or(true)
-        {
-            write_atomic(&target, before)?;
-            restored += 1;
-        }
-    }
-    Ok(restored)
+    Ok(verdicts)
 }
 
-/// undo 最近一条 mutation（最后一个提交的编辑）：恢复到它的 before 内容。
-/// 返回实际恢复的文件数；journal 为空时返回 Err(NotFound)。
+/// undo 最近一条 mutation（最后一个提交的编辑）。
+/// journal 为空时返回 Err(NotFound)。
 pub fn undo_last(
     mutations: &[JournalMutation],
     workspace_root: &std::path::Path,
-) -> std::io::Result<usize> {
+) -> std::io::Result<Vec<(String, CasVerdict)>> {
     let Some(last) = mutations.last() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -133,40 +243,12 @@ pub fn undo_last(
     undo_mutation(mutations, &last.mutation_id, workspace_root)
 }
 
-/// redo 单条 mutation：把每个文件恢复到 after_content（撤销 undo）。
-/// 返回实际恢复的文件数；文件当前内容已与 after 一致时跳过（幂等）。
-pub fn redo_mutation(
-    mutations: &[JournalMutation],
-    mutation_id: &str,
-    workspace_root: &std::path::Path,
-) -> std::io::Result<usize> {
-    let Some(mutation) = mutations.iter().find(|m| m.mutation_id == mutation_id) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("mutation not found: {mutation_id}"),
-        ));
-    };
-    let mut restored = 0usize;
-    for file in &mutation.files {
-        let target = resolve_target(&file.path, workspace_root);
-        let after = &file.after_content;
-        match std::fs::read(&target) {
-            Ok(current) if current == *after => {}
-            _ => {
-                write_atomic(&target, after)?;
-                restored += 1;
-            }
-        }
-    }
-    Ok(restored)
-}
-
 /// redo 最近一条 mutation（最后一个提交的编辑的 after 内容）。
 /// journal 为空时返回 Err(NotFound)。
 pub fn redo_last(
     mutations: &[JournalMutation],
     workspace_root: &std::path::Path,
-) -> std::io::Result<usize> {
+) -> std::io::Result<Vec<(String, CasVerdict)>> {
     let Some(last) = mutations.last() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -176,48 +258,133 @@ pub fn redo_last(
     redo_mutation(mutations, &last.mutation_id, workspace_root)
 }
 
+/// undo 全部 mutations：把每个文件恢复到**最早一次**变更前的内容。
+/// 多文件序列整体回滚（agent 多次 edit 的隐式事务）。
+///
+/// CAS：文件当前内容必须是其**最后一次**变更的 after（或已是最早 before），
+/// 否则 Conflict 且不写该文件。返回逐文件判定。
+pub fn undo_all(
+    mutations: &[JournalMutation],
+    workspace_root: &std::path::Path,
+) -> std::io::Result<Vec<(String, CasVerdict)>> {
+    // 每文件聚合：(earliest_before, latest_after)。key = identity（§B4）。
+    let mut agg: std::collections::HashMap<
+        String,
+        (
+            &crate::protocol::MutationFile,
+            &crate::protocol::MutationFile,
+        ),
+    > = std::collections::HashMap::new();
+    for mutation in mutations {
+        for file in &mutation.files {
+            let key = path_identity(&file.path);
+            match agg.get_mut(&key) {
+                None => {
+                    agg.insert(key, (file, file));
+                }
+                Some((_, latest_after)) => {
+                    // latest_after 更新为最晚（后续 mutation 的 after）。
+                    *latest_after = file;
+                }
+            }
+        }
+    }
+    let mut verdicts = Vec::with_capacity(agg.len());
+    let mut conflicts = false;
+    for (path, (earliest, latest_after)) in &agg {
+        let target = resolve_target(path, workspace_root);
+        let current = std::fs::read(&target).unwrap_or_default();
+        let verdict = if current == earliest.before_content {
+            CasVerdict::AlreadyDone
+        } else if current == latest_after.after_content {
+            CasVerdict::Applied
+        } else {
+            CasVerdict::Conflict
+        };
+        if verdict == CasVerdict::Conflict {
+            conflicts = true;
+        }
+        verdicts.push((path.clone(), verdict));
+    }
+    if conflicts {
+        return Ok(verdicts);
+    }
+    for ((path, (earliest, _)), (_, verdict)) in agg.iter().zip(&verdicts) {
+        if *verdict == CasVerdict::Applied {
+            let target = resolve_target(path, workspace_root);
+            write_atomic(&target, &earliest.before_content)?;
+        }
+    }
+    Ok(verdicts)
+}
+
 /// redo 全部 mutations：把每个文件恢复到**最后一次**变更后的内容。
 /// 与 undo_all 镜像（undo_all 恢复最早 before；redo_all 恢复最晚 after）。
 pub fn redo_all(
     mutations: &[JournalMutation],
     workspace_root: &std::path::Path,
-) -> std::io::Result<usize> {
-    let mut latest: std::collections::HashMap<String, &crate::protocol::MutationFile> =
-        std::collections::HashMap::new();
+) -> std::io::Result<Vec<(String, CasVerdict)>> {
+    // 每文件聚合：(earliest_before, latest_after)。key = identity（§B4）。
+    let mut agg: std::collections::HashMap<
+        String,
+        (
+            &crate::protocol::MutationFile,
+            &crate::protocol::MutationFile,
+        ),
+    > = std::collections::HashMap::new();
     for mutation in mutations {
         for file in &mutation.files {
-            latest.insert(file.path.clone(), file);
+            let key = path_identity(&file.path);
+            match agg.get_mut(&key) {
+                None => {
+                    agg.insert(key, (file, file));
+                }
+                Some((_, latest_after)) => {
+                    *latest_after = file;
+                }
+            }
         }
     }
-    let mut restored = 0usize;
-    for (path, file) in latest {
-        let target = resolve_target(&path, workspace_root);
-        let after = &file.after_content;
-        if std::fs::read(&target)
-            .map(|cur| cur != *after)
-            .unwrap_or(true)
-        {
-            write_atomic(&target, after)?;
-            restored += 1;
+    let mut verdicts = Vec::with_capacity(agg.len());
+    let mut conflicts = false;
+    for (path, (earliest, latest_after)) in &agg {
+        let target = resolve_target(path, workspace_root);
+        let current = std::fs::read(&target).unwrap_or_default();
+        let verdict = if current == latest_after.after_content {
+            CasVerdict::AlreadyDone
+        } else if current == earliest.before_content {
+            CasVerdict::Applied
+        } else {
+            CasVerdict::Conflict
+        };
+        if verdict == CasVerdict::Conflict {
+            conflicts = true;
+        }
+        verdicts.push((path.clone(), verdict));
+    }
+    if conflicts {
+        return Ok(verdicts);
+    }
+    for ((path, (_, latest_after)), (_, verdict)) in agg.iter().zip(&verdicts) {
+        if *verdict == CasVerdict::Applied {
+            let target = resolve_target(path, workspace_root);
+            write_atomic(&target, &latest_after.after_content)?;
         }
     }
-    Ok(restored)
+    Ok(verdicts)
 }
 
-/// 恢复单个文件到 before 内容。幂等：当前内容已等于 before 时跳过。
-fn restore_file(
-    file: &crate::protocol::MutationFile,
-    workspace_root: &std::path::Path,
-) -> std::io::Result<bool> {
-    let target = resolve_target(&file.path, workspace_root);
-    let before = &file.before_content;
-    match std::fs::read(&target) {
-        Ok(current) if current == *before => Ok(false), // 已一致，跳过
-        _ => {
-            write_atomic(&target, before)?;
-            Ok(true)
-        }
-    }
+/// §B4：Windows 路径 identity（大小写折叠）。`Foo.rs`/`foo.rs` 同一物理
+/// 文件——journal 按 identity 聚合/匹配，否则 case 变体产生重复条目。
+/// 非 Windows 原样返回。
+#[cfg(windows)]
+fn path_identity(path: &str) -> String {
+    path.to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn path_identity(path: &str) -> String {
+    path.to_string()
 }
 
 /// 目标路径解析：绝对路径直接用；相对路径拼到 workspace root。
@@ -280,38 +447,117 @@ mod tests {
         };
         append_mutation(dir.path(), session, &payload).unwrap();
         let loaded = load_journal(&journal_path(dir.path(), session)).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].mutation_id, "m1");
-        assert_eq!(loaded[0].files[0].before_content, b"old");
+        assert_eq!(loaded.mutations.len(), 1);
+        assert_eq!(loaded.mutations[0].mutation_id, "m1");
+        assert_eq!(loaded.mutations[0].files[0].before_content, b"old");
+        assert!(!loaded.is_tainted());
     }
 
     #[test]
     fn load_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let loaded = load_journal(&journal_path(dir.path(), "nope")).unwrap();
-        assert!(loaded.is_empty());
+        assert!(loaded.mutations.is_empty());
+        assert!(!loaded.is_tainted());
     }
 
+    /// CAS：current == after → Applied（写入 before）。
     #[test]
-    fn undo_mutation_restores_before_content() {
+    fn undo_mutation_applies_when_current_is_after() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("a.rs");
         std::fs::write(&target, "new\n").unwrap();
         let m = mutation("m1", &target.to_string_lossy(), b"old\n", b"new\n");
-        let restored = undo_mutation(&[m], "m1", dir.path()).unwrap();
-        assert_eq!(restored, 1);
+        let result = undo_mutation(&[m], "m1", dir.path()).unwrap();
+        assert_eq!(verdicts(&result), vec![CasVerdict::Applied]);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
     }
 
+    /// CAS：current == before → AlreadyDone（幂等跳过）。
     #[test]
-    fn undo_mutation_idempotent() {
+    fn undo_mutation_already_done_when_current_is_before() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("a.rs");
         std::fs::write(&target, "old\n").unwrap();
         let m = mutation("m1", &target.to_string_lossy(), b"old\n", b"new\n");
-        // 当前内容已等于 before → 跳过（不重复写）。
-        let restored = undo_mutation(&[m], "m1", dir.path()).unwrap();
-        assert_eq!(restored, 0);
+        let result = undo_mutation(&[m], "m1", dir.path()).unwrap();
+        assert_eq!(verdicts(&result), vec![CasVerdict::AlreadyDone]);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    }
+
+    /// CAS：current 是无关内容（用户/外部修改）→ Conflict，**不写文件**。
+    /// roadmap 示例：Agent A→B / User B→C / Undo 必须 Conflict（禁止 C→A）。
+    #[test]
+    fn undo_conflicts_with_external_change_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        std::fs::write(&target, "user-edited\n").unwrap(); // C（外部修改）
+        let m = mutation("m1", &target.to_string_lossy(), b"old\n", b"new\n");
+        let result = undo_mutation(&[m], "m1", dir.path()).unwrap();
+        assert_eq!(verdicts(&result), vec![CasVerdict::Conflict]);
+        // 禁止 C→A：文件保持用户内容。
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "user-edited\n");
+    }
+
+    /// CAS：redo——current == before → Applied；current == after → AlreadyDone。
+    #[test]
+    fn redo_mutation_applies_and_already_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        std::fs::write(&target, "old\n").unwrap(); // before
+        let m = mutation("m1", &target.to_string_lossy(), b"old\n", b"new\n");
+        let result = redo_mutation(std::slice::from_ref(&m), "m1", dir.path()).unwrap();
+        assert_eq!(verdicts(&result), vec![CasVerdict::Applied]);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+
+        // 已是 after → AlreadyDone。
+        let result2 = redo_mutation(std::slice::from_ref(&m), "m1", dir.path()).unwrap();
+        assert_eq!(verdicts(&result2), vec![CasVerdict::AlreadyDone]);
+    }
+
+    /// CAS：redo 遇到无关内容 → Conflict 不写文件。
+    #[test]
+    fn redo_conflicts_with_external_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        std::fs::write(&target, "user-edited\n").unwrap();
+        let m = mutation("m1", &target.to_string_lossy(), b"old\n", b"new\n");
+        let result = redo_mutation(&[m], "m1", dir.path()).unwrap();
+        assert_eq!(verdicts(&result), vec![CasVerdict::Conflict]);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "user-edited\n");
+    }
+
+    /// 原子性：mutation 内多文件，一个 Conflict → 全部不写（含本应 Applied 的）。
+    #[test]
+    fn undo_atomic_rejects_all_on_any_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let t1 = dir.path().join("a.rs");
+        let t2 = dir.path().join("b.rs");
+        std::fs::write(&t1, "new\n").unwrap(); // == after，本应 Applied
+        std::fs::write(&t2, "user\n").unwrap(); // 无关内容 → Conflict
+        let m = JournalMutation {
+            mutation_id: "m1".into(),
+            files: vec![
+                MutationFile {
+                    path: t1.to_string_lossy().to_string(),
+                    before_revision: "b3:b".into(),
+                    after_revision: "b3:a".into(),
+                    before_content: b"old\n".to_vec(),
+                    after_content: b"new\n".to_vec(),
+                },
+                MutationFile {
+                    path: t2.to_string_lossy().to_string(),
+                    before_revision: "b3:b".into(),
+                    after_revision: "b3:a".into(),
+                    before_content: b"old2\n".to_vec(),
+                    after_content: b"new2\n".to_vec(),
+                },
+            ],
+        };
+        let result = undo_mutation(&[m], "m1", dir.path()).unwrap();
+        assert!(verdicts(&result).contains(&CasVerdict::Conflict));
+        // 原子性：a.rs 也不得被写（保持 new，不回到 old）。
+        assert_eq!(std::fs::read_to_string(&t1).unwrap(), "new\n");
     }
 
     #[test]
@@ -319,11 +565,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("a.rs");
         std::fs::write(&target, "v2\n").unwrap();
-        // 两次 mutation：v0→v1→v2。undo_all 应恢复到最早的 v0。
         let m1 = mutation("m1", &target.to_string_lossy(), b"v0\n", b"v1\n");
         let m2 = mutation("m2", &target.to_string_lossy(), b"v1\n", b"v2\n");
-        let restored = undo_all(&[m1, m2], dir.path()).unwrap();
-        assert_eq!(restored, 1);
+        let result = undo_all(&[m1, m2], dir.path()).unwrap();
+        assert_eq!(verdicts(&result), vec![CasVerdict::Applied]);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "v0\n");
     }
 
@@ -334,10 +579,9 @@ mod tests {
         std::fs::write(&target, "v0\n").unwrap();
         let m1 = mutation("m1", &target.to_string_lossy(), b"v0\n", b"v1\n");
         let m2 = mutation("m2", &target.to_string_lossy(), b"v1\n", b"v2\n");
-        // 两次 mutation：v0→v1→v2。redo_all 应恢复到最后的 v2。
         let mutations = vec![m1, m2];
-        let restored = redo_all(&mutations, dir.path()).unwrap();
-        assert_eq!(restored, 1);
+        let result = redo_all(&mutations, dir.path()).unwrap();
+        assert_eq!(verdicts(&result), vec![CasVerdict::Applied]);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2\n");
     }
 
@@ -349,14 +593,12 @@ mod tests {
         let m1 = mutation("m1", &target.to_string_lossy(), b"v0\n", b"v1\n");
         let m2 = mutation("m2", &target.to_string_lossy(), b"v1\n", b"v2\n");
         let mutations = vec![m1, m2];
-        // undo_last：撤掉最近一条（m2），文件回到 v1。
-        let restored = undo_last(&mutations, dir.path()).unwrap();
-        assert_eq!(restored, 1);
+        let result = undo_last(&mutations, dir.path()).unwrap();
+        assert_eq!(verdicts(&result), vec![CasVerdict::Applied]);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1\n");
 
-        // redo_last：重做最近一条（m2），文件回到 v2。
-        let restored = redo_last(&mutations, dir.path()).unwrap();
-        assert_eq!(restored, 1);
+        let result = redo_last(&mutations, dir.path()).unwrap();
+        assert_eq!(verdicts(&result), vec![CasVerdict::Applied]);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2\n");
     }
 
@@ -368,10 +610,95 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn undo_unknown_mutation_errors() {
         let dir = tempfile::tempdir().unwrap();
         let result = undo_mutation(&[], "nope", dir.path());
         assert!(result.is_err());
+    }
+
+    /// §B3：损坏行 → Tainted，undo/redo 拒绝；Clean 放行。
+    #[test]
+    fn corrupt_line_taints_journal_and_rejects_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "s-taint";
+        // 先写一条合法 mutation，再写一条损坏行。
+        let payload = crate::protocol::MutationCommittedPayload {
+            mutation_id: "m1".into(),
+            files: vec![MutationFile {
+                path: "/tmp/x.rs".into(),
+                before_revision: "b3:b".into(),
+                after_revision: "b3:a".into(),
+                before_content: b"old".to_vec(),
+                after_content: b"new".to_vec(),
+            }],
+        };
+        append_mutation(dir.path(), session, &payload).unwrap();
+        let jpath = journal_path(dir.path(), session);
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&jpath)
+            .unwrap();
+        writeln!(f, "{{not valid json\n").unwrap();
+
+        let state = load_journal(&jpath).unwrap();
+        assert_eq!(state.mutations.len(), 1, "合法行仍加载");
+        assert!(state.is_tainted(), "损坏行 → Tainted");
+        assert_eq!(state.corrupt_lines, 1);
+
+        // Tainted 拒绝 undo（force=false）。
+        assert!(assert_can_mutate(&state, false).is_err());
+        // force=true 放行。
+        assert!(assert_can_mutate(&state, true).is_ok());
+    }
+
+    /// §B3：全合法 → Clean，undo 允许。
+    #[test]
+    fn clean_journal_allows_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "s-clean";
+        let payload = crate::protocol::MutationCommittedPayload {
+            mutation_id: "m1".into(),
+            files: vec![MutationFile {
+                path: "/tmp/x.rs".into(),
+                before_revision: "b3:b".into(),
+                after_revision: "b3:a".into(),
+                before_content: b"old".to_vec(),
+                after_content: b"new".to_vec(),
+            }],
+        };
+        append_mutation(dir.path(), session, &payload).unwrap();
+        let state = load_journal(&journal_path(dir.path(), session)).unwrap();
+        assert!(!state.is_tainted());
+        assert!(assert_can_mutate(&state, false).is_ok());
+    }
+
+    /// §B4：同文件不同大小写路径聚合为同一条目（Windows）。
+    #[test]
+    fn undo_all_unifies_case_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        let target_upper = dir.path().join("A.RS");
+        std::fs::write(&target, "new\n").unwrap();
+        let m1 = mutation("m1", &target.to_string_lossy(), b"old\n", b"new\n");
+        let m2 = mutation("m2", &target_upper.to_string_lossy(), b"old\n", b"new\n");
+        let result = undo_all(&[m1, m2], dir.path()).unwrap();
+        #[cfg(windows)]
+        {
+            // 两个 case 变体是同一物理文件 → 聚合为 1 条，Applied 一次。
+            assert_eq!(result.len(), 1, "大小写变体必须聚合（§B4）");
+            assert_eq!(verdicts(&result), vec![CasVerdict::Applied]);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+        }
+        #[cfg(not(windows))]
+        {
+            // 大小写敏感：两个不同文件。
+            assert_eq!(result.len(), 2);
+        }
+    }
+
+    /// 辅助：提取 verdict 列表。
+    fn verdicts(result: &[(String, CasVerdict)]) -> Vec<CasVerdict> {
+        result.iter().map(|(_, v)| v.clone()).collect()
     }
 }

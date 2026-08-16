@@ -1034,7 +1034,14 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                 &mut tool_calls_total,
                 &mut usage_total,
             )
-            .await?;
+            .await
+            .inspect_err(|_| {
+                // §B1：工具执行错误（session 写失败等）先统一补齐未完成 tool call
+                // 终态（ToolCompleted(Interrupted)），再传播——否则已提交的
+                // ToolRequested/ToolStarted 悬空，同一进程 refresh_from_log 会把
+                // 非法序列（assistant 带 tool_calls 无 tool result）发给 provider。
+                let _ = crate::agent::tool_runtime::finalize_unexecuted_calls(session);
+            })?;
             if let BatchEnd::SuspendRequested { args } = batch {
                 // §13（AGENTS.md）：request_input 成功 → run 在该点挂起。
                 // 记录 UserInputRequested（durable 事实）+ RunCompleted

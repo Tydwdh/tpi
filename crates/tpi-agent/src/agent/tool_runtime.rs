@@ -776,6 +776,64 @@ error: invalid_arguments
     }
     Ok(BatchEnd::Continue)
 }
+
+/// §B1：统一补齐未完成 tool call 终态（ToolCompleted(Interrupted)）。
+///
+/// invariant：`Every model-emitted tool_call eventually has exactly one
+/// terminal result`。wave 循环内 session 写失败/工具 panic 时，已提交的
+/// `ToolRequested`/`ToolStarted` 没有 `ToolCompleted`——run 以 Err 退出后
+/// 同一进程 `refresh_from_log` 会把非法序列发给 provider。
+///
+/// 扫描 session 事件流，找出所有 ToolRequested 无 ToolCompleted 的 call，
+/// best-effort 合成 Interrupted 终态。**best-effort**：session 已坏时
+/// 补齐失败不掩盖原始错误（调用方在 map_err 里调用，返回被忽略）。
+///
+/// 与 recovery.rs 的分工：recovery 在 `--resume`/`repair` 时修复；
+/// 本函数在**同一进程内、run 失败返回前**立即修复。
+pub fn finalize_unexecuted_calls<S: tpi_session::store::SessionStore>(
+    session: &mut S,
+) -> std::io::Result<()> {
+    use tpi_session::SessionEvent;
+    // 扫描：ToolRequested 入 pending，ToolStarted 记录 recovery，
+    // ToolCompleted 移除。与 recovery::recover 同构，但作用在 live session。
+    let mut pending: Vec<(
+        tpi_core::ids::ToolCallId,
+        String,
+        Option<tpi_session::RecoveryMetadata>,
+    )> = Vec::new();
+    for (_, event) in session.events_with_seq()? {
+        match event {
+            SessionEvent::ToolRequested { call } => {
+                pending.push((call.call_id, call.name, None));
+            }
+            SessionEvent::ToolStarted { call_id, recovery } => {
+                if let Some(entry) = pending.iter_mut().find(|(id, _, _)| *id == call_id) {
+                    entry.2 = recovery;
+                }
+            }
+            SessionEvent::ToolCompleted { call_id, .. } => {
+                pending.retain(|(id, _, _)| *id != call_id);
+            }
+            _ => {}
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    for (call_id, tool_name, recovery) in pending {
+        // 与 recovery::interrupted_outcome 同形态（effect 判定复用）。
+        let effect = tpi_session::recovery::classify_effect(&tool_name, recovery.as_ref());
+        let outcome =
+            tpi_session::recovery::interrupted_outcome(&tool_name, &call_id.to_string(), effect);
+        session.complete_tool(call_id, &outcome)?;
+        tracing::warn!(
+            call_id = %call_id,
+            tool = %tool_name,
+            "finalize_unexecuted_calls: 补齐中断终态"
+        );
+    }
+    Ok(())
+}
 /// §用户诉求（C：web_fetch 摘要化）：成功抓取后把正文交给摘要模型提炼，
 /// 主模型上下文只看到摘要（防注入、省 token），完整正文仍在 artifact。
 ///
@@ -991,11 +1049,6 @@ fn write_tool_plan(
                 BuiltinTool::Edit => {
                     let parsed =
                         serde_json::from_str::<tool::edit::EditArgs>(&call.arguments).ok()?;
-                    parsed.path
-                }
-                _ => {
-                    let parsed =
-                        serde_json::from_str::<tool::files::WriteArgs>(&call.arguments).ok()?;
                     parsed.path
                 }
                 _ => {
@@ -1296,5 +1349,68 @@ mod tests {
             write_tool_plan(BuiltinTool::Edit, &bad, &root, false).is_none(),
             "非法参数不生成 plan"
         );
+    }
+
+    /// §B1 contract：`Every model-emitted tool_call eventually has exactly one
+    /// terminal result`。已提交 ToolRequested/ToolStarted 但无 ToolCompleted
+    /// 的 call，finalize_unexecuted_calls 必须补齐 Interrupted 终态。
+    #[test]
+    fn finalize_unexecuted_calls_completes_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let mut session = tpi_session::store::SessionLog::create_with_id(
+            root.as_std_path(),
+            root.as_std_path(),
+            tpi_core::ids::RunId::new_v7(),
+            tpi_core::ids::SessionId::new_v7(),
+        )
+        .expect("session 创建");
+        let call = tpi_core::message::ToolCall {
+            call_id: tpi_core::ids::ToolCallId::new_v7(),
+            provider_id: "p1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"x"}"#.into(),
+        };
+        // 模拟 wave 中断：ToolRequested + ToolStarted 已提交，无 ToolCompleted。
+        session
+            .append_event(&tpi_session::SessionEvent::ToolRequested { call: call.clone() })
+            .unwrap();
+        session
+            .append_event(&tpi_session::SessionEvent::ToolStarted {
+                call_id: call.call_id,
+                recovery: None,
+            })
+            .unwrap();
+
+        finalize_unexecuted_calls(&mut session).unwrap();
+
+        // 事件流中必须有 ToolCompleted(Interrupted)。
+        use tpi_session::store::SessionStore;
+        let events = session.events_with_seq().unwrap();
+        let completed: Vec<_> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                tpi_session::SessionEvent::ToolCompleted { call_id, outcome } => {
+                    Some((call_id.to_string(), outcome.status))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed,
+            vec![(
+                call.call_id.to_string(),
+                tpi_core::outcome::ToolStatus::Interrupted
+            )],
+            "必须恰好一条 Interrupted 终态（无重复）"
+        );
+        // 再次调用：无 pending，不产生第二条终态（恰好一次）。
+        finalize_unexecuted_calls(&mut session).unwrap();
+        let events2 = session.events_with_seq().unwrap();
+        let completed2 = events2
+            .iter()
+            .filter(|(_, e)| matches!(e, tpi_session::SessionEvent::ToolCompleted { .. }))
+            .count();
+        assert_eq!(completed2, 1, "幂等：不重复合成终态");
     }
 }

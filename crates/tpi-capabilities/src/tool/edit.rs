@@ -1754,11 +1754,14 @@ impl SnapshotStore {
             return;
         }
         let path = snapshot.path.clone();
-        if let Some(pos) = self.order.iter().position(|p| *p == path) {
+        // §B4：identity key（Windows 大小写折叠）——`Foo.rs`/`foo.rs` 同一物理
+        // 文件必须共享 snapshot 条目，否则 read 用大写 edit 用小写会查不到。
+        let key = crate::tool::path_identity(path.as_str());
+        if let Some(pos) = self.order.iter().position(|p| p.as_str() == key) {
             self.order.remove(pos);
         }
-        self.order.push_back(path.clone());
-        let entry = self.versions.entry(path.clone()).or_default();
+        self.order.push_back(Utf8PathBuf::from(&key));
+        let entry = self.versions.entry(Utf8PathBuf::from(&key)).or_default();
         if let Some(position) = entry
             .iter()
             .position(|old| old.revision == snapshot.revision)
@@ -1794,15 +1797,18 @@ impl SnapshotStore {
     }
 
     /// 按 revision 取快照（digest 自校验，§10.1：损坏即视为不存在）。
+    /// §B4：用 identity key 查找（大小写折叠）。
     pub fn get(&self, path: &Utf8PathBuf, revision: &str) -> Option<&FileSnapshot> {
-        let entry = self.versions.get(path)?;
+        let key = Utf8PathBuf::from(crate::tool::path_identity(path.as_str()));
+        let entry = self.versions.get(&key)?;
         entry.iter().find(|snapshot| {
             snapshot.revision == revision && revision_of(&snapshot.raw) == snapshot.revision
         })
     }
 
     pub fn latest(&self, path: &Utf8PathBuf) -> Option<&FileSnapshot> {
-        self.versions.get(path)?.front()
+        let key = Utf8PathBuf::from(crate::tool::path_identity(path.as_str()));
+        self.versions.get(&key)?.front()
     }
 
     pub fn clear(&mut self) {

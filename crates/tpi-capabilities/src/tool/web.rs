@@ -678,7 +678,7 @@ async fn search_exa(
     let mut args = serde_json::json!({
         "query": query,
         "type": "auto",
-        "numResults": count as u32,
+        "numResults": count,
         "livecrawl": "fallback",
         "contextMaxCharacters": EXA_CONTEXT_MAX_CHARS,
     });

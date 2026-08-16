@@ -1321,18 +1321,25 @@ mod tests {
 
         // journal 文件已生成且含 1 条 mutation。
         let journal_path = tpi_session::journal::journal_path(&ctx.artifacts_root, &ctx.session_id);
-        let mutations = tpi_session::journal::load_journal(&journal_path).unwrap();
-        assert_eq!(mutations.len(), 1, "journal 必须有 1 条 mutation");
+        let state = tpi_session::journal::load_journal(&journal_path).unwrap();
+        assert_eq!(state.mutations.len(), 1, "journal 必须有 1 条 mutation");
         assert_eq!(
-            mutations[0].files[0].before_content,
+            state.mutations[0].files[0].before_content,
             b"line1\nline2\nline3\n"
         );
 
-        // undo：恢复 before 内容。
-        let restored =
-            tpi_session::journal::undo_mutation(&mutations, &mutations[0].mutation_id, dir.path())
-                .unwrap();
-        assert_eq!(restored, 1);
+        // undo：恢复 before 内容（CAS：current==after → Applied）。
+        let result = tpi_session::journal::undo_mutation(
+            &state.mutations,
+            &state.mutations[0].mutation_id,
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            result[0].1,
+            tpi_session::journal::CasVerdict::Applied,
+            "current==after → Applied"
+        );
         assert_eq!(
             std::fs::read_to_string(path.as_std_path()).unwrap(),
             "line1\nline2\nline3\n"

@@ -2929,15 +2929,24 @@ fn session_resume_label(log: Option<&SessionLog>, artifacts_root: &std::path::Pa
     };
     // §B：崩溃恢复提示——该会话有已记录的文件变更时，提示可回滚。
     // journal 数据在，编辑是已提交事实；恢复后模型/用户可 `tpi undo` 回滚。
+    // §B3：journal 损坏（Tainted）时提示无法 undo（需修复或 --force）。
     let jpath = crate::session::journal::journal_path(artifacts_root, &id);
     if jpath.exists() {
-        if let Ok(mutations) = crate::session::journal::load_journal(&jpath)
-            && !mutations.is_empty()
+        if let Ok(state) = crate::session::journal::load_journal(&jpath)
+            && !state.mutations.is_empty()
         {
-            label.push_str(&format!(
-                "（{} 条文件变更，`tpi undo` 可回滚）",
-                mutations.len()
-            ));
+            if state.is_tainted() {
+                label.push_str(&format!(
+                    "（{} 条变更，journal 损坏 {} 行——`tpi undo` 需修复或 --force）",
+                    state.mutations.len(),
+                    state.corrupt_lines
+                ));
+            } else {
+                label.push_str(&format!(
+                    "（{} 条文件变更，`tpi undo` 可回滚）",
+                    state.mutations.len()
+                ));
+            }
         }
     }
     label

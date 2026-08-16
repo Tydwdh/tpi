@@ -92,6 +92,9 @@ enum Command {
         /// 撤销到最早（整个会话所有变更）；否则只撤销最近一条。
         #[arg(long)]
         all: bool,
+        /// 强制：journal 损坏（Tainted）时仍执行（默认拒绝 destructive 操作）。
+        #[arg(long)]
+        force: bool,
     },
     /// 重做已撤销的文件变更（Mutation Journal 的 after 内容）。
     Redo {
@@ -101,6 +104,9 @@ enum Command {
         /// 重做到最后（整个会话所有变更的最终状态）；否则只重做最近一条。
         #[arg(long)]
         all: bool,
+        /// 强制：journal 损坏（Tainted）时仍执行（默认拒绝 destructive 操作）。
+        #[arg(long)]
+        force: bool,
     },
     /// 局域网网页接口（粗糙版）：手机发送/接收消息，不用守在电脑前。
     /// 无 TLS；同一时刻只处理一条消息；可选 --token 做简单访问控制。
@@ -482,7 +488,12 @@ fn repair_sessions(
 /// - 默认操作最近一次编辑（undo_last/redo_last）；`--all` 时整体回滚/重放。
 /// - `--session <id>` 指定会话；默认当前 workspace 最近有 journal 的会话。
 /// - journal 在 `~/.tpi/artifacts/<session>/journal.jsonl`（§B1）。
-fn run_journal_cmd(action: &str, session: Option<&str>, all: bool) -> Result<(), String> {
+fn run_journal_cmd(
+    action: &str,
+    session: Option<&str>,
+    all: bool,
+    force: bool,
+) -> Result<(), String> {
     let home = tpi::config::tpi_home();
     let artifacts_root = home.join("artifacts");
     let workspace_root = current_workspace_root(None)?;
@@ -518,7 +529,10 @@ fn run_journal_cmd(action: &str, session: Option<&str>, all: bool) -> Result<(),
     };
 
     let jpath = tpi::session::journal::journal_path(&artifacts_root, &session_id);
-    let mutations = tpi::session::journal::load_journal(&jpath).map_err(|e| e.to_string())?;
+    let state = tpi::session::journal::load_journal(&jpath).map_err(|e| e.to_string())?;
+    // §B3：journal 损坏（Tainted）时拒绝 destructive 操作（除非 --force）。
+    tpi::session::journal::assert_can_mutate(&state, force).map_err(|e| e.to_string())?;
+    let mutations = &state.mutations;
     if mutations.is_empty() {
         println!(
             "会话 {} 的 journal 为空（没有已记录的文件变更）",
@@ -539,16 +553,45 @@ fn run_journal_cmd(action: &str, session: Option<&str>, all: bool) -> Result<(),
     );
 
     let ws = workspace_root.as_std_path();
-    let restored = match (action, all) {
-        ("undo", true) => tpi::session::journal::undo_all(&mutations, ws),
-        ("undo", false) => tpi::session::journal::undo_last(&mutations, ws),
-        ("redo", true) => tpi::session::journal::redo_all(&mutations, ws),
-        ("redo", false) => tpi::session::journal::redo_last(&mutations, ws),
+    let verdicts = match (action, all) {
+        ("undo", true) => tpi::session::journal::undo_all(mutations, ws),
+        ("undo", false) => tpi::session::journal::undo_last(mutations, ws),
+        ("redo", true) => tpi::session::journal::redo_all(mutations, ws),
+        ("redo", false) => tpi::session::journal::redo_last(mutations, ws),
         _ => unreachable!("run_journal_cmd 只接受 undo/redo"),
     }
     .map_err(|e| format!("{} 失败: {e}", action))?;
 
-    println!("{} 完成：{} 个文件已恢复", action, restored);
+    use tpi::session::journal::CasVerdict;
+    let applied = verdicts
+        .iter()
+        .filter(|(_, v)| *v == CasVerdict::Applied)
+        .count();
+    let already = verdicts
+        .iter()
+        .filter(|(_, v)| *v == CasVerdict::AlreadyDone)
+        .count();
+    let conflicts: Vec<&String> = verdicts
+        .iter()
+        .filter(|(_, v)| *v == CasVerdict::Conflict)
+        .map(|(p, _)| p)
+        .collect();
+    if !conflicts.is_empty() {
+        println!(
+            "{} 冲突：{} 个文件已被外部修改，未写文件（CAS 拒绝）：",
+            action,
+            conflicts.len()
+        );
+        for p in conflicts {
+            println!("  {p}");
+        }
+        println!("  已应用 {applied} 个，已处于目标状态 {already} 个");
+    } else {
+        println!(
+            "{} 完成：应用 {applied} 个，已处于目标状态 {already} 个",
+            action
+        );
+    }
     Ok(())
 }
 
@@ -885,11 +928,21 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 
     // §B：`tpi undo` / `tpi redo`——基于 Mutation Journal 撤销/重做文件变更。
-    if let Some(Command::Undo { session, all }) = &cli.command {
-        return run_journal_cmd("undo", session.as_deref(), *all);
+    if let Some(Command::Undo {
+        session,
+        all,
+        force,
+    }) = &cli.command
+    {
+        return run_journal_cmd("undo", session.as_deref(), *all, *force);
     }
-    if let Some(Command::Redo { session, all }) = &cli.command {
-        return run_journal_cmd("redo", session.as_deref(), *all);
+    if let Some(Command::Redo {
+        session,
+        all,
+        force,
+    }) = &cli.command
+    {
+        return run_journal_cmd("redo", session.as_deref(), *all, *force);
     }
 
     // P2：`tpi prune`——清理过期 session/artifact（~/.tpi/sessions 与 artifacts）。
