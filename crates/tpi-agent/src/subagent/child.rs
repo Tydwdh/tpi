@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{self, LiveEvent, RunInput};
 use crate::provider::Provider;
 use crate::subagent::{SubagentProvider, SubagentReport, SubagentRequest};
-use tpi_capabilities::tool::registry::{ToolRegistry, read_only_registry};
 use tpi_capabilities::tool::ToolStreamEvent;
+use tpi_capabilities::tool::registry::{ToolRegistry, read_only_registry};
 use tpi_capabilities::workspace::ActiveWorkspace;
 use tpi_core::ids::{RunId, ToolCallId};
 use tpi_session::store::SessionLog;
@@ -105,7 +105,9 @@ fn evidence_from(text: &str) -> Vec<String> {
 fn child_event_to_text(event: &LiveEvent) -> Option<String> {
     match event {
         LiveEvent::AssistantDelta { text, .. } if !text.is_empty() => Some(text.clone()),
-        LiveEvent::ToolStarted { name, arguments, .. } => {
+        LiveEvent::ToolStarted {
+            name, arguments, ..
+        } => {
             let summary = arguments.trim();
             let summary = if summary.len() > 100 {
                 let mut s: String = summary.chars().take(97).collect();
@@ -386,10 +388,7 @@ mod tests {
                 SubagentRequest {
                     instruction: "调查 src/main.rs".into(),
                     child_session: child,
-                    capabilities: vec![
-                        ReadOnlyCapability::Read,
-                        ReadOnlyCapability::Search,
-                    ],
+                    capabilities: vec![ReadOnlyCapability::Read, ReadOnlyCapability::Search],
                     parent: None,
                 },
                 CancellationToken::new(),

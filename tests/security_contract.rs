@@ -234,7 +234,6 @@ fn scheduler_locks_use_resolved_paths() {
         &ValidatedArgs::Edit(EditArgs {
             path: "src/a.rs".into(),
             revision: String::new(),
-            operations: Vec::new(),
             replacements: Vec::new(),
         }),
         &workspace,
@@ -245,7 +244,6 @@ fn scheduler_locks_use_resolved_paths() {
         &ValidatedArgs::Edit(EditArgs {
             path: "./src/a.rs".into(),
             revision: String::new(),
-            operations: Vec::new(),
             replacements: Vec::new(),
         }),
         &workspace,
@@ -332,7 +330,6 @@ fn freedom_mode_normalizes_outside_path_locks() {
             &ValidatedArgs::Edit(EditArgs {
                 path,
                 revision: String::new(),
-                operations: Vec::new(),
                 replacements: Vec::new(),
             }),
             &workspace,

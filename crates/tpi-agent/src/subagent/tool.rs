@@ -462,7 +462,9 @@ mod tool_tests {
                     return Err(crate::provider::ProviderError::Cancelled);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                let _ = events.send(ProviderEvent::TextDelta("child 调查完成".into())).await;
+                let _ = events
+                    .send(ProviderEvent::TextDelta("child 调查完成".into()))
+                    .await;
                 Ok(ProviderResponse {
                     finish_reason: FinishReason::Stop,
                     tool_calls: Vec::new(),
@@ -479,9 +481,7 @@ mod tool_tests {
             None,
         );
         let ctx = minimal_ctx();
-        let outcome = tool
-            .execute(r#"{"instruction": "调查 a.rs"}"#, &ctx)
-            .await;
+        let outcome = tool.execute(r#"{"instruction": "调查 a.rs"}"#, &ctx).await;
         assert_eq!(outcome.status, tpi_core::outcome::ToolStatus::Succeeded);
         let duration = outcome.model_payload.duration_ms;
         assert!(
