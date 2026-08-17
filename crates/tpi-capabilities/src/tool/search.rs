@@ -534,12 +534,17 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         };
         // 计算 revision 并注册 snapshot（edit_range stale 恢复用）。
         let revision = crate::tool::edit::revision_of(&bytes);
-        if let Ok(snapshot) = crate::tool::edit::build_snapshot(
+        // §模型协议：record 先行以分配 r{id}，再用 display_revision 输出。
+        let display_rev = if let Ok(snapshot) = crate::tool::edit::build_snapshot(
             Utf8PathBuf::from_path_buf(entry.path().to_path_buf()).unwrap_or_default(),
             bytes.clone(),
         ) {
-            tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
-        }
+            let mut store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+            store.record(snapshot);
+            store.display_revision(&revision)
+        } else {
+            revision
+        };
         // 该文件局部匹配行（跨文件分组，不直接塞全局 items）。
         let mut file_items: Vec<String> = Vec::new();
         let limits = SearchLimits {
@@ -560,7 +565,7 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
             stop_reason = StopReason::ResultLimit;
         }
         if !file_items.is_empty() {
-            file_groups.push((rel.clone(), revision, file_items));
+            file_groups.push((rel.clone(), display_rev, file_items));
         }
         if stop_reason == StopReason::ResultLimit {
             break 'scan;
@@ -570,11 +575,11 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
     // 拼分组文本：每个文件一段，段首 [path#revision]（§anchor）。
     // 同时把扁平 items 存进 snapshot（供 cursor 翻页，翻页不带 revision）。
     let mut grouped_body = String::new();
-    for (rel, revision, file_items) in &file_groups {
+    for (rel, display_rev, file_items) in &file_groups {
         if !grouped_body.is_empty() {
             grouped_body.push('\n');
         }
-        grouped_body.push_str(&format!("[{}#{revision}]", display_rel(rel)));
+        grouped_body.push_str(&format!("[{}#{display_rev}]", display_rel(rel)));
         for item in file_items {
             grouped_body.push('\n');
             grouped_body.push_str(item);
@@ -627,9 +632,14 @@ fn search_single_file(
             }
         };
         let revision = crate::tool::edit::revision_of(&bytes);
-        if let Ok(snapshot) = crate::tool::edit::build_snapshot(path.clone(), bytes.clone()) {
-            tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
-        }
+        let display_rev =
+            if let Ok(snapshot) = crate::tool::edit::build_snapshot(path.clone(), bytes.clone()) {
+                let mut store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+                store.record(snapshot);
+                store.display_revision(&revision)
+            } else {
+                revision
+            };
         let mut searcher = build_searcher(args.context);
         let mut match_count = 0usize;
         let limits = SearchLimits {
@@ -651,7 +661,7 @@ fn search_single_file(
         }
         if !items.is_empty() {
             // 单文件也输出 [path#revision] header（与其他路径一致）。
-            let mut grouped = format!("[{}#{revision}]", display_rel(&rel));
+            let mut grouped = format!("[{}#{display_rev}]", display_rel(&rel));
             for item in &items {
                 grouped.push('\n');
                 grouped.push_str(item);

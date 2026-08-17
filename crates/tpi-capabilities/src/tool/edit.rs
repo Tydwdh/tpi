@@ -9,7 +9,7 @@
 //!   整块共同前缀平移；Makefile 等缩进敏感语言禁用）。
 //! - CRLF/LF 完全内部化：文件读取时记录原始 EOL，内部统一 LF 匹配，写回时
 //!   恢复原 EOL。模型永远用 LF（old_text/new_text 带 `\r` 拒绝，防歧义）。
-//! - revision 对原始字节计算 BLAKE3，协议传完整 256 bit digest：`b3:<64-hex>`（§10.1）。
+//! - revision 对原始字节计算 BLAKE3（内部保留）；模型协议使用不透明 `r{id}` 标识符。
 //! - stale revision 处理（§修复）：先对**当前文件**做唯一匹配预检——若所有
 //!   非 no-op replacement 仍唯一匹配（fmt 等外部空白改动后常见），允许宽松应用
 //!   （免重新 read）；否则仍 `stale_revision` 拒绝，并回填当前文件相关区域
@@ -39,8 +39,8 @@ pub use tpi_core::outcome::Effect;
 pub struct EditArgs {
     /// 目标文件路径（workspace 内相对路径或绝对路径）。
     pub path: String,
-    /// `read`/`search` 输出的 `[revision=...]` 或裸 `b3:<64-hex>`——目标
-    /// 快照 identity（所有 old_text 坐标属于此 revision）。
+    /// `read`/`search` 输出的 `[revision=r42]` 或裸 `r42` / `b3:<64-hex>`
+    /// ——目标快照 identity（所有 old_text 坐标属于此 revision）。
     pub revision: String,
     /// 编辑列表：`old_text → new_text`。每个 old_text 在文件中必须唯一匹配
     /// （经规范化匹配链：Exact → NormalizeEOL → IgnoreTrailingWhitespace →
@@ -1700,6 +1700,9 @@ pub fn write_new_file(
 /// 每个 session 拥有自己的 store，不能是进程全局 singleton。
 /// 默认保存最多 64 个文件、每个文件 8 个 revision；淘汰只影响 rebase/诊断，
 /// 不影响磁盘文件。`read` 在合理文件大小下保存完整 snapshot。
+///
+/// 模型协议使用不透明 `r{id}` 标识符（§模型协议）：完整 BLAKE3 hash
+/// 仅在内部保留用于一致性校验，不暴露给 LLM。
 #[derive(Debug)]
 pub struct SnapshotStore {
     versions: std::collections::HashMap<Utf8PathBuf, std::collections::VecDeque<FileSnapshot>>,
@@ -1709,6 +1712,10 @@ pub struct SnapshotStore {
     max_versions_per_path: usize,
     stored_bytes: usize,
     max_total_bytes: usize,
+    /// 模型可见的不透明 revision ID 映射（b3:hash → r{id}）。
+    hash_to_id: std::collections::HashMap<String, u64>,
+    id_to_hash: std::collections::HashMap<u64, String>,
+    next_id: u64,
 }
 
 const MAX_STORED_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
@@ -1742,6 +1749,9 @@ impl SnapshotStore {
             max_versions_per_path,
             stored_bytes: 0,
             max_total_bytes: MAX_SNAPSHOT_STORE_BYTES,
+            hash_to_id: Default::default(),
+            id_to_hash: Default::default(),
+            next_id: 1,
         }
     }
 
@@ -1771,6 +1781,14 @@ impl SnapshotStore {
                 .stored_bytes
                 .saturating_sub(snapshot_memory_bytes(&old));
         }
+        // 分配不透明 revision ID：同一 hash 复用已有 ID（§模型协议）。
+        let hash = snapshot.revision.clone();
+        self.hash_to_id.entry(hash.clone()).or_insert_with(|| {
+            let id = self.next_id;
+            self.next_id = self.next_id.saturating_add(1);
+            self.id_to_hash.insert(id, hash);
+            id
+        });
         entry.push_front(snapshot);
         self.stored_bytes = self.stored_bytes.saturating_add(snapshot_bytes);
         while entry.len() > self.max_versions_per_path {
@@ -1815,6 +1833,43 @@ impl SnapshotStore {
         self.versions.clear();
         self.order.clear();
         self.stored_bytes = 0;
+        self.hash_to_id.clear();
+        self.id_to_hash.clear();
+        self.next_id = 1;
+    }
+
+    /// 将模型传回的 revision token（`r42` 或 `b3:...`）解析为内部完整 BLAKE3 hash。
+    pub fn resolve_token(&self, token: &str) -> Option<String> {
+        let trimmed = token.trim();
+        let inner = if let Some(inner) = trimmed
+            .strip_prefix("[revision=")
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            inner
+        } else {
+            trimmed
+        };
+        // r{id} 格式
+        if let Some(id_str) = inner.strip_prefix('r') {
+            if let Ok(id) = id_str.parse::<u64>() {
+                return self.id_to_hash.get(&id).cloned();
+            }
+        }
+        // b3:hash 格式（向后兼容）
+        if is_valid_revision(inner) {
+            return Some(inner.to_string());
+        }
+        None
+    }
+
+    /// 将内部 BLAKE3 hash 转换为模型可见的 `r{id}` 格式。
+    pub fn display_revision(&self, hash: &str) -> String {
+        if let Some(&id) = self.hash_to_id.get(hash) {
+            format!("r{id}")
+        } else {
+            // 未注册的 hash（理论上不应发生）：回退到完整 hash。
+            hash.to_string()
+        }
     }
 }
 
@@ -1881,6 +1936,55 @@ mod tests {
             Some(revision.as_str())
         );
         assert_eq!(parse_revision_token("bogus"), None);
+    }
+
+    #[test]
+    fn snapshot_store_revision_id_mapping() {
+        // §模型协议：同一 hash 复用 ID，不同 hash 分配新 ID。
+        let mut store = SnapshotStore::new(64, 8);
+        let raw_a = b"fn main() {}\n";
+        let raw_b = b"fn test() {}\n";
+        let hash_a = revision_of(raw_a);
+        let hash_b = revision_of(raw_b);
+
+        // record snapshot A
+        let snap_a = build_snapshot(Utf8PathBuf::from("a.rs"), raw_a.to_vec()).unwrap();
+        store.record(snap_a);
+        assert_eq!(store.display_revision(&hash_a), "r1");
+
+        // record snapshot B → 新 ID
+        let snap_b = build_snapshot(Utf8PathBuf::from("b.rs"), raw_b.to_vec()).unwrap();
+        store.record(snap_b);
+        assert_eq!(store.display_revision(&hash_b), "r2");
+
+        // record same hash A again → 复用 ID
+        let snap_a2 = build_snapshot(Utf8PathBuf::from("a.rs"), raw_a.to_vec()).unwrap();
+        store.record(snap_a2);
+        assert_eq!(store.display_revision(&hash_a), "r1");
+
+        // resolve_token: r1 → b3:hash
+        assert_eq!(store.resolve_token("r1"), Some(hash_a.clone()));
+        assert_eq!(store.resolve_token("r2"), Some(hash_b.clone()));
+        assert_eq!(store.resolve_token("r999"), None);
+
+        // resolve_token: b3:hash 向后兼容
+        assert_eq!(store.resolve_token(&hash_a), Some(hash_a.clone()));
+
+        // resolve_token: [revision=r1] 带 header 前缀
+        assert_eq!(store.resolve_token("[revision=r1]"), Some(hash_a.clone()));
+
+        // resolve_token: [revision=b3:...] 带 header 前缀
+        let header = format_revision_header(&hash_b);
+        assert_eq!(store.resolve_token(&header), Some(hash_b));
+
+        // 未注册 hash → display_revision 回退
+        assert_eq!(store.display_revision("b3:unknown"), "b3:unknown");
+
+        // clear 重置 ID
+        store.clear();
+        let snap_c = build_snapshot(Utf8PathBuf::from("c.rs"), raw_a.to_vec()).unwrap();
+        store.record(snap_c);
+        assert_eq!(store.display_revision(&hash_a), "r1"); // 重新从 1 开始
     }
 
     #[test]

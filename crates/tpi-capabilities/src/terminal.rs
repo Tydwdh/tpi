@@ -6,6 +6,8 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 const OUTPUT_LIMIT: usize = 256 * 1024;
+/// PTY 资源昂贵（fd + 读线程 + 缓冲区），限制上限防止模型无限打开。
+const MAX_TERMINALS: usize = 8;
 #[derive(Default)]
 struct Output {
     bytes: Vec<u8>,
@@ -75,6 +77,11 @@ impl TerminalRegistry {
         workspace: Option<crate::workspace::tracked::TrackedWorkspace>,
         journal: Option<(std::path::PathBuf, String)>,
     ) -> Result<String, String> {
+        if self.terminals.len() >= MAX_TERMINALS {
+            return Err(format!(
+                "terminal limit reached ({MAX_TERMINALS}); close an existing terminal first"
+            ));
+        }
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: rows.max(1),

@@ -156,14 +156,19 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
             //（复制即精确），不引入不可逆的视觉字符。须在 snapshot 移动前分析。
             let ws = crate::tool::edit::analyze_whitespace(&snapshot);
             let window = edit::read_window_from_snapshot(&snapshot, args.start_line, line_count);
-            tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
+            // §模型协议：record 先行以分配不透明 r{id}，再用 display_revision 输出。
+            let display_rev = {
+                let mut store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+                store.record(snapshot);
+                store.display_revision(&window.revision)
+            };
             let mut text = window.text;
             let mut truncated = window.truncated;
             if text.len() > DEFAULT_READ_MAX_BYTES {
                 tpi_core::util::truncate_to_char_boundary(&mut text, DEFAULT_READ_MAX_BYTES);
                 truncated = true;
             }
-            let revision_header = edit::format_revision_header(&window.revision);
+            let revision_header = edit::format_revision_header(&display_rev);
             // 空文件/超界窗口没有返回行：不显示 "1-0" 这类无效区间。
             let line_range = if window.returned_lines == 0 {
                 "0".to_string()
@@ -221,7 +226,7 @@ pub fn read(args: ReadArgs, ctx: &ToolContext) -> ToolOutcome {
                 ..Default::default()
             })
         }
-        Err(error) => failed_outcome("read", error),
+        Err(error) => failed_outcome("read", error, &ctx.snapshot_store),
     }
 }
 
@@ -383,19 +388,31 @@ pub fn edit(
     // V3：唯一编辑协议 = replacements（old_text → new_text）。
     // apply_edit 内部：revision 校验 → 匹配链（Exact → Trailing →
     // UniformOuterIndent → Fail）→ 唯一性/重叠/no-op 预检 → 原子应用。
-    match crate::tool::edit::apply_edit(&path, &args.revision, &args.replacements).and_then(
-        |result| {
-            crate::tool::edit::commit_edit(&result, &path, plan)?;
-            if let Ok(snapshot) =
-                crate::tool::edit::build_snapshot(path.clone(), result.new_raw.clone())
-            {
-                tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
-            }
-            Ok(result)
-        },
-    ) {
+    // §模型协议：将不透明 r{id} 解析为内部 b3:hash（apply_edit 仍用完整 hash）。
+    let resolved_revision = {
+        let store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+        store.resolve_token(&args.revision)
+    };
+    let Some(resolved) = resolved_revision else {
+        return failed_outcome(
+            "edit",
+            crate::tool::edit::EditError::InvalidRevision {
+                value: args.revision,
+            },
+            &ctx.snapshot_store,
+        );
+    };
+    match crate::tool::edit::apply_edit(&path, &resolved, &args.replacements).and_then(|result| {
+        crate::tool::edit::commit_edit(&result, &path, plan)?;
+        if let Ok(snapshot) =
+            crate::tool::edit::build_snapshot(path.clone(), result.new_raw.clone())
+        {
+            tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
+        }
+        Ok(result)
+    }) {
         Ok(result) => edit_success_outcome(ctx, &path, result, "edit"),
-        Err(error) => failed_outcome("edit", error),
+        Err(error) => failed_outcome("edit", error, &ctx.snapshot_store),
     }
 }
 
@@ -421,12 +438,20 @@ fn edit_success_outcome(
     };
     let _ = tpi_session::journal::append_mutation(&ctx.artifacts_root, &ctx.session_id, &payload);
     let diff = crate::tool::edit::unified_diff(&result);
+    // §模型协议：输出 r{id} 而非完整 BLAKE3 hash。
+    let (display_prev, display_curr) = {
+        let store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+        (
+            store.display_revision(&result.previous_revision),
+            store.display_revision(&result.current_revision),
+        )
+    };
     let mut output = format!(
         "status: succeeded\ntool: {tool}\npath: {}\napplied: {}\nprevious_revision: {}\ncurrent_revision: {}",
         display_path(&ctx.workspace_root, path),
         result.applied,
-        result.previous_revision,
-        result.current_revision,
+        display_prev,
+        display_curr,
     );
     if result.skipped_noops > 0 {
         output.push_str(&format!("\nskipped_noops: {}", result.skipped_noops));
@@ -436,7 +461,7 @@ fn edit_success_outcome(
         .observed_resources
         .push(tpi_core::outcome::ResourceVersion {
             path: display_path(&ctx.workspace_root, path),
-            revision: result.current_revision,
+            revision: display_curr,
         });
     outcome.session_metadata = ToolMetadata {
         tool: tool.into(),
@@ -463,6 +488,7 @@ pub fn write(
                 path,
                 bytes: args.content.len(),
             },
+            &ctx.snapshot_store,
         );
     }
     let Some(plan) = plan else {
@@ -486,9 +512,13 @@ pub fn write(
         // 省去“再 read 一次才能重试”（edit 的 stale_revision 报错同样带 current）。
         let current = match crate::tool::edit::read_raw_file(&path) {
             Ok(raw) => crate::tool::edit::revision_of(&raw),
-            Err(error) => return failed_outcome("write", error),
+            Err(error) => return failed_outcome("write", error, &ctx.snapshot_store),
         };
         let Some(expected_token) = args.revision.as_deref() else {
+            let display_current = {
+                let store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+                store.display_revision(&current)
+            };
             return ToolOutcome::failed(
                 "write",
                 ModelPayload {
@@ -500,31 +530,46 @@ pub fn write(
                         "status: failed\ntool: write\nerror: already_exists\n\n{} 已存在；整体重写必须提供当前 revision（先 read 获取，或改用 edit）。
 当前 revision: {}",
                         display_path(&ctx.workspace_root, &path),
-                        current,
+                        display_current,
                     ),
                     effect: None,
                     artifact: None,
                 },
             );
         };
-        let Some(expected) = crate::tool::edit::parse_revision_token(expected_token) else {
+        // §模型协议：将不透明 r{id} 解析为内部 b3:hash。
+        let resolved = {
+            let store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+            store.resolve_token(expected_token)
+        };
+        let Some(expected) = resolved else {
             return failed_outcome(
                 "write",
                 crate::tool::edit::EditError::InvalidRevision {
                     value: expected_token.to_string(),
                 },
+                &ctx.snapshot_store,
             );
         };
         if current != expected {
+            let display_current = {
+                let store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+                store.display_revision(&current)
+            };
+            let display_expected = {
+                let store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+                store.display_revision(&expected)
+            };
             return failed_outcome(
                 "write",
                 crate::tool::edit::EditError::StaleRevision {
                     path: path.clone(),
-                    current,
-                    expected: expected.clone(),
+                    current: display_current,
+                    expected: display_expected,
                     // 整文件重写：无 replacement 可定位，回填 None。
                     context: None,
                 },
+                &ctx.snapshot_store,
             );
         }
         // revision 匹配：按重写流程提交（保留目标文件，带 backup 恢复语义）。
@@ -539,16 +584,24 @@ pub fn write(
     }
     match edit::write_new_file(&path, args.content.as_bytes(), plan) {
         Ok(revision) => {
+            // §模型协议：record 先行以分配 r{id}，再用 display_revision 输出。
+            let display_rev = {
+                let mut store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+                if let Ok(snapshot) = crate::tool::edit::build_snapshot(
+                    path.clone(),
+                    args.content.as_bytes().to_vec(),
+                ) {
+                    store.record(snapshot);
+                }
+                store.display_revision(&revision)
+            };
             let output = format!(
                 "status: succeeded\ntool: write\npath: {}\nrevision: {}",
                 display_path(&ctx.workspace_root, &path),
-                revision,
+                display_rev,
             );
             let mut outcome = ToolOutcome::succeeded("write", output);
             let new_raw = args.content.into_bytes();
-            if let Ok(snapshot) = crate::tool::edit::build_snapshot(path.clone(), new_raw.clone()) {
-                tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
-            }
             // §B1：新建文件记录 journal（before = 空）。
             let payload = tpi_session::protocol::MutationCommittedPayload {
                 mutation_id: tpi_core::ids::EventId::new_v7().to_string(),
@@ -593,7 +646,7 @@ pub fn write(
             };
             outcome
         }
-        Err(error) => failed_outcome("write", error),
+        Err(error) => failed_outcome("write", error, &ctx.snapshot_store),
     }
 }
 
@@ -609,7 +662,7 @@ fn rewrite_with_revision(
 ) -> ToolOutcome {
     let previous_raw = match crate::tool::edit::read_raw_file(path) {
         Ok(raw) => raw,
-        Err(error) => return failed_outcome("write", error),
+        Err(error) => return failed_outcome("write", error, &ctx.snapshot_store),
     };
     let observed_revision = crate::tool::edit::revision_of(&previous_raw);
     if observed_revision != expected_revision {
@@ -622,6 +675,7 @@ fn rewrite_with_revision(
                 // 整文件重写：无 replacement 可定位，回填 None。
                 context: None,
             },
+            &ctx.snapshot_store,
         );
     }
     let result = crate::tool::edit::EditResult {
@@ -636,16 +690,22 @@ fn rewrite_with_revision(
     match crate::tool::edit::commit_edit(&result, path, plan) {
         Ok(()) => {
             let diff = crate::tool::edit::unified_diff(&result);
+            // §模型协议：record 先行以分配 r{id}，再用 display_revision 输出。
+            let (display_prev, display_curr) = {
+                let mut store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+                store.record(
+                    crate::tool::edit::build_snapshot(path.clone(), result.new_raw.clone())
+                        .unwrap_or_else(|_| unreachable!("snapshot just committed")),
+                );
+                (
+                    store.display_revision(&result.previous_revision),
+                    store.display_revision(&result.current_revision),
+                )
+            };
             let output = format!(
-                "status: succeeded\ntool: write\npath: {display_path}\nrewritten: true\nprevious_revision: {}\ncurrent_revision: {}",
-                result.previous_revision, result.current_revision,
+                "status: succeeded\ntool: write\npath: {display_path}\nrewritten: true\nprevious_revision: {display_prev}\ncurrent_revision: {display_curr}",
             );
             let mut outcome = ToolOutcome::succeeded("write", output);
-            if let Ok(snapshot) =
-                crate::tool::edit::build_snapshot(path.clone(), result.new_raw.clone())
-            {
-                tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store").record(snapshot);
-            }
             // §B1：重写已有文件记录 journal（before = 旧内容）。
             let payload = tpi_session::protocol::MutationCommittedPayload {
                 mutation_id: tpi_core::ids::EventId::new_v7().to_string(),
@@ -679,13 +739,34 @@ fn rewrite_with_revision(
             };
             outcome
         }
-        Err(error) => failed_outcome("write", error),
+        Err(error) => failed_outcome("write", error, &ctx.snapshot_store),
     }
 }
 
-fn failed_outcome(tool: &str, error: EditError) -> ToolOutcome {
+fn failed_outcome(
+    tool: &str,
+    error: EditError,
+    snapshot_store: &std::sync::Mutex<crate::tool::edit::SnapshotStore>,
+) -> ToolOutcome {
+    // §模型协议：将错误中的 b3:hash 转换为 r{id} 显示格式。
+    let store = snapshot_store.lock().unwrap_or_else(|p| p.into_inner());
+    let display_error = match &error {
+        EditError::StaleRevision {
+            path,
+            current,
+            expected,
+            context,
+        } => EditError::StaleRevision {
+            path: path.clone(),
+            current: store.display_revision(current),
+            expected: store.display_revision(expected),
+            context: context.clone(),
+        },
+        other => other.clone(),
+    };
+    drop(store);
     // P2：给模型明确的下一步动作，而不是只拒绝（“硬拒绝”→“可恢复引导”）。
-    let hint = match &error {
+    let hint = match &display_error {
         EditError::StaleRevision { current, .. } => format!(
             "\nhint: 文件已变化（current_revision {current}）。可直接用该 revision 重试 edit（无需重新 read）；需要确认内容时再 read。"
         ),
@@ -720,15 +801,15 @@ fn failed_outcome(tool: &str, error: EditError) -> ToolOutcome {
         _ => String::new(),
     };
     // §修复 #2/#3：stale/no_match 时回填当前文件相关区域内容，模型免 read 自纠。
-    let context_note = match &error {
+    let context_note = match &display_error {
         EditError::StaleRevision { context, .. } | EditError::NoMatch { context, .. } => context
             .as_deref()
             .map(|ctx| format!("\n当前文件相关区域:\n{ctx}")),
         _ => None,
     };
     let mut output = format!(
-        "status: failed\ntool: {tool}\nerror: {}\n\n{error}{hint}",
-        error.code()
+        "status: failed\ntool: {tool}\nerror: {}\n\n{display_error}{hint}",
+        display_error.code()
     );
     if let Some(note) = context_note {
         output.push_str(&note);
@@ -1070,6 +1151,9 @@ mod tests {
     // ---- V3：唯一编辑协议 = replacements（old_text → new_text）----
 
     /// 读文件拿 revision（并 record snapshot）。
+    /// 读文件拿 revision token（并 record snapshot）。
+    /// 返回值是模型可见的 revision token（如 `r1` 或 `b3:...`），
+    /// 可直接传给 `edit()`（edit 内部通过 resolve_token 解析）。
     fn read_revision(path: &Utf8PathBuf, ctx: &ToolContext) -> String {
         let outcome = read(
             ReadArgs {
@@ -1081,18 +1165,15 @@ mod tests {
             ctx,
         );
         assert_eq!(outcome.status, ToolStatus::Succeeded);
-        crate::tool::edit::parse_revision_token(
-            outcome
-                .model_payload
-                .output
-                .lines()
-                .find_map(|l| {
-                    l.strip_prefix("[revision=")
-                        .map(|r| r.strip_suffix(']').unwrap())
-                })
-                .unwrap(),
-        )
-        .unwrap()
+        outcome
+            .model_payload
+            .output
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("[revision=")
+                    .map(|r| r.strip_suffix(']').unwrap().to_string())
+            })
+            .unwrap()
     }
 
     fn do_edit(

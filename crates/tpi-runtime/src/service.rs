@@ -96,6 +96,8 @@ pub struct RuntimeTask<P: Provider + 'static> {
     sessions: HashMap<SessionId, Arc<StdMutex<Option<SessionRuntime<P>>>>>,
     /// 进行中的 run 取消表（主循环独占）。
     runs: HashMap<SessionId, CancellationToken>,
+    /// 进行中的 run task JoinHandle（shutdown 时等待结束）。
+    run_handles: HashMap<SessionId, tokio::task::JoinHandle<()>>,
     build_provider: ProviderFactory<P>,
     registry: Arc<StdMutex<ToolRegistry>>,
 }
@@ -115,6 +117,7 @@ impl<P: Provider + 'static> RuntimeTask<P> {
             workspace_root,
             sessions: HashMap::new(),
             runs: HashMap::new(),
+            run_handles: HashMap::new(),
             build_provider,
             registry,
         }
@@ -148,14 +151,26 @@ impl<P: Provider + 'static> RuntimeTask<P> {
                 finished = done_rx.recv() => {
                     if let Some(session_id) = finished {
                         self.runs.remove(&session_id);
+                        self.run_handles.remove(&session_id);
                     }
                 }
             }
         }
 
-        // 退出前取消所有 run，等它们结束。
+        // 退出前取消所有 run，等它们结束（最多 5 秒）。
         for (_, cancel) in self.runs.drain() {
             cancel.cancel();
+        }
+        for (sid, handle) in self.run_handles.drain() {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(?sid, "run task panicked: {e}");
+                }
+                Err(_) => {
+                    warn!(?sid, "run task did not finish within 5s after cancel");
+                }
+            }
         }
         info!("tpi-runtime 已停止");
     }
@@ -416,7 +431,7 @@ impl<P: Provider + 'static> RuntimeTask<P> {
 
         // 在 run task 启动前记录 UserInputReceived（Answer 语义，与 app 层一致）。
         // 在 task 内做：先 take session，写 log，再跑 agent。
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // take session（独占）。
             let session = {
                 let mut guard = session_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -526,6 +541,7 @@ impl<P: Provider + 'static> RuntimeTask<P> {
             // 通知主循环清理 runs 表。
             let _ = run_done.send(session_id).await;
         });
+        self.run_handles.insert(session_id, handle);
 
         Ok(())
     }

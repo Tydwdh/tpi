@@ -460,19 +460,35 @@ fn render_frame(
     let area = frame.area();
     // §用户诉求：右侧边栏（todo + 用户消息大纲）。打开时横向切分——主区让出
     // SIDEBAR_WIDTH 列，边栏占右侧整列高（贯穿 transcript 到 footer）。
+    // §LayoutPolicy：窄屏按比例缩窄侧边栏，避免挤压主区到不可用。
     let (main_area, sidebar_area) = if view.sidebar.open {
-        let main_w = area
-            .width
-            .saturating_sub(crate::model::SIDEBAR_WIDTH)
-            .max(1);
+        let policy = crate::layout::LayoutPolicy::for_width(area.width);
+        // 按 LayoutPolicy 百分比计算，但保留 MIN_SIDEBAR 底线；
+        // 超宽时用固定值 SIDEBAR_WIDTH。
+        let sidebar_w = if policy.sidebar_percent() == 0 {
+            // Minimal（< 40 列）：不应打开侧边栏，但防御性处理。
+            0u16
+        } else {
+            let pct_w = area.width * policy.sidebar_percent() / 100;
+            // Narrow 档按比例；Standard/Wide 用固定 SIDEBAR_WIDTH。
+            match policy {
+                crate::layout::LayoutPolicy::Narrow => pct_w.max(16),
+                _ => pct_w.max(crate::model::SIDEBAR_WIDTH),
+            }
+        };
+        let main_w = area.width.saturating_sub(sidebar_w).max(1);
         (
             Rect::new(area.x, area.y, main_w, area.height),
-            Some(Rect::new(
-                area.x + main_w,
-                area.y,
-                area.width - main_w,
-                area.height,
-            )),
+            if sidebar_w > 0 {
+                Some(Rect::new(
+                    area.x + main_w,
+                    area.y,
+                    area.width - main_w,
+                    area.height,
+                ))
+            } else {
+                None
+            },
         )
     } else {
         (area, None)

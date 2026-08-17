@@ -760,7 +760,9 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             } else if let Some(overlay) = &mut state.view.overlay {
                 overlay.scroll = overlay.scroll.saturating_sub(10);
             } else {
-                state.view.scroll_up(8);
+                // §10：PageUp 移动 viewport-2 行（大终端翻页更快）。
+                let page = state.view.transcript_rows.saturating_sub(2).max(1);
+                state.view.scroll_up(page);
             }
         }
         KeyAction::PageDown => {
@@ -778,7 +780,9 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             } else if let Some(overlay) = &mut state.view.overlay {
                 overlay.scroll = overlay.scroll.saturating_add(10);
             } else {
-                state.view.scroll_down(8);
+                // §10：PageDown 移动 viewport-2 行（与 PageUp 对称）。
+                let page = state.view.transcript_rows.saturating_sub(2).max(1);
+                state.view.scroll_down(page);
             }
         }
         KeyAction::Copy => {
