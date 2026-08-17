@@ -4,6 +4,19 @@ use crate::editor::Editor;
 use crate::keymap::Keymap;
 use crate::model::ViewModel;
 
+/// 是否抢占型 slash 命令：这类命令会结束/重建/重试/取消当前 run，run 中
+/// 提交时必须立即打断 run（不被排队中的普通消息挡住）。其余信息/切换型
+/// 命令（help/settings/model/session/sessions/theme/thinking/diff/doctor/mcp）
+/// 与 agent turn 无关，run 中提交只排队、run 结束后生效，不得取消 run。
+fn is_preemptive_slash(message: &str) -> bool {
+    let trimmed = message.trim();
+    ["/new", "/cancel", "/compact", "/retry"]
+        .iter()
+        .any(|cmd| trimmed == *cmd || trimmed.starts_with(&format!("{cmd} ")))
+        || trimmed == "/quit"
+        || trimmed == "/exit"
+}
+
 /// TUI 全部 UI 状态（app 层唯一持有的状态对象；reducer 只改它）。
 #[derive(Debug, Clone)]
 pub struct UiState {
@@ -149,19 +162,23 @@ impl UiState {
         self.pending_messages.front().map(String::as_str)
     }
 
-    /// 队列中是否存在 `/` 命令（任意位置）——run 中提交的 / 命令必须立即
-    /// 取消 run 执行（不被前面排队的普通消息挡住）。
+    /// 队列中是否存在需要抢占当前 run 的 `/` 命令（任意位置）。
+    ///
+    /// 只有会结束/重建/重试/取消 run 的命令（quit/new/cancel/compact/retry）
+    /// 才必须立即打断 run——它们是本地即时操作，不被排队中的普通消息挡住。
+    /// 其余信息/切换型命令（help/settings/model/session/theme/thinking/diff/
+    /// doctor/mcp 等）与 agent turn 无关，run 结束后排队消费即可，**不得**
+    /// 因用户只是打开菜单看一眼就取消正在进行的 run。
     pub fn has_pending_slash(&self) -> bool {
-        self.pending_messages.iter().any(|m| m.starts_with('/'))
+        self.pending_messages.iter().any(|m| is_preemptive_slash(m))
     }
 
-    /// 把队列中第一个 `/` 命令提到队首（app 消费时优先执行——/ 命令是本地
-    /// 即时操作，不应被排队中的普通 agent 消息阻塞）。
+    /// 把队列中第一个抢占型 `/` 命令提到队首（app 消费时优先执行）。
     pub fn promote_pending_slash(&mut self) {
         if let Some(idx) = self
             .pending_messages
             .iter()
-            .position(|m| m.starts_with('/'))
+            .position(|m| is_preemptive_slash(m))
             && let Some(cmd) = self.pending_messages.remove(idx)
         {
             self.pending_messages.push_front(cmd);

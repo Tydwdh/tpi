@@ -2208,19 +2208,12 @@ fn cached_markdown(
     (lines, links)
 }
 
-/// 侧边栏 Todo 项：当前项优先，其余开放项随后，终态项沉底。侧边栏自身可滚动。
+/// 侧边栏 Todo 项：按原计划顺序摆放（不做状态重排）。
+///
+/// 用户诉求：完成项不沉底、当前项不提前——按提交顺序排列更能直观看到
+/// 进度（已完成 ✓ 勾选在各自位置，开放项在下方继续）。侧边栏自身可滚动。
 fn sidebar_plan_items(plan: &tpi_core::plan::Plan) -> Vec<&tpi_core::plan::PlanItem> {
-    use tpi_core::plan::PlanStatus;
-    let rank = |status| match status {
-        PlanStatus::InProgress => 0,
-        PlanStatus::Pending => 1,
-        PlanStatus::Blocked => 2,
-        PlanStatus::Completed => 3,
-        PlanStatus::Cancelled => 4,
-    };
-    let mut out: Vec<_> = plan.items.iter().collect();
-    out.sort_by_key(|item| rank(item.status));
-    out
+    plan.items.iter().collect()
 }
 
 /// 右侧边栏（§用户诉求：opencode 式）。上方 Todo（`view.plan` 项），
@@ -2254,7 +2247,7 @@ fn draw_sidebar(
     // §用户诉求：全部项完成/取消后计划视为结束——与 plan_snapshot 的语义一致
     // （plan.rs：全部终态 → 空快照，不再注入模型上下文），侧边栏同样不显示
     // 已结束计划的完成态列表（此前只检查 items 非空，全标完成后 Todo 仍挂在 UI）。
-    // 有开放项时保留历史（终态项沉底，sidebar_plan_items 排序）。
+    // 有开放项时保留历史（终态项按原顺序留在原位，sidebar_plan_items 不重排）。
     let has_open = view
         .plan
         .as_ref()
@@ -2767,11 +2760,10 @@ fn draw_modal(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: t
     let inner_h = rect.height.saturating_sub(2).max(1) as usize;
 
     let mut content: Vec<Line<'static>> = Vec::new();
+    // 标题改由边框 title 显示；内容首行只放操作提示，避免与标题重复。
     content.push(Line::styled(
-        format!("{}（Esc 关闭 · ↑/↓ 滚动）", modal.title),
-        Style::default()
-            .fg(theme.primary)
-            .add_modifier(Modifier::BOLD),
+        "↑/↓ 滚动 · Esc 关闭",
+        Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
     ));
     content.push(Line::default());
     // §16.2 增强：/diff Modal 的 diff 行红绿着色；其他 Modal 保持纯文本
@@ -2808,20 +2800,23 @@ fn draw_modal(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: t
     let start = scroll;
     let window = wrapped[start..start + inner_h.min(total)].to_vec();
 
+    // 统一悬浮浮层观感：不透明背景覆盖整个 rect（边框 + 内容 + 空行），
+    // 杜绝底部 transcript 从边框/内容间隙透出；边框统一用灰阶 `border` 色
+    //（与菜单浮层一致），而非刺眼的 info/accent。
+    let block = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_style(Style::default().fg(theme.border).bg(theme.surface_subtle))
+        .title(modal.title.clone())
+        .style(Style::default().bg(theme.surface_subtle));
+    // 先清底再整体铺 surface_subtle 背景（含内容行不足区域）。
     frame.render_widget(ratatui::widgets::Clear, rect);
     frame.render_widget(
-        ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(theme.info)),
+        Paragraph::new(window)
+            .block(block)
+            .scroll((0, 0))
+            .style(Style::default().bg(theme.surface_subtle)),
         rect,
     );
-    let inner = Rect::new(
-        rect.x + 1,
-        rect.y + 1,
-        rect.width.saturating_sub(2),
-        rect.height.saturating_sub(2),
-    );
-    frame.render_widget(Paragraph::new(window).scroll((0, 0)), inner);
 }
 
 /// §子代理内部视图渲染（opencode 形态，主窗口式）：点击 subagent 卡后
@@ -3245,20 +3240,19 @@ fn draw_question(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme
     let start = scroll.min(total.saturating_sub(inner_h));
     let window = wrapped[start..start + inner_h.min(total)].to_vec();
 
+    // 统一悬浮浮层观感：不透明背景 + 灰阶 border 边框（与 Modal/Overlay/菜单一致）。
+    let block = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_style(Style::default().fg(theme.border).bg(theme.surface_subtle))
+        .style(Style::default().bg(theme.surface_subtle));
     frame.render_widget(ratatui::widgets::Clear, rect);
     frame.render_widget(
-        ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
+        Paragraph::new(window)
+            .block(block)
+            .scroll((0, 0))
+            .style(Style::default().bg(theme.surface_subtle)),
         rect,
     );
-    let inner = Rect::new(
-        rect.x + 1,
-        rect.y + 1,
-        rect.width.saturating_sub(2),
-        rect.height.saturating_sub(2),
-    );
-    frame.render_widget(Paragraph::new(window).scroll((0, 0)), inner);
 }
 
 fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme: theme::Theme) {
@@ -3368,16 +3362,20 @@ fn draw_overlay(frame: &mut ratatui::Frame, rect: Rect, view: &ViewModel, theme:
         model::OverlayKind::Reasoning => " 思考（reasoning） ",
         model::OverlayKind::Link => " 链接 ",
     };
+    // 统一悬浮浮层观感：不透明 surface_subtle 背景覆盖整个 rect，杜绝底部
+    // transcript 透出；边框统一灰阶 `border` 色（与菜单/Modal 浮层一致）。
     let block = ratatui::widgets::Block::default()
         .borders(ratatui::widgets::Borders::ALL)
-        .border_style(Style::default().fg(theme.primary))
-        .title(border_title);
-    // 先清空 Overlay 覆盖区域，否则底层 transcript 文字会透过内容间隙显示（用户反馈“思考悬浮窗被其他文字干扰背景”）。
+        .border_style(Style::default().fg(theme.border).bg(theme.surface_subtle))
+        .title(border_title)
+        .style(Style::default().bg(theme.surface_subtle));
+    // 先清底再整体铺 surface_subtle 背景（含内容行不足区域）。
     frame.render_widget(ratatui::widgets::Clear, rect);
     frame.render_widget(
         ratatui::widgets::Paragraph::new(window)
             .block(block)
-            .scroll((0, 0)),
+            .scroll((0, 0))
+            .style(Style::default().bg(theme.surface_subtle)),
         rect,
     );
 }

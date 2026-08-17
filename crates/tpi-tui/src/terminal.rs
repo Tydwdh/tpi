@@ -8,7 +8,15 @@ use std::io::{BufWriter, Stdout};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste};
+use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+
+/// 关闭鼠标捕获的转义序列（与 `MOUSE_CAPTURE_SEQUENCE` 对称）。
+///
+/// 用 crossterm 的 `DisableMouseCapture` 会调用 `original_console_mode()`（其
+/// enable 时才 init）；本终端初始化直接写 `MOUSE_CAPTURE_SEQUENCE`，不经过
+/// crossterm 的 init，退出/错误路径调用它会误报
+/// "Initial console modes not set"（main 打印“错误:”）。故统一直接写序列。
+const MOUSE_DISABLE_SEQUENCE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1003l";
 use ratatui::crossterm::execute;
 
 const MOUSE_CAPTURE_SEQUENCE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
@@ -131,21 +139,20 @@ impl TerminalDriver {
         self.terminal.insert_before(height, f)
     }
 
-    /// 逆序恢复终端（§30）：show_cursor → DisableMouseCapture →
+    /// 逆序恢复终端（§30）：show_cursor → 关鼠标捕获 →
     /// DisableBracketedPaste → LeaveAlternateScreen → disable_raw_mode。
     pub fn restore(&mut self) -> std::io::Result<()> {
         let mut first_error = self.terminal.show_cursor().err();
-        // §美化：显式关闭 ?1003h（DisableMouseCapture 只发 ?1000l，不关 any-event）。
-        if let Err(error) = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1003l")
+        // 关闭 ?1003h（any-event）与 ?1000/?1002/?1006。直接用转义序列而非
+        // crossterm 的 `DisableMouseCapture`（见 `MOUSE_DISABLE_SEQUENCE` 注）。
+        if let Err(error) =
+            std::io::Write::write_all(&mut std::io::stdout(), MOUSE_DISABLE_SEQUENCE)
             && first_error.is_none()
         {
             first_error = Some(error);
         }
-        if let Err(error) = execute!(
-            std::io::stdout(),
-            DisableMouseCapture,
-            DisableBracketedPaste,
-        ) && first_error.is_none()
+        if let Err(error) = execute!(std::io::stdout(), DisableBracketedPaste)
+            && first_error.is_none()
         {
             first_error = Some(error);
         }
@@ -174,12 +181,10 @@ impl TerminalDriver {
     /// 尽力恢复全局终端状态（不依赖实例；panic hook 与初始化失败路径用）。
     pub fn restore_global() {
         use std::io::Write;
-        // §美化：显式关 ?1003h（与 restore 对称）。
-        let _ = std::io::stdout().write_all(b"\x1b[?1003l");
+        let _ = std::io::stdout().write_all(MOUSE_DISABLE_SEQUENCE);
         let _ = execute!(
             std::io::stdout(),
             ratatui::crossterm::cursor::Show,
-            DisableMouseCapture,
             DisableBracketedPaste,
             ratatui::crossterm::terminal::LeaveAlternateScreen,
             ratatui::crossterm::style::ResetColor,
@@ -193,12 +198,10 @@ impl Drop for TerminalDriver {
     fn drop(&mut self) {
         // app 因错误提前返回时仍尽力还原终端（显式 restore 是正常路径；
         // 这里的重复调用安全且避免用户遗留在 raw mode，§31）。
+        use std::io::Write;
         let _ = self.terminal.show_cursor();
-        let _ = execute!(
-            std::io::stdout(),
-            DisableMouseCapture,
-            DisableBracketedPaste,
-        );
+        let _ = std::io::stdout().write_all(MOUSE_DISABLE_SEQUENCE);
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         if self.mode == ViewMode::Fullscreen {
             let _ = execute!(
                 std::io::stdout(),

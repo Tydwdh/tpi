@@ -1662,15 +1662,18 @@ where
         }
     }
 
-    // P3-06：显式 join 键盘线程（drop receiver 触发线程退出；join 不遗留）。
+    // P3-06：显式 join 键盘线程（不遗留）。键盘线程阻塞在 `event::read()`
+    //（等下一个按键），仅 drop receiver 不会唤醒它——必须先 restore 终端
+    //（退出 raw mode）让阻塞的 read 返回，join 才能完成；否则 /quit /new
+    // 等退出类命令必须再补一个输入才真正退出。
     drop(key_rx);
+    renderer.restore().map_err(|e| e.to_string())?;
     if let Err(panic) = key_thread.join() {
         eprintln!("键盘线程异常退出: {:?}", panic);
     }
 
     // README2 Phase 3：退出前关闭所有 MCP server（不留孤儿进程，§9）。
     mcp_manager.shutdown_all().await;
-    renderer.restore().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2482,10 +2485,11 @@ async fn run_interactive<P: Provider>(
                                 }
                             }
                         }
-                        // §bug 修复：run 中提交 `/` 命令 → 立即取消 run，命令在
-                        // run 结束后执行（/命令与 agent 消息不冲突，不应排队等
-                        // run 结束——否则 /quit 必须等模型跑完才能退出）。
-                        // 队列任意位置（前面可能有 run 中排队的普通消息）。
+                        // §bug 修复：run 中提交**抢占型** `/` 命令（quit/new/cancel/
+                        // compact/retry）→ 立即取消 run，命令在 run 结束后执行
+                        //（不应排队等 run 结束——否则 /quit 必须等模型跑完才能
+                        // 退出）。信息/切换型命令（help/model/theme 等）与 agent
+                        // turn 无关，只排队、run 结束后生效，**不**取消 run。
                         if ui_state.has_pending_slash() {
                             cancel.cancel();
                             ui_state.view.transient_hint = Some(

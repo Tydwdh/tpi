@@ -120,6 +120,29 @@ fn pending_slash_promoted_over_queued_messages() {
     assert!(!state.has_pending_slash(), "无 / 命令时 false");
 }
 
+/// 非抢占型 /命令（model/session/theme/help 等信息/切换型）不打断 run：
+/// 用户在 run 中只是想打开菜单看一眼，或让切换在下一轮再生效——不得
+/// 因此取消正在进行的 run。只有抢占型命令（quit/new/cancel/compact/retry）
+/// 才触发 has_pending_slash 并被提到队首。
+#[test]
+fn non_preemptive_slash_does_not_trigger_run_cancel() {
+    let mut state = UiState::new(ViewModel::default());
+    state.push_pending("/model".into());
+    state.push_pending("刚才那个任务的后续".into());
+    // 信息/切换型命令不得判定为抢占（run 中不应被取消）。
+    assert!(
+        !state.has_pending_slash(),
+        "/model 不允许打断 run（切换在下轮再生效）"
+    );
+    // promote 也不应把 /model 提前（保持 FIFO 消费即可）。
+    state.promote_pending_slash();
+    assert_eq!(
+        state.pop_pending().as_deref(),
+        Some("/model"),
+        "无抢占命令时保持原 FIFO 顺序"
+    );
+}
+
 /// §修复：UsageUpdated 事件实时累加到累计字段（不等 run 结束）——
 /// footer 的 ↑↓⇄ 与缓存命中率因此同口径（累计 cache_read / 累计 input），
 /// 不再出现“累计值旁挂本次命中率”的矛盾（⇄27.1M(33%)）。
@@ -323,9 +346,10 @@ fn tool_card_only_header_clickable() {
     }
 }
 
-/// 侧边栏 Todo 显示全部项目，活跃项优先、完成历史沉底。
+/// 侧边栏 Todo 按原计划顺序摆放（完成项不沉底、当前项不提前）——
+/// 按提交顺序排列更能直观看到进度。
 #[test]
-fn sidebar_plan_shows_all_active_items_before_history() {
+fn sidebar_plan_keeps_original_item_order() {
     use tpi_core::plan::{Plan, PlanItem, PlanStatus};
     let plan = Plan {
         explanation: None,
@@ -356,8 +380,8 @@ fn sidebar_plan_shows_all_active_items_before_history() {
     let texts: Vec<&str> = shown.iter().map(|i| i.text.as_str()).collect();
     assert_eq!(
         texts,
-        vec!["new1", "new2", "new3", "old1", "old2"],
-        "全部活跃项优先，完成历史沉底"
+        vec!["old1", "old2", "new1", "new2", "new3"],
+        "按原计划顺序摆放，完成项不沉底"
     );
     let plan2 = Plan {
         explanation: None,
@@ -376,7 +400,7 @@ fn sidebar_plan_shows_all_active_items_before_history() {
         .iter()
         .map(|i| i.text.as_str())
         .collect();
-    assert_eq!(texts2, vec!["new1", "old1"]);
+    assert_eq!(texts2, vec!["old1", "new1"], "原顺序：完成后项仍留在原位置");
     // 全部完成：侧边栏仍显示全部已保留的完成历史。
     let plan3 = Plan {
         explanation: None,
