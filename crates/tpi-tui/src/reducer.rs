@@ -487,10 +487,9 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             {
                 match key.code {
                     KeyCode::Char(c)
-                        if !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-                            && !c.is_ascii_control() =>
+                        if !key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        ) && !c.is_ascii_control() =>
                     {
                         menu.filter_push(c);
                         sync_session_preview(state);
@@ -605,8 +604,16 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             // §oh-my-pi：Modal 型菜单过滤词非空时，Esc 先清空过滤词（回到全列表），
             // 再按一次才关闭菜单——避免误关（与搜索 Esc 语义一致）。
             if state.view.menu.is_some()
-                && state.view.menu.as_ref().is_some_and(|m| m.is_browser_menu())
-                && state.view.menu.as_ref().is_some_and(|m| !m.filter.is_empty())
+                && state
+                    .view
+                    .menu
+                    .as_ref()
+                    .is_some_and(|m| m.is_browser_menu())
+                && state
+                    .view
+                    .menu
+                    .as_ref()
+                    .is_some_and(|m| !m.filter.is_empty())
             {
                 if let Some(menu) = state.view.menu.as_mut() {
                     menu.filter.clear();

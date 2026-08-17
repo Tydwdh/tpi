@@ -162,6 +162,46 @@ pub struct AppServices<P: Provider> {
     pub registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
 }
 
+/// 为子代理生成当前所选模型的完整运行配置。
+///
+/// `subagent` 在注册时持有配置和 provider 工厂；因此 `/model` 切换后必须
+/// 用新模型覆盖该工具，不能继续复用启动时捕获的 primary 模型/凭据。
+fn subagent_config_for_model(config: &Config, model: &crate::config::ModelConfig) -> Arc<Config> {
+    let mut child_config = config.clone();
+    child_config.model = model.clone();
+    Arc::new(child_config)
+}
+
+/// 在 registry 中安装（或替换）使用 `model` 的 OpenAI-compatible 子代理。
+///
+/// [`ToolRegistry::register_validated`] 对同名 `subagent` 是 ABA-safe 覆盖，
+/// 所以此函数可同时用于启动和 `/model` 切换。
+fn register_openai_subagent_tool(
+    registry: &Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
+    config: &Config,
+    model: &crate::config::ModelConfig,
+    api_key: String,
+) {
+    let model = model.clone();
+    crate::subagent::tool::register_subagent_tool::<OpenAiCompatClient, _>(
+        registry,
+        subagent_config_for_model(config, &model),
+        move || {
+            OpenAiCompatClient::new(
+                model.base_url.clone(),
+                model.name.clone(),
+                api_key.clone(),
+                model.reasoning.clone(),
+                model.max_output_tokens,
+                model.context_window,
+            )
+        },
+        // P8-06：report 通道在 run 时按 run 注入（此处 None = 不投影
+        // TUI；run_turn 的 ui_tx 不在此作用域）。
+        None,
+    );
+}
+
 impl AppServices<OpenAiCompatClient> {
     /// object construction：真实 provider + 会话恢复 + cancel 全部集中于此。
     ///
@@ -216,28 +256,7 @@ impl AppServices<OpenAiCompatClient> {
         );
         // P8-04 接线：把 `subagent` 工具注册进 registry（模型可发起只读调查）。
         // 每个 child 独立 provider 实例（不与 parent 争用 &mut provider）。
-        {
-            let child_api_key = api_key.clone();
-            let model = config.model.clone();
-            let child_config = Arc::new(config.clone());
-            crate::subagent::tool::register_subagent_tool::<OpenAiCompatClient, _>(
-                &registry,
-                child_config,
-                move || {
-                    OpenAiCompatClient::new(
-                        model.base_url.clone(),
-                        model.name.clone(),
-                        child_api_key.clone(),
-                        model.reasoning.clone(),
-                        model.max_output_tokens,
-                        model.context_window,
-                    )
-                },
-                // P8-06：report 通道在 run 时按 run 注入（此处 None = 不投影
-                // TUI；run_turn 的 ui_tx 不在此作用域）。
-                None,
-            );
-        }
+        register_openai_subagent_tool(&registry, &config, &config.model, api_key);
 
         // 共享的当前取消 token（Ctrl-C 第一次取消 run，空闲时退出）。
         let current_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
@@ -365,20 +384,32 @@ pub async fn run(
     no_session: bool,
 ) -> Result<(), String> {
     let services = AppServices::from_config(config, session_target, no_session)?;
+    // `/model` 在交互循环里只接收一个重建 provider 的闭包。捕获 registry 和
+    // 完整配置模板，使同一次切换同时替换 subagent 的 provider 工厂；否则 child
+    // 会继续携带启动时模型的 API key，表现为 parent 正常而 child 立即 401。
+    let subagent_registry = services.registry.clone();
+    let subagent_config_template = services.config.clone();
     // /model 切换：重建 provider（run 是非泛型入口，P 具体 = OpenAiCompatClient）。
-    let rebuild_provider = |model: &crate::config::ModelConfig| -> Result<
+    let rebuild_provider = move |model: &crate::config::ModelConfig| -> Result<
         crate::provider::openai_compat::OpenAiCompatClient,
         String,
     > {
         let api_key = crate::config::read_api_key_for(model)?;
-        Ok(crate::provider::openai_compat::OpenAiCompatClient::new(
+        let provider = crate::provider::openai_compat::OpenAiCompatClient::new(
             model.base_url.clone(),
             model.name.clone(),
-            api_key,
+            api_key.clone(),
             model.reasoning.clone(),
             model.max_output_tokens,
             model.context_window,
-        ))
+        );
+        register_openai_subagent_tool(
+            &subagent_registry,
+            &subagent_config_template,
+            model,
+            api_key,
+        );
+        Ok(provider)
     };
     if let Some(text) =
         run_with_services(services, prompt, non_interactive, rebuild_provider).await?
@@ -3132,6 +3163,29 @@ mod tests {
     use super::*;
     use crate::tui::model::ViewModel;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    #[test]
+    fn subagent_config_tracks_the_model_selected_after_startup() {
+        let workspace = camino::Utf8PathBuf::from(".");
+        let mut config = crate::config::test_config(&workspace);
+        config.model.name = "startup-model".into();
+        config.model.api_key = Some("startup-key".into());
+
+        let mut selected = config.model.clone();
+        selected.provider = "huoshan".into();
+        selected.name = "ark-code-latest".into();
+        selected.base_url = "https://example.invalid/ark".into();
+        selected.api_key = Some("selected-key".into());
+
+        let child_config = subagent_config_for_model(&config, &selected);
+        assert_eq!(child_config.model.name, "ark-code-latest");
+        assert_eq!(child_config.model.provider, "huoshan");
+        assert_eq!(child_config.model.api_key.as_deref(), Some("selected-key"));
+        assert_eq!(
+            config.model.name, "startup-model",
+            "切换子代理模型不得反向改写当前启动配置模板"
+        );
+    }
 
     /// P1-03：LiveEvent → RuntimeEvent 投影覆盖全部变体（headless 消费 LiveEvent
     /// 不依赖此投影；TUI 依赖它生成 view event）。

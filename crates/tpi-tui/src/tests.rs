@@ -21,7 +21,9 @@ fn auto_recovery_shows_footer_progress_every_attempt() {
     );
     let hint1 = state.view.transient_hint.clone();
     assert!(
-        hint1.as_deref().is_some_and(|h| h.contains("自动续写") && h.contains("1/10")),
+        hint1
+            .as_deref()
+            .is_some_and(|h| h.contains("自动续写") && h.contains("1/10")),
         "第一次续写 footer 提示: {hint1:?}"
     );
     // 第二次续写：footer 提示更新（不追加新系统行——刷屏防护保留）。
@@ -41,7 +43,9 @@ fn auto_recovery_shows_footer_progress_every_attempt() {
     );
     let hint3 = state.view.transient_hint.clone();
     assert!(
-        hint3.as_deref().is_some_and(|h| h.contains("自动重试") && h.contains("3/10")),
+        hint3
+            .as_deref()
+            .is_some_and(|h| h.contains("自动重试") && h.contains("3/10")),
         "重生成 footer 提示: {hint3:?}"
     );
 }
@@ -58,7 +62,11 @@ fn idle_submit_slash_queues_immediately() {
     }
     assert!(state.view.menu.is_some(), "/ 前缀菜单弹出");
     let effects = reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Enter)));
-    assert_eq!(state.pop_pending().as_deref(), Some("/quit"), "一次 Enter 即入队");
+    assert_eq!(
+        state.pop_pending().as_deref(),
+        Some("/quit"),
+        "一次 Enter 即入队"
+    );
     assert!(effects.is_empty());
 }
 
@@ -103,7 +111,11 @@ fn pending_slash_promoted_over_queued_messages() {
     assert!(state.has_pending_slash(), "队列中存在 / 命令");
     state.promote_pending_slash();
     assert_eq!(state.pop_pending().as_deref(), Some("/quit"), "/ 命令优先");
-    assert_eq!(state.pop_pending().as_deref(), Some("继续干活"), "原顺序保持");
+    assert_eq!(
+        state.pop_pending().as_deref(),
+        Some("继续干活"),
+        "原顺序保持"
+    );
     assert_eq!(state.pop_pending().as_deref(), Some("第三条"));
     assert!(!state.has_pending_slash(), "无 / 命令时 false");
 }
@@ -3459,7 +3471,7 @@ fn model_menu_enter_sets_pending_model() {
         selected: 1,
         kind: crate::model::MenuKind::Model,
         session_previews: Vec::new(),
-            filter: String::new(),
+        filter: String::new(),
     });
     state.view.modal = Some(crate::model::ModalState::new(
         "/model",
@@ -3492,7 +3504,7 @@ fn model_menu_navigation_keeps_menu() {
         selected: 0,
         kind: crate::model::MenuKind::Model,
         session_previews: Vec::new(),
-            filter: String::new(),
+        filter: String::new(),
     });
     let _ = reducer::update(
         &mut state,
@@ -3527,10 +3539,7 @@ fn browser_menu_type_to_filter() {
     assert_eq!(menu.filtered_len(), 1, "过滤后只剩 claude");
     assert!(state.view.input.is_empty(), "不落 composer");
     // 过滤后 Enter → 选中过滤后的项。
-    let effects = reducer::update(
-        &mut state,
-        UiEvent::Key(key_event(KeyCode::Enter)),
-    );
+    let effects = reducer::update(&mut state, UiEvent::Key(key_event(KeyCode::Enter)));
     assert_eq!(state.pending_model.as_deref(), Some("claude-sonnet"));
     assert!(effects.is_empty());
 }
@@ -4158,7 +4167,9 @@ mod subagent_view_tests {
     #[test]
     fn click_normal_tool_still_toggles_expand() {
         let mut state = UiState::new(ViewModel::default());
-        state.view.begin_tool("c1", "bash", Some("echo hi".into()), None);
+        state
+            .view
+            .begin_tool("c1", "bash", Some("echo hi".into()), None);
         reducer::update(&mut state, UiEvent::ClickTool("c1".into()));
         assert!(
             state.view.subagent.active.is_none(),
@@ -4220,7 +4231,10 @@ mod subagent_view_tests {
         state.view.open_subagent("c1".into());
         // 打字应被拦截（浏览模式，不落 composer）。
         reducer::update(&mut state, UiEvent::Key(key(KeyCode::Char('x'))));
-        assert!(state.view.input.is_empty(), "内部视图打开时按键不落 composer");
+        assert!(
+            state.view.input.is_empty(),
+            "内部视图打开时按键不落 composer"
+        );
     }
 
     /// §子代理：subagent 卡永不紧凑——两张 subagent 卡之间保持 1 行空行
@@ -4250,11 +4264,24 @@ mod subagent_view_tests {
             None,
         );
         let mut cache = HashMap::new();
-        let plan = plan_window_simple(&mut view, crate::theme::Theme::omp(), 80, 30, 0, false, &mut cache);
+        let plan = plan_window_simple(
+            &mut view,
+            crate::theme::Theme::omp(),
+            80,
+            30,
+            0,
+            false,
+            &mut cache,
+        );
         let texts: Vec<String> = plan
             .window
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect();
         // 两个子代理卡之间必须有空行（间隔）。
         let pos1 = texts.iter().position(|t| t.contains("调查 a")).unwrap_or(0);
@@ -4272,7 +4299,8 @@ mod subagent_view_tests {
         let card = crate::model::ToolCard {
             id: "c1".into(),
             name: "subagent".into(),
-            target: Some("调查 src".into()),command: None,
+            target: Some("调查 src".into()),
+            command: None,
             state: ToolCardState::Done {
                 status: tpi_core::outcome::ToolStatus::Succeeded,
                 duration_ms: 1200,
@@ -4302,4 +4330,3 @@ mod subagent_view_tests {
         );
     }
 }
-

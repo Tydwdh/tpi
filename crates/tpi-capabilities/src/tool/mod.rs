@@ -377,7 +377,7 @@ Example: process action=status id=\"p17\"; process action=wait id=\"p17\" timeou
                 "Open a persistent interactive PTY. Unlike a background job it preserves stdin and terminal state. Example: terminal_open rows=24 cols=80"
             }
             BuiltinTool::TerminalWrite => {
-                "Write input bytes to a persistent PTY. Include newline/CR when the shell needs Enter. Example: terminal_write id=\"t1\" data=\"echo ready\\r\\n\""
+                "Write raw input bytes to a persistent PTY (no escape-sequence interpretation). Set submit=true to append the platform Enter byte so the shell runs it. Example: terminal_write id=\"t1\" data=\"echo ready\" submit=true"
             }
             BuiltinTool::TerminalRead => {
                 "Read only terminal output appended after a cursor. Use next_cursor for the next read to avoid duplicate context. Example: terminal_read id=\"t1\" after=42"

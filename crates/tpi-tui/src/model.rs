@@ -1674,7 +1674,11 @@ impl ViewModel {
             self.close_subagent();
             return;
         }
-        let current = self.subagent.active.as_deref().and_then(|a| ids.iter().position(|i| i == a));
+        let current = self
+            .subagent
+            .active
+            .as_deref()
+            .and_then(|a| ids.iter().position(|i| i == a));
         let next = match current {
             Some(i) => (i as i64 + dir as i64).rem_euclid(ids.len() as i64) as usize,
             None => 0,

@@ -99,7 +99,16 @@ impl OpenAiCompatClient {
             body.insert("tools".into(), json!(tools));
         }
         if let Some(reasoning) = &request.reasoning {
-            body.insert("reasoning".into(), json!(reasoning));
+            // OpenAI-compatible gateways (including Ark Coding Plan) expose
+            // this as `reasoning_effort`, not `reasoning`.
+            // Keep the existing user-facing `max` spelling working by mapping
+            // it to Ark's highest supported level.
+            let effort = if reasoning.eq_ignore_ascii_case("max") {
+                "high"
+            } else {
+                reasoning.as_str()
+            };
+            body.insert("reasoning_effort".into(), json!(effort));
         }
         if let Some(max_tokens) = request.max_output_tokens {
             body.insert("max_tokens".into(), json!(max_tokens));
@@ -207,6 +216,12 @@ struct SseFunctionDelta {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+}
+
+/// Some OpenAI-compatible gateways encode omitted fields in a streamed tool
+/// delta as `""` instead of leaving the field out.
+fn non_empty_delta(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
 }
 
 #[derive(Deserialize)]
@@ -412,6 +427,12 @@ impl Provider for OpenAiCompatClient {
                     match consume_stream(response, events.clone(), cancel.clone()).await {
                         ConsumeResult::Ok(response) => return Ok(response),
                         ConsumeResult::Failed { error, retryable } => {
+                            if trace::enabled() {
+                                let mut fields = serde_json::Map::new();
+                                fields.insert("error".into(), json!(error.to_string()));
+                                fields.insert("retryable".into(), json!(retryable));
+                                trace::log("stream_failed", fields);
+                            }
                             if !retryable || matches!(error, ProviderError::Cancelled) {
                                 return Err(error);
                             }
@@ -865,11 +886,12 @@ async fn consume_stream(
                     });
                 }
                 let slot = &mut pending[index];
-                if let Some(id) = &call.id {
-                    if id.is_empty()
-                        || id.len() > MAX_PROVIDER_CALL_ID_BYTES
-                        || id.chars().any(char::is_control)
-                    {
+                // Ark emits the id/name only in the first tool delta, then
+                // represents omitted fields as empty strings in following
+                // argument deltas. Treat those placeholders as absent; the
+                // completed call below still requires non-empty values.
+                if let Some(id) = non_empty_delta(call.id.as_deref()) {
+                    if id.len() > MAX_PROVIDER_CALL_ID_BYTES || id.chars().any(char::is_control) {
                         return ConsumeResult::Failed {
                             error: ProviderError::Protocol("invalid tool call id".into()),
                             retryable: false,
@@ -887,19 +909,21 @@ async fn consume_stream(
                             retryable: false,
                         };
                     }
-                    slot.provider_id.get_or_insert_with(|| id.clone());
+                    slot.provider_id.get_or_insert_with(|| id.to_string());
                 }
-                if let Some(name) = &call.function.as_ref().and_then(|f| f.name.as_ref()) {
-                    if name.is_empty()
-                        || name.len() > MAX_TOOL_NAME_BYTES
-                        || name.chars().any(char::is_control)
-                    {
+                if let Some(name) = call
+                    .function
+                    .as_ref()
+                    .and_then(|function| function.name.as_deref())
+                    .and_then(|name| non_empty_delta(Some(name)))
+                {
+                    if name.len() > MAX_TOOL_NAME_BYTES || name.chars().any(char::is_control) {
                         return ConsumeResult::Failed {
                             error: ProviderError::Protocol("invalid tool call name".into()),
                             retryable: false,
                         };
                     }
-                    if !slot.name.is_empty() && slot.name != name.as_str() {
+                    if !slot.name.is_empty() && slot.name != name {
                         return ConsumeResult::Failed {
                             error: ProviderError::Protocol(
                                 "tool call name changed while streaming".into(),
@@ -1151,6 +1175,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_streamed_tool_fields_are_treated_as_omitted() {
+        // Ark emits id/name in the first tool-call chunk and `""` for those
+        // fields in following argument chunks.
+        assert_eq!(non_empty_delta(Some("call_123")), Some("call_123"));
+        assert_eq!(non_empty_delta(Some("")), None);
+        assert_eq!(non_empty_delta(None), None);
+    }
+
+    #[test]
     fn raw_sse_frame_guard_handles_split_delimiters_and_rejects_oversize() {
         let mut guard = SseFrameGuard::default();
         guard.inspect_with_limit(b"data: 1\r\n\r", 16).unwrap();
@@ -1241,6 +1274,29 @@ mod tests {
         assert_eq!(body["max_tokens"], 1024);
     }
 
+    #[test]
+    fn reasoning_uses_openai_compatible_effort_field() {
+        let client = OpenAiCompatClient::new(
+            "https://example.invalid/v1".into(),
+            "ignored-model".into(),
+            "key".into(),
+            None,
+            None,
+            None,
+        );
+        let request = ModelRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage::User("hi".into())],
+            tools: Vec::new(),
+            max_output_tokens: None,
+            reasoning: Some("max".into()),
+            context_window: None,
+        };
+        let body = client.build_body(&request);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("reasoning").is_none(), "{body}");
+    }
+
     /// P0-4：client 构造参数（model/reasoning/max_output_tokens）不再影响 body。
     #[test]
     fn client_config_never_leaks_into_body() {
@@ -1263,7 +1319,7 @@ mod tests {
         let body = client.build_body(&request);
         assert_eq!(body["model"], "request-model");
         assert!(body.get("max_tokens").is_none(), "{body}");
-        assert!(body.get("reasoning").is_none(), "{body}");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
     }
 }
 

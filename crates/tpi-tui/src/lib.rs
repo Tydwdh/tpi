@@ -2920,7 +2920,10 @@ fn draw_subagent_view(
                 Style::default().fg(theme.muted).bg(theme.panel),
             ));
         }
-        spans.push(Span::styled(line.to_string(), panel_style(Style::default().fg(theme.text))));
+        spans.push(Span::styled(
+            line.to_string(),
+            panel_style(Style::default().fg(theme.text)),
+        ));
         content.push(Line::from(spans));
     }
     if body.is_empty() {
@@ -2934,10 +2937,7 @@ fn draw_subagent_view(
     }
     let wrapped = wrap_lines(content, inner_w);
     let total_rows = wrapped.len();
-    let scroll = view
-        .subagent
-        .scroll
-        .min(total_rows.saturating_sub(inner_h));
+    let scroll = view.subagent.scroll.min(total_rows.saturating_sub(inner_h));
     let window = wrapped[scroll..scroll + inner_h.min(total_rows)].to_vec();
     // 主窗口式：直接渲染进转录区（无边框），输入框/footer 由主布局保留。
     frame.render_widget(Paragraph::new(window).scroll((0, 0)), rect);
