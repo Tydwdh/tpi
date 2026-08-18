@@ -6,7 +6,7 @@
 //! 长期兼容面：**P2-01 拆分不改任何字段/序列化**（golden hash 证明）。
 
 use serde::{Deserialize, Serialize};
-use tpi_core::ids::{EventId, RequestId, RunId, SessionId, ToolCallId};
+use tpi_core::ids::{AgentId, DelegationId, EventId, RequestId, RunId, SessionId, ToolCallId};
 use tpi_core::message::ToolCall;
 use tpi_core::outcome::StoredToolOutcome;
 
@@ -209,6 +209,48 @@ pub enum SessionEvent {
         reason: CompletionReason,
         usage: Usage,
     },
+    /// ADR-007：一次子代理委托已注册（child 后台开始工作）。落盘到 parent session。
+    SubagentSpawned {
+        delegation_id: DelegationId,
+        agent_id: AgentId,
+        child_session: SessionId,
+        /// 任务指令（诊断/重放摘要）。
+        instruction: String,
+        /// 只读能力白名单快照（工具名）。
+        capabilities: Vec<String>,
+    },
+    /// ADR-007：child 给出语义 report（可多条 progress / 单条 final）。
+    /// 先 durable 再 model-visible：落盘后只在下一个 deterministic boundary 注入。
+    SubagentReported {
+        delegation_id: DelegationId,
+        agent_id: AgentId,
+        child_session: SessionId,
+        summary: String,
+        evidence: Vec<String>,
+        /// false = progress 进度，true = 首个 final 报告。
+        final_report: bool,
+    },
+    /// ADR-007：AgentLoop 达到终态（runtime truth；可能无 report）。
+    SubagentSettled {
+        delegation_id: DelegationId,
+        agent_id: AgentId,
+        child_session: SessionId,
+        reason: SubagentFinishedReason,
+        /// 终态 report（若曾有过 final report 也在此冗余，简化重放）。
+        summary: Option<String>,
+        evidence: Vec<String>,
+    },
+}
+
+/// ADR-007：子代理 AgentLoop 终态原因（runtime truth，与语义 report 分离）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubagentFinishedReason {
+    /// 正常完成（可能带 report）。
+    Stopped,
+    /// 不可恢复失败。
+    Failed,
+    /// 被取消（parent cancel / session 关闭）。
+    Cancelled,
 }
 
 impl SessionEvent {
@@ -228,6 +270,9 @@ impl SessionEvent {
             SessionEvent::CompactionCommitted { .. } => "compaction_committed",
             SessionEvent::MutationCommitted { .. } => "mutation_committed",
             SessionEvent::RunCompleted { .. } => "run_completed",
+            SessionEvent::SubagentSpawned { .. } => "subagent_spawned",
+            SessionEvent::SubagentReported { .. } => "subagent_reported",
+            SessionEvent::SubagentSettled { .. } => "subagent_settled",
         }
     }
 }
@@ -288,6 +333,44 @@ pub enum EventBody {
     RunCompleted {
         payload: RunCompletedPayload,
     },
+    SubagentSpawned {
+        payload: SubagentSpawnedPayload,
+    },
+    SubagentReported {
+        payload: SubagentReportedPayload,
+    },
+    SubagentSettled {
+        payload: SubagentSettledPayload,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentSpawnedPayload {
+    pub delegation_id: DelegationId,
+    pub agent_id: AgentId,
+    pub child_session: SessionId,
+    pub instruction: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentReportedPayload {
+    pub delegation_id: DelegationId,
+    pub agent_id: AgentId,
+    pub child_session: SessionId,
+    pub summary: String,
+    pub evidence: Vec<String>,
+    pub final_report: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentSettledPayload {
+    pub delegation_id: DelegationId,
+    pub agent_id: AgentId,
+    pub child_session: SessionId,
+    pub reason: SubagentFinishedReason,
+    pub summary: Option<String>,
+    pub evidence: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -448,6 +531,55 @@ impl Envelope {
                     usage: *usage,
                 },
             },
+            SessionEvent::SubagentSpawned {
+                delegation_id,
+                agent_id,
+                child_session,
+                instruction,
+                capabilities,
+            } => EventBody::SubagentSpawned {
+                payload: SubagentSpawnedPayload {
+                    delegation_id: *delegation_id,
+                    agent_id: *agent_id,
+                    child_session: *child_session,
+                    instruction: instruction.clone(),
+                    capabilities: capabilities.clone(),
+                },
+            },
+            SessionEvent::SubagentReported {
+                delegation_id,
+                agent_id,
+                child_session,
+                summary,
+                evidence,
+                final_report,
+            } => EventBody::SubagentReported {
+                payload: SubagentReportedPayload {
+                    delegation_id: *delegation_id,
+                    agent_id: *agent_id,
+                    child_session: *child_session,
+                    summary: summary.clone(),
+                    evidence: evidence.clone(),
+                    final_report: *final_report,
+                },
+            },
+            SessionEvent::SubagentSettled {
+                delegation_id,
+                agent_id,
+                child_session,
+                reason,
+                summary,
+                evidence,
+            } => EventBody::SubagentSettled {
+                payload: SubagentSettledPayload {
+                    delegation_id: *delegation_id,
+                    agent_id: *agent_id,
+                    child_session: *child_session,
+                    reason: *reason,
+                    summary: summary.clone(),
+                    evidence: evidence.clone(),
+                },
+            },
         };
         let timestamp = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -526,6 +658,29 @@ impl Envelope {
             EventBody::RunCompleted { payload } => SessionEvent::RunCompleted {
                 reason: payload.reason,
                 usage: payload.usage,
+            },
+            EventBody::SubagentSpawned { payload } => SessionEvent::SubagentSpawned {
+                delegation_id: payload.delegation_id,
+                agent_id: payload.agent_id,
+                child_session: payload.child_session,
+                instruction: payload.instruction.clone(),
+                capabilities: payload.capabilities.clone(),
+            },
+            EventBody::SubagentReported { payload } => SessionEvent::SubagentReported {
+                delegation_id: payload.delegation_id,
+                agent_id: payload.agent_id,
+                child_session: payload.child_session,
+                summary: payload.summary.clone(),
+                evidence: payload.evidence.clone(),
+                final_report: payload.final_report,
+            },
+            EventBody::SubagentSettled { payload } => SessionEvent::SubagentSettled {
+                delegation_id: payload.delegation_id,
+                agent_id: payload.agent_id,
+                child_session: payload.child_session,
+                reason: payload.reason,
+                summary: payload.summary.clone(),
+                evidence: payload.evidence.clone(),
             },
         }
     }

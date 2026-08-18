@@ -56,3 +56,7 @@ id_type!(RegistrationId);
 // 一个 TraceId；span 用 SpanId；跨 run 因果用显式 link，不嵌套到永不关闭的树）。
 id_type!(TraceId);
 id_type!(SpanId);
+// ADR-007：multi-agent delegation。AgentId = 谁在工作（一个被托管的 agent 实例）；
+// DelegationId = 为什么让它工作（一次委托/spawn 的记录）。
+id_type!(AgentId);
+id_type!(DelegationId);
