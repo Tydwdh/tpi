@@ -518,6 +518,13 @@ pub async fn run_task(
                 registry: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::tool::registry::builtin_registry(),
                 )),
+                // 单次 run 诊断：不经 session 级共享，每次新建。
+                processes: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::process::managed::ProcessRegistry::new(),
+                )),
+                terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::terminal::TerminalRegistry::default(),
+                )),
             },
         );
         tokio::pin!(run_fut);

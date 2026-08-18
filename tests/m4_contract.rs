@@ -423,6 +423,12 @@ async fn update_plan_and_compaction_integration() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
+            )),
         },
     )
     .await
@@ -499,6 +505,12 @@ async fn repeated_failing_action_blocked_in_agent_loop() {
             workspace: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
+            )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
             )),
         },
     )

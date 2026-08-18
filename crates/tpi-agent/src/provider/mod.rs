@@ -110,6 +110,12 @@ pub enum ProviderError {
     Http(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// 确定性非法请求（HTTP 400：tool schema 校验失败 / 请求体格式错误等）。
+    ///
+    /// 请求本身是**确定性非法**的——重发相同 JSON 必然得到相同 400，因此完全
+    /// 不值得重试/重放/自动重启（§用户诉求：禁止对 400 反复 regenerate）。
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     #[error("authentication failed: {0}")]
     Auth(String),
     #[error("rate limited: {0}")]

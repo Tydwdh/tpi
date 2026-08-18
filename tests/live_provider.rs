@@ -60,6 +60,12 @@ async fn live_provider_smoke_opt_in() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
+            )),
         },
     )
     .await
@@ -129,6 +135,12 @@ async fn live_canary_2_real_tool_call_loop() {
                 workspace: None,
                 registry: std::sync::Arc::new(std::sync::Mutex::new(
                     tpi::tool::registry::builtin_registry(),
+                )),
+                processes: std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi::process::managed::ProcessRegistry::new(),
+                )),
+                terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi::terminal::TerminalRegistry::default(),
                 )),
             },
         ),

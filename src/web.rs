@@ -70,6 +70,9 @@ struct ServerState {
     next_run: AtomicU64,
     /// P4 gate：composition root 注入的工具注册表。
     registry: std::sync::Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
+    /// Session 级共享托管进程 / PTY 注册表（跨 run 存活）。
+    processes: std::sync::Arc<std::sync::Mutex<crate::process::managed::ProcessRegistry>>,
+    terminals: std::sync::Arc<std::sync::Mutex<crate::terminal::TerminalRegistry>>,
 }
 
 /// 启动局域网网页服务（阻塞直到监听失败或 Ctrl-C）。
@@ -116,6 +119,12 @@ pub async fn serve(config: Arc<Config>, port: u16, token: Option<String>) -> Res
         next_run: AtomicU64::new(1),
         registry: std::sync::Arc::new(std::sync::Mutex::new(
             crate::tool::registry::builtin_registry(),
+        )),
+        processes: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::process::managed::ProcessRegistry::new(),
+        )),
+        terminals: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::terminal::TerminalRegistry::default(),
         )),
     });
 
@@ -596,6 +605,8 @@ async fn run_agent(state: &Arc<ServerState>, content: String) -> RunResult {
                 force_compaction: false,
                 workspace: None,
                 registry: state.registry.clone(),
+                processes: state.processes.clone(),
+                terminals: state.terminals.clone(),
             },
         )
         .await;

@@ -45,6 +45,12 @@ async fn finish_stop_without_tool_calls_completes_run_without_second_request() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
+            )),
         },
     )
     .await
@@ -113,6 +119,12 @@ async fn tool_call_loop_terminates_and_reports_completion() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
+            )),
         },
     )
     .await
@@ -180,6 +192,12 @@ async fn todo_state_is_not_reinjected_as_a_user_message() {
             workspace: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
+            )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
             )),
         },
     )
@@ -286,6 +304,12 @@ async fn usage_accumulates_across_turns() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
+            )),
         },
     )
     .await
@@ -339,6 +363,12 @@ async fn context_usage_event_sent_before_requests() {
             workspace: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
+            )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
             )),
         },
     )
@@ -400,6 +430,12 @@ async fn zero_max_turns_is_unlimited() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
+            )),
         },
     )
     .await
@@ -449,6 +485,12 @@ async fn final_turn_injects_wrapup_instruction() {
             workspace: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
+            )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
             )),
         },
     )
@@ -513,6 +555,12 @@ async fn request_input_suspends_run_with_durable_event() {
             workspace: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
+            )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
             )),
         },
     )
@@ -583,6 +631,12 @@ async fn resume_after_suspend_records_input_and_continues() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
+            )),
         },
     )
     .await
@@ -615,6 +669,12 @@ async fn resume_after_suspend_records_input_and_continues() {
             workspace: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
+            )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
             )),
         },
     )
@@ -700,6 +760,12 @@ async fn request_input_multi_question_suspends_with_rendered_prompt() {
             workspace: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
+            )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
             )),
         },
     )
@@ -793,6 +859,12 @@ async fn request_input_legacy_single_question_still_works() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
+            )),
         },
     )
     .await
@@ -855,6 +927,12 @@ async fn request_input_rejected_in_non_interactive_run() {
             workspace: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
+            )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
             )),
         },
     )
@@ -935,6 +1013,12 @@ async fn suspend_persists_rejected_outcomes_for_later_waves() {
             workspace: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
+            )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
             )),
         },
     )

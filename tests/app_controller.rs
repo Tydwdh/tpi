@@ -76,6 +76,8 @@ fn services() -> AppServices<EchoProvider> {
         current_cancel: Arc::new(Mutex::new(None)),
         mcp_manager: tpi::mcp::manager::McpManager::new(),
         registry: Arc::new(Mutex::new(tpi::tool::registry::builtin_registry())),
+        processes: Arc::new(Mutex::new(tpi::process::managed::ProcessRegistry::new())),
+        terminals: Arc::new(Mutex::new(tpi::terminal::TerminalRegistry::default())),
     }
 }
 

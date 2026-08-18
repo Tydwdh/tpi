@@ -198,6 +198,14 @@ impl<P: Provider + Send, F: Fn() -> P + Send> SubagentProvider for InProcessChil
                 force_compaction: false,
                 workspace: Some(self.workspace.clone()),
                 registry,
+                // Subagent 是只读调查（read/search/glob 白名单），不共享父进程的
+                // session 级注册表，也不允许生成后台进程/PTY（各自独立会话）。
+                processes: Arc::new(Mutex::new(
+                    tpi_capabilities::process::managed::ProcessRegistry::new(),
+                )),
+                terminals: Arc::new(Mutex::new(
+                    tpi_capabilities::terminal::TerminalRegistry::default(),
+                )),
             },
         )
         .await;

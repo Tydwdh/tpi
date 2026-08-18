@@ -136,6 +136,12 @@ async fn p0_2_empty_text_tool_call_replays_legal_protocol() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
+            )),
         },
     )
     .await
@@ -203,6 +209,12 @@ async fn p0_3_runtime_projection_matches_resume_projection() {
             workspace: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
+            )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
             )),
         },
     )
@@ -277,6 +289,12 @@ impl ReplayHarness {
                 workspace: None,
                 registry: std::sync::Arc::new(std::sync::Mutex::new(
                     tpi::tool::registry::builtin_registry(),
+                )),
+                processes: std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi::process::managed::ProcessRegistry::new(),
+                )),
+                terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi::terminal::TerminalRegistry::default(),
                 )),
             },
         )
@@ -500,6 +518,12 @@ async fn replay_cancelled_run_matches_runtime() {
             workspace: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
+            )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
             )),
         },
     )

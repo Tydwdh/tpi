@@ -74,6 +74,8 @@ impl ToolRuntime {
         initial_plan: Option<Plan>,
         active_workspace: tpi_capabilities::workspace::ActiveWorkspace,
         registry: Arc<std::sync::Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
+        processes: Arc<std::sync::Mutex<tpi_capabilities::process::managed::ProcessRegistry>>,
+        terminals: Arc<std::sync::Mutex<tpi_capabilities::terminal::TerminalRegistry>>,
     ) -> Self {
         // §W0/R4：workspace 由调用方注入（默认 Local；测试可传 remote）。
         // ctx.shell 与 workspace 内 shell 共享同一 Arc。
@@ -101,12 +103,8 @@ impl ToolRuntime {
             current_plan: Arc::new(Mutex::new(initial_plan)),
             shell,
             workspace,
-            processes: Arc::new(Mutex::new(
-                tpi_capabilities::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: Arc::new(Mutex::new(
-                tpi_capabilities::terminal::TerminalRegistry::default(),
-            )),
+            processes,
+            terminals,
             registry,
         }
     }

@@ -87,7 +87,7 @@ impl OpenAiCompatClient {
                     "function": {
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": tool.parameters,
+                        "parameters": normalize_parameters(&tool.parameters),
                     }
                 })
             })
@@ -157,6 +157,27 @@ fn message_to_json(message: &ChatMessage) -> serde_json::Value {
             "content": content,
         }),
     }
+}
+
+/// 协议 invariant 兜底（§provider 边界）：`type: object` 的 tool parameters
+/// **必须始终带 `properties`**（min：空 `{}`）。
+///
+/// schemars 对空结构体只生成 `{"type":"object"}`（见 capabilities 层
+/// [`normalize_tool_parameters`]），本处作为发往 provider 前的最终防线：
+/// 即便某些工具来源（第三方/MCP/手写 adapter）返回了缺 `properties` 的
+/// object schema，也不会触发 LM Studio 0.4.x 等严格 validator 的 HTTP 400
+/// （`function.parameters.properties` required）。非 object 参数原样透传。
+fn normalize_parameters(parameters: &serde_json::Value) -> serde_json::Value {
+    let mut value = match parameters {
+        serde_json::Value::Object(map) => map.clone(),
+        other => return other.clone(),
+    };
+    if value.get("type").and_then(|t| t.as_str()) == Some("object") {
+        value
+            .entry("properties")
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    serde_json::Value::Object(value)
 }
 
 /// 容忍数组字段为 `null`（视为空数组）：`#[serde(default)]` 只处理字段缺失，
@@ -385,6 +406,12 @@ impl Provider for OpenAiCompatClient {
                     if error == "cancelled" {
                         return Err(ProviderError::Cancelled);
                     }
+                    // §40：确定性非法请求（HTTP 400/422，如 tool schema 校验
+                    // 失败）——请求 body 是确定性的，重发相同 JSON 必然再 400，
+                    // 直接以 InvalidRequest 终态返回，**不做任何重试/重放**。
+                    if error.starts_with("invalid request") {
+                        return Err(ProviderError::InvalidRequest(error));
+                    }
                     // OpenAI-compatible gateways occasionally surface proxy
                     // failures as 4xx. Give such a result exactly one
                     // defensive replay, then retain its precise error class;
@@ -585,27 +612,43 @@ impl OpenAiCompatClient {
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
                 return Err(format!("auth ({status_text})"));
             }
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+                // §40：确定性非法请求（同 JSON 重发必然 400）。读取 provider body
+                //（tool schema 校验错误等，诊断用），作为 InvalidRequest 归类，
+                // 不进入 defensive_retry / RetryBudget 重试（重试无意义）。
+                let snippet = read_error_body(response, cancel).await?;
+                return Err(format!("invalid request ({status_text}): {snippet}"));
+            }
             _ => {
                 // §27：4xx/5xx 错误带 provider body（诊断；截断避免刷屏）。
                 // 此前只报 status code，真实 400 的具体原因完全不可见。
-                let mut stream = response.bytes_stream();
-                let mut body = Vec::new();
-                while body.len() < MAX_ERROR_BODY_BYTES {
-                    let next = tokio::select! {
-                        _ = cancel.cancelled() => return Err("cancelled".into()),
-                        next = stream.next() => next,
-                    };
-                    let Some(chunk) = next else { break };
-                    let Ok(chunk) = chunk else { break };
-                    let remaining = MAX_ERROR_BODY_BYTES - body.len();
-                    body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-                }
-                let snippet: String = String::from_utf8_lossy(&body).chars().take(300).collect();
+                let snippet = read_error_body(response, cancel).await?;
                 format!("http {status_text}: {snippet}")
             }
         };
         Err(message)
     }
+}
+
+/// 读取错误响应的 provider body（截断；用于诊断消息）。
+async fn read_error_body(
+    response: reqwest::Response,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while body.len() < MAX_ERROR_BODY_BYTES {
+        let next = tokio::select! {
+            _ = cancel.cancelled() => return Err("cancelled".into()),
+            next = stream.next() => next,
+        };
+        let Some(chunk) = next else { break };
+        let Ok(chunk) = chunk else { break };
+        let remaining = MAX_ERROR_BODY_BYTES - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    let snippet: String = String::from_utf8_lossy(&body).chars().take(300).collect();
+    Ok(snippet)
 }
 
 fn classify_error(message: String, attempt: u32) -> ProviderError {
@@ -614,6 +657,11 @@ fn classify_error(message: String, attempt: u32) -> ProviderError {
     }
     if message.starts_with("auth") {
         return ProviderError::Auth(message);
+    }
+    // §40：确定性非法请求（HTTP 400/422：tool schema 校验失败等）。同 JSON
+    // 重发必然再 400，归为 InvalidRequest，agent 层不得对其自动重启/续写。
+    if message.starts_with("invalid request") {
+        return ProviderError::InvalidRequest(message);
     }
     if message.starts_with("http 429") {
         return ProviderError::RateLimited(format!("attempt {attempt}: {message}"));
@@ -1274,6 +1322,65 @@ mod tests {
         assert_eq!(body["max_tokens"], 1024);
     }
 
+    /// 协议 invariant：`type: object` 的 parameters 必须带 `properties`
+    /// （无字段工具/第三方来源字段缺失时，兜底补空 `{}` 避免严格 validator 400）。
+    #[test]
+    fn object_parameters_always_carry_properties() {
+        // 无字段工具：源 schema 只有 `{"type":"object"}`。
+        let bare = serde_json::json!({ "type": "object" });
+        let normalized = normalize_parameters(&bare);
+        assert_eq!(normalized["properties"], serde_json::json!({}), "{normalized}");
+        assert_eq!(normalized["type"], "object");
+
+        // 带字段的 schema：properties 保留，不覆盖。
+        let with_fields = serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } }
+        });
+        let normalized = normalize_parameters(&with_fields);
+        assert_eq!(
+            normalized["properties"]["path"]["type"],
+            "string",
+            "已有 properties 不得被覆盖"
+        );
+
+        // 非 object 参数原样透传。
+        let array_schema = serde_json::json!({ "type": "array" });
+        assert_eq!(normalize_parameters(&array_schema), array_schema);
+    }
+
+    /// build_body 兜底：即便 ToolDef 的 parameters 缺 `properties`，发出的
+    /// 请求体里仍带 `properties: {}`。
+    #[test]
+    fn build_body_normalizes_bare_object_schema() {
+        let client = OpenAiCompatClient::new(
+            "https://example.invalid/v1".into(),
+            "ignored-model".into(),
+            "key".into(),
+            None,
+            None,
+            None,
+        );
+        let request = ModelRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage::User("hi".into())],
+            tools: vec![crate::provider::ToolDef {
+                name: "inspect".into(),
+                description: "inspect".into(),
+                parameters: serde_json::json!({ "type": "object" }),
+            }],
+            max_output_tokens: None,
+            reasoning: None,
+            context_window: None,
+        };
+        let body = client.build_body(&request);
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["properties"],
+            serde_json::json!({}),
+            "{body}"
+        );
+    }
+
     #[test]
     fn reasoning_uses_openai_compatible_effort_field() {
         let client = OpenAiCompatClient::new(
@@ -1369,6 +1476,22 @@ fn retry_after_cannot_exceed_total_wait_budget() {
     // 累计恰好等于预算：允许；再多 1ms 即拒绝。
     assert!(budget.permits_retry_after(Duration::from_secs(30)));
     assert!(!budget.permits_retry_after(Duration::from_secs(31)));
+}
+
+/// §40：确定性非法请求（HTTP 400/422：tool schema 校验失败等）必须归为
+/// `InvalidRequest`——同类 JSON 重发必然再 400，agent 不得对其自动重试/重启。
+#[test]
+fn invalid_request_classified_as_terminal_fatal() {
+    let err = classify_error("invalid request (400): schema error".into(), 0);
+    assert!(
+        matches!(err, ProviderError::InvalidRequest(_)),
+        "400 must be InvalidRequest: {err:?}"
+    );
+    let err = classify_error("invalid request (422): bad body".into(), 2);
+    assert!(
+        matches!(err, ProviderError::InvalidRequest(_)),
+        "422 must be InvalidRequest: {err:?}"
+    );
 }
 
 #[test]

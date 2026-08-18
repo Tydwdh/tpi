@@ -153,6 +153,12 @@ async fn p0_2_compaction_survives_delta_flood() {
                 registry: std::sync::Arc::new(std::sync::Mutex::new(
                     tpi::tool::registry::builtin_registry(),
                 )),
+                processes: std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi::process::managed::ProcessRegistry::new(),
+                )),
+                terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi::terminal::TerminalRegistry::default(),
+                )),
             },
         ),
     )

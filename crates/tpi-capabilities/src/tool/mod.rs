@@ -33,12 +33,34 @@ use tpi_core::message::ToolDef;
 /// 失败时记录日志并返回 null（模型将看到无参数 schema，但进程不崩溃）。
 fn schema_value<T: schemars::JsonSchema>(tool: &'static str) -> serde_json::Value {
     match serde_json::to_value(schemars::schema_for!(T)) {
-        Ok(value) => value,
+        Ok(value) => normalize_tool_parameters(value),
         Err(error) => {
             tracing::error!(tool, error = %error, "tool schema 序列化失败；暴露空 schema");
             serde_json::Value::Null
         }
     }
+}
+
+/// 统一工具 parameters 的 schema invariant（§协议）：`type: object` 的 schema
+/// **必须始终带 `properties`**（min：空 `{}`）。
+///
+/// schemars 对无字段结构体（如 `InspectArgs {}`）只生成 `{"type":"object"}`，
+/// **没有 `properties`**。LM Studio 0.4.x 等严格 validator（LMStudio issue
+/// #2203）在 `function.parameters.properties` 缺失时报 HTTP 400，而 DeepSeek/
+/// OpenAI 等宽松 provider 接受该缺省——schema 不合法被掩饰，直到遇到严格
+/// 端才暴露。这里把该 invariant 集中收敛：所有工具（含无参数工具）发出的
+/// parameters 都是合法 JSON Schema。
+fn normalize_tool_parameters(schema: serde_json::Value) -> serde_json::Value {
+    let mut schema = match schema {
+        serde_json::Value::Object(map) => map,
+        other => return other,
+    };
+    if schema.get("type").and_then(|t| t.as_str()) == Some("object") {
+        schema
+            .entry("properties")
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    serde_json::Value::Object(schema)
 }
 
 /// 参数校验失败（§8.2 预检）：serde 错误 + 期望的参数 JSON shape。
@@ -1101,6 +1123,52 @@ mod tests {
             let _ = tool.execution_class();
         }
         assert_eq!(BuiltinTool::from_name("unknown_tool"), None);
+    }
+
+    /// 协议 invariant：所有 builtin 工具的 parameters（`type: object`）必须带
+    /// `properties`（含无参数工具，如 runtime_inspect）。无此字段会触发严格
+    /// validator（LM Studio 0.4.x）的 HTTP 400。
+    #[test]
+    fn every_builtin_tool_parameters_carries_properties() {
+        for tool in implemented_tools() {
+            let def = tool.schema();
+            let params = &def.parameters;
+            assert!(
+                params.is_object(),
+                "{}/{} 参数 schema 必须是 object: {params}",
+                tool.name(),
+                def.name
+            );
+            if params.get("type") == Some(&serde_json::json!("object")) {
+                assert!(
+                    params.get("properties").is_some(),
+                    "{}/{} 的 object schema 必须带 properties: {params}",
+                    tool.name(),
+                    def.name
+                );
+            }
+        }
+    }
+
+    /// normalize_tool_parameters 对无字段 object schema 补 `properties: {}`。
+    #[test]
+    fn normalize_empty_object_schema_keeps_properties_object() {
+        let bare = serde_json::json!({ "type": "object" });
+        let normalized = normalize_tool_parameters(bare);
+        assert_eq!(normalized["type"], "object");
+        assert_eq!(normalized["properties"], serde_json::json!({}));
+
+        // 已有 properties 不覆盖。
+        let with = serde_json::json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } }
+        });
+        let normalized = normalize_tool_parameters(with);
+        assert_eq!(normalized["properties"]["id"]["type"], "string");
+
+        // 非 object 根节点原样透传。
+        let array = serde_json::json!({ "type": "array" });
+        assert_eq!(normalize_tool_parameters(array.clone()), array);
     }
 
     #[test]

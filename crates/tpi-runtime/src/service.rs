@@ -50,6 +50,11 @@ pub struct SessionRuntime<P: Provider> {
     pub conversation: Conversation,
     pub provider: P,
     pub registry: Arc<StdMutex<ToolRegistry>>,
+    /// session 级共享 ManagedProcess registry（任务书 §8：跨 run 存活；
+    /// background bash 注册，`process` 工具读取/取消）。
+    pub processes: Arc<StdMutex<tpi_capabilities::process::managed::ProcessRegistry>>,
+    /// session 级共享 Persistent PTY terminal registry（跨 run 存活）。
+    pub terminals: Arc<StdMutex<tpi_capabilities::terminal::TerminalRegistry>>,
     pub status: SessionStatus,
 }
 
@@ -258,6 +263,12 @@ impl<P: Provider + 'static> RuntimeTask<P> {
             conversation,
             provider,
             registry: self.registry.clone(),
+            processes: Arc::new(StdMutex::new(
+                tpi_capabilities::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: Arc::new(StdMutex::new(
+                tpi_capabilities::terminal::TerminalRegistry::default(),
+            )),
             status: SessionStatus::Idle,
         };
         let ws = self.workspace_name();
@@ -330,6 +341,12 @@ impl<P: Provider + 'static> RuntimeTask<P> {
             conversation,
             provider,
             registry: self.registry.clone(),
+            processes: Arc::new(StdMutex::new(
+                tpi_capabilities::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: Arc::new(StdMutex::new(
+                tpi_capabilities::terminal::TerminalRegistry::default(),
+            )),
             status,
         };
         let ws = self.workspace_name();
@@ -869,6 +886,8 @@ async fn execute_agent_run<P: Provider + 'static>(
     ));
 
     let registry = session.registry.clone();
+    let processes = session.processes.clone();
+    let terminals = session.terminals.clone();
     let result = agent::run(
         &mut session.provider,
         session_log,
@@ -882,6 +901,8 @@ async fn execute_agent_run<P: Provider + 'static>(
             force_compaction: false,
             workspace: None,
             registry,
+            processes,
+            terminals,
         },
     )
     .await

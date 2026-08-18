@@ -113,6 +113,11 @@ pub struct RunInput<'a> {
     /// P4-02/P4 gate：工具注册表由 composition root 注入（builtin + MCP 同一
     /// registry；禁止 global registry）。
     pub registry: std::sync::Arc<std::sync::Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
+    /// Session 级共享 ManagedProcess registry（跨 run 存活，任务书 §8）。
+    pub processes:
+        std::sync::Arc<std::sync::Mutex<tpi_capabilities::process::managed::ProcessRegistry>>,
+    /// Session 级共享 Persistent PTY terminal registry（跨 run 存活）。
+    pub terminals: std::sync::Arc<std::sync::Mutex<tpi_capabilities::terminal::TerminalRegistry>>,
 }
 
 /// 不可恢复的 run 失败（§19.1）。
@@ -311,6 +316,8 @@ pub async fn run<P: Provider, S: tpi_session::store::SessionStore>(
         force_compaction,
         workspace,
         registry,
+        processes,
+        terminals,
     } = input;
     let run_id = session.begin_run();
     // O1（P1-07）：一次 public Agent Run = 一个 TraceId；span 用 SpanId。
@@ -339,6 +346,8 @@ pub async fn run<P: Provider, S: tpi_session::store::SessionStore>(
             force_compaction,
             workspace,
             registry,
+            processes,
+            terminals,
         },
     )
     .instrument(span)
@@ -363,6 +372,8 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
         force_compaction,
         workspace,
         registry,
+        processes,
+        terminals,
     } = input;
     // P1-05：run_inner 只读窄视图 AgentConfig。
     let agent_cfg = config.agent_config();
@@ -545,6 +556,9 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
         active_workspace,
         // P4-02/P4 gate：registry 由 composition root 注入（无全局）。
         registry,
+        // session 级共享注册表由 RunInput 注入（跨 run 存活）。
+        processes,
+        terminals,
     );
 
     let mut turn = 0u32;
@@ -1313,6 +1327,9 @@ fn interrupt_cause(error: &crate::provider::ProviderError) -> tpi_session::Inter
         }
         ProviderError::Http(_) => InterruptCause::Connection,
         ProviderError::Protocol(_) => InterruptCause::Protocol,
+        // §40：确定性非法请求（HTTP 400/422）不是瞬时断联，归 Other 阻断
+        // 自动恢复（恢复无意义——重发必然再 400）。
+        ProviderError::InvalidRequest(_) => InterruptCause::Other,
         ProviderError::RateLimited(_) => InterruptCause::RateLimited,
         ProviderError::Auth(_) => InterruptCause::Auth,
         ProviderError::Cancelled => InterruptCause::Other,
@@ -1924,6 +1941,30 @@ mod tests {
         assert!(is_transient_transport_error(&ProviderError::RateLimited(
             "429".into()
         )));
+    }
+
+    /// §40：确定性非法请求（HTTP 400/422，InvalidRequest）既不是瞬时传输错误，
+    /// 也不可恢复——重发相同 JSON 必然再 400，agent 必须立即终态失败，
+    /// **不得**自动重启/续写（否则出现“第 N/10 次重新生成”刷屏）。
+    #[test]
+    fn invalid_request_is_never_auto_retried_or_recovered() {
+        use crate::provider::ProviderError;
+        let invalid = ProviderError::InvalidRequest(
+            "invalid request (400): function.parameters.properties required".into(),
+        );
+        assert!(
+            !is_transient_transport_error(&invalid),
+            "InvalidRequest 不是瞬时传输错误"
+        );
+        assert!(
+            !recoverable_stream_interrupt(&invalid),
+            "InvalidRequest 不可续写/重生成"
+        );
+        // 且不会被归类为 Connection / 其他可重启类别。
+        assert!(matches!(
+            crate::agent::interrupt_cause(&invalid),
+            tpi_session::InterruptCause::Other
+        ));
     }
 
     /// §bug 修复：退避等待——未取消时返回 true；取消时立即返回 false。

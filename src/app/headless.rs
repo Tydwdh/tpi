@@ -150,6 +150,9 @@ pub async fn run_headless<P: Provider, S: SessionStore>(
             force_compaction: false,
             workspace: None,
             registry,
+            // 单次 run 诊断：不经 session 级共享，每次新建（无跨 run 需求）。
+            processes: Arc::new(Mutex::new(crate::process::managed::ProcessRegistry::new())),
+            terminals: Arc::new(Mutex::new(crate::terminal::TerminalRegistry::default())),
         },
     )
     .await;

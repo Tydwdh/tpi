@@ -66,6 +66,12 @@ fn services_with(
         registry: std::sync::Arc::new(std::sync::Mutex::new(
             tpi::tool::registry::builtin_registry(),
         )),
+        processes: std::sync::Arc::new(std::sync::Mutex::new(
+            tpi::process::managed::ProcessRegistry::new(),
+        )),
+        terminals: std::sync::Arc::new(std::sync::Mutex::new(
+            tpi::terminal::TerminalRegistry::default(),
+        )),
     }
 }
 

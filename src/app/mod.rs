@@ -160,6 +160,10 @@ pub struct AppServices<P: Provider> {
     pub mcp_manager: crate::mcp::manager::McpManager,
     /// P4 gate：composition root 持有的工具注册表（builtin + MCP 同一实例）。
     pub registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
+    /// Session 级共享 ManagedProcess registry（跨 run 存活）。
+    pub processes: Arc<std::sync::Mutex<crate::process::managed::ProcessRegistry>>,
+    /// Session 级共享 Persistent PTY terminal registry（跨 run 存活）。
+    pub terminals: Arc<std::sync::Mutex<crate::terminal::TerminalRegistry>>,
 }
 
 /// 为子代理生成当前所选模型的完整运行配置。
@@ -245,6 +249,13 @@ impl AppServices<OpenAiCompatClient> {
         let registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>> = Arc::new(
             std::sync::Mutex::new(crate::tool::registry::builtin_registry()),
         );
+        // session 级共享托管进程 / PTY 注册表（跨 run 存活，AppServices 持有）。
+        let processes: Arc<std::sync::Mutex<crate::process::managed::ProcessRegistry>> = Arc::new(
+            std::sync::Mutex::new(crate::process::managed::ProcessRegistry::new()),
+        );
+        let terminals: Arc<std::sync::Mutex<crate::terminal::TerminalRegistry>> = Arc::new(
+            std::sync::Mutex::new(crate::terminal::TerminalRegistry::default()),
+        );
         let api_key = crate::config::read_api_key(&config)?;
         let provider = OpenAiCompatClient::new(
             config.model.base_url.clone(),
@@ -283,6 +294,8 @@ impl AppServices<OpenAiCompatClient> {
             current_cancel,
             mcp_manager: crate::mcp::manager::McpManager::with_registry(registry.clone()),
             registry,
+            processes,
+            terminals,
         })
     }
 }
@@ -313,6 +326,8 @@ where
         current_cancel,
         mut mcp_manager,
         registry,
+        processes,
+        terminals,
     } = services;
 
     if non_interactive {
@@ -367,6 +382,8 @@ where
         current_cancel.clone(),
         &mut mcp_manager,
         registry,
+        processes,
+        terminals,
     )
     .await?;
     Ok(None)
@@ -603,6 +620,13 @@ pub async fn run_prompt_once<P: Provider>(
             force_compaction: false,
             workspace: None,
             registry,
+            // `-p` 单次 run：不经 session 级共享，每次新建（无跨 run 需求）。
+            processes: Arc::new(std::sync::Mutex::new(
+                crate::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: Arc::new(std::sync::Mutex::new(
+                crate::terminal::TerminalRegistry::default(),
+            )),
         },
     )
     .await;
@@ -642,6 +666,8 @@ async fn interactive_loop<P: Provider, R>(
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     mcp_manager: &mut crate::mcp::manager::McpManager,
     registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
+    processes: Arc<std::sync::Mutex<crate::process::managed::ProcessRegistry>>,
+    terminals: Arc<std::sync::Mutex<crate::terminal::TerminalRegistry>>,
 ) -> Result<(), String>
 where
     R: FnMut(&crate::config::ModelConfig) -> Result<P, String> + Send,
@@ -1349,6 +1375,8 @@ where
                         key_rx: &mut key_rx,
                         current_cancel: current_cancel.clone(),
                         registry: registry.clone(),
+                        processes: processes.clone(),
+                        terminals: terminals.clone(),
                     },
                 )
                 .await
@@ -1482,6 +1510,8 @@ where
                         key_rx: &mut key_rx,
                         current_cancel: current_cancel.clone(),
                         registry: registry.clone(),
+                        processes: processes.clone(),
+                        terminals: terminals.clone(),
                     },
                 )
                 .await
@@ -1601,6 +1631,8 @@ where
                         key_rx: &mut key_rx,
                         current_cancel: current_cancel.clone(),
                         registry: registry.clone(),
+                        processes: processes.clone(),
+                        terminals: terminals.clone(),
                     },
                 )
                 .await
@@ -2352,6 +2384,9 @@ struct InteractiveIo<'a> {
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     /// P4 gate：composition root 注入的工具注册表（agent run 使用）。
     registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
+    /// Session 级共享托管进程 / PTY 注册表（跨 run 存活）。
+    processes: Arc<std::sync::Mutex<crate::process::managed::ProcessRegistry>>,
+    terminals: Arc<std::sync::Mutex<crate::terminal::TerminalRegistry>>,
 }
 
 async fn run_interactive<P: Provider>(
@@ -2375,6 +2410,8 @@ async fn run_interactive<P: Provider>(
         key_rx,
         current_cancel,
         registry,
+        processes,
+        terminals,
     } = io;
     let cancel = CancellationToken::new();
     *crate::util::lock_mutex(&current_cancel, "current_cancel") = Some(cancel.clone());
@@ -2403,6 +2440,8 @@ async fn run_interactive<P: Provider>(
             force_compaction: force,
             workspace: None,
             registry,
+            processes,
+            terminals,
         },
     );
     tokio::pin!(run_future);
