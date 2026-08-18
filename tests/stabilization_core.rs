@@ -142,6 +142,12 @@ async fn p0_2_empty_text_tool_call_replays_legal_protocol() {
             terminals: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::terminal::TerminalRegistry::default(),
             )),
+
+            agents: std::sync::Arc::new(std::sync::Mutex::new(
+
+                tpi_agent::agent::manager::AgentManager::new(),
+
+            )),
         },
     )
     .await
@@ -215,6 +221,12 @@ async fn p0_3_runtime_projection_matches_resume_projection() {
             )),
             terminals: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::terminal::TerminalRegistry::default(),
+            )),
+
+            agents: std::sync::Arc::new(std::sync::Mutex::new(
+
+                tpi_agent::agent::manager::AgentManager::new(),
+
             )),
         },
     )
@@ -295,6 +307,12 @@ impl ReplayHarness {
                 )),
                 terminals: std::sync::Arc::new(std::sync::Mutex::new(
                     tpi::terminal::TerminalRegistry::default(),
+                )),
+
+                agents: std::sync::Arc::new(std::sync::Mutex::new(
+
+                    tpi_agent::agent::manager::AgentManager::new(),
+
                 )),
             },
         )
@@ -524,6 +542,12 @@ async fn replay_cancelled_run_matches_runtime() {
             )),
             terminals: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::terminal::TerminalRegistry::default(),
+            )),
+
+            agents: std::sync::Arc::new(std::sync::Mutex::new(
+
+                tpi_agent::agent::manager::AgentManager::new(),
+
             )),
         },
     )

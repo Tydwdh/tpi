@@ -94,6 +94,12 @@ async fn run_with(
             terminals: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::terminal::TerminalRegistry::default(),
             )),
+
+            agents: std::sync::Arc::new(std::sync::Mutex::new(
+
+                tpi_agent::agent::manager::AgentManager::new(),
+
+            )),
         },
     )
     .await
@@ -444,6 +450,12 @@ async fn cancellation_during_parallel_bash_cancels_all() {
                 )),
                 terminals: std::sync::Arc::new(std::sync::Mutex::new(
                     tpi::terminal::TerminalRegistry::default(),
+                )),
+
+                agents: std::sync::Arc::new(std::sync::Mutex::new(
+
+                    tpi_agent::agent::manager::AgentManager::new(),
+
                 )),
             },
         )

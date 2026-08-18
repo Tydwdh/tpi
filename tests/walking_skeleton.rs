@@ -122,6 +122,12 @@ async fn fake_provider_drives_full_read_edit_verify_loop() {
             terminals: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::terminal::TerminalRegistry::default(),
             )),
+
+            agents: std::sync::Arc::new(std::sync::Mutex::new(
+
+                tpi_agent::agent::manager::AgentManager::new(),
+
+            )),
         },
     )
     .await

@@ -779,6 +779,12 @@ async fn invalid_tool_args_produce_observation_without_breaking_session() {
             terminals: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::terminal::TerminalRegistry::default(),
             )),
+
+            agents: std::sync::Arc::new(std::sync::Mutex::new(
+
+                tpi_agent::agent::manager::AgentManager::new(),
+
+            )),
         },
     )
     .await

@@ -246,6 +246,12 @@ async fn fake_store_runs_agent_flow() {
             terminals: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::terminal::TerminalRegistry::default(),
             )),
+
+            agents: std::sync::Arc::new(std::sync::Mutex::new(
+
+                tpi_agent::agent::manager::AgentManager::new(),
+
+            )),
         },
     )
     .await

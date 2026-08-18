@@ -78,6 +78,7 @@ fn services() -> AppServices<EchoProvider> {
         registry: Arc::new(Mutex::new(tpi::tool::registry::builtin_registry())),
         processes: Arc::new(Mutex::new(tpi::process::managed::ProcessRegistry::new())),
         terminals: Arc::new(Mutex::new(tpi::terminal::TerminalRegistry::default())),
+        agents: Arc::new(Mutex::new(tpi_agent::agent::manager::AgentManager::new())),
     }
 }
 

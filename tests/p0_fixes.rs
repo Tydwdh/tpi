@@ -159,6 +159,12 @@ async fn p0_2_compaction_survives_delta_flood() {
                 terminals: std::sync::Arc::new(std::sync::Mutex::new(
                     tpi::terminal::TerminalRegistry::default(),
                 )),
+
+                agents: std::sync::Arc::new(std::sync::Mutex::new(
+
+                    tpi_agent::agent::manager::AgentManager::new(),
+
+                )),
             },
         ),
     )
