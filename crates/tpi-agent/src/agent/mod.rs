@@ -1784,7 +1784,7 @@ mod tests {
         };
         let config = unit_config();
         let messages = vec![ChatMessage::User("hello".into())];
-        let ctx = build_context(&config, &messages, None, Some(&plan), None, None);
+        let ctx = build_context(&config, &messages, None, Some(&plan), None, None, None);
         // 首条 = system prompt；中间 = 原 messages；尾部 = plan 快照（system 角色）。
         assert!(
             matches!(&ctx[0], ChatMessage::System(_)),
@@ -1819,7 +1819,7 @@ mod tests {
         };
         let config = unit_config();
         let messages = vec![ChatMessage::User("hi".into())];
-        let ctx = build_context(&config, &messages, None, Some(&plan), None, None);
+        let ctx = build_context(&config, &messages, None, Some(&plan), None, None, None);
         assert_eq!(ctx.len(), 2, "全部完成后的计划不再注入尾部");
     }
 
@@ -1828,7 +1828,7 @@ mod tests {
     fn build_context_without_plan_injects_nothing() {
         let config = unit_config();
         let messages = vec![ChatMessage::User("hi".into())];
-        let ctx = build_context(&config, &messages, None, None, None, None);
+        let ctx = build_context(&config, &messages, None, None, None, None, None);
         assert_eq!(ctx.len(), 2, "无 plan 时只有 system + 原消息");
         assert!(matches!(&ctx[1], ChatMessage::User(_)));
     }
@@ -1840,7 +1840,7 @@ mod tests {
         let config = unit_config();
         let messages = vec![ChatMessage::User("hi".into())];
         let snapshot = "p17 running   python server.py  42.8s\np18 exited 0  wget model.bin";
-        let ctx = build_context(&config, &messages, None, None, None, Some(snapshot));
+        let ctx = build_context(&config, &messages, None, None, None, Some(snapshot), None);
         assert_eq!(ctx.len(), 3, "system + 原消息 + process snapshot");
         let tail = match &ctx[2] {
             ChatMessage::System(text) => text.clone(),
@@ -1860,7 +1860,7 @@ mod tests {
     fn build_context_skips_process_snapshot_when_none() {
         let config = unit_config();
         let messages = vec![ChatMessage::User("hi".into())];
-        let ctx = build_context(&config, &messages, None, None, None, None);
+        let ctx = build_context(&config, &messages, None, None, None, None, None);
         assert_eq!(ctx.len(), 2, "无进程快照时不注入");
     }
 
