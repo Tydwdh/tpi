@@ -26,7 +26,7 @@ pub use projector::{ConversationProjector, plan_from_events};
 pub use protocol::{
     AssistantMessage, CompactSummary, CompletionReason, Envelope, EventBody, EventRange,
     InterruptCause, MAX_SESSION_EVENT_BYTES, ModelRef, RecoveryMetadata, RunLimits, SCHEMA_VERSION,
-    SessionEvent, Usage,
+    SessionEvent, SubagentFinishedReason, Usage,
 };
 pub use store::read_envelopes;
 pub(crate) use store::{SessionProtocolState, open_and_lock_session};

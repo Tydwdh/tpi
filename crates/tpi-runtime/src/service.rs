@@ -55,6 +55,8 @@ pub struct SessionRuntime<P: Provider> {
     pub processes: Arc<StdMutex<tpi_capabilities::process::managed::ProcessRegistry>>,
     /// session 级共享 Persistent PTY terminal registry（跨 run 存活）。
     pub terminals: Arc<StdMutex<tpi_capabilities::terminal::TerminalRegistry>>,
+    /// ADR-007：session 级共享 AgentManager（跨 run 存活；后台调查注册/查询/取消）。
+    pub agents: Arc<StdMutex<tpi_agent::agent::manager::AgentManager>>,
     pub status: SessionStatus,
 }
 
@@ -269,6 +271,9 @@ impl<P: Provider + 'static> RuntimeTask<P> {
             terminals: Arc::new(StdMutex::new(
                 tpi_capabilities::terminal::TerminalRegistry::default(),
             )),
+            agents: Arc::new(StdMutex::new(
+                tpi_agent::agent::manager::AgentManager::new(),
+            )),
             status: SessionStatus::Idle,
         };
         let ws = self.workspace_name();
@@ -346,6 +351,9 @@ impl<P: Provider + 'static> RuntimeTask<P> {
             )),
             terminals: Arc::new(StdMutex::new(
                 tpi_capabilities::terminal::TerminalRegistry::default(),
+            )),
+            agents: Arc::new(StdMutex::new(
+                tpi_agent::agent::manager::AgentManager::new(),
             )),
             status,
         };

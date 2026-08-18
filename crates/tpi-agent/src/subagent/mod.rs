@@ -8,6 +8,7 @@
 
 pub mod child;
 pub mod tool;
+pub mod async_tool;
 
 use tpi_core::ids::{SessionId, SpanId, TraceId};
 
