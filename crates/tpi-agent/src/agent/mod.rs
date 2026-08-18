@@ -15,6 +15,8 @@ use tpi_config::config::Config;
 
 pub mod answer;
 pub mod limits;
+/// ADR-007：AgentManager（agent 资源管理器；resource 表 + inbox + 唤醒）。
+pub mod manager;
 /// 调度原语（§12：资源声明 / waves / 无进展检测）物理上属于 tool 领域
 /// （src/tool/scheduler.rs）。此处 re-export 仅兼容既有 `agent::scheduler`
 /// 引用（测试契约）；新代码请直接用 `tpi_capabilities::tool::scheduler`，
