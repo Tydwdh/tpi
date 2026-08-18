@@ -911,6 +911,7 @@ async fn execute_agent_run<P: Provider + 'static>(
             registry,
             processes,
             terminals,
+            agents: session.agents.clone(),
         },
     )
     .await

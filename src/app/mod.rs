@@ -633,6 +633,9 @@ pub async fn run_prompt_once<P: Provider>(
             terminals: Arc::new(std::sync::Mutex::new(
                 crate::terminal::TerminalRegistry::default(),
             )),
+            agents: Arc::new(std::sync::Mutex::new(
+                tpi_agent::agent::manager::AgentManager::new(),
+            )),
         },
     )
     .await;
@@ -2448,6 +2451,9 @@ async fn run_interactive<P: Provider>(
             registry,
             processes,
             terminals,
+            agents: Arc::new(std::sync::Mutex::new(
+                tpi_agent::agent::manager::AgentManager::new(),
+            )),
         },
     );
     tokio::pin!(run_future);

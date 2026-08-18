@@ -120,6 +120,8 @@ pub struct RunInput<'a> {
         std::sync::Arc<std::sync::Mutex<tpi_capabilities::process::managed::ProcessRegistry>>,
     /// Session 级共享 Persistent PTY terminal registry（跨 run 存活）。
     pub terminals: std::sync::Arc<std::sync::Mutex<tpi_capabilities::terminal::TerminalRegistry>>,
+    /// ADR-007：AgentManager（ToolRuntime drain inbox 供 build_context 注入 pending reports）。
+    pub agents: std::sync::Arc<std::sync::Mutex<crate::agent::manager::AgentManager>>,
 }
 
 /// 不可恢复的 run 失败（§19.1）。
@@ -320,6 +322,7 @@ pub async fn run<P: Provider, S: tpi_session::store::SessionStore>(
         registry,
         processes,
         terminals,
+        agents,
     } = input;
     let run_id = session.begin_run();
     let trace_id = tpi_core::ids::TraceId::new_v7();
@@ -342,6 +345,7 @@ pub async fn run<P: Provider, S: tpi_session::store::SessionStore>(
             registry,
             processes,
             terminals,
+            agents,
         },
     )
     .instrument(span)
@@ -368,6 +372,7 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
         registry,
         processes,
         terminals,
+        agents,
     } = input;
     // P1-05：run_inner 只读窄视图 AgentConfig。
     let agent_cfg = config.agent_config();
@@ -553,6 +558,7 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
         // session 级共享注册表由 RunInput 注入（跨 run 存活）。
         processes,
         terminals,
+        agents,
     );
 
     let mut turn = 0u32;
@@ -705,6 +711,7 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                     tool_runtime.plan_snapshot().as_ref(),
                     Some(&ws_snapshot),
                     process_snapshot.as_deref(),
+                    None,
                 ),
                 tools: tool_defs.clone(),
                 max_output_tokens: agent_cfg.model.max_output_tokens,
@@ -1573,6 +1580,7 @@ fn build_context(
     plan: Option<&tpi_core::plan::Plan>,
     workspace: Option<&tpi_capabilities::workspace::ActiveWorkspace>,
     process_snapshot: Option<&str>,
+    pending_reports: Option<&str>,
 ) -> Vec<ChatMessage> {
     // P1-05：build_context 只读窄视图 AgentConfig。
     let agent_cfg = config.agent_config();

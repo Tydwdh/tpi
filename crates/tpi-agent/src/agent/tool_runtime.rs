@@ -35,6 +35,8 @@ pub(super) struct ToolRuntime {
     /// ManagedProcess registry（session 级；background bash + process 工具共享）。
     processes: Arc<Mutex<tpi_capabilities::process::managed::ProcessRegistry>>,
     terminals: Arc<Mutex<tpi_capabilities::terminal::TerminalRegistry>>,
+    /// ADR-007：AgentManager（drain inbox 供 build_context 注入 pending reports）。
+    agents: Arc<std::sync::Mutex<crate::agent::manager::AgentManager>>,
     /// ToolRegistry（builtin + MCP；agent 工具目录，README2 Phase 5）。
     /// Mutex：Phase 3 的 McpManager 运行时注册 MCP 工具。
     registry: Arc<std::sync::Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
@@ -76,6 +78,7 @@ impl ToolRuntime {
         registry: Arc<std::sync::Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
         processes: Arc<std::sync::Mutex<tpi_capabilities::process::managed::ProcessRegistry>>,
         terminals: Arc<std::sync::Mutex<tpi_capabilities::terminal::TerminalRegistry>>,
+        agents: Arc<std::sync::Mutex<crate::agent::manager::AgentManager>>,
     ) -> Self {
         // §W0/R4：workspace 由调用方注入（默认 Local；测试可传 remote）。
         // ctx.shell 与 workspace 内 shell 共享同一 Arc。
@@ -105,8 +108,15 @@ impl ToolRuntime {
             workspace,
             processes,
             terminals,
+            agents,
             registry,
         }
+    }
+
+    /// ADR-007：drain inbox（pending subagent reports），由 run_inner 在 model
+    /// request boundary 调用，结果传给 build_context 注入 system message。
+    pub(super) fn drain_reports(&self) -> Vec<crate::agent::manager::PendingReport> {
+        tpi_core::util::lock_mutex(&self.agents, "agent_manager").drain_inbox()
     }
 
     pub(super) fn plan_snapshot(&self) -> Option<Plan> {

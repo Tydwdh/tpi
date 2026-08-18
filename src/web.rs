@@ -73,6 +73,7 @@ struct ServerState {
     /// Session 级共享托管进程 / PTY 注册表（跨 run 存活）。
     processes: std::sync::Arc<std::sync::Mutex<crate::process::managed::ProcessRegistry>>,
     terminals: std::sync::Arc<std::sync::Mutex<crate::terminal::TerminalRegistry>>,
+    agents: std::sync::Arc<std::sync::Mutex<tpi_agent::agent::manager::AgentManager>>,
 }
 
 /// 启动局域网网页服务（阻塞直到监听失败或 Ctrl-C）。
@@ -125,6 +126,9 @@ pub async fn serve(config: Arc<Config>, port: u16, token: Option<String>) -> Res
         )),
         terminals: std::sync::Arc::new(std::sync::Mutex::new(
             crate::terminal::TerminalRegistry::default(),
+        )),
+        agents: std::sync::Arc::new(std::sync::Mutex::new(
+            tpi_agent::agent::manager::AgentManager::new(),
         )),
     });
 
@@ -607,6 +611,7 @@ async fn run_agent(state: &Arc<ServerState>, content: String) -> RunResult {
                 registry: state.registry.clone(),
                 processes: state.processes.clone(),
                 terminals: state.terminals.clone(),
+                agents: state.agents.clone(),
             },
         )
         .await;

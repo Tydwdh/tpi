@@ -530,6 +530,9 @@ pub async fn run_task(
                 terminals: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::terminal::TerminalRegistry::default(),
                 )),
+                agents: std::sync::Arc::new(std::sync::Mutex::new(
+                    tpi_agent::agent::manager::AgentManager::new(),
+                )),
             },
         );
         tokio::pin!(run_fut);

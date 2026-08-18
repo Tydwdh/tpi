@@ -206,6 +206,9 @@ impl<P: Provider + Send, F: Fn() -> P + Send> SubagentProvider for InProcessChil
                 terminals: Arc::new(Mutex::new(
                     tpi_capabilities::terminal::TerminalRegistry::default(),
                 )),
+                agents: Arc::new(Mutex::new(
+                    crate::agent::manager::AgentManager::new(),
+                )),
             },
         )
         .await;
