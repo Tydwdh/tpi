@@ -701,6 +701,16 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
             let recovering_text = stream_recoveries > 0;
             let mut recovery_content = String::new();
             let ws_snapshot = tool_runtime.workspace_snapshot();
+            let pending_reports_text;
+            {
+                let reports = tool_runtime.drain_reports();
+                pending_reports_text = if reports.is_empty() {
+                    None
+                } else {
+                    Some(reports.iter().map(|r| format!("- {} (agent: {})", r.summary, r.agent_id)).collect::<Vec<_>>().join("
+"))
+                };
+            }
             let process_snapshot = tool_runtime.processes_snapshot();
             let request = ModelRequest {
                 model: agent_cfg.model.name.clone(),
@@ -711,7 +721,7 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                     tool_runtime.plan_snapshot().as_ref(),
                     Some(&ws_snapshot),
                     process_snapshot.as_deref(),
-                    None,
+                    pending_reports_text.as_deref(),
                 ),
                 tools: tool_defs.clone(),
                 max_output_tokens: agent_cfg.model.max_output_tokens,
