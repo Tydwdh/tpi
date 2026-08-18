@@ -322,17 +322,9 @@ pub async fn run<P: Provider, S: tpi_session::store::SessionStore>(
         terminals,
     } = input;
     let run_id = session.begin_run();
-    // O1（P1-07）：一次 public Agent Run = 一个 TraceId；span 用 SpanId。
-    // 只在真实边界注入（这里是 agent 的入口边界），后续 follow-up 新 run
-    // 生成新 TraceId，跨 run 因果用显式 link（O8/P8 子代理时落地）。
     let trace_id = tpi_core::ids::TraceId::new_v7();
     let span_id = tpi_core::ids::SpanId::new_v7();
     let span = tracing::info_span!("agent.run", %run_id, %trace_id, %span_id);
-    // O0（Medium-7）：async 函数体不能用同步 enter guard 跨 await 持有——
-    // thread-local scope 在 future yield 后仍持锁，同线程其他任务会被错误
-    // 归入当前 span，造成并发 run 的 parent/child 关系交叉（tests/
-    // trace_ancestry.rs 复现：enter 深度 = 2）。用 Future::instrument 使
-    // span 随 future 的 poll enter/exit（每次 poll 配对，yield 即释放）。
     run_inner(
         provider,
         session,

@@ -164,6 +164,8 @@ pub struct AppServices<P: Provider> {
     pub processes: Arc<std::sync::Mutex<crate::process::managed::ProcessRegistry>>,
     /// Session 级共享 Persistent PTY terminal registry（跨 run 存活）。
     pub terminals: Arc<std::sync::Mutex<crate::terminal::TerminalRegistry>>,
+    /// ADR-007：AgentManager（非阻塞子代理；进程级单例）。
+    pub agents: Arc<std::sync::Mutex<tpi_agent::agent::manager::AgentManager>>,
 }
 
 /// 为子代理生成当前所选模型的完整运行配置。
@@ -296,6 +298,9 @@ impl AppServices<OpenAiCompatClient> {
             registry,
             processes,
             terminals,
+            agents: Arc::new(std::sync::Mutex::new(
+                tpi_agent::agent::manager::AgentManager::new(),
+            )),
         })
     }
 }
@@ -328,6 +333,7 @@ where
         registry,
         processes,
         terminals,
+        agents: _,
     } = services;
 
     if non_interactive {
