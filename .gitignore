@@ -1,5 +1,8 @@
 /target
 **/*.rs.bk
+node_modules/
+dist/
+**/target/
 *.log
 .DS_Store
 Thumbs.db
