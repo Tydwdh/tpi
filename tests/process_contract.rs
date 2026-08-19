@@ -1,4 +1,4 @@
-//! 命令执行契约测试（对应 §4.2 tests/process_contract.rs）。
+//! 命令执行契约测试（对应 §4.2 `tests/process_contract.rs`）。
 //!
 //! §2.2/§3.2 不变量 5：退出码等判断下一步所需的状态必须进入 `model_payload`，
 //! 不能只存在于 UI/session metadata。
@@ -86,7 +86,7 @@ async fn background_bash_returns_immediately_and_process_keeps_running() {
     let process_id: ProcessId = pid_text.parse().expect("p{{n}} 格式");
 
     // 1 秒后（远小于 5 秒）进程仍在运行，且 registry 记录正确（跨调用存活）。
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     let (state, command) = {
         let reg = ctx.processes.lock().unwrap();
         let process = reg.get(process_id).expect("进程已注册到 registry");
@@ -170,7 +170,7 @@ async fn background_bash_reports_exit_code() {
     );
 }
 
-/// P2：shell `&` 逃逸在 ManagedProcess 语义下不被允许——命令内 `&` 只是
+/// P2：shell `&` 逃逸在 `ManagedProcess` 语义下不被允许——命令内 `&` 只是
 /// shell 语法，Job Object 仍拥有整棵进程树；进程结束（或 cancel）时整树被杀。
 /// 本测试只验证 background=true 下命令正常完成且状态正确。
 #[tokio::test]
@@ -736,11 +736,10 @@ fn python_available() -> bool {
         .arg("-c")
         .arg("print('ok')")
         .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|out| out.status.success())
 }
 
-/// 启动后台命令并解析 process_id。
+/// 启动后台命令并解析 `process_id`。
 async fn start_background(ctx: &tpi::tool::ToolContext, command: &str) -> ProcessId {
     let outcome = bash(
         BashArgs {
@@ -1029,7 +1028,7 @@ async fn foreground_and_background_cancel_both_cancelled() {
 }
 
 /// P8 gate：100 次 spawn/cancel 无泄漏——registry 每次 cancel 后无残留，
-/// 100 次后 active_count 归零（进程/任务不泄漏）。
+/// 100 次后 `active_count` 归零（进程/任务不泄漏）。
 #[tokio::test]
 async fn hundred_spawn_cancel_cycles_leave_no_leak() {
     fixtures::point_host_at_real_tpi();

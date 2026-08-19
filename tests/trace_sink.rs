@@ -78,8 +78,8 @@ fn normal_flush_writes_all_records() {
     assert_eq!(sink.stats().last_seq, Some(10));
 }
 
-/// queue full：小容量下大量 push → 溢出 → gap counter + TraceGap 声明。
-/// （TraceSink 容量是常量；通过不断 push 且不 flush 触发溢出。）
+/// queue full：小容量下大量 push → 溢出 → gap counter + `TraceGap` 声明。
+/// （`TraceSink` 容量是常量；通过不断 push 且不 flush 触发溢出。）
 #[test]
 fn queue_overflow_records_gap() {
     let writer = FaultyWriter::new();

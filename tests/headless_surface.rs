@@ -2,9 +2,9 @@
 //!
 //! - headless 直接订阅 semantic runtime（收集 LiveEvent），无 TUI drain task；
 //! - versioned JSON output（v1）；
-//! - 与 TUI（agent_flow 路径）对同一 fake provider 得到**等价业务终态**
-//!   （assistant_text + reason）；
-//! - 取消/完成有明确事件（run_completed.reason），退出码明确。
+//! - 与 `TUI（agent_flow` 路径）对同一 fake provider 得到**等价业务终态**
+//!   （`assistant_text` + reason）；
+//! - `取消/完成有明确事件（run_completed.reason），退出码明确`。
 
 mod fixtures;
 
@@ -15,10 +15,10 @@ use tpi::ids::RunId;
 use tpi::provider::{FinishReason, Provider, ProviderError, ProviderEvent, ProviderResponse};
 use tpi::session::store::{SessionLog, SessionStore};
 
-/// 与 TUI 测试（agent_flow）同一 fake：单文本 delta + Stop。
+/// 与 TUI `测试（agent_flow）同一` fake：单文本 delta + Stop。
 struct EchoProvider;
 impl Provider for EchoProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "echo"
     }
     async fn stream(
@@ -46,7 +46,7 @@ fn setup() -> (tempfile::TempDir, tpi::config::Config) {
     (dir, config)
 }
 
-/// headless 收集事件 + 终态：与 TUI 等价业务终态（assistant_text/reason）。
+/// headless 收集事件 + 终态：与 TUI `等价业务终态（assistant_text/reason`）。
 #[tokio::test]
 async fn headless_reaches_equivalent_terminal_state() {
     let (dir, config) = setup();

@@ -1,4 +1,4 @@
-//! 可靠编辑协议契约测试（对应 §4.2 tests/edit_contract.rs）。
+//! 可靠编辑协议契约测试（对应 §4.2 `tests/edit_contract.rs`）。
 //!
 //! §2.2：`read` 展示的 revision 是单独稳定字段，展示值必须可原样回传给 `edit`。
 //! §10.1：协议传完整 256 bit digest：`b3:<64-hex>`。
@@ -40,8 +40,8 @@ fn invalid_revision_is_rejected() {
     assert_eq!(parse_revision_token(""), None);
 }
 
-/// §10.7：commit_edit 成功即清理 temp；backup 保留到 ToolCompleted 持久化后
-///（agent 层清理，见 walking_skeleton 的全流程无残留断言）。
+/// §`10.7：commit_edit` 成功即清理 temp；backup 保留到 `ToolCompleted` 持久化后
+///（agent 层清理，见 `walking_skeleton` 的全流程无残留断言）。
 #[test]
 fn edit_commit_cleans_up_temp() {
     use tpi::tool::edit::{Replacement, apply_edit, commit_edit, prepare_commit, revision_of};
@@ -64,7 +64,7 @@ fn edit_commit_cleans_up_temp() {
 
     let leftovers: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|n| n.starts_with(".tpi-") && n.ends_with(".tmp") && n.contains("edit"))
         .collect();
@@ -86,7 +86,7 @@ fn write_new_file_cleans_up_temp() {
     write_new_file(&path, b"fn b() {}\n", &plan).unwrap();
     let leftovers: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|n| n.contains(".tmp"))
         .collect();
@@ -96,8 +96,8 @@ fn write_new_file_cleans_up_temp() {
     );
 }
 
-/// §用户诉求：连续 edit 无需重新 read——第一次 edit 返回的 current_revision
-/// 可直接用于第二次 edit（apply_edit 从磁盘重读 digest 匹配）。
+/// §用户诉求：连续 edit 无需重新 read——第一次 edit 返回的 `current_revision`
+/// 可直接用于第二次 `edit（apply_edit` 从磁盘重读 digest 匹配）。
 #[test]
 fn consecutive_edits_use_current_revision_without_read() {
     use tpi::tool::edit::{Replacement, apply_edit, commit_edit, prepare_commit};

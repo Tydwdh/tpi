@@ -1,7 +1,7 @@
 //! Loopback SSH 测试 server（russh server 端；exec + SFTP）。
 //!
 //! 本机无 sshd / 无真实主机时，用 russh 自带的 server 端在 127.0.0.1 起
-//! 测试 SSH server，client 连上去做集成测试。SFTP 后端用临时目录 + std::fs
+//! 测试 SSH server，client 连上去做集成测试。SFTP 后端用临时目录 + `std::fs`
 //!（测试专用，非产品代码）。
 
 use std::collections::HashMap;
@@ -208,7 +208,7 @@ impl russh_sftp::server::Handler for SftpBackend {
             opts.append(true);
         }
         opts.open(&path).map_err(|_| StatusCode::Failure)?;
-        let handle = format!("h{}", id);
+        let handle = format!("h{id}");
         self.handles.insert(handle.clone(), (path, pflags, 0));
         Ok(Handle { id, handle })
     }
@@ -435,7 +435,7 @@ pub fn win_to_posix(path: &Path) -> String {
     }
 }
 
-/// 启动一个测试 SSH server，返回 (port, tempdir_root, known_hosts 文件路径)。
+/// 启动一个测试 SSH server，返回 (port, `tempdir_root`, `known_hosts` 文件路径)。
 pub async fn start_test_server() -> (u16, tempfile::TempDir, PathBuf) {
     let root = tempfile::tempdir().unwrap();
     let known_hosts = root.path().join("known_hosts");

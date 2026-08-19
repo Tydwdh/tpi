@@ -119,7 +119,7 @@ enum Command {
         #[arg(long)]
         token: Option<String>,
     },
-    /// 多端 Server（web_desktop.md）：Axum HTTP + WebSocket，暴露统一
+    /// 多端 `Server（web_desktop.md）：Axum` HTTP + WebSocket，暴露统一
     /// Application API（tpi-runtime）。Web UI 与 Desktop 共用此服务。
     Server {
         /// 监听地址（默认 127.0.0.1:8765；显式 --listen 0.0.0.0:8765 才暴露局域网）。
@@ -131,7 +131,7 @@ enum Command {
         /// Web 前端静态资源目录（默认 apps/web/dist；不存在则不提供静态服务）。
         #[arg(long)]
         web_dist: Option<PathBuf>,
-        /// 允许的 CORS origin（默认不发送 CORS 头；开发时可用 http://localhost:5173）。
+        /// 允许的 CORS origin（默认不发送 CORS 头；开发时可用 <http://localhost:5173>）。
         #[arg(long)]
         cors_origin: Option<String>,
     },
@@ -204,7 +204,7 @@ fn main() {
     setup_console_utf8();
     // §11.5：单二进制 process-host 模式（隐藏进程，等待控制管道上的 start token）。
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("__process-host") {
+    if args.get(1).map(std::string::String::as_str) == Some("__process-host") {
         std::process::exit(tpi::process::host::run_host());
     }
     let cli = Cli::parse();
@@ -241,7 +241,7 @@ fn with_input_echo<T>(echo: bool, f: impl FnOnce() -> T) -> T {
         let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
         let mut mode: u32 = 0;
         // SAFETY: `mode` points to live writable storage for this call.
-        let ok = unsafe { GetConsoleMode(handle, &mut mode) != 0 };
+        let ok = unsafe { GetConsoleMode(handle, &raw mut mode) != 0 };
         let _guard = ok.then(|| ConsoleModeGuard {
             handle,
             original_mode: mode,
@@ -298,9 +298,10 @@ fn run_eval_cli(
     evals: Option<&Path>,
 ) -> Result<(), String> {
     let workspace_root = current_workspace_root(cwd)?;
-    let evals_root = evals
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| workspace_root.join(tpi::eval::EVALS_DIR).into());
+    let evals_root = evals.map_or_else(
+        || workspace_root.join(tpi::eval::EVALS_DIR).into(),
+        std::path::Path::to_path_buf,
+    );
 
     // 只读模式：列出任务/套件（不初始化日志/配置）。
     if list_suites {
@@ -348,9 +349,10 @@ fn run_eval_cli(
     // 配置与日志（复用用户 provider 配置；评测 session 独立）。
     init_logging()?;
     let config = config::load(&workspace_root, None)?;
-    let results_dir = results
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| tpi::config::tpi_home().join(tpi::eval::RESULTS_DIR));
+    let results_dir = results.map_or_else(
+        || tpi::config::tpi_home().join(tpi::eval::RESULTS_DIR),
+        std::path::Path::to_path_buf,
+    );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -386,7 +388,7 @@ fn run_eval_cli(
 }
 
 /// P2：`tpi prune`——清理 ~/.tpi 下超过 N 天的 session/artifact 文件。
-/// 返回被删除的文件数（dry_run 时只列出）。
+/// `返回被删除的文件数（dry_run` 时只列出）。
 fn prune_old_data(older_than_days: u64, dry_run: bool) -> Result<(), String> {
     let home = tpi::config::tpi_home();
     let cutoff = retention_cutoff(std::time::SystemTime::now(), older_than_days)?;
@@ -460,9 +462,9 @@ fn repair_sessions(
     }
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .map_err(|e| format!("读取会话目录失败: {e}"))?
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().map(|e| e == "jsonl").unwrap_or(false))
+        .filter(|path| path.extension().is_some_and(|e| e == "jsonl"))
         .collect();
     files.sort();
     for path in files {
@@ -502,7 +504,7 @@ fn repair_sessions(
 }
 /// `tpi undo` / `tpi redo`：基于 Mutation Journal 撤销/重做文件变更。
 ///
-/// - 默认操作最近一次编辑（undo_last/redo_last）；`--all` 时整体回滚/重放。
+/// - `默认操作最近一次编辑（undo_last/redo_last`）；`--all` 时整体回滚/重放。
 /// - `--session <id>` 指定会话；默认当前 workspace 最近有 journal 的会话。
 /// - journal 在 `~/.tpi/artifacts/<session>/journal.jsonl`（§B1）。
 fn run_journal_cmd(
@@ -516,32 +518,30 @@ fn run_journal_cmd(
     let workspace_root = current_workspace_root(None)?;
 
     // 选择会话：显式指定，或当前 workspace 最近有 journal 的会话。
-    let session_id = match session {
-        Some(id) => id.to_string(),
-        None => {
-            let sessions = tpi::app::list_sessions(&home.join("sessions"), &workspace_root)
-                .map_err(|e| e.to_string())?;
-            let mut candidate: Option<String> = None;
-            let mut latest: Option<std::time::SystemTime> = None;
-            for (id, modified, _, _) in &sessions {
-                let jpath = tpi::session::journal::journal_path(&artifacts_root, &id.to_string());
-                if jpath.exists() {
-                    match latest {
-                        Some(prev) if prev >= *modified => {}
-                        _ => {
-                            candidate = Some(id.to_string());
-                            latest = Some(*modified);
-                        }
+    let session_id = if let Some(id) = session {
+        id.to_string()
+    } else {
+        let sessions = tpi::app::list_sessions(&home.join("sessions"), &workspace_root)
+            .map_err(|e| e.clone())?;
+        let mut candidate: Option<String> = None;
+        let mut latest: Option<std::time::SystemTime> = None;
+        for (id, modified, _, _) in &sessions {
+            let jpath = tpi::session::journal::journal_path(&artifacts_root, &id.to_string());
+            if jpath.exists() {
+                match latest {
+                    Some(prev) if prev >= *modified => {}
+                    _ => {
+                        candidate = Some(id.to_string());
+                        latest = Some(*modified);
                     }
                 }
             }
-            match candidate {
-                Some(id) => id,
-                None => {
-                    println!("当前 workspace 没有可撤销的会话（无 journal 变更记录）");
-                    return Ok(());
-                }
-            }
+        }
+        if let Some(id) = candidate {
+            id
+        } else {
+            println!("当前 workspace 没有可撤销的会话（无 journal 变更记录）");
+            return Ok(());
         }
     };
 
@@ -551,10 +551,7 @@ fn run_journal_cmd(
     tpi::session::journal::assert_can_mutate(&state, force).map_err(|e| e.to_string())?;
     let mutations = &state.mutations;
     if mutations.is_empty() {
-        println!(
-            "会话 {} 的 journal 为空（没有已记录的文件变更）",
-            session_id
-        );
+        println!("会话 {session_id} 的 journal 为空（没有已记录的文件变更）");
         return Ok(());
     }
     println!(
@@ -577,7 +574,7 @@ fn run_journal_cmd(
         ("redo", false) => tpi::session::journal::redo_last(mutations, ws),
         _ => unreachable!("run_journal_cmd 只接受 undo/redo"),
     }
-    .map_err(|e| format!("{} 失败: {e}", action))?;
+    .map_err(|e| format!("{action} 失败: {e}"))?;
 
     use tpi::session::journal::CasVerdict;
     let applied = verdicts
@@ -593,7 +590,9 @@ fn run_journal_cmd(
         .filter(|(_, v)| *v == CasVerdict::Conflict)
         .map(|(p, _)| p)
         .collect();
-    if !conflicts.is_empty() {
+    if conflicts.is_empty() {
+        println!("{action} 完成：应用 {applied} 个，已处于目标状态 {already} 个");
+    } else {
         println!(
             "{} 冲突：{} 个文件已被外部修改，未写文件（CAS 拒绝）：",
             action,
@@ -603,11 +602,6 @@ fn run_journal_cmd(
             println!("  {p}");
         }
         println!("  已应用 {applied} 个，已处于目标状态 {already} 个");
-    } else {
-        println!(
-            "{} 完成：应用 {applied} 个，已处于目标状态 {already} 个",
-            action
-        );
     }
     Ok(())
 }
@@ -856,7 +850,7 @@ fn current_workspace_root(cwd: Option<&std::path::Path>) -> Result<Utf8PathBuf, 
         .map_err(|path| format!("路径不是 UTF-8: {}", path.display()))
 }
 
-/// `tpi server`：启动多端 Server（web_desktop.md Phase 4）。
+/// `tpi server`：启动多端 `Server（web_desktop.md` Phase 4）。
 ///
 /// 组装 tpi-runtime（真实 provider + builtin registry），然后由 tpi-server
 /// 暴露 HTTP + WebSocket。Ctrl-C 触发优雅关闭。
@@ -907,19 +901,18 @@ async fn run_server(
     let addr: std::net::SocketAddr = listen
         .parse()
         .map_err(|e| format!("监听地址无效 {listen:?}: {e}"))?;
-    let auth = match token {
-        Some(t) => tpi_server::auth::AuthConfig {
+    let auth = if let Some(t) = token {
+        tpi_server::auth::AuthConfig {
             token: Some(t),
             allowed_origin: cors_origin,
-        },
-        None => {
-            // 本地模式：随机 per-launch token（Desktop 场景；打印一次供连接）。
-            let auth = tpi_server::auth::AuthConfig::local_random();
-            if let Some(t) = &auth.token {
-                eprintln!("本地访问 token（Web/Desktop 连接用）: {t}");
-            }
-            auth
         }
+    } else {
+        // 本地模式：随机 per-launch token（Desktop 场景；打印一次供连接）。
+        let auth = tpi_server::auth::AuthConfig::local_random();
+        if let Some(t) = &auth.token {
+            eprintln!("本地访问 token（Web/Desktop 连接用）: {t}");
+        }
+        auth
     };
 
     println!("TPI Server 已启动：http://{listen}");

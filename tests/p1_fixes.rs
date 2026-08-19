@@ -1,7 +1,7 @@
 //! P1 修复回归测试（fix.md 外部审查报告，第二批）。
 //!
 //! - P1-1：取消后 session 已提交的 assistant 内容必须同步进 outcome.messages；
-//! - P1-2：max_tool_calls 超限必须是独立的 MaxToolCalls reason，不是 Error。
+//! - P1-2：max_tool_calls 超限必须是独立的 `MaxToolCalls` reason，不是 Error。
 
 mod fixtures;
 
@@ -22,7 +22,7 @@ use tpi::session::{CompletionReason, SessionEvent, SessionLog, Usage};
 struct CancelAfterDeltaProvider;
 
 impl Provider for CancelAfterDeltaProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "cancel-after-delta"
     }
 
@@ -123,8 +123,8 @@ async fn p1_1_cancel_keeps_history_consistent_with_session() {
     );
 }
 
-/// P1-2：工具调用预算超限必须是独立的 MaxToolCalls reason。
-/// 此前归为 CompletionReason::Error，用户/模型会误以为是协议错误。
+/// P1-2：工具调用预算超限必须是独立的 `MaxToolCalls` reason。
+/// 此前归为 `CompletionReason::Error，用户/模型会误以为是协议错误`。
 #[tokio::test]
 async fn p1_2_max_tool_calls_has_own_reason() {
     let dir = tempfile::tempdir().unwrap();
@@ -202,7 +202,7 @@ async fn p1_2_max_tool_calls_has_own_reason() {
 
 /// ISSUE-001：工具预算在**同一批**中途耗尽时，本批已 prepared（参数合法、
 /// 已计数）但未执行的调用必须合成 Rejected 终态并持久化——否则
-/// assistant.tool_calls 悬空，resume/继续对话重建出的 provider 消息序列非法。
+/// `assistant.tool_calls` 悬空，resume/继续对话重建出的 provider 消息序列非法。
 #[tokio::test]
 async fn issue_001_budget_exceeded_persists_all_unexecuted_calls() {
     let dir = tempfile::tempdir().unwrap();
@@ -388,7 +388,7 @@ async fn p1_4_context_overflow_stops_run_cleanly() {
     );
 }
 
-/// P1-3：watchdog 在 deadline 前触发 on_warn（TUI BudgetWarning 的发送源头）。
+/// P1-3：watchdog 在 deadline 前触发 `on_warn（TUI` `BudgetWarning` 的发送源头）。
 #[tokio::test]
 async fn p1_3_watchdog_fires_warn_before_deadline() {
     let cancel = CancellationToken::new();
@@ -410,7 +410,7 @@ async fn p1_3_watchdog_fires_warn_before_deadline() {
     let _ = handle.await;
 }
 
-/// P1-10：手动 /compact（force_compaction）在第一个完整边界无条件压缩，
+/// P1-10：手动 /`compact（force_compaction）在第一个完整边界无条件压缩`，
 /// 即使投影未超过窗口（此前只有自动触发，/compact 只是说明文字）。
 #[tokio::test]
 async fn p1_10_manual_compaction_runs_at_next_boundary() {
@@ -493,7 +493,7 @@ async fn p1_10_manual_compaction_runs_at_next_boundary() {
 struct InterruptAfterDeltaProvider;
 
 impl Provider for InterruptAfterDeltaProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "interrupt-after-delta"
     }
 
@@ -519,7 +519,7 @@ impl Provider for InterruptAfterDeltaProvider {
     }
 }
 
-/// §4.3：已收到部分内容后断联——run 以 ProviderInterrupted 正常结束，
+/// §4.3：已收到部分内容后断联——run 以 `ProviderInterrupted` 正常结束，
 /// partial content 写入 AssistantAttemptInterrupted（record 事件），
 /// 不丢、不进入对话投影（不是完整 turn）。
 #[tokio::test]
@@ -607,12 +607,12 @@ async fn interrupted_attempt_records_partial_and_keeps_session_consistent() {
     );
 }
 
-/// §4.3：未收到任何语义事件就连接失败——run 以 Err(RunFailure::Provider) 结束，
-/// reason 记为 ProviderUnavailable，且没有任何 AssistantAttemptInterrupted。
+/// §4.3：未收到任何语义事件就连接失败——run 以 `Err(RunFailure::Provider)` 结束，
+/// reason 记为 ProviderUnavailable，且没有任何 `AssistantAttemptInterrupted`。
 struct UnavailableProvider;
 
 impl Provider for UnavailableProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "unavailable-provider"
     }
 
@@ -715,7 +715,7 @@ impl RecoverThenSucceedProvider {
 }
 
 impl Provider for RecoverThenSucceedProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "recover-then-succeed"
     }
 
@@ -861,7 +861,7 @@ struct ProtocolAfterDeltaProvider {
 }
 
 impl Provider for ProtocolAfterDeltaProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "protocol-after-delta"
     }
 
@@ -1021,11 +1021,11 @@ async fn distinct_model_turns_use_distinct_request_ids() {
 }
 
 /// §4.3 第二阶段：每次 attempt 都断联（首次 + 续写）——续写再失败不得无限循环，
-/// 以 ProviderInterrupted 结束（额度用尽）。
+/// 以 `ProviderInterrupted` 结束（额度用尽）。
 struct AlwaysInterruptProvider;
 
 impl Provider for AlwaysInterruptProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "always-interrupt"
     }
 
@@ -1043,7 +1043,7 @@ impl Provider for AlwaysInterruptProvider {
     }
 }
 
-/// §4.3 第二阶段：续写一直断联时不得无限循环——以 ProviderInterrupted 结束。
+/// §4.3 第二阶段：续写一直断联时不得无限循环——以 `ProviderInterrupted` 结束。
 /// §用户诉求：上限提到 10 次续写（共 11 次调用）；session 记录每次中断。
 #[tokio::test]
 async fn recovery_capped_after_max_attempts() {
@@ -1109,7 +1109,7 @@ struct ToolDeltaThenRestartProvider {
 }
 
 impl Provider for ToolDeltaThenRestartProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "tool-delta-then-restart"
     }
 
@@ -1154,7 +1154,7 @@ impl Provider for ToolDeltaThenRestartProvider {
 
 /// §4.3 第三阶段：tool delta 后断联 → 自动 restart 整个 turn。
 /// 验证：run 以 Stop 正常结束；partial tool delta 不进入提交内容；
-/// session 记录 saw_tool_calls=true 的中断事件。
+/// session 记录 `saw_tool_calls=true` 的中断事件。
 #[tokio::test]
 async fn tool_delta_interrupt_restarts_whole_turn() {
     let dir = tempfile::tempdir().unwrap();
@@ -1231,13 +1231,13 @@ async fn tool_delta_interrupt_restarts_whole_turn() {
 }
 
 /// §4.3 第三阶段：tool delta 断联后 restart 再次失败（每次调用都断）——
-/// restart 额度用尽后以 ProviderInterrupted 结束（防无限 restart）。
+/// restart 额度用尽后以 `ProviderInterrupted` 结束（防无限 restart）。
 struct ToolDeltaAlwaysInterruptProvider {
     calls: u32,
 }
 
 impl Provider for ToolDeltaAlwaysInterruptProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "tool-delta-always-interrupt"
     }
 
@@ -1249,9 +1249,7 @@ impl Provider for ToolDeltaAlwaysInterruptProvider {
     ) -> Result<ProviderResponse, ProviderError> {
         self.calls += 1;
         // 首次 + 10 次 restart = 11 次；第 12 次说明 restart 未封顶（防无限循环）。
-        if self.calls > 11 {
-            panic!("restart 必须封顶（防无限循环）");
-        }
+        assert!(self.calls <= 11, "restart 必须封顶（防无限循环）");
         events
             .send(ProviderEvent::ToolCallStarted {
                 index: 0,
@@ -1325,8 +1323,8 @@ async fn tool_delta_restart_is_capped() {
     assert_eq!(interrupted, 11, "每次中断都必须记录: {events:?}");
 }
 
-/// §4.3 `/retry`：空 user_message = retry 语义。
-/// 验证：不追加 UserSubmitted 事件、不追加 User 消息（复用 history）、仍正常完成。
+/// §4.3 `/retry`：空 `user_message` = retry 语义。
+/// 验证：不追加 `UserSubmitted` 事件、不追加 User 消息（复用 history）、仍正常完成。
 #[tokio::test]
 async fn retry_with_empty_user_message_does_not_repeat_submission() {
     let dir = tempfile::tempdir().unwrap();
@@ -1476,7 +1474,7 @@ async fn retry_after_committed_partial_uses_ephemeral_continue_instruction() {
     );
 }
 
-/// UiState：push_retry/take_pending_retry 语义（`/retry` 入队→消费）。
+/// `UiState：push_retry/take_pending_retry` 语义（`/retry` 入队→消费）。
 #[test]
 fn retry_pending_round_trips_through_state() {
     let mut ui = tpi::tui::state::UiState::new(Default::default());
@@ -1491,7 +1489,7 @@ fn retry_pending_round_trips_through_state() {
     assert!(ui.take_pending_retry().is_none(), "取出后清空");
 }
 
-/// §用户诉求：手动 /compact 成功时，UI 收到 CompactionNotice 完成提示
+/// §用户诉求：手动 /compact 成功时，UI 收到 `CompactionNotice` 完成提示
 /// （此前只写日志、界面无感知）。历史足够且摘要显著缩小才走到成功分支。
 #[tokio::test]
 async fn force_compaction_success_notifies_ui() {

@@ -61,20 +61,15 @@ impl std::fmt::Display for ReversibilityIssue {
 }
 
 /// Safety policy for workspace mutations.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum MutationSafetyPolicy {
     /// Default: try to track everything, but never block execution because
     /// of tracking failures. Reversibility status is reported explicitly.
+    #[default]
     BestEffort,
     /// Strict: refuse to execute commands that may produce workspace mutations
     /// if exact undo cannot be guaranteed.
     RequireExactUndo,
-}
-
-impl Default for MutationSafetyPolicy {
-    fn default() -> Self {
-        Self::BestEffort
-    }
 }
 
 /// Controls which paths are tracked for undo.

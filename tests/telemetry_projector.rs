@@ -3,7 +3,7 @@
 //! 覆盖 roadmap 验收：
 //! - 任意合法 prefix：incremental == replay（逐条 project 与 rebuild 等价）；
 //! - 去重：`(session_id,event_seq,projector_version)`——handoff 重复幂等忽略；
-//! - 无声明缺口：seq 跳变 → TelemetryGap 记录；
+//! - 无声明缺口：seq 跳变 → `TelemetryGap` 记录；
 //! - sink drop 不影响 append（projector 是纯状态，不依赖 sink）。
 
 use tpi::ids::SessionId;
@@ -106,7 +106,7 @@ fn duplicate_handoff_is_idempotent() {
     assert!(p.gaps().is_empty());
 }
 
-/// 无声明缺口：seq 跳变（1 → 3）必须记录 TelemetryGap。
+/// 无声明缺口：seq 跳变（1 → 3）必须记录 `TelemetryGap`。
 #[test]
 fn seq_jump_declares_gap() {
     let mut p = SessionTelemetryProjector::new(sid());
@@ -127,7 +127,7 @@ fn seq_jump_declares_gap() {
     assert_eq!(p.len(), 2, "跳变后仍投影两条记录");
 }
 
-/// 去重三元组：record 携带 session_id/event_seq/projector_version。
+/// 去重三元组：record 携带 `session_id/event_seq/projector_version`。
 #[test]
 fn dedup_triple_is_present() {
     let mut p = SessionTelemetryProjector::new(sid());
@@ -142,7 +142,7 @@ fn dedup_triple_is_present() {
     assert_eq!(r.sidecar_seq, None);
 }
 
-/// 计数：ToolRequested → tool_calls=1；Interrupted → interrupted=1。
+/// 计数：ToolRequested → `tool_calls=1；Interrupted` → interrupted=1。
 #[test]
 fn counts_are_metadata_only() {
     let mut p = SessionTelemetryProjector::new(sid());
@@ -169,7 +169,7 @@ fn counts_are_metadata_only() {
     assert_eq!(p.records()[0].counts.tool_calls, 1);
     assert_eq!(p.records()[1].counts.interrupted, 1);
     // 正文不在 record（content 未存）。
-    assert!(p.records()[1].counts.tool_calls == 0);
+    assert_eq!(p.records()[1].counts.tool_calls, 0);
 }
 
 /// sink drop 不影响 append：projector 是纯状态，不依赖任何 sink。

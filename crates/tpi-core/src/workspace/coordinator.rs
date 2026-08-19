@@ -13,7 +13,6 @@
 
 use super::types::TransactionId;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 /// Access mode for a workspace transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,10 +131,10 @@ impl MutationCoordinator {
 
     /// Release access after transaction completes.
     pub fn release(&mut self, tx_id: &TransactionId) {
-        if let Some(info) = self.active.remove(tx_id) {
-            if info.access == WorkspaceAccess::SharedReadOnly {
-                self.reader_count = self.reader_count.saturating_sub(1);
-            }
+        if let Some(info) = self.active.remove(tx_id)
+            && info.access == WorkspaceAccess::SharedReadOnly
+        {
+            self.reader_count = self.reader_count.saturating_sub(1);
         }
     }
 

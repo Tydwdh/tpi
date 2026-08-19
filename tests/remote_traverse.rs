@@ -61,7 +61,7 @@ fn remote_ctx(root_posix: &str) -> tpi::tool::ToolContext {
     }
 }
 
-/// §47：远端 list 输出格式与本地一致（目录带 /、scanned_files、stop_reason）。
+/// §47：远端 list 输出格式与本地一致（目录带 /、`scanned_files、stop_reason`）。
 #[tokio::test]
 async fn remote_list_format_matches_local() {
     let (_root, mut client, root_posix) = setup_connected().await;

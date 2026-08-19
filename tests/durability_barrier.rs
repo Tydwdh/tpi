@@ -1,15 +1,15 @@
 //! P2-04：durability barrier 类型化的 fault injection 测试。
 //!
-//! 覆盖三种 barrier（commit / commit_terminal / commit_pre_effect）在写入
+//! 覆盖三种 barrier（commit / `commit_terminal` / `commit_pre_effect）在写入`
 //! 失败时的行为：
 //! - 错误必须传播（不静默吞掉）；
-//! - 部分写后 seq 不回滚但 pending_sync 状态正确（下次 sync 重试）；
-//! - recovery matrix（tests/recovery_matrix.rs）不退化——本文件聚焦 barrier
+//! - 部分写后 seq 不回滚但 `pending_sync` 状态正确（下次 sync 重试）；
+//! - recovery `matrix（tests/recovery_matrix.rs）不退化——本文件聚焦` barrier
 //!   语义，不重复 crash 场景。
 //!
-//! fault 注入方式：barrier 方法内部调用 append_event（写文件）+ sync_data
+//! fault 注入方式：barrier 方法内部调用 `append_event（写文件`）+ `sync_data`
 //! （落盘）。无法直接注入文件系统错误，因此用一个**可故障的 in-memory
-//! SessionStore**（append 成功但 sync 可失败）验证错误传播与意图方法等价
+//! `SessionStore`**（append 成功但 sync 可失败）验证错误传播与意图方法等价
 //! 于 append+sync。
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -136,7 +136,7 @@ fn commit_succeeds_after_fault_cleared() {
     assert_eq!(store.events().len(), 2);
 }
 
-/// commit_terminal 与 commit 等价（append+sync）：sync 失败传播。
+/// `commit_terminal` 与 commit 等价（append+sync）：sync 失败传播。
 #[test]
 fn commit_terminal_propagates_sync_failure() {
     let mut store = FaultyStore::new(true);
@@ -153,7 +153,7 @@ fn commit_terminal_propagates_sync_failure() {
     ));
 }
 
-/// commit_pre_effect（write-ahead）sync 失败传播；成功时 ToolStarted 已落盘。
+/// commit_pre_effect（write-ahead）sync 失败传播；成功时 `ToolStarted` 已落盘。
 #[test]
 fn commit_pre_effect_propagates_and_commits() {
     let mut store = FaultyStore::new(true);
@@ -172,7 +172,7 @@ fn commit_pre_effect_propagates_and_commits() {
     ));
 }
 
-/// 意图方法等价性：commit(event) == append_event + sync_data（无 fault 时）。
+/// 意图方法等价性：commit(event) == `append_event` + `sync_data（无` fault 时）。
 #[test]
 fn typed_barriers_equal_append_plus_sync() {
     let mut typed = FaultyStore::new(false);

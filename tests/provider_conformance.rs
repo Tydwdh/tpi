@@ -1,7 +1,7 @@
-//! P5-02：provider conformance suite——fake 与 OpenAI recorded adapter 共用。
+//! P5-02：provider conformance suite——fake 与 `OpenAI` recorded adapter 共用。
 //!
-//! 同一组断言（protocol / cancel / usage）对 fake 运行；recorded OpenAI fixtures
-//! 的等价断言在 provider_contract.rs（recorded_* 系列）运行——本文件显式
+//! 同一组断言（protocol / cancel / usage）对 fake 运行；recorded `OpenAI` fixtures
+//! 的等价断言在 `provider_contract.rs（recorded`_* 系列）运行——本文件显式
 //! conformance 结构保证两者对齐（P5-02 验收：接口不是单实现自画像）。
 
 mod fixtures;

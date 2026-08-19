@@ -2,7 +2,7 @@
 //!
 //! fake provider 驱动 TPI 读取 fixture、修改一处代码、运行一次失败检查、
 //! 再次修正并通过；验证 finish=stop 只有一次请求、session 持久化完整、
-//! 模型可见真实 exit_code。
+//! 模型可见真实 `exit_code`。
 
 mod fixtures;
 
@@ -166,7 +166,7 @@ async fn fake_provider_drives_full_read_edit_verify_loop() {
         .iter()
         .filter_map(|event| match event {
             SessionEvent::ToolStarted { call_id, recovery }
-                if recovery.as_ref().map(|r| r.tool == "edit").unwrap_or(false) =>
+                if recovery.as_ref().is_some_and(|r| r.tool == "edit") =>
             {
                 Some((call_id, recovery.clone().unwrap()))
             }
@@ -180,7 +180,7 @@ async fn fake_provider_drives_full_read_edit_verify_loop() {
     // §10.7 第 6 步：ToolCompleted 持久化后 backup 已清理，工作区无 .tpi-*.tmp 残留。
     let leftovers: Vec<String> = std::fs::read_dir(&workspace)
         .unwrap()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|n| n.starts_with(".tpi-") && n.ends_with(".tmp"))
         .collect();

@@ -76,7 +76,7 @@ impl FakeResponse {
 pub fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCall {
     ToolCall {
         call_id: ToolCallId::new_v7(),
-        provider_id: format!("call-{}", name),
+        provider_id: format!("call-{name}"),
         name: name.to_string(),
         arguments: arguments.to_string(),
     }
@@ -135,13 +135,13 @@ impl FakeProvider {
         }
     }
 
-    pub fn model_name(&self) -> &str {
+    pub fn model_name(&self) -> &'static str {
         "fake-model"
     }
 }
 
 impl Provider for FakeProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "fake-model"
     }
 

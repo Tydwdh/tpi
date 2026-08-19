@@ -1,12 +1,12 @@
 //! P0-03：session golden corpus 回归测试。
 //!
-//! corpus（tests/fixtures/session_corpus/）来自真实 session 的脱敏副本：
-//! - 001_tool_loop / 002_stream_interrupted / 003_awaiting_input /
-//!   004_compaction_segment：真实事件序列，`read_events` 必须完整 replay；
-//! - 005_corrupt_tail：尾部未完成行 → reader 必须截断并成功（TailRepair::Truncate）；
-//! - 006_corrupt_middle：中间坏行 → reader 必须返回 InvalidData。
+//! `corpus（tests/fixtures/session_corpus/）来自真实` session 的脱敏副本：
+//! - `001_tool_loop` / `002_stream_interrupted` / `003_awaiting_input` /
+//!   `004_compaction_segment：真实事件序列`，`read_events` 必须完整 replay；
+//! - `005_corrupt_tail：尾部未完成行` → reader `必须截断并成功（TailRepair::Truncate`）；
+//! - `006_corrupt_middle：中间坏行` → reader 必须返回 `InvalidData`。
 //!
-//! 脱敏规则见 scripts/scrub_session.py；来源/行数/hash 见 manifest.json。
+//! 脱敏规则见 `scripts/scrub_session.py；来源/行数/hash` 见 manifest.json。
 //! 这些 fixture 是 P2 拆 session 存储 / P10 迁移的回归网：任何改动必须
 //! 让本文件保持绿色（并重新生成 manifest 的 hash 校验）。
 

@@ -1,6 +1,6 @@
 //! M6 验收契约（§21 M6、§17）。
 //!
-//! - `web_search` 使用免费 DuckDuckGo 端点（无需 API key，零配置；§17）；
+//! - `web_search` 使用免费 `DuckDuckGo` 端点（无需 API key，零配置；§17）；
 //!   解析器契约在此 + src/tool/web.rs 单测覆盖（广告过滤、uddg 链接还原）；
 //! - 不打开浏览器、不调用隐藏模型（§17）；
 //! - `web_fetch` 有界（redirect/body/timeout）且 HTML 转换（§17）；
@@ -15,7 +15,7 @@ use tpi::tool::web::{
     WebFetchArgs, WebSearchArgs, parse_ddg_results, web_fetch, web_fetch_allowing_private_for_test,
 };
 
-/// §17：web_search 免费方案（无 key）——解析器对真实端点 fixture 的契约。
+/// §`17：web_search` 免费方案（无 key）——解析器对真实端点 fixture 的契约。
 #[test]
 fn web_search_is_keyless_ddg_parser() {
     // fixture 来自真实 html.duckduckgo.com 响应（1 广告 + 4 完整结果 + 1 截断残片）。
@@ -30,7 +30,7 @@ fn web_search_is_keyless_ddg_parser() {
     assert!(hits.iter().all(|h| h.url.starts_with("http")));
 }
 
-/// §17：web_search 对人机验证页返回明确错误而非乱码（解析层判定）。
+/// §`17：web_search` 对人机验证页返回明确错误而非乱码（解析层判定）。
 #[test]
 fn web_search_challenge_page_is_detected() {
     let challenge = "<div class=\"anomaly-modal\">Unfortunately, bots use DuckDuckGo too.</div>";
@@ -69,7 +69,7 @@ async fn live_ddg_search_returns_results() {
     );
 }
 
-/// web_fetch 对私有地址默认执行 SSRF 拦截。
+/// `web_fetch` 对私有地址默认执行 SSRF 拦截。
 #[tokio::test]
 async fn web_fetch_failure_is_explicit() {
     let dir = tempfile::tempdir().unwrap();
@@ -87,7 +87,7 @@ async fn web_fetch_failure_is_explicit() {
     assert!(outcome.model_text().contains("ssrf_blocked"));
 }
 
-/// web_fetch 对 HTML 做转换，正文有界。
+/// `web_fetch` 对 HTML 做转换，正文有界。
 #[tokio::test]
 async fn web_fetch_converts_html_and_bounds_body() {
     let dir = tempfile::tempdir().unwrap();
@@ -152,7 +152,7 @@ async fn web_fetch_converts_html_and_bounds_body() {
     );
 }
 
-/// §17：web_search/web_fetch 是 Pure（不打开浏览器、不调用隐藏模型——
+/// §`17：web_search/web_fetch` 是 Pure（不打开浏览器、不调用隐藏模型——
 /// 由实现保证：搜索只调 Brave Web Search endpoint，fetch 只做转换）。
 #[test]
 fn web_tools_are_pure_access() {

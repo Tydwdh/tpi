@@ -1,6 +1,6 @@
 //! Phase 5 端到端测试（README2 §15/§32）：MCP 工具在 **Agent Loop** 里
 //! 被模型调用并执行——Discovery → Tool Call → Result → LLM 闭环；
-//! 以及 ToolSelector 按上下文选择 MCP 工具（不一次塞给 LLM）。
+//! 以及 `ToolSelector` 按上下文选择 MCP 工具（不一次塞给 LLM）。
 
 mod fixtures;
 
@@ -31,7 +31,7 @@ fn test_server_config(name: &str) -> tpi::mcp::config::McpServerConfig {
 /// §15/§32：MCP 工具在 agent loop 被调用并执行成功。
 ///
 /// 流程：注册测试 MCP server → agent 请求（FakeProvider 调用
-/// mcp::e2e-server::echo）→ adapter 执行 → 结果返回模型 → 完成。
+/// `mcp::e2e-server::echo`）→ adapter 执行 → 结果返回模型 → 完成。
 #[tokio::test]
 async fn mcp_tool_executes_inside_agent_loop() {
     // 注册 MCP server 到注入 registry（agent 的 ToolRuntime 读取同一目录）。

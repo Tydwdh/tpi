@@ -1,5 +1,5 @@
-//! R1 Remote bash 集成测试（§35-§36：bash 按 ActiveWorkspace 分发到远端，
-//! 远端 cwd/env 持久，与 Local 同一 ShellSessionState 语义）。
+//! R1 Remote bash 集成测试（§35-§36：bash 按 `ActiveWorkspace` 分发到远端，
+//! 远端 cwd/env 持久，与 Local 同一 `ShellSessionState` 语义）。
 //!
 //! 测试 server 的 exec 在测试进程内 `bash -c` 执行，cwd 前缀指向 tempdir，
 //! 因此"远端文件系统"即 tempdir。
@@ -16,7 +16,7 @@ use tpi::remote::ssh::{HostKeyDecision, RemoteHost};
 use tpi::tool::command::{BashArgs, bash};
 use tpi::workspace::ActiveWorkspace;
 
-/// 启动 server + 确认 host key + 构造 Remote ToolContext。
+/// 启动 server + 确认 host key + 构造 Remote `ToolContext`。
 async fn setup_remote_ctx() -> (tempfile::TempDir, tpi::tool::ToolContext) {
     fixtures::point_host_at_real_tpi();
     let (port, root, known_hosts) = fixtures::remote_server::start_test_server().await;
@@ -100,16 +100,19 @@ async fn remote_cd_persists_across_calls() {
         .to_string_lossy()
         .into_owned();
 
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "mkdir -p scripts", cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
-    assert!(run_bash(&ctx, "cd scripts", cancel.clone()).await.status == ToolStatus::Succeeded);
+    assert_eq!(
+        run_bash(&ctx, "cd scripts", cancel.clone()).await.status,
+        ToolStatus::Succeeded
+    );
 
     let r = run_bash(&ctx, "pwd", cancel.clone()).await;
-    assert!(r.status == ToolStatus::Succeeded);
+    assert_eq!(r.status, ToolStatus::Succeeded);
     let out = stdout_part(&r.model_payload.output);
     assert!(
         out.contains(&base) && (out.contains("/scripts") || out.contains("\\scripts")),
@@ -131,16 +134,19 @@ async fn remote_export_and_unset_persist() {
     let (_root, ctx) = setup_remote_ctx().await;
     let cancel = CancellationToken::new();
 
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "export TPI_FOO=abc", cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
     let r = run_bash(&ctx, "echo \"$TPI_FOO\"", cancel.clone()).await;
     assert!(stdout_part(&r.model_payload.output).contains("abc"));
 
-    assert!(run_bash(&ctx, "unset TPI_FOO", cancel.clone()).await.status == ToolStatus::Succeeded);
+    assert_eq!(
+        run_bash(&ctx, "unset TPI_FOO", cancel.clone()).await.status,
+        ToolStatus::Succeeded
+    );
     let r = run_bash(&ctx, "echo \"${TPI_FOO-unset}\"", cancel.clone()).await;
     assert!(
         stdout_part(&r.model_payload.output).contains("unset"),
@@ -156,7 +162,7 @@ async fn remote_capture_does_not_leak() {
     let cancel = CancellationToken::new();
 
     let r = run_bash(&ctx, "echo hello", cancel.clone()).await;
-    assert!(r.status == ToolStatus::Succeeded);
+    assert_eq!(r.status, ToolStatus::Succeeded);
     let output = &r.model_payload.output;
     assert!(
         !output.contains("__TPI_CAPTURE_"),
@@ -171,7 +177,10 @@ async fn remote_failed_command_still_commits_cwd() {
     let (_root, ctx) = setup_remote_ctx().await;
     let cancel = CancellationToken::new();
 
-    assert!(run_bash(&ctx, "mkdir -p a/b", cancel.clone()).await.status == ToolStatus::Succeeded);
+    assert_eq!(
+        run_bash(&ctx, "mkdir -p a/b", cancel.clone()).await.status,
+        ToolStatus::Succeeded
+    );
     let r = run_bash(&ctx, "cd a/b; false", cancel.clone()).await;
     assert_eq!(r.status, ToolStatus::Failed);
     let state = ctx.shell.lock().unwrap();
@@ -188,8 +197,14 @@ async fn remote_explicit_cwd_is_one_shot() {
     let (root, ctx) = setup_remote_ctx().await;
     let cancel = CancellationToken::new();
 
-    assert!(run_bash(&ctx, "mkdir -p a", cancel.clone()).await.status == ToolStatus::Succeeded);
-    assert!(run_bash(&ctx, "cd a", cancel.clone()).await.status == ToolStatus::Succeeded);
+    assert_eq!(
+        run_bash(&ctx, "mkdir -p a", cancel.clone()).await.status,
+        ToolStatus::Succeeded
+    );
+    assert_eq!(
+        run_bash(&ctx, "cd a", cancel.clone()).await.status,
+        ToolStatus::Succeeded
+    );
 
     // 显式 cwd = root：本次在 root 执行（POSIX 形式，与远端一致）。
     let mut ctx2 = ctx.clone();
@@ -220,7 +235,7 @@ async fn remote_explicit_cwd_is_one_shot() {
     // session cwd 仍是 a。
     let state = ctx.shell.lock().unwrap();
     assert!(
-        state.cwd.as_str().ends_with("a"),
+        state.cwd.as_str().ends_with('a'),
         "session cwd 不变：{}",
         state.cwd
     );

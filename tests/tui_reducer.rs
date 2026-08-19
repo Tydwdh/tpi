@@ -1,4 +1,4 @@
-//! T3：UiState + Reducer 单向流测试（TPI_TUI_V2_TASK §26-27、§56）。
+//! T3：UiState + Reducer `单向流测试（TPI_TUI_V2_TASK` §26-27、§56）。
 //!
 //! 断言：状态可重放（相同事件序列 → 相同状态）、reducer 不产生副作用
 //! （跨边界动作只以 effect 返回）、键盘路由优先级（§11）。
@@ -1069,7 +1069,7 @@ fn esc_closes_theme_browser_in_one_press() {
     );
 }
 
-/// /theme 菜单在 ↑/↓ 导航后必须保持（同 /sessions 回归：refresh_menus
+/// /theme 菜单在 ↑/↓ 导航后必须保持（同 /sessions `回归：refresh_menus`
 /// 不得把 Modal+菜单组合清掉）。
 #[test]
 fn theme_menu_survives_up_down_navigation() {
@@ -1099,7 +1099,7 @@ fn theme_menu_survives_up_down_navigation() {
 }
 
 /// §用户诉求（回归）：/sessions 菜单在 ↑/↓ 导航后必须保持——reducer 的
-/// MoveUp/MoveDown 会调用 refresh_menus，此前会把 Session 菜单清成 None，
+/// MoveUp/MoveDown 会调用 `refresh_menus，此前会把` Session 菜单清成 None，
 /// 导致“在会话列表上下移动后列表突然消失”。
 #[test]
 fn sessions_menu_survives_up_down_navigation() {
@@ -1153,7 +1153,7 @@ fn sessions_menu_survives_up_down_navigation() {
     );
 }
 
-/// §用户诉求：鼠标拖动选择后 Ctrl+C 触发 CopySelection effect（复制到剪贴板）。
+/// §用户诉求：鼠标拖动选择后 Ctrl+C 触发 `CopySelection` effect（复制到剪贴板）。
 #[test]
 fn ctrl_c_with_selection_triggers_copy_effect() {
     use tpi::tui::interaction::TextPosition;
@@ -1227,7 +1227,7 @@ fn selection_events_update_view_selection() {
     assert!(s.view.selection.is_some(), "SelectionEnd 保留选区");
 }
 
-/// §成熟化：链接点击 → Link Overlay 打开；Enter 确认 → OpenUrl effect 并关闭。
+/// §成熟化：链接点击 → Link Overlay 打开；Enter 确认 → `OpenUrl` effect 并关闭。
 #[test]
 fn link_click_opens_overlay_and_enter_opens_url() {
     let mut s = state();
@@ -1246,7 +1246,7 @@ fn link_click_opens_overlay_and_enter_opens_url() {
     assert!(s.view.overlay.is_none(), "确认后 Overlay 关闭");
 }
 
-/// §成熟化：Link Overlay 内 `c` → CopyText effect 并关闭。
+/// §成熟化：Link Overlay 内 `c` → `CopyText` effect 并关闭。
 #[test]
 fn link_overlay_c_copies_url() {
     let mut s = state();

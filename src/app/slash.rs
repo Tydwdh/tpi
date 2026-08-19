@@ -17,6 +17,7 @@ pub struct SlashCommandSpec {
     pub dangerous: bool,
 }
 
+#[must_use]
 pub const fn spec(name: &'static str, desc: &'static str, dangerous: bool) -> SlashCommandSpec {
     SlashCommandSpec {
         name,
@@ -45,16 +46,19 @@ pub const SLASH_COMMANDS: &[SlashCommandSpec] = &[
 ];
 
 /// 命令名 → 描述（help 渲染与补全共用）。
+#[must_use]
 pub fn help_lines() -> Vec<(&'static str, &'static str)> {
     SLASH_COMMANDS.iter().map(|s| (s.name, s.desc)).collect()
 }
 
 /// 是否登记的命令（补全过滤用）。
+#[must_use]
 pub fn is_registered(name: &str) -> bool {
     SLASH_COMMANDS.iter().any(|s| s.name == name)
 }
 
-/// P3-01 adapter（移入 registry 同源）：slash 命令文本 → 语义 AppCommand。
+/// P3-01 adapter（移入 registry 同源）：slash 命令文本 → 语义 `AppCommand`。
+#[must_use]
 pub fn command_from_slash(message: &str) -> Option<AppCommand> {
     let msg = message.trim();
     match msg {
@@ -119,7 +123,7 @@ mod tests {
     fn registry_names_are_unique() {
         let mut names: Vec<&str> = SLASH_COMMANDS.iter().map(|s| s.name).collect();
         let n = names.len();
-        names.sort();
+        names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), n, "registry 不允许重复 name");
     }

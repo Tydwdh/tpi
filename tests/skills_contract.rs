@@ -71,7 +71,7 @@ async fn discovery_is_metadata_only() {
     assert!(!manager.is_activated("hello-skill"));
 }
 
-/// §25 Activation：activate_skill 返回完整 SKILL.md + references/scripts。
+/// §25 `Activation：activate_skill` 返回完整 SKILL.md + references/scripts。
 #[tokio::test]
 async fn activate_skill_returns_full_body_and_assets() {
     let (_dir, workspace) = setup_workspace_with_skills();
@@ -103,7 +103,7 @@ async fn read_reference_on_demand() {
     assert!(manager.read_reference("rust-review", "missing.md").is_err());
 }
 
-/// §25 Context：activate_skill 工具经 ToolContext 可调用（端到端工具级）。
+/// §25 `Context：activate_skill` 工具经 `ToolContext` 可调用（端到端工具级）。
 #[tokio::test]
 async fn activate_skill_tool_executes_via_tool() {
     let (_dir, workspace) = setup_workspace_with_skills();

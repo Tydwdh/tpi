@@ -15,7 +15,7 @@ use tpi::tool::edit::{
     Replacement, apply_edit, commit_edit, prepare_commit, revision_of, verify_after_replace,
 };
 
-/// 构造一个带 recovery metadata 的 ToolStarted + 缺 ToolCompleted 的崩溃 session。
+/// 构造一个带 recovery metadata 的 `ToolStarted` + 缺 `ToolCompleted` 的崩溃 session。
 fn crashed_session(
     workspace: &Utf8PathBuf,
     relative_target: &str,
@@ -65,7 +65,7 @@ fn crashed_session(
     session
 }
 
-/// 场景 18a：replace 前崩溃（temp 未创建、target 仍为旧内容）→ effect=not_applied。
+/// 场景 18a：replace 前崩溃（temp 未创建、target 仍为旧内容）→ `effect=not_applied`。
 #[tokio::test]
 async fn crash_before_replace_recovers_as_not_applied() {
     let dir = tempfile::tempdir().unwrap();
@@ -124,7 +124,7 @@ async fn crash_after_replace_recovers_as_committed() {
 }
 
 /// 场景 19：外部 writer 在最终 revision check 后竞争修改 → backup digest 检测到并发，
-/// 恢复 target（保留外部修改）并返回 concurrent_modification_during_commit，不报告成功。
+/// 恢复 target（保留外部修改）并返回 `concurrent_modification_during_commit，不报告成功`。
 #[test]
 fn concurrent_external_writer_detected_via_backup_digest() {
     let dir = tempfile::tempdir().unwrap();

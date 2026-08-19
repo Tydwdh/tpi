@@ -74,6 +74,11 @@ impl<'a> MutationBoundary<'a> {
         &self.tx_id
     }
 
+    /// Get the mutation cause that created this boundary.
+    pub fn cause(&self) -> &MutationCause {
+        &self.cause
+    }
+
     /// Get the preimages captured at boundary creation.
     pub fn preimages(&self) -> &[(String, super::types::BlobId)] {
         &self.preimages

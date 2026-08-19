@@ -284,7 +284,7 @@ async fn bash_output_lands_in_artifact_and_readable_via_opaque_ref() {
     assert!(text.contains("line-50"), "{text}");
 }
 
-/// 实时输出链路：output_tx 订阅时，bash 执行中收到增量流事件（UI 卡片实时输出）。
+/// `实时输出链路：output_tx` 订阅时，bash 执行中收到增量流事件（UI 卡片实时输出）。
 #[tokio::test]
 async fn bash_streams_live_output_through_output_tx() {
     point_host_at_real_tpi();
@@ -336,7 +336,7 @@ async fn bash_streams_live_output_through_output_tx() {
     );
 }
 
-/// BUG-012：有界流通道 + try_send——UI 不消费时 bash 不得阻塞/无限堆积，
+/// BUG-012：有界流通道 + `try_send——UI` 不消费时 bash 不得阻塞/无限堆积，
 /// 必须正常完成并返回（实时输出是 lossy telemetry）。
 #[tokio::test]
 async fn bash_does_not_block_when_stream_channel_full() {

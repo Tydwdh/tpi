@@ -72,8 +72,8 @@ fn waves_parallelize_reads_and_serialize_writes() {
         3,
         "write 必须与冲突 read 隔离并串行: {waves:?}"
     );
-    assert!(waves[1][0].source_index == 1);
-    assert!(waves[2][0].source_index == 3);
+    assert_eq!(waves[1][0].source_index, 1);
+    assert_eq!(waves[2][0].source_index, 3);
 }
 
 /// §12.1/§12.2：WorkspaceUnknown（bash）独占 wave，后续任何工具不得并入其 wave。
@@ -202,7 +202,7 @@ async fn watchdog_cancels_at_wall_deadline() {
     assert!(cancel.is_cancelled(), "watchdog 必须主动取消 run（§12.4）");
 }
 
-/// §13：update_plan 不变量（≤7 项、显式状态、完整替换、拒绝无效）。
+/// §`13：update_plan` 不变量（≤7 项、显式状态、完整替换、拒绝无效）。
 #[test]
 fn plan_invariants_enforced() {
     use tpi::plan::{PlanItemArg, PlanStatus, UpdatePlanArgs, build_plan, validate_invariants};
@@ -296,7 +296,7 @@ fn plan_invariants_enforced() {
     assert!(cleared.items.is_empty());
 }
 
-/// §13 + §15.4 集成：update_plan 替换完整计划、计划以工具事实进入后续请求；
+/// §13 + §15.4 `集成：update_plan` 替换完整计划、计划以工具事实进入后续请求；
 /// 长会话触发 compaction（无工具请求）后继续准确执行。
 #[tokio::test]
 async fn update_plan_and_compaction_integration() {
@@ -466,7 +466,7 @@ async fn update_plan_and_compaction_integration() {
     assert!(!outcome.messages.is_empty());
 }
 
-/// §12.3 集成：相同失败动作连续 3 次 → 第 3 次被拦截为 repeated_without_progress。
+/// §12.3 集成：相同失败动作连续 3 次 → 第 3 次被拦截为 `repeated_without_progress`。
 #[tokio::test]
 async fn repeated_failing_action_blocked_in_agent_loop() {
     let dir = tempfile::tempdir().unwrap();
@@ -633,6 +633,6 @@ fn read_only_external_tools_share_wave_with_reads_but_not_writes() {
         2,
         "ReadOnly external 与 workspace 内 write 必须隔离: {waves:?}"
     );
-    assert!(waves[0][0].source_index == 0);
-    assert!(waves[1][0].source_index == 1);
+    assert_eq!(waves[0][0].source_index, 0);
+    assert_eq!(waves[1][0].source_index, 1);
 }

@@ -70,6 +70,7 @@ struct RuntimeConfig {
 }
 
 impl ToolRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         config: &Config,
         session_id: String,
@@ -117,6 +118,7 @@ impl ToolRuntime {
     }
 
     /// Set the workspace session (called during agent init).
+    #[allow(dead_code)]
     pub(super) fn set_workspace_session(
         &mut self,
         session: Arc<tpi_capabilities::workspace::session::WorkspaceSession>,

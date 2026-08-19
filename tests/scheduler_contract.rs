@@ -29,10 +29,10 @@ fn lifecycle(events: &[SessionEvent]) -> Vec<(char, String)> {
                 by_call.insert(call.call_id, call.name.clone());
             }
             SessionEvent::ToolStarted { call_id, .. } => {
-                out.push(('S', by_call.get(call_id).cloned().unwrap_or_default()))
+                out.push(('S', by_call.get(call_id).cloned().unwrap_or_default()));
             }
             SessionEvent::ToolCompleted { call_id, .. } => {
-                out.push(('C', by_call.get(call_id).cloned().unwrap_or_default()))
+                out.push(('C', by_call.get(call_id).cloned().unwrap_or_default()));
             }
             _ => {}
         }
@@ -107,7 +107,7 @@ async fn run_with(
     (outcome, events)
 }
 
-/// §15：max_parallel_tools=1 基线——同轮 3 个 read 完全串行。
+/// §`15：max_parallel_tools=1` 基线——同轮 3 个 read 完全串行。
 #[tokio::test]
 async fn max_parallel_one_serializes_everything() {
     point_host_at_real_tpi();
@@ -348,7 +348,7 @@ struct CancelAwareProvider {
 }
 
 impl tpi::provider::Provider for CancelAwareProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "cancel-aware"
     }
 
@@ -395,8 +395,8 @@ impl tpi::provider::Provider for CancelAwareProvider {
         }
         // 后续请求：cancel 生效则立即失败（真实 provider 行为）。
         tokio::select! {
-            _ = cancel.cancelled() => Err(tpi::provider::ProviderError::Cancelled),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            () = cancel.cancelled() => Err(tpi::provider::ProviderError::Cancelled),
+            () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                 Ok(tpi::provider::ProviderResponse {
                     finish_reason: tpi::provider::FinishReason::Stop,
                     usage: Default::default(),

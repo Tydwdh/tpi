@@ -8,7 +8,7 @@
 //! ```
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Set of dirty paths that need reconciliation.

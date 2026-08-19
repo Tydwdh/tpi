@@ -1,6 +1,6 @@
 //! Runtime Introspection 契约测试（AGENTS.md §15 / P7）。
 //!
-//! runtime_inspect 是只读能力查询：报告工具目录（含 provider/origin）、
+//! `runtime_inspect` 是只读能力查询：报告工具目录（含 provider/origin）、
 //! skills、workspace、后台进程——Runtime 是事实来源，Agent 不靠 system prompt 猜。
 
 mod fixtures;
@@ -39,7 +39,7 @@ async fn runtime_inspect_is_listed_as_builtin_tool() {
     // implemented_tools 包含 runtime_inspect；schema 生成成功（无参数）。
     let names: Vec<&str> = tpi::tool::implemented_tools()
         .iter()
-        .map(|t| t.name())
+        .map(tpi::tool::BuiltinTool::name)
         .collect();
     assert!(names.contains(&"runtime_inspect"), "{names:?}");
     assert!(names.contains(&"request_input"), "{names:?}");

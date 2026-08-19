@@ -44,7 +44,7 @@ pub enum AppCommand {
     OpenSearch,
     /// 恢复一个历史会话（/sessions 选择）。
     OpenSession(SessionId),
-    /// 回答 request_input 挂起问题（用户输入答案）。
+    /// 回答 `request_input` 挂起问题（用户输入答案）。
     RequestInputAnswer(RequestId, String),
     /// 粘贴多行文本（鼠标中键/粘贴事件）。
     Paste(String),
@@ -68,6 +68,7 @@ pub enum IntentSource {
 }
 
 impl UiIntent {
+    #[must_use]
     pub fn new(command: AppCommand, source: IntentSource) -> Self {
         Self { command, source }
     }
@@ -84,7 +85,7 @@ pub enum AppEffect {
     OpenUrl(String),
     /// 设置终端标题。
     SetTerminalTitle(String),
-    /// 打开文件选择器（返回结果经 request_input 回 controller）。
+    /// 打开文件选择器（返回结果经 `request_input` 回 controller）。
     OpenFilePicker { filter: Option<String> },
     /// 通知（一次性 toast/状态栏）。
     Notify(String),

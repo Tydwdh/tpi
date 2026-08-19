@@ -1,4 +1,4 @@
-//! Agent 状态机契约测试（对应 §4.2 tests/agent_flow.rs）。
+//! Agent 状态机契约测试（对应 §4.2 `tests/agent_flow.rs`）。
 //!
 //! §3.2 不变量 2：一个 provider response 对应一次明确的状态转换；
 //! `finish=stop` 且无 tool call 时 run 立即结束，不自动补一次模型请求。
@@ -348,7 +348,7 @@ async fn usage_accumulates_across_turns() {
     assert_eq!(completed.output_tokens, 30);
 }
 
-/// 上下文用量事件：配置 context_window 时每次请求前发送 ContextUsage（TUI 用量条）。
+/// 上下文用量事件：配置 `context_window` 时每次请求前发送 ContextUsage（TUI 用量条）。
 #[tokio::test]
 async fn context_usage_event_sent_before_requests() {
     let dir = tempfile::tempdir().unwrap();
@@ -407,7 +407,7 @@ async fn context_usage_event_sent_before_requests() {
     assert!(saw_usage, "必须发送 ContextUsage 事件");
 }
 
-/// §用户诉求：max_model_turns=0（默认）不限制——多轮工具循环正常完成，
+/// §`用户诉求：max_model_turns=0（默认）不限制——多轮工具循环正常完成`，
 /// 不因回合数被截断。
 #[tokio::test]
 async fn zero_max_turns_is_unlimited() {
@@ -472,7 +472,7 @@ async fn zero_max_turns_is_unlimited() {
     assert_eq!(provider.requests.len(), 3, "三轮请求都应执行");
 }
 
-/// §用户诉求（软着陆）：max_model_turns 已配置时，最后一轮请求注入收尾
+/// §`用户诉求（软着陆）：max_model_turns` 已配置时，最后一轮请求注入收尾
 /// 指令（harness control metadata），而非硬断。
 #[tokio::test]
 async fn final_turn_injects_wrapup_instruction() {
@@ -752,7 +752,7 @@ async fn resume_after_suspend_records_input_and_continues() {
     );
 }
 
-/// AGENTS.md §13（对标 AskUserQuestion）：`request_input` 一次请求多个问题
+/// AGENTS.md §13（对标 `AskUserQuestion`）：`request_input` 一次请求多个问题
 /// （各带 header/options）——渲染后的挂起问题文本包含全部问题、标题与选项，
 /// session 记录 `user_input_requested`；旧单问题格式仍兼容。
 #[tokio::test]
@@ -836,7 +836,7 @@ async fn request_input_multi_question_suspends_with_rendered_prompt() {
         awaiting.questions[0]
             .options
             .iter()
-            .map(|o| o.label())
+            .map(tpi::tool::request_input::QuestionOption::label)
             .collect::<Vec<_>>(),
         vec!["是，运行全部", "只跑单元测试", "跳过"]
     );
@@ -845,7 +845,7 @@ async fn request_input_multi_question_suspends_with_rendered_prompt() {
         awaiting.questions[1]
             .options
             .iter()
-            .map(|o| o.label())
+            .map(tpi::tool::request_input::QuestionOption::label)
             .collect::<Vec<_>>(),
         vec!["生产", "staging"]
     );
@@ -859,8 +859,7 @@ async fn request_input_multi_question_suspends_with_rendered_prompt() {
     assert!(requested.is_some(), "缺少 user_input_requested");
     assert!(
         requested.unwrap().contains("发布到哪个环境"),
-        "durable prompt 应含全部问题: {:?}",
-        requested
+        "durable prompt 应含全部问题: {requested:?}"
     );
 }
 
@@ -932,7 +931,7 @@ async fn request_input_legacy_single_question_still_works() {
         awaiting.questions[0]
             .options
             .iter()
-            .map(|o| o.label())
+            .map(tpi::tool::request_input::QuestionOption::label)
             .collect::<Vec<_>>(),
         vec!["是", "否"]
     );
@@ -1026,8 +1025,8 @@ async fn request_input_rejected_in_non_interactive_run() {
 
 /// §13 回归：挂起时同一批中**后续 wave** 的工具调用不再执行，但必须有
 /// 对应的 ToolRequested/ToolCompleted（Rejected）——否则 resume 重建的
-/// 消息序列里 assistant.tool_calls 缺少 tool result，provider 拒绝。
-/// 构造：request_input（Pure，wave 1）+ bash（WorkspaceUnknown，wave 2）。
+/// 消息序列里 `assistant.tool_calls` 缺少 tool result，provider 拒绝。
+/// `构造：request_input（Pure，wave` 1）+ bash（WorkspaceUnknown，wave 2）。
 #[tokio::test]
 async fn suspend_persists_rejected_outcomes_for_later_waves() {
     let dir = tempfile::tempdir().unwrap();

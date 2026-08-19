@@ -3,15 +3,13 @@
 //! Wraps `tpi_core::workspace::WorkspaceManager` with a tool-friendly API.
 //! Every tool that may mutate the workspace goes through this session.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tpi_core::workspace::blob::BlobStore;
-use tpi_core::workspace::index::WorkspaceIndex;
 use tpi_core::workspace::manager::{WorkspaceConfig, WorkspaceManager};
 use tpi_core::workspace::mutation::WorkspaceMutation;
 use tpi_core::workspace::policy::{MutationSafetyPolicy, Reversibility, TrackingPolicy};
 use tpi_core::workspace::transaction::MutationCause;
-use tpi_core::workspace::types::{BlobId, NormalizedPath, TransactionId};
+use tpi_core::workspace::types::{BlobId, TransactionId};
 
 /// Shared handle to the workspace manager — passed through ToolContext.
 pub type SharedWorkspaceManager = Arc<Mutex<WorkspaceManager>>;
@@ -106,7 +104,7 @@ impl WorkspaceSession {
     pub fn reconcile_after_execution(
         &self,
         cause: MutationCause,
-        workspace_root: &std::path::Path,
+        _workspace_root: &std::path::Path,
     ) -> Result<Reversibility, String> {
         let mut mgr = self.shared.lock().map_err(|e| e.to_string())?;
 
@@ -183,6 +181,7 @@ impl TransactionGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {

@@ -39,7 +39,7 @@ fn read_file(dir: &tempfile::TempDir, name: &str) -> String {
     std::fs::read_to_string(dir.path().join(name)).unwrap()
 }
 
-/// Tier 2：文件行有 trailing whitespace，模型 old_text 无 → 宽容定位成功；
+/// Tier 2：文件行有 trailing whitespace，模型 `old_text` 无 → 宽容定位成功；
 /// 未变化行（context）的真实 trailing 必须保留，只替换真正变化的行。
 #[test]
 fn trailing_tolerance_keeps_context_line_trailing_whitespace() {
@@ -94,7 +94,7 @@ fn trailing_tolerance_ambiguous_rewrite_is_rejected() {
 }
 
 /// Tier 3：uniform outer-indent——模型整体少 8 空格（坐标系平移）→ 成功，
-/// new_text 按实际前缀重建缩进。
+/// `new_text` 按实际前缀重建缩进。
 #[test]
 fn uniform_indent_shifts_outer_coordinate_system() {
     let dir = tempfile::tempdir().unwrap();
@@ -140,7 +140,7 @@ fn uniform_indent_rejects_relative_indentation_change() {
     );
 }
 
-/// P2b：Makefile 的 tab 是语法——空格版 old_text 不宽容（NoMatch），
+/// P2b：Makefile 的 tab 是语法——空格版 `old_text` 不宽容（NoMatch），
 /// 精确 tab 版本正常。
 #[test]
 fn makefile_tab_indent_is_not_lenient() {
@@ -175,8 +175,8 @@ fn makefile_tab_indent_is_not_lenient() {
     assert_eq!(read_file(&dir, "Makefile"), "target:\n\tnewcmd\n");
 }
 
-/// P1：宽容定位 + 未变化行保留——old_text 带 trailing（模型复制了读到的
-/// 行尾空白）时，因 old_text 精确存在于文件 → Exact 命中（同样正确）。
+/// P1：宽容定位 + `未变化行保留——old_text` 带 trailing（模型复制了读到的
+/// 行尾空白）时，因 `old_text` 精确存在于文件 → Exact 命中（同样正确）。
 #[test]
 fn trailing_tolerance_accepts_both_sides_normalized() {
     let dir = tempfile::tempdir().unwrap();
@@ -201,7 +201,7 @@ fn trailing_tolerance_accepts_both_sides_normalized() {
     assert_eq!(read_file(&dir, "f.rs"), "fn a() {   \n    run();\n}\n");
 }
 
-/// P0b：no_match 现在带结构化诊断（差异类型/行/相似度），模型免 read 即可
+/// `P0b：no_match` 现在带结构化诊断（差异类型/行/相似度），模型免 read 即可
 /// 知道差异在缩进还是文本。
 #[test]
 fn no_match_carries_structured_diagnostic() {

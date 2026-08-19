@@ -3,9 +3,9 @@
 //! 目标：为重构建立**可重复**的性能高水位，不要求先优化（P0-05 验收：
 //! 结果存 artifact）。覆盖文档要求的核心 fixture/指标：
 //!
-//! - session replay：1k / 10k 消息合成 session 的 append + read_events 耗时；
-//! - context build：1k / 10k 消息的 estimate_request + prune_messages 耗时；
-//! - 1MB streaming message：estimate_tokens + model push 耗时；
+//! - session replay：1k / 10k 消息合成 session 的 append + `read_events` 耗时；
+//! - context build：1k / 10k 消息的 `estimate_request` + `prune_messages` 耗时；
+//! - 1MB streaming `message：estimate_tokens` + model push 耗时；
 //! - 100 tool cards：model 高频 append（近似卡片行）耗时；
 //! - 高频 append：连续 append 的耗时曲线（10h 模拟的合成形式）。
 //!
@@ -89,7 +89,7 @@ fn synth_session(n_messages: usize) -> (std::time::Duration, u64, std::time::Dur
     (append, bytes, replay)
 }
 
-/// 合成 n 条消息的 ChatMessage 数组，测 estimate_request + prune 耗时。
+/// 合成 n 条消息的 `ChatMessage` 数组，测 `estimate_request` + prune 耗时。
 fn synth_context(n_messages: usize) -> (std::time::Duration, u64, std::time::Duration) {
     let mut messages: Vec<ChatMessage> = Vec::with_capacity(n_messages);
     for i in 0..n_messages {

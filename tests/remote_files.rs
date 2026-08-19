@@ -13,7 +13,7 @@ use tpi::remote::files::{RemoteEditArgs, RemoteReadArgs, RemoteWriteArgs};
 use tpi::remote::ssh::{HostKeyDecision, RemoteHost};
 use tpi::workspace::ActiveWorkspace;
 
-/// 启动 server + 确认 host key + 返回已连接的 SshClient 和远端 root（POSIX）。
+/// 启动 server + 确认 host key + 返回已连接的 `SshClient` 和远端 root（POSIX）。
 async fn setup_connected() -> (tempfile::TempDir, tpi::remote::ssh::SshClient, String) {
     let (port, root, known_hosts) = fixtures::remote_server::start_test_server().await;
     let mut probe = fixtures::remote_server::test_client(port, &known_hosts).await;
@@ -215,7 +215,7 @@ async fn remote_edit_applies_and_returns_diff() {
         .output
         .lines()
         .find(|l| l.starts_with("[revision="))
-        .map(|l| l.to_string());
+        .map(std::string::ToString::to_string);
     assert!(
         rev_in_output.unwrap().contains(&new_rev[3..]),
         "新 revision 应出现在输出"

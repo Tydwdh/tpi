@@ -48,6 +48,7 @@ impl TerminalRegistry {
     /// Open a PTY with a workspace snapshot owned for the whole terminal
     /// lifetime. The caller checkpoints it after observable command progress
     /// and on close, so PTY writes cannot bypass the mutation journal.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_tracked(
         &mut self,
         program: &str,

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use tpi::remote::ssh::{ConnectionState, HostKeyDecision, SshClient};
 
-/// §34：未知 host 首次连接 → UnknownPending；用户确认（confirm_host_key）后
+/// §34：未知 host 首次连接 → `UnknownPending；用户确认（confirm_host_key）后`
 /// 重连 → Accepted 且可执行命令。Agent 不得自动信任（decision 必须显式确认）。
 #[tokio::test]
 async fn host_key_unknown_requires_confirmation_then_connects() {
@@ -43,7 +43,7 @@ async fn host_key_unknown_requires_confirmation_then_connects() {
     client.disconnect().await;
 }
 
-/// 已确认的主机再次连接（known_hosts 命中）→ 直接 Accepted（不重复询问）。
+/// `已确认的主机再次连接（known_hosts` 命中）→ 直接 Accepted（不重复询问）。
 #[tokio::test]
 async fn known_host_connects_directly() {
     let (port, _root, known_hosts) = fixtures::remote_server::start_test_server().await;
@@ -104,7 +104,7 @@ async fn exec_returns_output_and_exit_code() {
     client.disconnect().await;
 }
 
-/// §R0 primitive：write_file（temp+rename）与 read_file 往返一致。
+/// §R0 `primitive：write_file（temp+rename）与` `read_file` 往返一致。
 #[tokio::test]
 async fn write_and_read_file_roundtrip() {
     let (port, root, known_hosts) = fixtures::remote_server::start_test_server().await;

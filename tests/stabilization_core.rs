@@ -1,10 +1,10 @@
-//! TPI_STABILIZATION_TASK Phase 1：Core Conversation Model。
+//! `TPI_STABILIZATION_TASK` Phase 1：Core Conversation Model。
 //!
 //! - P0-1：interactive 层每轮 `history.extend(outcome.messages)`，而
 //!   `AgentOutcome.messages` 是 agent 从调用方 history 复制构造的**完整 context**
 //!   → 历史每轮整体重复（token 膨胀、模型看到重复消息）。
 //!   修复契约：outcome.messages = 完整 context，由 `Conversation` 整体接纳，
-//!   app 不再分别持有 SessionLog 与 history。
+//!   app 不再分别持有 `SessionLog` 与 history。
 //!
 //! 本文件同时承载 Phase 1 后续的 replay / runtime-resume 等价测试。
 
@@ -83,7 +83,7 @@ async fn p0_1_history_never_duplicates_across_turns() {
     );
 }
 
-/// 构造一个最小脚本 provider：request 1 返回 tool_calls（可带文本），后续请求返回文本。
+/// 构造一个最小脚本 provider：request 1 返回 `tool_calls（可带文本），后续请求返回文本`。
 /// 返回 (provider, request 引用计数)。
 fn tool_loop_provider(_workspace: &Utf8PathBuf, first_text: &'static str) -> FakeProvider {
     FakeProvider::scripted(vec![
@@ -103,8 +103,8 @@ fn tool_loop_provider(_workspace: &Utf8PathBuf, first_text: &'static str) -> Fak
 }
 
 /// P0-2：assistant content 为空（纯 tool-call 轮）时，session 必须仍然持久化
-/// assistant turn（含 tool_calls）——resume 重建出的消息序列必须合法：
-/// User → Assistant(tool_calls) → Tool → Assistant。
+/// assistant turn（含 `tool_calls）——resume` 重建出的消息序列必须合法：
+/// User → `Assistant(tool_calls)` → Tool → Assistant。
 #[tokio::test]
 async fn p0_2_empty_text_tool_call_replays_legal_protocol() {
     fixtures::point_host_at_real_tpi();
@@ -182,7 +182,7 @@ async fn p0_2_empty_text_tool_call_replays_legal_protocol() {
 }
 
 /// P0-3：runtime context 与 resume projection 必须语义等价
-/// （role 顺序、assistant content、tool call name/provider_id/args、tool result）。
+/// （role 顺序、assistant content、tool call `name/provider_id/args、tool` result）。
 #[tokio::test]
 async fn p0_3_runtime_projection_matches_resume_projection() {
     fixtures::point_host_at_real_tpi();
@@ -487,7 +487,7 @@ async fn replay_text_only_one_tool_multi_tool_text_plus_tool_failed_and_write() 
 struct CancelAfterDeltaProvider;
 
 impl tpi::provider::Provider for CancelAfterDeltaProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "cancel-after-delta"
     }
 
@@ -582,7 +582,7 @@ async fn replay_survives_corrupt_trailing_line() {
 }
 
 /// §30 第 14 条：5~10 个连续 user turns，context 线性增长（无重复膨胀）。
-/// P0-1 修复后：每轮 history 精确 +2 条消息（U_i + A_i）。
+/// P0-1 修复后：每轮 history 精确 +2 `条消息（U_i` + `A_i`）。
 #[tokio::test]
 async fn ten_turns_context_grows_linearly() {
     let dir = tempfile::tempdir().unwrap();

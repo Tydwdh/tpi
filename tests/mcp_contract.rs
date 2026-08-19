@@ -111,7 +111,7 @@ async fn tool_call_unknown_tool_returns_error() {
     client.shutdown().await;
 }
 
-/// §15 Timeout：sleep 超过 client timeout → McpError::Timeout。
+/// §15 Timeout：sleep 超过 client timeout → `McpError::Timeout`。
 #[tokio::test]
 async fn tool_call_timeout() {
     let mut config = test_server_config("test-server");
@@ -184,7 +184,7 @@ async fn lifecycle_no_orphan_process() {
     let _ = pid;
 }
 
-/// Phase 3：McpManager 注册工具到 registry，statuses() 显示 connected。
+/// Phase 3：McpManager 注册工具到 `registry，statuses()` 显示 connected。
 #[tokio::test]
 async fn manager_registers_tools_and_reports_status() {
     let registry = Arc::new(Mutex::new(ToolRegistry::new()));
@@ -272,7 +272,7 @@ async fn raii_registrations_unregister_on_shutdown() {
     }
 }
 
-/// AGENTS.md §11：单独 ToolRegistration 句柄 drop 即注销（最小 revertible effect）。
+/// AGENTS.md §11：单独 `ToolRegistration` 句柄 drop 即注销（最小 revertible effect）。
 #[test]
 fn tool_registration_drop_unregisters() {
     let registry = Arc::new(Mutex::new(ToolRegistry::new()));

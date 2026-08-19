@@ -53,8 +53,8 @@ impl PlatformEffects for LocalPlatformEffects {
         // 终端标题经 ANSI escape（OSC 0）；错误反馈（写入失败）。
         use std::io::Write;
         let mut out = std::io::stdout();
-        write!(out, "\x1b]0;{}\x07", title)
-            .map(|_| ())
+        write!(out, "\x1b]0;{title}\x07")
+            .map(|()| ())
             .map_err(|e| format!("设置终端标题失败: {e}"))
     }
 
@@ -64,7 +64,7 @@ impl PlatformEffects for LocalPlatformEffects {
     }
 }
 
-/// 执行一个 AppEffect（Draw 忽略；副作用经 PlatformEffects 执行，错误返回）。
+/// 执行一个 AppEffect（Draw 忽略；副作用经 `PlatformEffects` 执行，错误返回）。
 pub fn apply_effect(platform: &dyn PlatformEffects, effect: &AppEffect) -> Result<(), String> {
     match effect {
         AppEffect::Draw => Ok(()), // 渲染由 surface adapter 处理

@@ -1,8 +1,8 @@
-//! 滚动引擎属性测试（§31：random heights / random area_h / random scroll）。
+//! 滚动引擎属性测试（§31：random heights / random `area_h` / random scroll）。
 //!
 //! 不变量：
-//! - 任意高度表 + 视口下，window_start_row 必须在 [0, total-area_h] 内；
-//! - locate_row/row_of 往返一致；
+//! - 任意高度表 + `视口下，window_start_row` 必须在 [0, total-area_h] 内；
+//! - `locate_row/row_of` 往返一致；
 //! - Follow = 尾部窗口。
 
 use proptest::prelude::*;

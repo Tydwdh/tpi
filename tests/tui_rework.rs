@@ -1,8 +1,8 @@
 //! TUI 整改验收回归（建议书 §13.1-13.8）。
 //!
 //! 核心不变量：
-//! - 同一个 ToolCallId 在 transcript 中最多一个可见 ToolActivity block；
-//! - 单个 ToolCard header 恒为 1 个 visual line（ellipsis + metadata 可见）；
+//! - 同一个 `ToolCallId` 在 transcript 中最多一个可见 `ToolActivity` block；
+//! - 单个 `ToolCard` header 恒为 1 个 visual line（ellipsis + metadata 可见）；
 //! - reasoning 默认折叠，不形成正文墙；
 //! - 成功工具不输出日志正文；失败工具只显示有限 tail；
 //! - 历史详情走 Overlay，不重写 scrollback；
@@ -19,7 +19,7 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
     buffer
         .content()
         .iter()
-        .map(|cell| cell.symbol())
+        .map(ratatui::buffer::Cell::symbol)
         .collect::<String>()
         .replace(' ', "")
 }
@@ -46,7 +46,7 @@ fn tool_card(id: &str, status: ToolStatus, output: Option<&str>) -> ToolCard {
                 Some(101)
             },
         },
-        output: output.map(|s| s.to_string()),
+        output: output.map(std::string::ToString::to_string),
         diff: None,
         output_truncated: false,
         expanded: false,
@@ -56,7 +56,7 @@ fn tool_card(id: &str, status: ToolStatus, output: Option<&str>) -> ToolCard {
         tail: if status == ToolStatus::Succeeded {
             None
         } else {
-            output.map(|s| s.to_string())
+            output.map(std::string::ToString::to_string)
         },
     }
 }
@@ -116,8 +116,7 @@ fn long_command_stays_single_line_with_ellipsis() {
         .content()
         .chunks(buffer.area().width as usize)
         .nth(first_row + 1)
-        .map(|row| row.iter().any(|c| c.symbol() != " "))
-        .unwrap_or(false);
+        .is_some_and(|row| row.iter().any(|c| c.symbol() != " "));
     assert!(!next_row, "卡片主行必须只占 1 个 visual line");
 }
 
@@ -200,7 +199,7 @@ fn failure_shows_bounded_tail_only() {
     );
 }
 
-/// 13.6：历史展开——详情走 Overlay，不重写 scrollback（open_tool_overlay 构造详情）。
+/// 13.6：历史展开——详情走 Overlay，不重写 `scrollback（open_tool_overlay` 构造详情）。
 #[test]
 fn detail_opens_overlay_not_inline_rewrite() {
     let mut view = ViewModel::default();
@@ -310,7 +309,7 @@ fn scroll_lock_keeps_position_and_counts() {
     assert_eq!(view.pending_below, 0);
 }
 
-/// HitTarget 类型检查：卡片行命中 Tool，reasoning 行命中 Reasoning。
+/// `HitTarget` 类型检查：卡片行命中 Tool，reasoning 行命中 Reasoning。
 #[test]
 fn hit_targets_distinguish_tool_and_reasoning() {
     let mut view = ViewModel::default();
@@ -344,7 +343,7 @@ fn modal_keeps_transcript_clean_and_renders() {
     let text: String = buffer
         .content()
         .iter()
-        .map(|c| c.symbol())
+        .map(ratatui::buffer::Cell::symbol)
         .collect::<Vec<_>>()
         .join("");
     assert!(text.contains("/settings"), "Modal 标题可见: {text}");

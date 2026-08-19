@@ -10,9 +10,9 @@
 //!   Failed/Aborted → skip
 //! ```
 
-use super::journal::{JournalEntry, JournalIntegrity, JournalState, MutationJournal};
+use super::journal::{JournalIntegrity, MutationJournal};
 use super::transaction::TransactionState;
-use super::types::{BlobId, TransactionId};
+use super::types::TransactionId;
 
 /// Result of crash recovery scan.
 #[derive(Debug)]
@@ -46,7 +46,7 @@ pub struct UnrecoverableTransaction {
 /// 4. Mark as Committed or Aborted
 pub fn recover(
     journal: &MutationJournal,
-    workspace_root: &std::path::Path,
+    _workspace_root: &std::path::Path,
 ) -> Result<RecoveryResult, String> {
     let state = journal.load().map_err(|e| format!("load journal: {e}"))?;
 
@@ -64,7 +64,7 @@ pub fn recover(
     //
     // For now, we validate CAS integrity of the blob store references.
     for entry in &state.entries {
-        let mut files_ok = true;
+        let files_ok = true;
         let mut affected = Vec::new();
 
         for mutation in &entry.mutations {

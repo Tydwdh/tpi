@@ -15,7 +15,7 @@ use crate::app::intent::{AppCommand, AppEffect, UiIntent};
 use crate::provider::Provider;
 use tokio_util::sync::CancellationToken;
 
-/// controller 持有的 ports（P1-06 AppServices 的只读视图 + cancel 控制）。
+/// controller 持有的 ports（P1-06 `AppServices` 的只读视图 + cancel 控制）。
 pub struct AppController<P: Provider> {
     pub services: crate::app::AppServices<P>,
 }
@@ -26,7 +26,7 @@ impl<P: Provider> AppController<P> {
     }
 
     /// 处理一个 surface 意图，返回需要执行的 effects。
-    /// 同步决策：不做 IO/await；副作用经 AppEffect 返回由 adapter 执行。
+    /// 同步决策：不做 IO/await；副作用经 `AppEffect` 返回由 adapter 执行。
     pub fn handle(&mut self, intent: UiIntent) -> Result<Vec<AppEffect>, String> {
         let mut effects = Vec::new();
         match intent.command {

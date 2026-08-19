@@ -1,6 +1,6 @@
 //! P0-04：recorded UI trace 回放测试。
 //!
-//! 从 tests/fixtures/ui_trace/ 读取录制的事件序列，逐行映射为 `UiEvent` 并
+//! 从 `tests/fixtures/ui_trace`/ 读取录制的事件序列，逐行映射为 `UiEvent` 并
 //! 依次应用 `reducer::update`，断言终态（见 manifest 的 `assert` 字段）。
 //! 回放不依赖 wall clock / network（trace 无时间戳，逐行立即应用）。
 //!
@@ -35,7 +35,11 @@ fn parse_event(line: &str) -> UiEvent {
                 "end" | "ctrl_end" => KeyCode::End,
                 other => panic!("trace 含未支持的 key code: {other}"),
             };
-            let modifiers = if v.get("ctrl").and_then(|b| b.as_bool()).unwrap_or(false) {
+            let modifiers = if v
+                .get("ctrl")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
                 KeyModifiers::CONTROL
             } else {
                 KeyModifiers::NONE

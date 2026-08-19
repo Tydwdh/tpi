@@ -26,7 +26,7 @@ impl Tool for FakeMcpTool {
     fn name(&self) -> &str {
         &self.name
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "fake mcp echo"
     }
     fn input_schema(&self) -> serde_json::Value {

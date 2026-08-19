@@ -4,11 +4,11 @@
 //! 不进入 domain。具体断言：
 //!
 //! 1. 双向往返：合法 `ChatMessage` 经 `ChatMessage -> DomainMessage -> ChatMessage`
-//!    语义等价（role / text / tool_calls / tool result 逐字段）。
+//!    语义等价（role / text / `tool_calls` / tool result 逐字段）。
 //! 2. projection parity：`session::project_messages`（events -> domain -> provider）
 //!    与直接 `events -> ChatMessage` 语义等价——重构内部先产出 domain message，
 //!    对外 `ChatMessage` 契约不变。
-//! 3. corpus parity：真实 session（session_golden corpus 001_tool_loop）经
+//! 3. corpus parity：真实 `session（session_golden` corpus `001_tool_loop）经`
 //!    `replay_domain_messages -> ChatMessage::from` 与 `replay_messages` 等价。
 
 mod fixtures;
@@ -75,7 +75,7 @@ fn domain_has_no_provider_specific_fields() {
 }
 
 /// 构造包含 User/Assistant(+tool calls)/Tool result 的事件序列，验证
-/// project_messages（domain 中转）与直接投影语义一致。
+/// `project_messages（domain` 中转）与直接投影语义一致。
 #[test]
 fn projection_parity_domain_vs_direct() {
     let c1 = tool_call("c1");

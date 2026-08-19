@@ -2,7 +2,7 @@
 //!
 //! - 初始化后 streaming path 不包含 CSI 全屏清除序列；
 //! - 一个 frame 至多一次 stdout flush；
-//! - 100-500 deltas/s 时按 FRAME_INTERVAL 合并，而不是 delta 数量等于 draw 次数；
+//! - 100-500 deltas/s 时按 `FRAME_INTERVAL` 合并，而不是 delta 数量等于 draw 次数；
 //! - 高速流式输出期间不发全屏 clear，动画仍按目标帧率更新；
 //! - inline scrollback 窗口语义（§16.1）：活动区只显示尾部，旧行提交到 scrollback；
 //! - 工具卡片（§16.2）、思考折叠、命令菜单、Markdown 渲染。
@@ -16,7 +16,7 @@ use tpi::outcome::ToolStatus;
 use tpi::tui::model::{LineKind, ViewModel};
 use tpi::tui::{FRAME_INTERVAL, draw_captured_bytes, draw_to_test_backend};
 
-/// 把 TestBackend buffer 拼成文本：跳过空 cell，并跳过宽字符的延续 cell
+/// 把 `TestBackend` buffer 拼成文本：跳过空 cell，并跳过宽字符的延续 cell
 /// （ratatui 0.30 中延续 cell 与空白 cell 都是单个空格，需按前一字符宽度识别）。
 fn buffer_text(buffer: &Buffer) -> String {
     let width = buffer.area().width as usize;
@@ -34,8 +34,7 @@ fn buffer_text(buffer: &Buffer) -> String {
                 .symbol()
                 .chars()
                 .next()
-                .map(unicode_width::UnicodeWidthChar::width)
-                .unwrap_or(None)
+                .and_then(unicode_width::UnicodeWidthChar::width)
                 .unwrap_or(0);
             if prev > 1 {
                 continue;

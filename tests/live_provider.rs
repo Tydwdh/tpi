@@ -17,7 +17,7 @@ use tpi::session::{CompletionReason, SessionLog};
 /// 运行条件（§20.1）：
 /// - 环境变量 `TPI_RUN_LIVE_TESTS=1`
 /// - `TPI_API_KEY` 或配置的 `api_key_env`
-/// - 配置 `~/.tpi/config.toml` 的 `[model.primary]`（provider/name/base_url）
+/// - 配置 `~/.tpi/config.toml` 的 `[model.primary]`（`provider/name/base_url`）
 #[tokio::test]
 #[ignore = "live provider smoke test: set TPI_RUN_LIVE_TESTS=1 and credentials"]
 async fn live_provider_smoke_opt_in() {
@@ -123,7 +123,7 @@ async fn live_canary_2_real_tool_call_loop() {
     let (tx, _rx) = mpsc::channel(128);
 
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(180),
+        std::time::Duration::from_mins(3),
         agent::run(
             &mut provider,
             &mut session,

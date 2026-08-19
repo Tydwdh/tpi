@@ -266,7 +266,7 @@ fn scheduler_locks_use_resolved_paths() {
     assert_eq!(lock_a[0].mode, AccessMode::Write);
 }
 
-/// §9.1 自由模式（allow_outside_workspace=true，默认）：read 允许 workspace 外绝对路径。
+/// §9.1 `自由模式（allow_outside_workspace=true，默认）：read` 允许 workspace 外绝对路径。
 #[test]
 fn read_allows_outside_absolute_path_when_freedom_enabled() {
     let dir = tempfile::tempdir().unwrap();
@@ -294,7 +294,7 @@ fn read_allows_outside_absolute_path_when_freedom_enabled() {
     );
 }
 
-/// §9.1 自由模式：resolve_tool_path 对 workspace 外绝对路径返回 Ok。
+/// §9.1 `自由模式：resolve_tool_path` 对 workspace 外绝对路径返回 Ok。
 #[test]
 fn resolve_tool_path_accepts_outside_when_freedom_enabled() {
     let dir = tempfile::tempdir().unwrap();

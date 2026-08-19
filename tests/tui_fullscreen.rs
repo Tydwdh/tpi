@@ -1,4 +1,4 @@
-//! T2：Fullscreen 切换验收测试（TPI_TUI_V2_TASK §55、§64）。
+//! T2：Fullscreen `切换验收测试（TPI_TUI_V2_TASK` §55、§64）。
 //!
 //! 自动化可覆盖：fullscreen 布局占满终端、resize 不 panic、极小终端降级、
 //! footer 无兼容模式提示（fullscreen 是正常模式）、inline 兼容保留。
@@ -68,7 +68,7 @@ fn fullscreen_transcript_gets_all_remaining_height() {
     let texts = row_texts(&buf);
     // 视觉瘦身：无常驻 header，transcript 从第 0 行开始。
     assert!(
-        !texts.first().map(|s| s.contains("TPI")).unwrap_or(false),
+        !texts.first().is_some_and(|s| s.contains("TPI")),
         "无常驻 header（信息并入 footer）: {:?}",
         texts.first()
     );
@@ -100,12 +100,7 @@ fn fullscreen_resize_keeps_layout_stable() {
     for (w, h) in [(120u16, 40u16), (70, 25), (160, 50), (80, 24)] {
         let buf = draw_to_test_backend_mode(&mut view, w, h, ViewMode::Fullscreen);
         let texts = row_texts(&buf);
-        assert!(
-            texts
-                .last()
-                .map(|s| s.contains("fake-model"))
-                .unwrap_or(false)
-        );
+        assert!(texts.last().is_some_and(|s| s.contains("fake-model")));
     }
 }
 
@@ -115,12 +110,7 @@ fn inline_mode_keeps_compat_behavior() {
     let mut view = busy_view(30);
     let buf = draw_to_test_backend_mode(&mut view, 80, 24, ViewMode::Inline);
     let texts = row_texts(&buf);
-    assert!(
-        texts
-            .last()
-            .map(|s| s.contains("fake-model"))
-            .unwrap_or(false)
-    );
+    assert!(texts.last().is_some_and(|s| s.contains("fake-model")));
 }
 
 #[test]

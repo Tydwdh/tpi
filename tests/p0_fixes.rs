@@ -31,7 +31,7 @@ struct FloodProvider {
 }
 
 impl Provider for FloodProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "flood"
     }
 
@@ -61,7 +61,7 @@ impl Provider for FloodProvider {
 
 /// P0-1：`-p` 模式 `(ui_tx, _ui_rx)` 丢弃 rx 后，agent 的 `ui.send().await`
 /// 在 channel 满（128）时永久等待 → 整个进程挂死。
-/// 修复：run_prompt_once 启动 drain task 消费 UI 事件。
+/// `修复：run_prompt_once` 启动 drain task 消费 UI 事件。
 #[tokio::test]
 async fn p0_1_prompt_mode_survives_delta_flood() {
     let dir = tempfile::tempdir().unwrap();
@@ -103,8 +103,8 @@ async fn p0_1_prompt_mode_survives_delta_flood() {
 }
 
 /// P0-2：compaction 请求（无工具 schema）返回大量 delta 时，`compact_turn`
-/// 先 `stream().await` 再收 event_rx 会死锁（provider 同一 task 内 send().await，
-/// 事件数超过 EVENT_CHANNEL_CAPACITY=256）。
+/// 先 `stream().await` 再收 `event_rx` 会死锁（provider 同一 task 内 send().await，
+/// 事件数超过 `EVENT_CHANNEL_CAPACITY=256`）。
 /// 修复：stream 与事件消费并发（select!），stream 返回后 drain 残余事件。
 #[tokio::test]
 async fn p0_2_compaction_survives_delta_flood() {

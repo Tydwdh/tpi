@@ -1,16 +1,16 @@
 //! 系统剪贴板（§用户诉求：Ctrl+C 复制选中文本）。
 //!
-//! 面向 Windows：OpenClipboard + EmptyClipboard + SetClipboardData(CF_UNICODETEXT)，
+//! 面向 Windows：OpenClipboard + `EmptyClipboard` + `SetClipboardData(CF_UNICODETEXT)`，
 //! 用 windows-sys 的 Win32 剪贴板 API（不引入额外跨平台依赖）。
 //!
 //! 所有 Win32 FFI 都收束在本模块的安全包装函数内。
 
 use std::ptr;
 
-/// CF_UNICODETEXT（windows-sys 放在 Win32::System::Ole；值为 13）。
+/// CF_UNICODETEXT（windows-sys 放在 `Win32::System::Ole；值为` 13）。
 const CF_UNICODETEXT: u32 = 13;
 
-/// 读取系统剪贴板文本（CF_UNICODETEXT）。
+/// `读取系统剪贴板文本（CF_UNICODETEXT`）。
 ///
 /// - `Ok(Some(text))`：剪贴板有 Unicode 文本；
 /// - `Ok(None)`：无文本 / 剪贴板被占用 / 打开失败（粘贴尽力而为，不打断）；
@@ -56,10 +56,11 @@ pub fn read_text() -> std::io::Result<Option<String>> {
     result
 }
 
-/// 把 UTF-8 文本写入系统剪贴板（CF_UNICODETEXT）。
+/// 把 UTF-8 `文本写入系统剪贴板（CF_UNICODETEXT`）。
 ///
 /// 失败（剪贴板被占用/打开失败）时静默返回 false——复制是尽力而为，
 /// 不打断用户。
+#[must_use]
 pub fn set_text(text: &str) -> bool {
     // 转 UTF-16（含结尾 NUL）。
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -157,28 +158,28 @@ fn global_alloc(bytes: usize) -> *mut std::ffi::c_void {
 fn global_lock(h: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
     use windows_sys::Win32::System::Memory::GlobalLock;
     // SAFETY: h is returned by global_alloc and remains owned by this module.
-    unsafe { GlobalLock(h as _) }
+    unsafe { GlobalLock(h.cast()) }
 }
 
 #[cfg(windows)]
 fn global_unlock(h: *mut std::ffi::c_void) {
     use windows_sys::Win32::System::Memory::GlobalUnlock;
     // SAFETY: h was successfully locked by global_lock above.
-    let _ = unsafe { GlobalUnlock(h as _) };
+    let _ = unsafe { GlobalUnlock(h.cast()) };
 }
 
 #[cfg(windows)]
 fn global_size(h: *mut std::ffi::c_void) -> usize {
     use windows_sys::Win32::System::Memory::GlobalSize;
     // SAFETY: h is the system-owned handle returned by GetClipboardData.
-    unsafe { GlobalSize(h as _) }
+    unsafe { GlobalSize(h.cast()) }
 }
 
 #[cfg(windows)]
 fn global_free(h: *mut std::ffi::c_void) {
     use windows_sys::Win32::Foundation::GlobalFree;
     // SAFETY: invoked only while this module still owns the allocation.
-    let _ = unsafe { GlobalFree(h as _) };
+    let _ = unsafe { GlobalFree(h.cast()) };
 }
 
 #[cfg(windows)]
@@ -186,7 +187,7 @@ fn set_clipboard_data(h: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
     use windows_sys::Win32::System::DataExchange::SetClipboardData;
     // SAFETY: clipboard is open and h is an unlocked GMEM_MOVEABLE allocation
     // containing a NUL-terminated UTF-16 string.
-    unsafe { SetClipboardData(CF_UNICODETEXT, h as _) }
+    unsafe { SetClipboardData(CF_UNICODETEXT, h.cast()) }
 }
 
 #[cfg(windows)]

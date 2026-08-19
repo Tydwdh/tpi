@@ -36,7 +36,7 @@ impl FileEntry {
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| (d.as_secs(), d.subsec_nanos()));
         let current = (self.mtime_secs, self.mtime_nanos);
-        self.size == size && mtime.map_or(false, |m| m == current)
+        self.size == size && (mtime == Some(current))
     }
 }
 
@@ -115,14 +115,13 @@ impl WorkspaceIndex {
             let name_str = name.to_string_lossy();
 
             // Skip well-known internal directories.
-            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                if name_str == ".git"
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                && (name_str == ".git"
                     || name_str == ".tpi"
                     || name_str == ".tpi-workspace"
-                    || name_str == "blob"
-                {
-                    continue;
-                }
+                    || name_str == "blob")
+            {
+                continue;
             }
 
             // Check exclusion patterns (simple substring match for now).

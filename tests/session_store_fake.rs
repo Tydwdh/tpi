@@ -1,7 +1,7 @@
 //! P2-02：SessionStore port 的 in-memory fake + adapter 契约测试。
 //!
 //! 验收：
-//! - in-memory fake 跑 agent_flow（agent 通过 `S: SessionStore` 泛型访问，
+//! - in-memory fake 跑 `agent_flow（agent` 通过 `S: SessionStore` 泛型访问，
 //!   不依赖 JSONL/文件）；
 //! - 单写者 / seq / recovery 契约对 adapter（SessionLog）运行。
 
@@ -196,7 +196,7 @@ async fn fake_store_runs_agent_flow() {
 
     struct EchoProvider;
     impl Provider for EchoProvider {
-        fn model_name(&self) -> &str {
+        fn model_name(&self) -> &'static str {
             "echo"
         }
         async fn stream(

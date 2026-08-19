@@ -1,12 +1,12 @@
 //! 应用层：输入路由、会话选择与交互生命周期。
 //!
 //! 活动 run 中的输入路由（§6.2）：
-//! - 普通 Enter：输入排队（pending_message），**当前 run 完成后**作为下一条
+//! - 普通 `Enter：输入排队（pending_message`），**当前 run 完成后**作为下一条
 //!   消息提交（§12 稳定化任务书：不是 run 内的 boundary steering）；
 //! - Esc：取消当前 run，保留 session（Ctrl-C 只用于复制，见 reducer）。
 //!
 //! M5：Ratatui inline renderer——只有 renderer 写 stdout（§3.2 不变量 11、
-//! §16.1），FRAME_INTERVAL 帧合并，synchronized update。
+//! §`16.1），FRAME_INTERVAL` 帧合并，synchronized update。
 //! M6+：键盘由独立线程持续读取（运行中也响应输入/翻页/折叠），
 //! 命令补全菜单（Tab）、输入历史（↑/↓）、多行输入（Alt+Enter）、
 //! 思考折叠（Alt+T）、动画时钟（spinner）。
@@ -160,7 +160,7 @@ pub struct AppServices<P: Provider> {
     pub mcp_manager: crate::mcp::manager::McpManager,
     /// P4 gate：composition root 持有的工具注册表（builtin + MCP 同一实例）。
     pub registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
-    /// Session 级共享 ManagedProcess registry（跨 run 存活）。
+    /// Session 级共享 `ManagedProcess` registry（跨 run 存活）。
     pub processes: Arc<std::sync::Mutex<crate::process::managed::ProcessRegistry>>,
     /// Session 级共享 Persistent PTY terminal registry（跨 run 存活）。
     pub terminals: Arc<std::sync::Mutex<crate::terminal::TerminalRegistry>>,
@@ -449,6 +449,7 @@ pub async fn run(
 ///
 /// agent 只发语义事实；展示投影（工具 target/command 摘要、tail 数据源）
 /// 在此生成。headless / RPC / 测试可直接消费 `LiveEvent`，无需本投影。
+#[must_use]
 pub fn project_live_event(event: crate::agent::LiveEvent) -> Option<crate::agent::RuntimeEvent> {
     use crate::agent::{LiveEvent, RuntimeEvent};
     match event {
@@ -531,13 +532,13 @@ pub fn project_live_event(event: crate::agent::LiveEvent) -> Option<crate::agent
     }
 }
 
-/// 工具调用的主行 target 与完整命令（P1-03：从 agent/tool_runtime 移入
+/// 工具调用的主行 target 与完整命令（P1-03：从 `agent/tool_runtime` 移入
 /// presentation projector）。
 ///
 /// - bash：target = 压缩后的命令（换行折空格、连续空白压缩、200 字符截断）；
 ///   command = 原文（≤8KiB，overlay 展示）。
 /// - 其他文件工具：target = `name path`；其余只显示工具名。
-/// - request_input：主行携带问题摘要（首行）。
+/// - `request_input：主行携带问题摘要（首行`）。
 fn tool_target(name: &str, arguments: &str) -> (String, Option<String>) {
     fn truncate(text: &str, max_chars: usize) -> String {
         if text.chars().count() <= max_chars {
@@ -567,8 +568,7 @@ fn tool_target(name: &str, arguments: &str) -> (String, Option<String>) {
                 .as_ref()
                 .and_then(|v| v.get("path"))
                 .and_then(|p| p.as_str())
-                .map(|path| format!("{name} {path}"))
-                .unwrap_or_else(|| name.to_string());
+                .map_or_else(|| name.to_string(), |path| format!("{name} {path}"));
             (truncate(&target, 120), None)
         }
         // §去重/信息：request_input（askuser）卡片主行携带问题摘要（首行）。
@@ -588,8 +588,10 @@ fn tool_target(name: &str, arguments: &str) -> (String, Option<String>) {
                 })
                 .map(|q| q.lines().next().unwrap_or("").trim().to_string())
                 .filter(|s| !s.is_empty())
-                .map(|s| format!("request_input {s}"))
-                .unwrap_or_else(|| "request_input".to_string());
+                .map_or_else(
+                    || "request_input".to_string(),
+                    |s| format!("request_input {s}"),
+                );
             (truncate(&summary, 120), None)
         }
         name => (name.to_string(), None),
@@ -667,6 +669,7 @@ struct ProviderSlot<P, R> {
     rebuild: R,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn interactive_loop<P: Provider, R>(
     mut slot: ProviderSlot<P, R>,
     conversation: &mut Conversation,
@@ -700,7 +703,7 @@ where
         workspace: config
             .workspace_root
             .file_name()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .unwrap_or_default(),
         // §16.2：模型单价（config [model.primary] price_input/price_output）注入，
         // add_usage 按 token 累计花费显示。
@@ -1008,24 +1011,21 @@ where
                                         }
                                         continue;
                                     }
-                                    match paste::paste_char(k) {
-                                        Some(c) => buf.push(c),
-                                        None => {
-                                            // 异常键（修饰组合/特殊键）：flush 已收，
-                                            // 原样转发该键，退出收集。
-                                            if !buf.is_empty()
-                                                && send_event!(Event::Paste(std::mem::take(
-                                                    &mut buf
-                                                )))
+                                    if let Some(c) = paste::paste_char(k) {
+                                        buf.push(c)
+                                    } else {
+                                        // 异常键（修饰组合/特殊键）：flush 已收，
+                                        // 原样转发该键，退出收集。
+                                        if !buf.is_empty()
+                                            && send_event!(Event::Paste(std::mem::take(&mut buf)))
                                                 .is_err()
-                                            {
-                                                return;
-                                            }
-                                            if send_event!(Event::Key(*k)).is_err() {
-                                                return;
-                                            }
-                                            break;
+                                        {
+                                            return;
                                         }
+                                        if send_event!(Event::Key(*k)).is_err() {
+                                            return;
+                                        }
+                                        break;
                                     }
                                 }
                                 other => {
@@ -1710,7 +1710,7 @@ where
     drop(key_rx);
     renderer.restore().map_err(|e| e.to_string())?;
     if let Err(panic) = key_thread.join() {
-        eprintln!("键盘线程异常退出: {:?}", panic);
+        eprintln!("键盘线程异常退出: {panic:?}");
     }
 
     // README2 Phase 3：退出前关闭所有 MCP server（不留孤儿进程，§9）。
@@ -1718,12 +1718,12 @@ where
     Ok(())
 }
 
-/// §PointerHit ⑥：统一 idle/run 的鼠标 dispatch——同一实现，杜绝两处 drift。
+/// §`PointerHit` ⑥：统一 idle/run 的鼠标 dispatch——同一实现，杜绝两处 drift。
 /// 分派 slash 命令（从 `interactive_loop` 内联块提取）：命令在循环内短路
 /// run 路径。返回 [`SlashAction`] 由主循环解释；错误（draw/IO）向上传播，
 /// 与原内联 `?` 语义一致。
 ///
-/// 8 个参数是 interactive_loop 的局部状态（config/会话/取消/渲染），每个
+/// 8 个参数是 `interactive_loop` 的局部状态（config/会话/取消/渲染），每个
 /// 分支都用其子集；聚合 struct 需给 300 行函数体机械加前缀、无行为收益，
 /// 故保留扁平签名并 allow 阈值 lint。
 #[allow(clippy::too_many_arguments)]
@@ -1913,11 +1913,10 @@ fn handle_settings_command(
     config: &Config,
     ui_cfg: &tpi_config::UiConfig,
 ) -> Result<SlashAction, String> {
-    let shell = config
-        .shell_path
-        .as_ref()
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "未配置（自动查找 Git Bash）".to_string());
+    let shell = config.shell_path.as_ref().map_or_else(
+        || "未配置（自动查找 Git Bash）".to_string(),
+        std::string::ToString::to_string,
+    );
     let mut keymap_text = String::new();
     for (action, keys) in ui_cfg.keymap.display_bindings() {
         keymap_text.push_str(&format!("  {action}: {keys}\n"));
@@ -2098,7 +2097,7 @@ fn handle_retry_command(
     Ok(SlashAction::Consumed)
 }
 
-/// 输入 crossterm MouseEvent + renderer + 状态机，输出语义化 UiEvent。
+/// 输入 crossterm `MouseEvent` + renderer + 状态机，输出语义化 `UiEvent`。
 /// `overlay_open`：弹层打开时点击不动作。
 /// README2 Phase 3：/mcp 状态页文本（Server/Status/Tools 表）。
 fn render_mcp_status(mcp_manager: &crate::mcp::manager::McpManager) -> String {
@@ -2265,7 +2264,7 @@ enum EffectResult {
     /// 请求退出主循环（BUG-004：空闲 Ctrl-C）。
     Quit,
     /// `request_input` 模态提交：答案是模型收到的回答（app 记录
-    /// UserInputReceived 并 resume）。
+    /// `UserInputReceived` 并 resume）。
     QuestionAnswer(String),
     /// `request_input` 模态拒绝（Esc）：模型收到 dismissed 语义。
     QuestionRejected,
@@ -2665,9 +2664,7 @@ async fn run_interactive<P: Provider>(
         // 避免反复挂起时 transcript 被相同提示刷屏。
         crate::session::CompletionReason::AwaitingUserInput => {
             let awaiting = outcome.awaiting_input.as_ref();
-            let question = awaiting
-                .map(|a| a.text.as_str())
-                .unwrap_or("请提供你的输入");
+            let question = awaiting.map_or("请提供你的输入", |a| a.text.as_str());
             // 打开 `request_input` 交互模态（opencode 形态：选项选择器/多问题
             // tab/自定义回答/拒绝）。投影：capabilities 的 RequestInputQuestion
             // → tui 的 QuestionView。
@@ -2712,8 +2709,7 @@ fn last_edit_diff(log: &SessionLog) -> String {
     let recent_start = events
         .iter()
         .rposition(|e| matches!(e, SessionEvent::RunStarted { .. }))
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
+        .map_or(0, |idx| idx + 1);
     let diffs: Vec<String> = events[recent_start..]
         .iter()
         .filter_map(|event| match event {
@@ -2809,8 +2805,7 @@ fn spawn_ctrl_c_handler(current_cancel: Arc<Mutex<Option<CancellationToken>>>) {
             } else {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                    .map_or(0, |d| d.as_millis() as u64);
                 let first = exit_armed.swap(now_ms, std::sync::atomic::Ordering::SeqCst);
                 if first != 0 && now_ms.saturating_sub(first) < 2000 {
                     // 2 秒内第二次：退出。process::exit 不执行析构，必须显式
@@ -2824,7 +2819,7 @@ fn spawn_ctrl_c_handler(current_cancel: Arc<Mutex<Option<CancellationToken>>>) {
     });
 }
 
-/// 退出前恢复终端（inline TUI 打开过 raw mode；process::exit 不触发 Drop）。
+/// 退出前恢复终端（inline TUI 打开过 raw `mode；process::exit` 不触发 Drop）。
 fn restore_terminal_on_exit() {
     use std::io::Write;
     let _ = ratatui::crossterm::execute!(
@@ -2840,7 +2835,7 @@ fn restore_terminal_on_exit() {
 }
 
 /// §31：panic hook——先尽力恢复终端，再走默认 panic 输出。
-/// 只安装一次（进程级）；恢复逻辑不依赖具体实例（TerminalDriver::restore_global）。
+/// `只安装一次（进程级）；恢复逻辑不依赖具体实例（TerminalDriver::restore_global`）。
 fn install_terminal_panic_hook() {
     use std::sync::Once;
     static HOOK: Once = Once::new();
@@ -2860,6 +2855,7 @@ fn install_terminal_panic_hook() {
 ///
 /// 委托 [`crate::session::project_messages`]（P0-3 统一投影语义）；
 /// 无 seq 输入时以 index+1 近似 seq（仅用于测试构造的事件数组）。
+#[must_use]
 pub fn session_to_messages(events: &[SessionEvent]) -> Vec<ChatMessage> {
     let with_seq: Vec<(u64, SessionEvent)> = events
         .iter()
@@ -2953,11 +2949,7 @@ pub fn list_sessions(
     let mut candidates: Vec<(std::time::SystemTime, SessionId, std::path::PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let Ok(entry) = entry else { continue };
-        if entry
-            .path()
-            .extension()
-            .map(|e| e == "jsonl")
-            .unwrap_or(false)
+        if entry.path().extension().is_some_and(|e| e == "jsonl")
             && let Ok(meta) = entry.metadata()
             && let Ok(modified) = meta.modified()
             && let Some(name) = entry.path().file_stem().and_then(|s| s.to_str())
@@ -3018,7 +3010,7 @@ fn session_resume_label(log: Option<&SessionLog>, artifacts_root: &std::path::Pa
 
 /// P2：从 session 文件提取首条用户消息摘要（≤40 字符，单行）。
 /// UX/性能：只流式读文件头部（≤500 行），不解析整个 session——
-/// 长会话下 `/sessions` 列表保持轻量（此前 read_events 解析全部事件）。
+/// 长会话下 `/sessions` 列表保持轻量（此前 `read_events` 解析全部事件）。
 fn first_user_preview(path: &std::path::Path) -> String {
     const MAX_LINES: usize = 500;
     const MAX_PREVIEW_EVENT_BYTES: usize = 1024 * 1024;
@@ -3063,7 +3055,7 @@ fn first_user_preview(path: &std::path::Path) -> String {
     String::new()
 }
 /// 会话对话预览（§用户诉求：/sessions 菜单内预览选中会话）：流式读文件头部，
-/// 只收集 UserSubmitted 与 AssistantMessageCommitted 消息（不含工具/系统事件），
+/// 只收集 `UserSubmitted` 与 `AssistantMessageCommitted` 消息（不含工具/系统事件），
 /// 每条取首行前 [`PREVIEW_LINE_CHARS`] 字符；最多 [`PREVIEW_MAX_LINES`] 条。
 /// 与 [`first_user_preview`] 同一有界读策略（≤500 行 / 1 MiB 预算）。
 fn session_dialogue_preview(path: &std::path::Path) -> Vec<crate::tui::model::MenuPreviewLine> {
@@ -3221,7 +3213,7 @@ mod tests {
         );
     }
 
-    /// P1-03：LiveEvent → RuntimeEvent 投影覆盖全部变体（headless 消费 LiveEvent
+    /// P1-03：LiveEvent → `RuntimeEvent` 投影覆盖全部变体（headless 消费 `LiveEvent`
     /// 不依赖此投影；TUI 依赖它生成 view event）。
     #[test]
     fn project_live_event_covers_all_variants() {
@@ -3346,7 +3338,7 @@ mod tests {
         assert_eq!(map_pending_answer(&free, "1"), "1", "无选项时数字原样");
     }
 
-    /// §13 修复：RequestInputQuestion → QuestionView 投影——无选项且禁止
+    /// §13 修复：RequestInputQuestion → `QuestionView` 投影——无选项且禁止
     /// 自定义的问题在模态里无法回答（死胡同），投影层强制允许自定义。
     #[test]
     fn project_questions_forces_custom_for_optionless() {
@@ -3518,7 +3510,7 @@ mod tests {
 
     /// P0-5 回归：Tab 补全必须同步到 editor（此前只改 view.input，
     /// 主循环 `view.input = editor.text()` 会把补全结果覆盖掉，Enter 提交原文）。
-    /// T3：走 reducer 单向流（UiEvent::Key → UiState）。
+    /// T3：走 reducer `单向流（UiEvent::Key` → `UiState`）。
     #[test]
     fn menu_completion_syncs_editor_text() {
         use crate::tui::event::UiEvent;
@@ -3553,7 +3545,7 @@ mod tests {
     }
 }
 
-/// UX：首条用户消息预览只读文件头部——超过 500 行才出现的 UserSubmitted 不读取
+/// UX：首条用户消息预览只读文件头部——超过 500 行才出现的 `UserSubmitted` 不读取
 /// （长会话 `/sessions` 列表保持轻量，不解析整个 session）。
 #[test]
 fn first_user_preview_is_bounded_to_file_head() {

@@ -105,13 +105,13 @@ impl BlobStore {
             source: e,
         })?;
         for bucket in entries.flatten() {
-            if bucket.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                if let Ok(bucket_entries) = std::fs::read_dir(bucket.path()) {
-                    count += bucket_entries
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
-                        .count();
-                }
+            if bucket.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                && let Ok(bucket_entries) = std::fs::read_dir(bucket.path())
+            {
+                count += bucket_entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+                    .count();
             }
         }
         Ok(count)
@@ -125,14 +125,14 @@ impl BlobStore {
             source: e,
         })?;
         for bucket in entries.flatten() {
-            if bucket.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                if let Ok(bucket_entries) = std::fs::read_dir(bucket.path()) {
-                    for entry in bucket_entries.flatten() {
-                        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                            if let Ok(meta) = entry.metadata() {
-                                total += meta.len();
-                            }
-                        }
+            if bucket.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                && let Ok(bucket_entries) = std::fs::read_dir(bucket.path())
+            {
+                for entry in bucket_entries.flatten() {
+                    if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                        && let Ok(meta) = entry.metadata()
+                    {
+                        total += meta.len();
                     }
                 }
             }

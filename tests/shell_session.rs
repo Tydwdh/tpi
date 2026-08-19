@@ -1,4 +1,4 @@
-//! Logical Shell Session 本地集成测试（任务书 §59 本地矩阵 + §66 DoD）。
+//! Logical Shell Session 本地集成测试（任务书 §59 本地矩阵 + §66 `DoD`）。
 //!
 //! 依赖真实 Git Bash（`locate_git_bash`）与 `TPI_PROCESS_HOST` 指向真实
 //! tpi.exe（单二进制 process-host 握手，§11.5）。
@@ -11,7 +11,7 @@ use tpi::outcome::ToolStatus;
 use tpi::tool::command::{BashArgs, bash};
 
 /// Windows 路径比较：盘符大小写不敏感 + 分隔符归一化（session cwd 来自
-/// cygpath -w 是反斜杠，workspace.join() 是正斜杠）。
+/// cygpath -w `是反斜杠，workspace.join()` 是正斜杠）。
 fn path_eq(a: &Utf8PathBuf, b: &Utf8PathBuf) -> bool {
     let norm = |s: &str| s.to_lowercase().replace('\\', "/");
     norm(a.as_str()) == norm(b.as_str())
@@ -80,7 +80,7 @@ async fn cd_persists_across_calls() {
 
     // 未传 cwd 的下一条命令在 session cwd 执行（pwd 应输出 a/b 目录）。
     let r = run_bash(&ctx, "pwd", 60_000, cancel.clone()).await;
-    assert!(r.status == ToolStatus::Succeeded);
+    assert_eq!(r.status, ToolStatus::Succeeded);
     assert!(
         r.model_payload.output.contains("a\\b") || r.model_payload.output.contains("a/b"),
         "pwd 应指向 a/b：{}",
@@ -94,19 +94,22 @@ async fn cd_up_and_no_capture_leak() {
     let (_dir, workspace, ctx) = setup();
     let cancel = CancellationToken::new();
 
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "mkdir -p a/b", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "cd a/b", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
-    assert!(run_bash(&ctx, "cd ..", 60_000, cancel.clone()).await.status == ToolStatus::Succeeded);
+    assert_eq!(
+        run_bash(&ctx, "cd ..", 60_000, cancel.clone()).await.status,
+        ToolStatus::Succeeded
+    );
 
     {
         let state = ctx.shell.lock().unwrap();
@@ -114,7 +117,7 @@ async fn cd_up_and_no_capture_leak() {
     }
 
     let r = run_bash(&ctx, "echo hello", 60_000, cancel.clone()).await;
-    assert!(r.status == ToolStatus::Succeeded);
+    assert_eq!(r.status, ToolStatus::Succeeded);
     assert!(r.model_payload.output.contains("hello"));
     assert!(
         !r.model_payload.output.contains("__TPI_CAPTURE_"),
@@ -129,11 +132,11 @@ async fn failed_command_still_commits_cwd() {
     let (_dir, workspace, ctx) = setup();
     let cancel = CancellationToken::new();
 
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "mkdir -p a/b", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
     let r = run_bash(&ctx, "cd a/b; false", 60_000, cancel.clone()).await;
     assert_eq!(r.status, ToolStatus::Failed, "exit 非 0 → Failed");
@@ -151,13 +154,16 @@ async fn timeout_does_not_commit_unknown_state() {
     let (_dir, workspace, ctx) = setup();
     let cancel = CancellationToken::new();
 
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "mkdir -p a", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
-    assert!(run_bash(&ctx, "cd a", 60_000, cancel.clone()).await.status == ToolStatus::Succeeded);
+    assert_eq!(
+        run_bash(&ctx, "cd a", 60_000, cancel.clone()).await.status,
+        ToolStatus::Succeeded
+    );
     let r = run_bash(&ctx, "cd b; sleep 1000", 400, cancel.clone()).await;
     assert_eq!(r.status, ToolStatus::TimedOut);
 
@@ -172,7 +178,7 @@ async fn timeout_does_not_commit_unknown_state() {
 
     // 下一条 bash 仍正常，且沿用已确认 cwd（pwd 指向 a 目录，非 b）。
     let r = run_bash(&ctx, "pwd", 60_000, cancel.clone()).await;
-    assert!(r.status == ToolStatus::Succeeded);
+    assert_eq!(r.status, ToolStatus::Succeeded);
     let stdout_part = r
         .model_payload
         .output
@@ -192,13 +198,16 @@ async fn cancel_keeps_last_confirmed_and_recovers() {
     let (_dir, workspace, ctx) = setup();
     let cancel = CancellationToken::new();
 
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "mkdir -p a", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
-    assert!(run_bash(&ctx, "cd a", 60_000, cancel.clone()).await.status == ToolStatus::Succeeded);
+    assert_eq!(
+        run_bash(&ctx, "cd a", 60_000, cancel.clone()).await.status,
+        ToolStatus::Succeeded
+    );
 
     // 长命令，执行中取消。
     let cancel_for_run = CancellationToken::new();
@@ -223,7 +232,7 @@ async fn cancel_keeps_last_confirmed_and_recovers() {
 
     // 下一条 bash 仍正常。
     let r = run_bash(&ctx, "pwd", 60_000, cancel.clone()).await;
-    assert!(r.status == ToolStatus::Succeeded);
+    assert_eq!(r.status, ToolStatus::Succeeded);
 }
 
 /// bash.cwd 显式 override：本次生效，不改变 session cwd（任务书 §15/§16）。
@@ -232,13 +241,16 @@ async fn explicit_cwd_is_one_shot_override() {
     let (_dir, workspace, ctx) = setup();
     let cancel = CancellationToken::new();
 
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "mkdir -p a", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
-    assert!(run_bash(&ctx, "cd a", 60_000, cancel.clone()).await.status == ToolStatus::Succeeded);
+    assert_eq!(
+        run_bash(&ctx, "cd a", 60_000, cancel.clone()).await.status,
+        ToolStatus::Succeeded
+    );
 
     // 显式 cwd = workspace root：本次在 root 执行，session cwd 不变。
     let mut ctx2 = ctx.clone();
@@ -253,7 +265,7 @@ async fn explicit_cwd_is_one_shot_override() {
         &ctx2,
     )
     .await;
-    assert!(r.status == ToolStatus::Succeeded);
+    assert_eq!(r.status, ToolStatus::Succeeded);
     assert!(
         !r.model_payload.output.contains("a\\b") && !r.model_payload.output.contains("a/b"),
         "override 后应从 workspace root 执行：{}",
@@ -268,7 +280,7 @@ async fn explicit_cwd_is_one_shot_override() {
     );
 }
 
-/// 严格模式（allow_outside_workspace=false）：`cd` 逃出 workspace 不 commit（§17）。
+/// `严格模式（allow_outside_workspace=false`）：`cd` 逃出 workspace 不 commit（§17）。
 #[tokio::test]
 async fn strict_mode_rejects_escape_from_workspace() {
     fixtures::point_host_at_real_tpi();
@@ -290,7 +302,7 @@ async fn strict_mode_rejects_escape_from_workspace() {
     drop(state);
 }
 
-/// 取 model_payload.output 中 `--- stdout ---` 段（避免 program 行等干扰断言）。
+/// 取 `model_payload.output` 中 `--- stdout ---` 段（避免 program 行等干扰断言）。
 fn stdout_part(output: &str) -> &str {
     output.split("--- stdout ---").nth(1).unwrap_or("")
 }
@@ -301,14 +313,14 @@ async fn exported_env_persists_across_calls() {
     let (_dir, _workspace, ctx) = setup();
     let cancel = CancellationToken::new();
 
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "export TPI_FOO=abc", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
     let r = run_bash(&ctx, "echo \"$TPI_FOO\"", 60_000, cancel.clone()).await;
-    assert!(r.status == ToolStatus::Succeeded);
+    assert_eq!(r.status, ToolStatus::Succeeded);
     assert!(
         stdout_part(&r.model_payload.output).contains("abc"),
         "export 后的变量应保持：{}",
@@ -329,20 +341,20 @@ async fn unset_env_persists_across_calls() {
     let (_dir, _workspace, ctx) = setup();
     let cancel = CancellationToken::new();
 
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "export TPI_FOO=abc", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "unset TPI_FOO", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
     let r = run_bash(&ctx, "echo \"${TPI_FOO-unset}\"", 60_000, cancel.clone()).await;
-    assert!(r.status == ToolStatus::Succeeded);
+    assert_eq!(r.status, ToolStatus::Succeeded);
     assert!(
         stdout_part(&r.model_payload.output).contains("unset"),
         "unset 后变量应消失：{}",
@@ -363,14 +375,14 @@ async fn export_on_first_call_persists() {
     let (_dir, _workspace, ctx) = setup();
     let cancel = CancellationToken::new();
 
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "export TPI_FIRST=yes", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
     let r = run_bash(&ctx, "echo \"$TPI_FIRST\"", 60_000, cancel.clone()).await;
-    assert!(r.status == ToolStatus::Succeeded);
+    assert_eq!(r.status, ToolStatus::Succeeded);
     assert!(
         stdout_part(&r.model_payload.output).contains("yes"),
         "首次 export 也应保持：{}",
@@ -385,11 +397,11 @@ async fn dynamic_env_vars_do_not_pollute_overlay() {
     let cancel = CancellationToken::new();
 
     for _ in 0..3 {
-        assert!(
+        assert_eq!(
             run_bash(&ctx, "echo hi", 60_000, cancel.clone())
                 .await
-                .status
-                == ToolStatus::Succeeded
+                .status,
+            ToolStatus::Succeeded
         );
     }
     let state = ctx.shell.lock().unwrap();
@@ -412,7 +424,7 @@ async fn env_capture_does_not_leak_to_model_output() {
     let cancel = CancellationToken::new();
 
     let r = run_bash(&ctx, "echo hello", 60_000, cancel.clone()).await;
-    assert!(r.status == ToolStatus::Succeeded);
+    assert_eq!(r.status, ToolStatus::Succeeded);
     let output = &r.model_payload.output;
     assert!(
         !output.contains("__TPI_CAPTURE_"),
@@ -430,11 +442,11 @@ async fn cwd_matrix_full_sequence() {
     let (_dir, workspace, ctx) = setup();
     let cancel = CancellationToken::new();
 
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "mkdir -p src", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
     // tempdir 名（msys /tmp/.tmpXXX 或 Windows C:\...\.tmpXXX 都以它结尾）。
     let base = workspace.file_name().unwrap().to_string();
@@ -446,11 +458,11 @@ async fn cwd_matrix_full_sequence() {
         r.model_payload.output
     );
 
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "cd src", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
     let r = run_bash(&ctx, "pwd", 60_000, cancel.clone()).await;
     assert!(
@@ -460,7 +472,10 @@ async fn cwd_matrix_full_sequence() {
         r.model_payload.output
     );
 
-    assert!(run_bash(&ctx, "cd ..", 60_000, cancel.clone()).await.status == ToolStatus::Succeeded);
+    assert_eq!(
+        run_bash(&ctx, "cd ..", 60_000, cancel.clone()).await.status,
+        ToolStatus::Succeeded
+    );
     let r = run_bash(&ctx, "pwd", 60_000, cancel.clone()).await;
     assert!(
         stdout_part(&r.model_payload.output).contains(&base),
@@ -480,11 +495,11 @@ async fn timeout_does_not_commit_unknown_env() {
     let cancel = CancellationToken::new();
 
     // 先建立已知 overlay。
-    assert!(
+    assert_eq!(
         run_bash(&ctx, "export TPI_GOOD=keep", 60_000, cancel.clone())
             .await
-            .status
-            == ToolStatus::Succeeded
+            .status,
+        ToolStatus::Succeeded
     );
 
     // timeout 命令：export 了 TPI_BAD 但命令未正常结束 → 不得 commit。

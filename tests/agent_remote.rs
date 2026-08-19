@@ -2,7 +2,7 @@
 //! 上完整跑一个真实任务——写脚本、运行、读结果，全程不出现 ssh/scp。
 //!
 //! 用 loopback russh server 充当"远端机器"，其临时目录即远端 FS；
-//! FakeProvider 脚本驱动 Agent 按合理顺序调用工具（list/read/write/bash/read）。
+//! `FakeProvider` 脚本驱动 Agent 按合理顺序调用工具（list/read/write/bash/read）。
 
 mod fixtures;
 
@@ -22,8 +22,8 @@ fn tool_call(name: &str, args: serde_json::Value) -> ToolCall {
     fixtures::fake_provider::tool_call(name, args)
 }
 
-/// 启动 server + 确认 host key + 构造 remote ActiveWorkspace。
-/// 返回 (tempdir_remote_fs, workspace)。
+/// 启动 server + 确认 host key + 构造 remote `ActiveWorkspace`。
+/// 返回 (`tempdir_remote_fs`, workspace)。
 async fn setup_remote_workspace() -> (tempfile::TempDir, tpi::workspace::ActiveWorkspace) {
     let (port, root, known_hosts) = fixtures::remote_server::start_test_server().await;
     let mut probe = fixtures::remote_server::test_client(port, &known_hosts).await;
@@ -50,7 +50,7 @@ async fn setup_remote_workspace() -> (tempfile::TempDir, tpi::workspace::ActiveW
 /// "project/logs/input.log 里有多种错误，写一个脚本统计每种错误数量，
 /// 输出 result.csv，并运行验证。"
 ///
-/// FakeProvider 脚本：list logs → read input.log → write analyze.sh →
+/// `FakeProvider` 脚本：list logs → read input.log → write analyze.sh →
 /// bash bash analyze.sh → read result.csv → 完成。
 #[tokio::test]
 async fn agent_solves_task_on_remote_workspace() {

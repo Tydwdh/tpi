@@ -925,8 +925,7 @@ async fn consume_responses_stream(
         usage,
         tool_calls: pending
             .into_iter()
-            .enumerate()
-            .map(|(i, call)| crate::provider::ToolCall {
+            .map(|call| crate::provider::ToolCall {
                 call_id: tpi_core::ids::ToolCallId::new_v7(),
                 provider_id: call.provider_id.unwrap_or_default(),
                 name: call.name,

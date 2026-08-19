@@ -40,7 +40,7 @@ async fn cancellation_terminates_running_command_with_cancelled_status() {
     assert!(outcome.model_payload.output.contains("status: cancelled"));
 }
 
-/// timeout 是独立状态：超时后命令以 TimedOut 结束。
+/// timeout 是独立状态：超时后命令以 `TimedOut` 结束。
 #[tokio::test]
 async fn timeout_terminates_command_with_timed_out_status() {
     fixtures::point_host_at_real_tpi();

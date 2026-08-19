@@ -26,7 +26,7 @@ fn text_strategy() -> impl Strategy<Value = String> {
         })
 }
 
-/// 取文本中恰好出现一次、不含 \r 的子串（作为 old_text）；无唯一子串则跳过该 case。
+/// 取文本中恰好出现一次、不含 \r 的子串（作为 `old_text）；无唯一子串则跳过该` case。
 fn unique_substring(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     if bytes.is_empty() {

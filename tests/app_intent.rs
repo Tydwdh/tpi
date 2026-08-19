@@ -1,6 +1,6 @@
-//! P3-01：recorded input trace → AppCommand sequence 固定（验收）。
+//! P3-01：recorded input trace → `AppCommand` sequence 固定（验收）。
 //!
-//! 从 tests/fixtures/ui_trace/ 读取录制事件，映射为 UiEvent，再把与 app
+//! 从 `tests/fixtures/ui_trace`/ 读取录制事件，映射为 UiEvent，再把与 app
 //! 相关的动作映射为 `AppCommand`，断言序列确定（同一 trace → 同一 command
 //! sequence；不依赖 wall clock / network）。
 
@@ -13,7 +13,7 @@ fn corpus_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui_trace")
 }
 
-/// 与 tui_trace_replay::parse_event 相同的 trace 解析（key/scroll 子集）。
+/// 与 `tui_trace_replay::parse_event` 相同的 trace 解析（key/scroll 子集）。
 fn parse_event(line: &str) -> UiEvent {
     let v: serde_json::Value = serde_json::from_str(line).expect("trace 行应为合法 JSON");
     match v["kind"].as_str().unwrap() {
@@ -28,7 +28,11 @@ fn parse_event(line: &str) -> UiEvent {
                 "end" | "ctrl_end" => KeyCode::End,
                 other => panic!("trace 含未支持的 key code: {other}"),
             };
-            let modifiers = if v.get("ctrl").and_then(|b| b.as_bool()).unwrap_or(false) {
+            let modifiers = if v
+                .get("ctrl")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
                 KeyModifiers::CONTROL
             } else {
                 KeyModifiers::NONE
@@ -50,7 +54,7 @@ fn parse_event(line: &str) -> UiEvent {
     }
 }
 
-/// 把 UiEvent 映射为 AppCommand（P3-01：surface 语义意图）。
+/// 把 `UiEvent` 映射为 AppCommand（P3-01：surface 语义意图）。
 /// 纯函数：同一事件 → 同一命令（确定性）。
 fn to_command(event: &UiEvent) -> Option<UiIntent> {
     match event {
@@ -113,7 +117,7 @@ fn command_sequence_is_deterministic() {
     }
 }
 
-/// 同义输入（不同 trace 表达同一语义动作）→ 同一 AppCommand。
+/// 同义输入（不同 trace 表达同一语义动作）→ 同一 `AppCommand`。
 #[test]
 fn semantic_equivalence_across_traces() {
     // Ctrl+D 无论如何拼写（char 'd' + CONTROL）都是 Quit。
@@ -163,7 +167,7 @@ fn slash_commands_map_to_app_commands() {
     assert_eq!(command_from_slash("/unknown-cmd"), None);
 }
 
-/// P3-03 golden：TUI 的 SLASH_COMMANDS 投影与 app::slash registry 完全一致
+/// P3-03 golden：TUI 的 `SLASH_COMMANDS` 投影与 `app::slash` registry 完全一致
 /// （help/completion 来自同一 snapshot，双份数据不允许漂移）。
 #[test]
 fn tui_slash_commands_match_registry() {

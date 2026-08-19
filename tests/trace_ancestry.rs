@@ -5,10 +5,10 @@
 //! 同一 executor 线程上的其他任务会被错误归入该 span，造成并发 run 的
 //! parent/child 关系交叉。
 //!
-//! 验收（P0-09）：并发两个带不同 run_id 的 future，subscriber 记录的
+//! 验收（P0-09）：并发两个带不同 `run_id` 的 future，subscriber 记录的
 //! event ancestry 不能交叉；任意时刻 `agent.run` 的 enter 深度 ≤ 1。
 //! 官方 contract：<https://docs.rs/tracing/latest/tracing/span/struct.EnteredSpan.html>
-//! 明确警告跨 await 持有 EnteredSpan 会导致不可预测的父子关系。
+//! 明确警告跨 await 持有 `EnteredSpan` 会导致不可预测的父子关系。
 
 mod fixtures;
 
@@ -24,12 +24,12 @@ use tpi::ids::RunId;
 use tpi::provider::{FinishReason, Provider, ProviderError, ProviderEvent, ProviderResponse};
 use tpi::session::{SessionLog, Usage};
 
-/// 每次 poll 都让出（yield_now）的 fake provider：保证并发 run 在单线程
+/// 每次 poll `都让出（yield_now）的` fake provider：保证并发 run 在单线程
 /// runtime 上真正交替执行，从而暴露"同步 enter guard 跨 await 泄漏"。
 struct YieldingProvider;
 
 impl Provider for YieldingProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "yield"
     }
 
@@ -60,8 +60,8 @@ struct Capture {
     max_run_depth: usize,
 }
 
-/// registry-based capture layer：on_new_span 把 span 名存入 extensions，
-/// on_enter/on_exit 维护 enter 栈（enter/exit 严格嵌套配对）。
+/// registry-based capture `layer：on_new_span` 把 span 名存入 extensions，
+/// `on_enter/on_exit` 维护 enter 栈（enter/exit 严格嵌套配对）。
 struct CaptureLayer(Arc<Mutex<Capture>>);
 
 impl<S> tracing_subscriber::Layer<S> for CaptureLayer

@@ -1600,6 +1600,8 @@ fn build_context(
     process_snapshot: Option<&str>,
     pending_reports: Option<&str>,
 ) -> Vec<ChatMessage> {
+    // pending_reports reserved for ADR-007 context projection (injected via pending_reports_text when non-empty).
+    let _ = pending_reports;
     // P1-05：build_context 只读窄视图 AgentConfig。
     let agent_cfg = config.agent_config();
     let mut out = Vec::with_capacity(messages.len() + 3);

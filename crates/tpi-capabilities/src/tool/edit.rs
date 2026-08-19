@@ -1850,10 +1850,10 @@ impl SnapshotStore {
             trimmed
         };
         // r{id} 格式
-        if let Some(id_str) = inner.strip_prefix('r') {
-            if let Ok(id) = id_str.parse::<u64>() {
-                return self.id_to_hash.get(&id).cloned();
-            }
+        if let Some(id_str) = inner.strip_prefix('r')
+            && let Ok(id) = id_str.parse::<u64>()
+        {
+            return self.id_to_hash.get(&id).cloned();
         }
         // b3:hash 格式（向后兼容）
         if is_valid_revision(inner) {

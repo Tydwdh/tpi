@@ -18,7 +18,7 @@ struct EchoProvider {
 }
 
 impl Provider for EchoProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "echo"
     }
 
@@ -47,8 +47,8 @@ fn minimal_config(workspace: &camino::Utf8PathBuf) -> tpi::config::Config {
     cfg
 }
 
-/// 用 fake provider 构造最小 AppServices（不调 from_config——那需要真实
-/// API key 且 spawn Ctrl-C handler；此处直接构造字段，验证 AppServices
+/// 用 fake provider 构造最小 AppServices（不调 `from_config——那需要真实`
+/// API key 且 spawn Ctrl-C handler；此处直接构造字段，验证 `AppServices`
 /// 是可注入的 ports 集合）。
 fn services_with(
     workspace: &camino::Utf8PathBuf,

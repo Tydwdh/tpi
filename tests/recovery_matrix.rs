@@ -1,6 +1,6 @@
 ﻿//! Phase F（任务书 §36）：crash 恢复矩阵——agent 级恢复测试。
 //!
-//! 覆盖：crash after ToolRequested / after ToolStarted（副作用前）/
+//! 覆盖：crash after `ToolRequested` / after ToolStarted（副作用前）/
 //! after 副作用 before ToolCompleted。验收：恢复后不自动重放未知副作用、
 //! assistant/tool protocol 仍合法、effect 明确、模型看到重新 inspect 提示。
 
@@ -51,8 +51,8 @@ fn write_events(
 }
 
 /// §36 场景 A：crash after ToolRequested（无 ToolStarted/ToolCompleted）。
-/// 恢复后：合成 Interrupted outcome（effect=not_applied），
-/// resume history 序列合法（User → Assistant(tool_calls) → Tool(interrupted)）。
+/// 恢复后：合成 Interrupted `outcome（effect=not_applied`），
+/// resume history 序列合法（User → `Assistant(tool_calls)` → Tool(interrupted)）。
 #[test]
 fn crash_after_tool_requested_recovers_with_clear_effect() {
     let (_dir, workspace) = workspace();
@@ -108,7 +108,7 @@ fn crash_after_tool_requested_recovers_with_clear_effect() {
 }
 
 /// §36 场景 B：crash after ToolStarted（write-ahead）before 副作用——
-/// 文件未变（target 仍是 expected revision）→ effect=not_applied。
+/// 文件未变（target 仍是 expected revision）→ `effect=not_applied`。
 #[test]
 fn crash_after_write_ahead_before_effect_is_not_applied() {
     let (_dir, workspace) = workspace();
@@ -171,7 +171,7 @@ fn crash_after_write_ahead_before_effect_is_not_applied() {
     );
 }
 
-/// §36 场景 C：crash after 副作用 before ToolCompleted——
+/// §36 场景 C：crash after 副作用 before `ToolCompleted`——
 /// 文件已变（revision != expected）→ effect=committed，模型能看到已提交事实。
 #[test]
 fn crash_after_effect_before_completed_is_committed() {

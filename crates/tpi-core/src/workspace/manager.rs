@@ -44,7 +44,10 @@ pub struct WorkspaceManager {
     index: WorkspaceIndex,
     blob_store: BlobStore,
     journal: MutationJournal,
+    // Reserved for future policy enforcement (tracking/budget checks).
+    #[allow(dead_code)]
     policy: MutationSafetyPolicy,
+    #[allow(dead_code)]
     tracking_policy: TrackingPolicy,
     /// Checkpoints form a chain: checkpoints\[0\] is the baseline.
     checkpoints: Vec<Checkpoint>,
@@ -251,15 +254,15 @@ impl WorkspaceManager {
                 WorkspaceMutation::Create { path, content } => {
                     // Undo create = delete. Check that file content matches.
                     let norm = NormalizedPath::new(&self.root.join(path.as_str()), &self.root);
-                    if let Some(current_blob) = self.index.get_blob_id(&norm) {
-                        if current_blob != content {
-                            conflicts.push(WorkspaceConflict {
-                                path: path.to_string(),
-                                expected_blob: content.to_string(),
-                                actual_blob: current_blob.to_string(),
-                                modified_by: "external".into(),
-                            });
-                        }
+                    if let Some(current_blob) = self.index.get_blob_id(&norm)
+                        && current_blob != content
+                    {
+                        conflicts.push(WorkspaceConflict {
+                            path: path.to_string(),
+                            expected_blob: content.to_string(),
+                            actual_blob: current_blob.to_string(),
+                            modified_by: "external".into(),
+                        });
                     }
                 }
                 WorkspaceMutation::Delete { path, content } => {
@@ -267,21 +270,21 @@ impl WorkspaceManager {
                     let full_path = self.root.join(path.as_str());
                     if full_path.exists() {
                         let norm = NormalizedPath::new(&full_path, &self.root);
-                        if let Some(current_blob) = self.index.get_blob_id(&norm) {
-                            if current_blob != content {
-                                conflicts.push(WorkspaceConflict {
-                                    path: path.to_string(),
-                                    expected_blob: "(deleted)".into(),
-                                    actual_blob: current_blob.to_string(),
-                                    modified_by: "external".into(),
-                                });
-                            }
+                        if let Some(current_blob) = self.index.get_blob_id(&norm)
+                            && current_blob != content
+                        {
+                            conflicts.push(WorkspaceConflict {
+                                path: path.to_string(),
+                                expected_blob: "(deleted)".into(),
+                                actual_blob: current_blob.to_string(),
+                                modified_by: "external".into(),
+                            });
                         }
                     }
                 }
                 WorkspaceMutation::Modify {
                     path,
-                    before,
+                    before: _,
                     after,
                 } => {
                     let norm = NormalizedPath::new(&self.root.join(path.as_str()), &self.root);
@@ -305,17 +308,21 @@ impl WorkspaceManager {
                         }
                     }
                 }
-                WorkspaceMutation::Rename { from, to, content } => {
+                WorkspaceMutation::Rename {
+                    from: _,
+                    to,
+                    content,
+                } => {
                     let to_norm = NormalizedPath::new(&self.root.join(to.as_str()), &self.root);
-                    if let Some(current_blob) = self.index.get_blob_id(&to_norm) {
-                        if current_blob != content {
-                            conflicts.push(WorkspaceConflict {
-                                path: to.to_string(),
-                                expected_blob: content.to_string(),
-                                actual_blob: current_blob.to_string(),
-                                modified_by: "external".into(),
-                            });
-                        }
+                    if let Some(current_blob) = self.index.get_blob_id(&to_norm)
+                        && current_blob != content
+                    {
+                        conflicts.push(WorkspaceConflict {
+                            path: to.to_string(),
+                            expected_blob: content.to_string(),
+                            actual_blob: current_blob.to_string(),
+                            modified_by: "external".into(),
+                        });
                     }
                 }
             }

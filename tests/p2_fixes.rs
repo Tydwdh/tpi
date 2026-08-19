@@ -13,7 +13,7 @@ use tpi::tool::files::{WriteArgs, write};
 
 /// P2：write 支持 revision-bound 整体重写（此前只能新建文件）。
 /// - 已存在文件不带 revision → 明确拒绝（给出下一步）；
-/// - revision 不匹配 → stale_rejected（可恢复引导）；
+/// - revision 不匹配 → `stale_rejected（可恢复引导`）；
 /// - revision 匹配 → 整体重写成功，返回 previous/current revision。
 #[test]
 fn p2_write_rewrite_requires_matching_revision() {

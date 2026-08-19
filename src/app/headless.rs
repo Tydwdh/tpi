@@ -40,7 +40,8 @@ pub struct JsonEvent {
     pub assistant_text: Option<String>,
 }
 
-/// LiveEvent → JsonEvent（纯投影；无正文泄露：tool output 已是有界摘要）。
+/// `LiveEvent` → JsonEvent（纯投影；无正文泄露：tool output 已是有界摘要）。
+#[must_use]
 pub fn json_event(event: &LiveEvent) -> JsonEvent {
     match event {
         LiveEvent::StepStarted { step } => JsonEvent {
@@ -116,7 +117,7 @@ pub struct HeadlessOutput {
     pub outcome: AgentOutcome,
 }
 
-/// 跑一次 run，消费 LiveEvent 并收集为 JSON 事件（无 drain task）。
+/// 跑一次 run，消费 `LiveEvent` 并收集为 JSON 事件（无 drain task）。
 pub async fn run_headless<P: Provider, S: SessionStore>(
     provider: &mut P,
     session: &mut S,
@@ -172,7 +173,8 @@ pub async fn run_headless<P: Provider, S: SessionStore>(
     Ok(HeadlessOutput { events, outcome })
 }
 
-/// 终态 → JSON 事件（含 reason/assistant_text；调用方据此定退出码）。
+/// 终态 → JSON 事件（含 `reason/assistant_text；调用方据此定退出码`）。
+#[must_use]
 pub fn final_json(outcome: &AgentOutcome) -> JsonEvent {
     JsonEvent {
         v: JSON_OUTPUT_VERSION,
@@ -184,6 +186,7 @@ pub fn final_json(outcome: &AgentOutcome) -> JsonEvent {
 }
 
 /// 退出码建议（headless 调用方用）：正常 Stop 0；取消 130；错误 1。
+#[must_use]
 pub fn exit_code_for(reason: &crate::session::CompletionReason) -> i32 {
     match reason {
         crate::session::CompletionReason::Stop => 0,

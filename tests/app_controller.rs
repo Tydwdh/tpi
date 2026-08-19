@@ -1,6 +1,6 @@
 //! P3-02：AppController 验收——fake runtime/session/platform 的 integration tests。
 //!
-//! 覆盖：controller 接收 UiIntent → 返回 AppEffect；cancel run 传播到 cancel
+//! 覆盖：controller 接收 `UiIntent` → 返回 AppEffect；cancel run 传播到 cancel
 //! token；start new session 重置会话；Quit 请求渲染。不引用 Crossterm/Ratatui。
 
 use std::sync::{Arc, Mutex};
@@ -10,10 +10,10 @@ use tpi::app::controller::AppController;
 use tpi::app::intent::{AppCommand, AppEffect, IntentSource, UiIntent};
 use tpi::provider::{FinishReason, Provider, ProviderError, ProviderEvent, ProviderResponse};
 
-/// 最小 fake provider（同 tests/app_services.rs 的 EchoProvider）。
+/// 最小 fake provider（同 `tests/app_services.rs` 的 `EchoProvider`）。
 struct EchoProvider;
 impl Provider for EchoProvider {
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "echo"
     }
     async fn stream(
@@ -86,7 +86,7 @@ fn intent(cmd: AppCommand) -> UiIntent {
     UiIntent::new(cmd, IntentSource::Keyboard)
 }
 
-/// Cancel run：controller 取消 current_cancel token（若在跑）。
+/// Cancel run：controller 取消 `current_cancel` token（若在跑）。
 #[test]
 fn cancel_run_cancels_token() {
     let mut controller = AppController::new(services());
@@ -150,7 +150,7 @@ fn quit_requests_draw() {
     );
 }
 
-/// ToggleSidebar 是视图意图：controller 返回渲染 effect（不产生业务副作用）。
+/// `ToggleSidebar` 是视图意图：controller 返回渲染 effect（不产生业务副作用）。
 #[test]
 fn toggle_sidebar_is_view_intent() {
     let mut controller = AppController::new(services());
@@ -196,7 +196,7 @@ impl PlatformEffects for FakePlatform {
     fn notify(&self, _message: &str) {}
 }
 
-/// CopyToClipboard 成功：调用 fake，错误不静默。
+/// `CopyToClipboard` 成功：调用 fake，错误不静默。
 #[test]
 fn copy_to_clipboard_success_and_error() {
     let fake = FakePlatform::default();
@@ -227,7 +227,7 @@ fn open_url_rejects_non_http() {
     assert_eq!(fake.urls.borrow().as_slice(), ["https://example.com"]);
 }
 
-/// OpenUrl 平台失败：错误反馈。
+/// `OpenUrl` 平台失败：错误反馈。
 #[test]
 fn open_url_platform_error_feedback() {
     let fake = FakePlatform {

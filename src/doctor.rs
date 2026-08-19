@@ -18,6 +18,7 @@ pub struct DoctorCheck {
 }
 
 /// 运行全部环境检查。
+#[must_use]
 pub fn doctor_report(workspace_root: &Utf8PathBuf) -> Vec<DoctorCheck> {
     doctor_report_with_home(workspace_root, &crate::config::tpi_home())
 }
@@ -35,8 +36,7 @@ fn doctor_report_with_home(
     let loaded_config = crate::config::load_from_home(workspace_root, None, home);
     let model_configured = loaded_config
         .as_ref()
-        .map(|config| !config.model.name.is_empty())
-        .unwrap_or(false);
+        .is_ok_and(|config| !config.model.name.is_empty());
     checks.push(DoctorCheck {
         name: "config",
         ok: config_exists,
@@ -73,8 +73,7 @@ fn doctor_report_with_home(
     let api_key_env = loaded_config
         .as_ref()
         .ok()
-        .map(|config| config.model.api_key_env.as_str())
-        .unwrap_or("TPI_API_KEY");
+        .map_or("TPI_API_KEY", |config| config.model.api_key_env.as_str());
     let api_key_ok = loaded_config
         .as_ref()
         .ok()
@@ -196,8 +195,9 @@ fn doctor_report_with_home(
     let keymap = loaded_config
         .as_ref()
         .ok()
-        .map(|config| config.ui_config().keymap)
-        .unwrap_or_else(crate::tui::keymap::Keymap::builtin);
+        .map_or_else(crate::tui::keymap::Keymap::builtin, |config| {
+            config.ui_config().keymap
+        });
     use crate::tui::keymap::KeyAction;
     let critical = [
         ("submit", KeyAction::Submit),
@@ -228,9 +228,9 @@ fn doctor_report_with_home(
     let mut corrupted: Vec<(String, usize, String)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&session_dir) {
         let mut files: Vec<std::path::PathBuf> = entries
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.path())
-            .filter(|p| p.extension().map(|e| e == "jsonl").unwrap_or(false))
+            .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
             .collect();
         files.sort();
         for path in files {
@@ -293,6 +293,7 @@ fn probe_directory_writable(dir: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// 报告渲染（CLI 与 /doctor 共用）。
+#[must_use]
 pub fn render_report(workspace_root: &Utf8PathBuf) -> String {
     let mut out = String::from("TPI 环境检查\n");
     for check in doctor_report(workspace_root) {

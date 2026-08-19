@@ -1,7 +1,7 @@
 //! `tpi serve`：局域网网页接口（粗糙版，供手机在局域网内发送/接收消息）。
 //!
 //! 设计约束（用户诉求：可以稍微粗糙一点）：
-//! - **零新依赖**：手写 HTTP/1.1 最小实现（tokio TcpListener + 逐行解析），
+//! - **零新依赖**：手写 HTTP/1.1 最小实现（tokio `TcpListener` + 逐行解析），
 //!   不引入 axum/hyper（保持 P0-06 依赖卫生）；每次连接 `Connection: close`。
 //! - 无 TLS：只监听局域网（0.0.0.0），可选 `--token` 做简单访问控制。
 //! - 串行执行：同一时刻只跑一个 agent run（busy 时新消息返回 409）；
@@ -42,7 +42,7 @@ const MAX_LINE_BYTES: usize = 8 * 1024;
 /// 全部 header 总大小上限。
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// 并发连接上限（防局域网恶意/失控客户端用大量连接耗尽内存；每个连接
-/// 最多持有一个解析缓冲 + 15s READ_TIMEOUT 窗口）。
+/// 最多持有一个解析缓冲 + 15s `READ_TIMEOUT` 窗口）。
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
 /// 一次 run 的结果（供 /api/status 轮询）。
@@ -58,7 +58,7 @@ struct ServerState {
     conversation: Mutex<Conversation>,
     provider: Mutex<OpenAiCompatClient>,
     busy: AtomicBool,
-    /// 最近一次完成的结果，关联其 run_id（供轮询方区分“是不是我的消息”）。
+    /// 最近一次完成的结果，关联其 `run_id（供轮询方区分“是不是我的消息`”）。
     last: std::sync::Mutex<Option<(u64, RunResult)>>,
     token: Option<String>,
     sessions_root: std::path::PathBuf,
@@ -260,30 +260,27 @@ async fn read_line_bounded(
             // EOF：无内容 → None；有部分内容 → 返回（未换行的最后一段）。
             return Ok(if line.is_empty() { None } else { Some(line) });
         }
-        match buf.iter().position(|b| *b == b'\n') {
-            Some(index) => {
-                let take = index + 1;
-                if line.len() + take > max {
-                    return Err("行过长".into());
-                }
-                line.push_str(&String::from_utf8_lossy(&buf[..take]));
-                let consumed = take;
-                reader.consume(consumed);
-                return Ok(Some(line));
+        if let Some(index) = buf.iter().position(|b| *b == b'\n') {
+            let take = index + 1;
+            if line.len() + take > max {
+                return Err("行过长".into());
             }
-            None => {
-                if line.len() + buf.len() > max {
-                    return Err("行过长".into());
-                }
-                line.push_str(&String::from_utf8_lossy(buf));
-                let consumed = buf.len();
-                reader.consume(consumed);
+            line.push_str(&String::from_utf8_lossy(&buf[..take]));
+            let consumed = take;
+            reader.consume(consumed);
+            return Ok(Some(line));
+        } else {
+            if line.len() + buf.len() > max {
+                return Err("行过长".into());
             }
+            line.push_str(&String::from_utf8_lossy(buf));
+            let consumed = buf.len();
+            reader.consume(consumed);
         }
     }
 }
 
-/// 逐行读取请求：请求行 + headers + Content-Length body（上限 MAX_BODY_BYTES）。
+/// 逐行读取请求：请求行 + headers + Content-Length body（上限 `MAX_BODY_BYTES`）。
 async fn read_request(stream: &mut tokio::net::TcpStream) -> Result<Request, String> {
     let mut reader = BufReader::new(stream);
     let line = read_line_bounded(&mut reader, MAX_LINE_BYTES)
@@ -358,8 +355,8 @@ fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             // 粗糙解码：仅处理 %20 空格与 +。
-            let decode = |s: &str| s.replace("+", " ").replace("%20", " ");
-            out.insert(decode(k).to_string(), decode(v).to_string());
+            let decode = |s: &str| s.replace('+', " ").replace("%20", " ");
+            out.insert(decode(k).clone(), decode(v).clone());
         }
     }
     out
@@ -370,7 +367,10 @@ fn token_ok(state: &ServerState, req: &Request) -> bool {
         return true;
     };
     let from_query = req.query.get("token").map(String::as_str);
-    let from_header = req.headers.get("x-tpi-token").map(|s| s.as_str());
+    let from_header = req
+        .headers
+        .get("x-tpi-token")
+        .map(std::string::String::as_str);
     from_query == Some(expected.as_str()) || from_header == Some(expected.as_str())
 }
 
@@ -429,7 +429,7 @@ async fn history_json(state: &Arc<ServerState>) -> Result<String, String> {
     let path = state
         .log_path
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let messages: Vec<ChatMessage> = match &path {
         Some(path) => replay_messages(path).map_err(|e| format!("重建历史失败: {e}"))?,
@@ -455,7 +455,7 @@ fn status_json(state: &Arc<ServerState>) -> (String, String, String) {
     let last = state
         .last
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let (run_id, result) = match last {
         Some((run_id, result)) => (
@@ -484,8 +484,7 @@ async fn send_message(
     let content = content
         .get("content")
         .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("")
+        .map_or("", str::trim)
         .to_string();
     if content.is_empty() {
         return Err((
@@ -522,7 +521,7 @@ async fn send_message(
         *state
             .last
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some((run_id, result));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((run_id, result));
         guard.finish();
     });
 
@@ -560,7 +559,7 @@ impl Drop for RunGuard<'_> {
             let mut last = self
                 .last
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // ISSUE-035：run_id 从 1 开始（next_run 初值 1），错误占位用 0——
             // 两者不再冲突，轮询端不会把 panic 错误误认成自己那条消息的结果。
             *last = Some((
@@ -586,7 +585,7 @@ async fn run_agent(state: &Arc<ServerState>, content: String) -> RunResult {
         *state
             .log_path
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(log.path().to_path_buf());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(log.path().to_path_buf());
     }
     let run = async {
         let (session, history) = conversation

@@ -8,7 +8,7 @@
 //!   repo/          —— 可重置的 git 仓库（每次评测前 reset --hard + clean）
 //! ```
 //!
-//! 流程：reset repo → 创建独立 session → agent::run(task.md) →
+//! 流程：reset repo → 创建独立 session → `agent::run(task.md)` →
 //! 统计 session 事件指标 → 执行验收断言 → JSON 结果。
 //!
 //! 结果写入 `~/.tpi/evals/results/<task-id>.json`（最近一次）+ `runs.jsonl`
@@ -88,7 +88,7 @@ pub struct Expected {
     /// 单任务超时（秒；默认 900）。
     #[serde(default = "default_timeout_sec")]
     pub timeout_sec: u64,
-    /// 验收断言（全部通过 → verification_passed）。
+    /// 验收断言（全部通过 → `verification_passed`）。
     #[serde(default)]
     pub verify: Vec<VerifyStep>,
 }
@@ -123,7 +123,7 @@ pub fn discover(evals_root: &Path) -> Result<Vec<TaskEntry>, String> {
     let mut tasks = Vec::new();
     for entry in std::fs::read_dir(evals_root).map_err(|e| format!("读取 evals 失败: {e}"))? {
         let entry = entry.map_err(|e| format!("读取 evals 失败: {e}"))?;
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
         let dir = entry.path();
@@ -248,7 +248,7 @@ pub fn list_suites(evals_root: &Path) -> Result<Vec<String>, String> {
 }
 
 /// 把 repo reset 到 base commit（`git reset --hard` + `git clean -fdx`）。
-/// 默认 base_commit = HEAD；保证每次评测从干净现场开始（可重复）。
+/// 默认 `base_commit` = HEAD；保证每次评测从干净现场开始（可重复）。
 pub fn reset_repo(repo_dir: &Path, base_commit: Option<&str>) -> Result<(), String> {
     let git = |args: &[&str]| -> Result<(), String> {
         let output = std::process::Command::new("git")
@@ -338,7 +338,7 @@ impl VerifyResult {
     }
 }
 
-/// 从 session 事件统计的指标（seq, timestamp_ms, event）。
+/// 从 session 事件统计的指标（seq, `timestamp_ms`, event）。
 #[derive(Default)]
 struct EvalStats {
     turns: u32,
@@ -361,7 +361,7 @@ struct EvalStats {
     compaction_count: u32,
 }
 
-/// 读取并严格验证 session JSONL，再生成 (timestamp_ms, SessionEvent) 列表。
+/// 读取并严格验证 session JSONL，再生成 (`timestamp_ms`, `SessionEvent`) 列表。
 /// session 协议知识只由持久层维护；eval 不再自行跳过坏行后生成误导性指标。
 fn read_events_with_ts(path: &Path) -> Result<Vec<(i128, SessionEvent)>, String> {
     let envelopes = crate::session::read_envelopes(path)
@@ -474,7 +474,7 @@ pub async fn run_task(
 
     // 3. 以 repo 为 workspace 的独立配置。
     let repo_root = Utf8PathBuf::from_path_buf(task.repo_dir.clone())
-        .map_err(|e| format!("repo 路径非法: {:?}", e))?;
+        .map_err(|e| format!("repo 路径非法: {e:?}"))?;
     let mut eval_config = config.clone();
     eval_config.workspace_root = repo_root.clone();
     eval_config.sessions_root = sessions_root.clone();
@@ -538,13 +538,13 @@ pub async fn run_task(
         tokio::pin!(run_fut);
         let run_result = tokio::select! {
             result = &mut run_fut => Ok(result),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(task.expected.timeout_sec)) => Err(()),
+            () = tokio::time::sleep(std::time::Duration::from_secs(task.expected.timeout_sec)) => Err(()),
         };
 
         // §PointerHit 5：超时时显式 cancel token，并真正等待 run 结束（含
         // Job Object 进程树终止），再进入 verify——否则残留子进程与断言并发。
         match run_result {
-            Err(_) => {
+            Err(()) => {
                 cancel_run.cancel();
                 // 等 run future 响应取消并结束（Cancelled 是正常终态）；5s 兜底防
                 // 极端情况（provider 卡在不可取消的 IO）阻塞整个 eval。
@@ -671,7 +671,7 @@ async fn run_verify_bash(
         resolved_program: &resolved_program,
         launcher: Some("git-bash"),
         cancel: tokio_util::sync::CancellationToken::new(),
-        timeout: std::time::Duration::from_secs(60),
+        timeout: std::time::Duration::from_mins(1),
         output_budget: MAX_VERIFY_OUTPUT_BYTES,
         artifact: None,
         stream_sink: None,
@@ -824,12 +824,13 @@ pub fn persist_result(result: &EvalResult, results_dir: &Path) -> Result<(), Str
         .open(&runs)
         .map_err(|e| format!("打开 runs.jsonl 失败: {e}"))?;
     f.write_all(line.as_bytes())
-        .and_then(|_| f.write_all(b"\n"))
+        .and_then(|()| f.write_all(b"\n"))
         .map_err(|e| format!("写入 runs.jsonl 失败: {e}"))?;
     Ok(())
 }
 
 /// stdout 摘要（人类可读）。
+#[must_use]
 pub fn render_summary(result: &EvalResult) -> String {
     let mut out = String::new();
     out.push_str(&format!(
