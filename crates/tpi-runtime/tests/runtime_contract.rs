@@ -550,7 +550,7 @@ async fn request_input_suspend_emits_input_requested_and_answer_resumes() {
         vec![
             FakeResponse::with_tool_calls(vec![tool_call(
                 "request_input",
-                serde_json::json!({"question": "继续吗？", "options": ["是", "否"]}),
+                serde_json::json!({"questions": [{"question": "继续吗？", "options": [{"label": "是"}, {"label": "否"}]}]}),
             )]),
             FakeResponse::text("好的，继续了"),
         ],
@@ -705,7 +705,7 @@ async fn double_answer_input_first_wins_second_rejected() {
         vec![
             FakeResponse::with_tool_calls(vec![tool_call(
                 "request_input",
-                serde_json::json!({"question": "选哪个？"}),
+                serde_json::json!({"questions": [{"question": "选哪个？"}]}),
             )]),
             FakeResponse::text("已选择"),
         ],

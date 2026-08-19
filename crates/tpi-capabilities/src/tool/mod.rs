@@ -6,6 +6,7 @@
 //!
 //! `ask_user` 不是工具：需要用户决定时，模型直接输出问题并结束当前 run。
 
+pub mod builtins;
 pub mod command;
 pub mod edit;
 pub mod files;
@@ -190,12 +191,8 @@ pub enum BuiltinTool {
     Write,
     Bash,
     Process,
-    TerminalOpen,
-    TerminalWrite,
-    TerminalRead,
-    TerminalResize,
-    TerminalSignal,
-    TerminalClose,
+    /// §8：六个 terminal_* 操作合并为统一的 tagged-action terminal 工具。
+    Terminal,
     /// §13（AGENTS.md）：模型请求用户输入（run 挂起，非结束）。
     RequestInput,
     /// §15（AGENTS.md）：Runtime Introspection——查询能力快照。
@@ -237,12 +234,7 @@ impl BuiltinTool {
             BuiltinTool::Write => "write",
             BuiltinTool::Bash => "bash",
             BuiltinTool::Process => "process",
-            BuiltinTool::TerminalOpen => "terminal_open",
-            BuiltinTool::TerminalWrite => "terminal_write",
-            BuiltinTool::TerminalRead => "terminal_read",
-            BuiltinTool::TerminalResize => "terminal_resize",
-            BuiltinTool::TerminalSignal => "terminal_signal",
-            BuiltinTool::TerminalClose => "terminal_close",
+            BuiltinTool::Terminal => "terminal",
             BuiltinTool::RequestInput => "request_input",
             BuiltinTool::RuntimeInspect => "runtime_inspect",
             BuiltinTool::UpdatePlan => "update_plan",
@@ -262,12 +254,7 @@ impl BuiltinTool {
             "write" => Some(Self::Write),
             "bash" => Some(Self::Bash),
             "process" => Some(Self::Process),
-            "terminal_open" => Some(Self::TerminalOpen),
-            "terminal_write" => Some(Self::TerminalWrite),
-            "terminal_read" => Some(Self::TerminalRead),
-            "terminal_resize" => Some(Self::TerminalResize),
-            "terminal_signal" => Some(Self::TerminalSignal),
-            "terminal_close" => Some(Self::TerminalClose),
+            "terminal" => Some(Self::Terminal),
             "request_input" => Some(Self::RequestInput),
             "runtime_inspect" => Some(Self::RuntimeInspect),
             "update_plan" => Some(Self::UpdatePlan),
@@ -290,12 +277,7 @@ impl BuiltinTool {
             // A terminal can run arbitrary shell commands over multiple calls, so
             // it must be isolated from other workspace mutations and use the
             // conservative recovery policy.
-            Self::TerminalOpen
-            | Self::TerminalWrite
-            | Self::TerminalRead
-            | Self::TerminalResize
-            | Self::TerminalSignal
-            | Self::TerminalClose => ToolExecutionClass::WorkspaceUnknown,
+            Self::Terminal => ToolExecutionClass::WorkspaceUnknown,
             // §13：request_input 请求用户输入（无文件副作用）。
             Self::RequestInput => ToolExecutionClass::Pure,
             // §15：runtime_inspect 只读投影（无文件副作用）。
@@ -395,23 +377,13 @@ Use wait/status only when the result is needed; do not poll an unchanged process
 Cost: list/status/output/cancel ~local I/O; wait blocks up to timeout_ms. \
 Example: process action=status id=\"p17\"; process action=wait id=\"p17\" timeout_ms=10000"
             }
-            BuiltinTool::TerminalOpen => {
-                "Open a persistent interactive PTY. Unlike a background job it preserves stdin and terminal state. Example: terminal_open rows=24 cols=80"
-            }
-            BuiltinTool::TerminalWrite => {
-                "Write raw input bytes to a persistent PTY (no escape-sequence interpretation). Set submit=true to append the platform Enter byte so the shell runs it. Example: terminal_write id=\"t1\" data=\"echo ready\" submit=true"
-            }
-            BuiltinTool::TerminalRead => {
-                "Read only terminal output appended after a cursor. Use next_cursor for the next read to avoid duplicate context. Example: terminal_read id=\"t1\" after=42"
-            }
-            BuiltinTool::TerminalResize => {
-                "Resize the PTY using terminal rows and columns. Example: terminal_resize id=\"t1\" rows=40 cols=120"
-            }
-            BuiltinTool::TerminalSignal => {
-                "Interrupt a persistent PTY process. Example: terminal_signal id=\"t1\""
-            }
-            BuiltinTool::TerminalClose => {
-                "Close a persistent PTY and release its resources. Example: terminal_close id=\"t1\""
+            BuiltinTool::Terminal => {
+                "Manage a persistent interactive PTY terminal (tagged action schema). \
+Actions: open (create new PTY), write (send raw input bytes), read (read incremental output), \
+resize (change terminal dimensions), signal (send interrupt), close (terminate and release). \
+Unlike a background job, a terminal preserves stdin and terminal state. \
+Examples: terminal action=open rows=24 cols=80; terminal action=write id=\"t1\" data=\"cargo test\" submit=true; \
+terminal action=read id=\"t1\" after=42; terminal action=close id=\"t1\""
             }
             BuiltinTool::RequestInput => {
                 "Request input from the user. Use when you need a decision, clarification, \
@@ -423,10 +395,9 @@ rejected; proceed with existing information instead. \
 Supports multiple questions in one call: pass a `questions` array; each item may \
 carry a `header` grouping title and suggested `options` the user can pick (by number) \
 or override with custom text. Batch related questions into one call instead of \
-suspending repeatedly. The legacy single-question form (`question` + `options`) \
-still works. Do not end the conversation with a question — call this tool instead. \
+suspending repeatedly. Do not end the conversation with a question — call this tool instead. \
 Example: request_input questions=[{\"question\": \"should I run the full test suite?\", \
-\"options\": [\"yes\", \"no\"]}, {\"question\": \"deploy target?\", \"header\": \"release\"}]"
+\"options\": [{\"label\": \"yes\"}, {\"label\": \"no\"}]}, {\"question\": \"deploy target?\", \"header\": \"release\"}]"
             }
             BuiltinTool::RuntimeInspect => {
                 "Inspect the current runtime capabilities: available tools (with provider/\
@@ -490,24 +461,7 @@ Example: activate_skill name=\"rust-review\""
             BuiltinTool::Write => schema_value::<files::WriteArgs>("write"),
             BuiltinTool::Bash => schema_value::<command::BashArgs>("bash"),
             BuiltinTool::Process => schema_value::<process::ProcessArgs>("process"),
-            BuiltinTool::TerminalOpen => {
-                schema_value::<terminal::TerminalOpenArgs>("terminal_open")
-            }
-            BuiltinTool::TerminalWrite => {
-                schema_value::<terminal::TerminalWriteArgs>("terminal_write")
-            }
-            BuiltinTool::TerminalRead => {
-                schema_value::<terminal::TerminalReadArgs>("terminal_read")
-            }
-            BuiltinTool::TerminalResize => {
-                schema_value::<terminal::TerminalResizeArgs>("terminal_resize")
-            }
-            BuiltinTool::TerminalSignal => {
-                schema_value::<terminal::TerminalIdArgs>("terminal_signal")
-            }
-            BuiltinTool::TerminalClose => {
-                schema_value::<terminal::TerminalIdArgs>("terminal_close")
-            }
+            BuiltinTool::Terminal => schema_value::<terminal::TerminalArgs>("terminal"),
             BuiltinTool::RequestInput => {
                 schema_value::<request_input::RequestInputArgs>("request_input")
             }
@@ -538,23 +492,8 @@ Example: activate_skill name=\"rust-review\""
             BuiltinTool::Write => parse_args_typed("write", arguments, ValidatedArgs::Write),
             BuiltinTool::Bash => parse_args_typed("bash", arguments, ValidatedArgs::Bash),
             BuiltinTool::Process => parse_args_typed("process", arguments, ValidatedArgs::Process),
-            BuiltinTool::TerminalOpen => {
-                parse_args_typed("terminal_open", arguments, ValidatedArgs::TerminalOpen)
-            }
-            BuiltinTool::TerminalWrite => {
-                parse_args_typed("terminal_write", arguments, ValidatedArgs::TerminalWrite)
-            }
-            BuiltinTool::TerminalRead => {
-                parse_args_typed("terminal_read", arguments, ValidatedArgs::TerminalRead)
-            }
-            BuiltinTool::TerminalResize => {
-                parse_args_typed("terminal_resize", arguments, ValidatedArgs::TerminalResize)
-            }
-            BuiltinTool::TerminalSignal => {
-                parse_args_typed("terminal_signal", arguments, ValidatedArgs::TerminalSignal)
-            }
-            BuiltinTool::TerminalClose => {
-                parse_args_typed("terminal_close", arguments, ValidatedArgs::TerminalClose)
+            BuiltinTool::Terminal => {
+                parse_args_typed("terminal", arguments, ValidatedArgs::Terminal)
             }
             BuiltinTool::RequestInput => {
                 parse_args_typed("request_input", arguments, ValidatedArgs::RequestInput)
@@ -588,12 +527,7 @@ pub enum ValidatedArgs {
     Write(files::WriteArgs),
     Bash(command::BashArgs),
     Process(process::ProcessArgs),
-    TerminalOpen(terminal::TerminalOpenArgs),
-    TerminalWrite(terminal::TerminalWriteArgs),
-    TerminalRead(terminal::TerminalReadArgs),
-    TerminalResize(terminal::TerminalResizeArgs),
-    TerminalSignal(terminal::TerminalIdArgs),
-    TerminalClose(terminal::TerminalIdArgs),
+    Terminal(terminal::TerminalArgs),
     RequestInput(request_input::RequestInputArgs),
     RuntimeInspect(inspect::InspectArgs),
     UpdatePlan(tpi_core::plan::UpdatePlanArgs),
@@ -614,12 +548,7 @@ impl ValidatedArgs {
             Self::Write(_) => BuiltinTool::Write,
             Self::Bash(_) => BuiltinTool::Bash,
             Self::Process(_) => BuiltinTool::Process,
-            Self::TerminalOpen(_) => BuiltinTool::TerminalOpen,
-            Self::TerminalWrite(_) => BuiltinTool::TerminalWrite,
-            Self::TerminalRead(_) => BuiltinTool::TerminalRead,
-            Self::TerminalResize(_) => BuiltinTool::TerminalResize,
-            Self::TerminalSignal(_) => BuiltinTool::TerminalSignal,
-            Self::TerminalClose(_) => BuiltinTool::TerminalClose,
+            Self::Terminal(_) => BuiltinTool::Terminal,
             Self::RequestInput(_) => BuiltinTool::RequestInput,
             Self::RuntimeInspect(_) => BuiltinTool::RuntimeInspect,
             Self::UpdatePlan(_) => BuiltinTool::UpdatePlan,
@@ -640,12 +569,7 @@ impl ValidatedArgs {
             Self::Write(args) => Some(&args.path),
             Self::Bash(_)
             | Self::Process(_)
-            | Self::TerminalOpen(_)
-            | Self::TerminalWrite(_)
-            | Self::TerminalRead(_)
-            | Self::TerminalResize(_)
-            | Self::TerminalSignal(_)
-            | Self::TerminalClose(_)
+            | Self::Terminal(_)
             | Self::RequestInput(_)
             | Self::RuntimeInspect(_)
             | Self::UpdatePlan(_)
@@ -997,23 +921,8 @@ pub async fn execute(
         }
         (BuiltinTool::WebFetch, ValidatedArgs::WebFetch(args)) => web::web_fetch(args, ctx).await,
         (BuiltinTool::Process, ValidatedArgs::Process(args)) => process::process(args, ctx).await,
-        (BuiltinTool::TerminalOpen, ValidatedArgs::TerminalOpen(args)) => {
-            terminal::open(args, ctx).await
-        }
-        (BuiltinTool::TerminalWrite, ValidatedArgs::TerminalWrite(args)) => {
-            terminal::write(args, ctx).await
-        }
-        (BuiltinTool::TerminalRead, ValidatedArgs::TerminalRead(args)) => {
-            terminal::read(args, ctx).await
-        }
-        (BuiltinTool::TerminalResize, ValidatedArgs::TerminalResize(args)) => {
-            terminal::resize(args, ctx).await
-        }
-        (BuiltinTool::TerminalSignal, ValidatedArgs::TerminalSignal(args)) => {
-            terminal::signal(args, ctx).await
-        }
-        (BuiltinTool::TerminalClose, ValidatedArgs::TerminalClose(args)) => {
-            terminal::close(args, ctx).await
+        (BuiltinTool::Terminal, ValidatedArgs::Terminal(args)) => {
+            terminal::terminal(args, ctx).await
         }
         (BuiltinTool::RequestInput, ValidatedArgs::RequestInput(args)) => {
             request_input::request_input(args, ctx).await
@@ -1092,12 +1001,7 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
         BuiltinTool::Write,
         BuiltinTool::Bash,
         BuiltinTool::Process,
-        BuiltinTool::TerminalOpen,
-        BuiltinTool::TerminalWrite,
-        BuiltinTool::TerminalRead,
-        BuiltinTool::TerminalResize,
-        BuiltinTool::TerminalSignal,
-        BuiltinTool::TerminalClose,
+        BuiltinTool::Terminal,
         BuiltinTool::RequestInput,
         BuiltinTool::RuntimeInspect,
         BuiltinTool::UpdatePlan,

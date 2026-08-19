@@ -87,7 +87,6 @@ async fn remote_read_returns_local_style_output() {
     .await;
     assert_eq!(outcome.status, tpi::outcome::ToolStatus::Succeeded);
     let out = &outcome.model_payload.output;
-    assert!(out.contains("[revision="), "必须带 revision header：{out}");
     assert!(out.contains("lines: 1-3 of 3"), "行区间：{out}");
     assert!(out.contains("1: line1"), "行号：{out}");
     assert!(out.contains("3: line3"), "{out}");
@@ -106,14 +105,11 @@ async fn remote_write_then_read_roundtrip() {
         &RemoteWriteArgs {
             path: path.clone(),
             content: "hello 世界\n".into(),
-            revision: None,
         },
         &ctx,
     )
     .await;
     assert_eq!(outcome.status, tpi::outcome::ToolStatus::Succeeded);
-    let out = &outcome.model_payload.output;
-    assert!(out.contains("[revision="), "{out}");
 
     let raw = client.read_file(&path).await.unwrap();
     assert_eq!(raw, b"hello \xe4\xb8\x96\xe7\x95\x8c\n");
@@ -130,7 +126,7 @@ async fn remote_stale_edit_is_rejected() {
 
     // TPI read 拿到 R1。
     let r1 = client.read_file(&path).await.unwrap();
-    let rev1 = tpi::tool::edit::revision_of(&r1);
+    let _rev1 = tpi::tool::edit::revision_of(&r1);
 
     // 外部修改 → R2（模拟另一 SSH 会话改文件）。
     client
@@ -138,12 +134,11 @@ async fn remote_stale_edit_is_rejected() {
         .await
         .unwrap();
 
-    // TPI edit(R1) 必须 stale_rejected。
+    // TPI edit(R1)：old_text 已不存在 → no_match rejected。
     let outcome = tpi::remote::files::remote_edit(
         &mut client,
         &RemoteEditArgs {
             path: path.clone(),
-            revision: Some(rev1),
             replacements: vec![tpi::tool::edit::Replacement {
                 old_text: "old content".into(),
                 new_text: "tpi edit".into(),
@@ -154,8 +149,8 @@ async fn remote_stale_edit_is_rejected() {
     .await;
     assert_eq!(outcome.status, tpi::outcome::ToolStatus::Failed);
     assert!(
-        outcome.model_payload.output.contains("stale_revision"),
-        "必须 stale：{}",
+        outcome.model_payload.output.contains("no_match"),
+        "必须 no_match：{}",
         outcome.model_payload.output
     );
 
@@ -172,13 +167,12 @@ async fn remote_edit_applies_and_returns_diff() {
 
     let path = format!("{root_posix}/edit.txt");
     client.write_file(&path, b"a\nb\nc\n").await.unwrap();
-    let rev = tpi::tool::edit::revision_of(b"a\nb\nc\n");
+    let _rev = tpi::tool::edit::revision_of(b"a\nb\nc\n");
 
     let outcome = tpi::remote::files::remote_edit(
         &mut client,
         &RemoteEditArgs {
             path: path.clone(),
-            revision: Some(rev),
             replacements: vec![
                 tpi::tool::edit::Replacement {
                     old_text: "a".into(),
@@ -207,19 +201,6 @@ async fn remote_edit_applies_and_returns_diff() {
     // 文件已更新。
     let now = client.read_file(&path).await.unwrap();
     assert_eq!(now, b"A\nb\nC\n");
-
-    // 新 revision = 编辑后内容。
-    let new_rev = tpi::tool::edit::revision_of(b"A\nb\nC\n");
-    let rev_in_output = outcome
-        .model_payload
-        .output
-        .lines()
-        .find(|l| l.starts_with("[revision="))
-        .map(std::string::ToString::to_string);
-    assert!(
-        rev_in_output.unwrap().contains(&new_rev[3..]),
-        "新 revision 应出现在输出"
-    );
 }
 
 /// §41：atomic batch——任一条不匹配整体拒绝，文件不变。
@@ -230,13 +211,12 @@ async fn remote_edit_atomic_batch_rejects_partial() {
 
     let path = format!("{root_posix}/atomic.txt");
     client.write_file(&path, b"keep\n").await.unwrap();
-    let rev = tpi::tool::edit::revision_of(b"keep\n");
+    let _rev = tpi::tool::edit::revision_of(b"keep\n");
 
     let outcome = tpi::remote::files::remote_edit(
         &mut client,
         &RemoteEditArgs {
             path: path.clone(),
-            revision: Some(rev),
             replacements: vec![
                 tpi::tool::edit::Replacement {
                     old_text: "keep".into(),

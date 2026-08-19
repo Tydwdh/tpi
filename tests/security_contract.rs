@@ -40,7 +40,6 @@ fn write_through_workspace_junction_is_blocked() {
         WriteArgs {
             path: "link/escaped.txt".into(),
             content: "x".into(),
-            revision: None,
         },
         &ctx,
         Some(&plan),
@@ -136,7 +135,6 @@ fn write_rejects_outside_workspace() {
         WriteArgs {
             path: "../../escape.txt".into(),
             content: "x".into(),
-            revision: None,
         },
         &ctx,
         None,
@@ -233,7 +231,6 @@ fn scheduler_locks_use_resolved_paths() {
         BuiltinTool::Edit,
         &ValidatedArgs::Edit(EditArgs {
             path: "src/a.rs".into(),
-            revision: String::new(),
             replacements: Vec::new(),
         }),
         &workspace,
@@ -243,7 +240,6 @@ fn scheduler_locks_use_resolved_paths() {
         BuiltinTool::Edit,
         &ValidatedArgs::Edit(EditArgs {
             path: "./src/a.rs".into(),
-            revision: String::new(),
             replacements: Vec::new(),
         }),
         &workspace,
@@ -329,7 +325,6 @@ fn freedom_mode_normalizes_outside_path_locks() {
             BuiltinTool::Edit,
             &ValidatedArgs::Edit(EditArgs {
                 path,
-                revision: String::new(),
                 replacements: Vec::new(),
             }),
             &workspace,

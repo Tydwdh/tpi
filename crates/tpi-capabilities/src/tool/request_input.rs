@@ -6,10 +6,10 @@
 //!
 //! 对标 Claude Code `AskUserQuestion` 的形态：一次调用可携带**多个问题**
 //! （每个问题可带 `header` 分组标题与 `options` 建议选项），避免多次
-//! 挂起-恢复往返；同时保留旧单问题格式（`question` + `options`）兼容。
+//! 挂起-恢复往返。
 //!
-//! 挂起信号不在工具 outcome 里（工具本身返回 Succeeded“已请求输入”），
-//! 而由 batch 执行器检测本工具成功调用 → 以 `SuspendRequested` 结束 batch。
+//! §9：旧兼容格式（`question` + `options`、`QuestionOption::Plain`）已删除。
+//! 模型必须使用结构化的 `questions` 数组。
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -19,22 +19,12 @@ use tpi_core::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 
 /// `request_input` 参数。
 ///
-/// 主路径是 `questions` 数组（一次请求多个问题，各带 header/options）；
-/// `question` + `options` 是旧单问题格式的兼容快捷方式，两者同时提供时
-/// `questions` 优先。
+/// §9：只接受 `questions` 数组作为唯一顶层表示。旧兼容格式（`question` +
+/// `options`）已删除——模型必须使用 `questions` 数组。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct RequestInputArgs {
-    /// 兼容旧调用：单个问题快捷方式（等价于 `questions=[{question}]`，
-    /// `options` 作为该问题的建议选项）。新调用建议使用 `questions` 数组；
-    /// 两者同时提供时 `questions` 优先。
-    #[serde(default)]
-    pub question: Option<String>,
-    /// 兼容旧调用：单问题（`question` 字段）的建议选项。用户可直接选择或
-    /// 输入自定义内容；与 `questions` 同时提供时被忽略。
-    #[serde(default)]
-    pub options: Vec<String>,
     /// 问题列表：每个问题可带 `header`（分组标题）与 `options`（建议选项）。
-    /// 为空时回退到 `question` 字段构造单个问题。
+    /// 至少需要一个问题。
     #[serde(default)]
     pub questions: Vec<RequestInputQuestion>,
 }
@@ -62,60 +52,33 @@ fn default_true() -> bool {
     true
 }
 
-/// 单个建议选项（label + description；label 是选择结果，description 是说明）。
-///
-/// 兼容旧调用：反序列化接受 `"字符串"`（→ label）或 `{label, description}`。
+/// §9：单个建议选项——只接受结构化 `{label, description}` 格式。
+/// 旧兼容格式（裸字符串）已删除。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(untagged)]
-pub enum QuestionOption {
-    /// 纯字符串（旧格式）：label = 字符串，description 为空。
-    Plain(String),
-    /// 结构化：label + description。
-    Structured {
-        label: String,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        description: String,
-    },
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 impl QuestionOption {
     pub fn label(&self) -> &str {
-        match self {
-            QuestionOption::Plain(s) => s,
-            QuestionOption::Structured { label, .. } => label,
-        }
+        &self.label
     }
 
     pub fn description(&self) -> &str {
-        match self {
-            QuestionOption::Plain(_) => "",
-            QuestionOption::Structured { description, .. } => description,
-        }
+        &self.description
     }
 }
 
 impl RequestInputArgs {
-    /// 规范化问题列表：`questions` 非空时使用它；否则用兼容字段
-    /// （`question` + `options`）构造单个问题。没有任何问题时返回 `None`
-    /// （调用方按 invalid_arguments 拒绝）。
+    /// §9：返回规范化的 `questions` 列表。为空时返回 `None`（调用方按
+    /// invalid_arguments 拒绝）。旧兼容字段（`question`/`options`）已删除。
     pub fn normalized_questions(&self) -> Option<Vec<RequestInputQuestion>> {
         if !self.questions.is_empty() {
             return Some(self.questions.clone());
         }
-        self.question.as_ref().map(|question| {
-            vec![RequestInputQuestion {
-                question: question.clone(),
-                header: None,
-                options: self
-                    .options
-                    .iter()
-                    .cloned()
-                    .map(QuestionOption::Plain)
-                    .collect(),
-                multiple: false,
-                custom: true,
-            }]
-        })
+        None
     }
 
     /// 渲染为模型/用户可见的多行问题文本（编号 + header + 选项）。

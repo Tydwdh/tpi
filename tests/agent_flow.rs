@@ -241,8 +241,9 @@ async fn todo_state_is_not_reinjected_as_a_user_message() {
 
     // 后续请求（plan 已建立）：
     // 1. 不伪装成额外 User 消息；
-    // 2. plan 仍以合法 Tool 协议存在于历史；
-    // 3. 尾部注入 [当前计划·唯一权威] System 快照供模型每轮可见（§用户诉求）。
+    // 2. plan 仍以合法 Tool 协议存在于历史（update_plan tool call + tool result）；
+    // 3. 不再有 [当前计划·唯一权威] System 快照注入（§13：plan 是 session state，
+    //    不是 synthetic conversation message；模型从 tool-call history 获取 plan）。
     for request in &provider.requests[1..] {
         let users: Vec<_> = request
             .messages
@@ -261,11 +262,11 @@ async fn todo_state_is_not_reinjected_as_a_user_message() {
             "update_plan 必须以 Tool 消息存在于历史"
         );
         assert!(
-            request.messages.iter().any(|m| matches!(
+            !request.messages.iter().any(|m| matches!(
                 m,
-                ChatMessage::System(text) if text.contains("[当前计划·唯一权威")
+                ChatMessage::System(text) if text.contains("[当前计划")
             )),
-            "plan 建立后每轮请求尾部必须注入 [当前计划·唯一权威] System 快照"
+            "plan 不再注入为 System 消息（§13：plan 是 session state）"
         );
     }
     assert!(
@@ -558,7 +559,7 @@ async fn request_input_suspends_run_with_durable_event() {
     let mut provider = FakeProvider::new(vec![FakeResponse::with_tool_calls(vec![
         fixtures::fake_provider::tool_call(
             "request_input",
-            serde_json::json!({"question": "要运行完整测试套件吗？"}),
+            serde_json::json!({"questions": [{"question": "要运行完整测试套件吗？"}]}),
         ),
     ])]);
     let mut session = SessionLog::create(
@@ -638,7 +639,7 @@ async fn resume_after_suspend_records_input_and_continues() {
     let mut provider = FakeProvider::new(vec![FakeResponse::with_tool_calls(vec![
         fixtures::fake_provider::tool_call(
             "request_input",
-            serde_json::json!({"question": "要跑测试吗？"}),
+            serde_json::json!({"questions": [{"question": "要跑测试吗？"}]}),
         ),
     ])]);
     let mut session = SessionLog::create(
@@ -767,12 +768,12 @@ async fn request_input_multi_question_suspends_with_rendered_prompt() {
                 "questions": [
                     {
                         "question": "要运行完整测试套件吗？",
-                        "options": ["是，运行全部", "只跑单元测试", "跳过"]
+                        "options": [{"label": "是，运行全部"}, {"label": "只跑单元测试"}, {"label": "跳过"}]
                     },
                     {
                         "question": "发布到哪个环境？",
                         "header": "部署",
-                        "options": ["生产", "staging"]
+                        "options": [{"label": "生产"}, {"label": "staging"}]
                     }
                 ]
             }),
@@ -863,10 +864,9 @@ async fn request_input_multi_question_suspends_with_rendered_prompt() {
     );
 }
 
-/// AGENTS.md §13：旧单问题格式（question + options）仍可用，
-/// 渲染文本包含问题与建议选项（兼容回归）。
+/// §9：旧单问题格式已删除。此测试验证新格式仍然正常挂起。
 #[tokio::test]
-async fn request_input_legacy_single_question_still_works() {
+async fn request_input_single_question_still_works() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let config = test_config(&workspace);
@@ -874,8 +874,10 @@ async fn request_input_legacy_single_question_still_works() {
         fixtures::fake_provider::tool_call(
             "request_input",
             serde_json::json!({
-                "question": "要运行完整测试套件吗？",
-                "options": ["是", "否"]
+                "questions": [{
+                    "question": "要运行完整测试套件吗？",
+                    "options": [{"label": "是"}, {"label": "否"}]
+                }]
             }),
         ),
     ])]);
@@ -948,7 +950,7 @@ async fn request_input_rejected_in_non_interactive_run() {
     let mut provider = FakeProvider::new(vec![
         FakeResponse::with_tool_calls(vec![fixtures::fake_provider::tool_call(
             "request_input",
-            serde_json::json!({"question": "要跑测试吗？"}),
+            serde_json::json!({"questions": [{"question": "要跑测试吗？"}]}),
         )]),
         FakeResponse::text("没有用户可答，我基于现有信息继续"),
     ]);
@@ -1035,7 +1037,7 @@ async fn suspend_persists_rejected_outcomes_for_later_waves() {
     let mut provider = FakeProvider::new(vec![FakeResponse::with_tool_calls(vec![
         fixtures::fake_provider::tool_call(
             "request_input",
-            serde_json::json!({"question": "继续吗？"}),
+            serde_json::json!({"questions": [{"question": "继续吗？"}]}),
         ),
         fixtures::fake_provider::tool_call(
             "bash",

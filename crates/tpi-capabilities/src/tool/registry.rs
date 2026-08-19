@@ -68,8 +68,8 @@ pub trait Tool: Send + Sync {
 
     /// P4-04：definition 投影（name/schema/origin 的不可变描述；handler 保持
     /// `execute`）。默认从基础方法组装；自定义实现可覆写（如带 limits 的声明）。
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
+    fn definition(&self) -> ToolSpec {
+        ToolSpec {
             name: self.name().to_string(),
             description: self.description().to_string(),
             parameters: self.input_schema(),
@@ -100,18 +100,10 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// P4-04：工具 definition（纯数据；与 handler `execute` 分离的只读描述）。
+/// §10：统一工具元数据——名称、描述、JSON Schema、来源。
+/// 消除了此前 `ToolDefinition` 与 `ToolDescriptor` 的重复。
 #[derive(Debug, Clone, PartialEq)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
-    pub origin: ToolOrigin,
-}
-
-/// 工具描述（发给模型的 schema，对齐现有 `ToolDef`）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolDescriptor {
+pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
@@ -281,12 +273,12 @@ impl ToolRegistry {
     }
 
     /// 发给模型的描述（Phase 5 前 = 全量；overlay 优先语义同 [`Self::list`]）。
-    pub fn descriptors(&self) -> Vec<ToolDescriptor> {
-        let mut out: Vec<ToolDescriptor> = self
+    pub fn descriptors(&self) -> Vec<ToolSpec> {
+        let mut out: Vec<ToolSpec> = self
             .tools
             .iter()
             .filter(|(name, _)| !self.overlay.contains_key(name.as_str()))
-            .map(|(_, (_, tool))| ToolDescriptor {
+            .map(|(_, (_, tool))| ToolSpec {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
                 parameters: tool.input_schema(),
@@ -294,7 +286,7 @@ impl ToolRegistry {
             })
             .collect();
         for (_, tool) in self.overlay.values() {
-            out.push(ToolDescriptor {
+            out.push(ToolSpec {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
                 parameters: tool.input_schema(),

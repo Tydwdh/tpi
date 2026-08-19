@@ -10,7 +10,7 @@
 use camino::Utf8PathBuf;
 use tpi::tool::edit::{
     EditError, MatchTier, Replacement, WhitespacePolicy, apply_edit, commit_edit, prepare_commit,
-    revision_of, whitespace_policy_for,
+    whitespace_policy_for,
 };
 
 fn edit_file(
@@ -22,10 +22,8 @@ fn edit_file(
 ) -> Result<tpi::tool::edit::EditResult, EditError> {
     let path = Utf8PathBuf::from_path_buf(dir.path().join(name)).unwrap();
     std::fs::write(path.as_std_path(), content).unwrap();
-    let revision = revision_of(content.as_bytes());
     let result = apply_edit(
         &path,
-        &revision,
         &[Replacement {
             old_text: old_text.into(),
             new_text: new_text.into(),
@@ -71,10 +69,8 @@ fn trailing_tolerance_ambiguous_rewrite_is_rejected() {
     let content = "x()   \nx()\n";
     let path = Utf8PathBuf::from_path_buf(dir.path().join("f.rs")).unwrap();
     std::fs::write(path.as_std_path(), content).unwrap();
-    let revision = revision_of(content.as_bytes());
     let err = apply_edit(
         &path,
-        &revision,
         &[Replacement {
             old_text: "x()".into(),
             new_text: "y()".into(),
@@ -122,11 +118,9 @@ fn uniform_indent_rejects_relative_indentation_change() {
     let content = "def f():\n    if x:\n        foo()\n";
     let path = Utf8PathBuf::from_path_buf(dir.path().join("f.py")).unwrap();
     std::fs::write(path.as_std_path(), content).unwrap();
-    let revision = revision_of(content.as_bytes());
     // 模型把嵌套层级写平（bar() 少 4 空格）→ 相对缩进破坏 → 拒绝。
     let err = apply_edit(
         &path,
-        &revision,
         &[Replacement {
             old_text: "if x:\n    foo()".into(),
             new_text: "if x:\nbar()".into(),
@@ -209,11 +203,9 @@ fn no_match_carries_structured_diagnostic() {
     let path = Utf8PathBuf::from_path_buf(dir.path().join("f.rs")).unwrap();
     let content = "fn main() {\n        if x {\n            foo();\n        }\n}\n";
     std::fs::write(path.as_std_path(), content).unwrap();
-    let revision = revision_of(content.as_bytes());
     // 缩进差异：old_text 无 outer indent → NoMatch + Indentation 诊断。
     let err = apply_edit(
         &path,
-        &revision,
         &[Replacement {
             old_text: "if y {\n    foo();\n}".into(),
             new_text: "if y {\n    bar();\n}".into(),

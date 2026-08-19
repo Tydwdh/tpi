@@ -3398,7 +3398,10 @@ mod tests {
             RequestInputQuestion {
                 question: "选一个".into(),
                 header: None,
-                options: vec![QuestionOption::Plain("是".into())],
+                options: vec![QuestionOption {
+                    label: "是".into(),
+                    description: String::new(),
+                }],
                 multiple: false,
                 custom: false,
             },

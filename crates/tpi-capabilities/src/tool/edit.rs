@@ -9,13 +9,14 @@
 //!   整块共同前缀平移；Makefile 等缩进敏感语言禁用）。
 //! - CRLF/LF 完全内部化：文件读取时记录原始 EOL，内部统一 LF 匹配，写回时
 //!   恢复原 EOL。模型永远用 LF（old_text/new_text 带 `\r` 拒绝，防歧义）。
-//! - revision 对原始字节计算 BLAKE3（内部保留）；模型协议使用不透明 `r{id}` 标识符。
+//! - §5/§6：模型不再可见 revision token。内部 BLAKE3 仅用于 CAS commit-time
+//!   竞态检测和 journal 记录，不暴露给 LLM。
 //! - stale revision 处理（§修复）：先对**当前文件**做唯一匹配预检——若所有
 //!   非 no-op replacement 仍唯一匹配（fmt 等外部空白改动后常见），允许宽松应用
 //!   （免重新 read）；否则仍 `stale_revision` 拒绝，并回填当前文件相关区域
 //!   内容，模型免 read 即可纠正。
 //! - no-op（old_text == new_text）项跳过不整批拒绝（§修复）；全部 no-op 才报错。
-//! - `write` 是 revision-bound 整文件写入：新建或提供匹配 revision 的整体重写（§10.6）。
+//! - §7：`write` 是 create-only——目标已存在时拒绝，模型必须使用 `edit`。
 //! - M3：Windows 提交使用 `ReplaceFileW` + 同卷唯一 backup（§10.7）；
 //!   成功校验 backup digest，失败/校验不符进入可诊断恢复。
 
@@ -35,13 +36,12 @@ pub use tpi_core::outcome::Effect;
 /// 插入 = 空 new_text 的 old_text；删除 = 空 new_text；替换 = 两者都非空。
 /// batch 语义：全部 replacement 先 resolve 到 base revision 坐标，任一个
 /// 失败/重叠则整批拒绝，文件不变（§10.3）。
+///
+/// 并发保护由 Harness 内部 BLAKE3 CAS 完成，不需要模型传入 revision。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 pub struct EditArgs {
     /// 目标文件路径（workspace 内相对路径或绝对路径）。
     pub path: String,
-    /// `read`/`search` 输出的 `[revision=r42]` 或裸 `r42` / `b3:<64-hex>`
-    /// ——目标快照 identity（所有 old_text 坐标属于此 revision）。
-    pub revision: String,
     /// 编辑列表：`old_text → new_text`。每个 old_text 在文件中必须唯一匹配
     /// （经规范化匹配链：Exact → NormalizeEOL → IgnoreTrailingWhitespace →
     /// EquivalentIndentation；>1 匹配拒绝）。
@@ -67,29 +67,6 @@ pub fn is_valid_revision(value: &str) -> bool {
         return false;
     };
     hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-/// 模型可见的 revision 头（与 `read`/`edit`/`write` 共享，§2.2）。
-pub fn format_revision_header(revision: &str) -> String {
-    format!("[revision={revision}]")
-}
-
-/// 接受裸 revision token 或 `read` 输出的完整 header（§2.2：展示值可原样回传）。
-pub fn parse_revision_token(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    let candidate = if let Some(inner) = trimmed
-        .strip_prefix("[revision=")
-        .and_then(|rest| rest.strip_suffix(']'))
-    {
-        inner
-    } else {
-        trimmed
-    };
-    if is_valid_revision(candidate) {
-        Some(candidate.to_string())
-    } else {
-        None
-    }
 }
 
 /// 行尾策略（§10.5：按 anchor 附近行尾 / 文件多数行尾编码）。
@@ -338,12 +315,9 @@ pub enum EditError {
         path: Utf8PathBuf,
         current: String,
         expected: String,
-        /// stale 且 replacement 不再唯一匹配时，当前文件相关区域上下文
-        /// （模型免 read 自纠；§修复）。
+        /// 当前文件相关区域上下文（模型免 read 自纠；§修复）。
         context: Option<String>,
     },
-    #[error("invalid revision: {value}")]
-    InvalidRevision { value: String },
     #[error(
         "invalid line range in {path}: {start_line}..={end_line} (must be 1-indexed, end >= start)"
     )]
@@ -402,7 +376,6 @@ impl EditError {
             EditError::UnsupportedEncoding { .. } => "unsupported_encoding",
             EditError::FileTooLarge { .. } => "file_too_large",
             EditError::StaleRevision { .. } => "stale_revision",
-            EditError::InvalidRevision { .. } => "invalid_revision",
             EditError::InvalidRange { .. } => "invalid_range",
             EditError::EmptyOldText { .. } => "empty_old_text",
             EditError::TooManyReplacements { .. } => "too_many_replacements",
@@ -961,42 +934,35 @@ pub fn diagnose_no_match(text: &str, old_text: &str) -> Option<NoMatchDiagnostic
     })
 }
 
-/// 流程：读快照 → revision 校验 → 全部 replacements 预检（存在/唯一/不重叠/no-op）
-/// 流程：读快照 → revision 校验 → 全部 replacements 预检（存在/唯一/不重叠/no-op）
-/// → 一次性应用 → temp + sync → 原子替换。
+/// 流程：读快照 → 全部 replacements 预检（存在/唯一/不重叠/no-op）
+/// → 一次性应用 → 返回 EditResult。
+///
+/// 并发保护由 `commit_edit` 内部 BLAKE3 CAS 完成，不需要模型传入 revision。
 pub fn apply_edit(
     path: &Utf8PathBuf,
-    revision: &str,
     replacements: &[Replacement],
 ) -> Result<EditResult, EditError> {
-    let Some(revision) = parse_revision_token(revision) else {
-        return Err(EditError::InvalidRevision {
-            value: revision.to_string(),
-        });
-    };
     let snapshot = snapshot_file(path)?;
-    apply_edit_to_snapshot(snapshot, &revision, replacements)
+    apply_edit_to_snapshot(snapshot, replacements)
 }
 
 /// 纯内存版 apply（R2：远端 edit 复用同一 semantic contract，§41/§42）。
 ///
 /// 基于原始字节构建 snapshot（`build_snapshot`）后应用 replacement，
-/// 不触碰本地磁盘；revision 校验、原子批、diff 语义与本地 `apply_edit`
-/// 完全一致。远端提交由 SFTP temp+rename 完成。
+/// 不触碰本地磁盘；原子批、diff 语义与本地 `apply_edit` 完全一致。
+/// 远端提交由 SFTP temp+rename 完成。
 #[allow(dead_code)] // 远端工具接线后移除
 pub fn apply_edit_bytes(
     path: &Utf8PathBuf,
     raw: Vec<u8>,
-    revision: &str,
     replacements: &[Replacement],
 ) -> Result<EditResult, EditError> {
     let snapshot = build_snapshot(path.clone(), raw)?;
-    apply_edit_to_snapshot(snapshot, revision, replacements)
+    apply_edit_to_snapshot(snapshot, replacements)
 }
 
 fn apply_edit_to_snapshot(
     snapshot: FileSnapshot,
-    expected_revision: &str,
     replacements: &[Replacement],
 ) -> Result<EditResult, EditError> {
     if replacements.is_empty() {
@@ -1104,31 +1070,10 @@ fn apply_edit_to_snapshot(
         });
     }
 
-    // revision 判定：
-    // - 预检失败（NoMatch/MultipleMatches）优先报告；stale 时归并为
-    //   StaleRevision（§修复 #2：回填当前区域上下文），非 stale 报原错误。
-    // - stale 且所有非 no-op 项仍唯一匹配（§修复 #1：fmt 等外部空白改动后
-    //   常见）→ 宽松应用（基于当前内容，免重新 read）。
+    // 预检失败直接报告（NoMatch/MultipleMatches），不再需要 stale revision 判定：
+    // 并发保护由 commit_edit 内部 BLAKE3 CAS 完成，不需要模型传入 revision。
     if let Some(error) = precheck_error {
-        if snapshot.revision != expected_revision {
-            let context = match &error {
-                EditError::NoMatch { context, .. } => context.clone(),
-                _ => None,
-            };
-            return Err(EditError::StaleRevision {
-                path: snapshot.path.clone(),
-                current: snapshot.revision,
-                expected: expected_revision.to_string(),
-                context,
-            });
-        }
         return Err(error);
-    }
-    if snapshot.revision != expected_revision {
-        tracing::info!(
-            path = %snapshot.path,
-            "edit: revision stale but all replacements match current content; applying (lenient unique match)",
-        );
     }
     // §修复 #4：无预检错误但没有任何可应用项（全部是 no-op）→ 明确拒绝。
     if prepared.is_empty() {
@@ -1701,8 +1646,7 @@ pub fn write_new_file(
 /// 默认保存最多 64 个文件、每个文件 8 个 revision；淘汰只影响 rebase/诊断，
 /// 不影响磁盘文件。`read` 在合理文件大小下保存完整 snapshot。
 ///
-/// 模型协议使用不透明 `r{id}` 标识符（§模型协议）：完整 BLAKE3 hash
-/// 仅在内部保留用于一致性校验，不暴露给 LLM。
+/// §5/§6：模型不再可见 revision token——内部 b3:hash 仅用于 CAS 和 journal。
 #[derive(Debug)]
 pub struct SnapshotStore {
     versions: std::collections::HashMap<Utf8PathBuf, std::collections::VecDeque<FileSnapshot>>,
@@ -1712,10 +1656,6 @@ pub struct SnapshotStore {
     max_versions_per_path: usize,
     stored_bytes: usize,
     max_total_bytes: usize,
-    /// 模型可见的不透明 revision ID 映射（b3:hash → r{id}）。
-    hash_to_id: std::collections::HashMap<String, u64>,
-    id_to_hash: std::collections::HashMap<u64, String>,
-    next_id: u64,
 }
 
 const MAX_STORED_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
@@ -1749,9 +1689,6 @@ impl SnapshotStore {
             max_versions_per_path,
             stored_bytes: 0,
             max_total_bytes: MAX_SNAPSHOT_STORE_BYTES,
-            hash_to_id: Default::default(),
-            id_to_hash: Default::default(),
-            next_id: 1,
         }
     }
 
@@ -1781,14 +1718,7 @@ impl SnapshotStore {
                 .stored_bytes
                 .saturating_sub(snapshot_memory_bytes(&old));
         }
-        // 分配不透明 revision ID：同一 hash 复用已有 ID（§模型协议）。
-        let hash = snapshot.revision.clone();
-        self.hash_to_id.entry(hash.clone()).or_insert_with(|| {
-            let id = self.next_id;
-            self.next_id = self.next_id.saturating_add(1);
-            self.id_to_hash.insert(id, hash);
-            id
-        });
+        // §5/§6：模型不再可见 revision ID 映射——不再分配 r{id} 不透明 ID。
         entry.push_front(snapshot);
         self.stored_bytes = self.stored_bytes.saturating_add(snapshot_bytes);
         while entry.len() > self.max_versions_per_path {
@@ -1833,50 +1763,16 @@ impl SnapshotStore {
         self.versions.clear();
         self.order.clear();
         self.stored_bytes = 0;
-        self.hash_to_id.clear();
-        self.id_to_hash.clear();
-        self.next_id = 1;
     }
 
-    /// 将模型传回的 revision token（`r42` 或 `b3:...`）解析为内部完整 BLAKE3 hash。
-    pub fn resolve_token(&self, token: &str) -> Option<String> {
-        let trimmed = token.trim();
-        let inner = if let Some(inner) = trimmed
-            .strip_prefix("[revision=")
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            inner
-        } else {
-            trimmed
-        };
-        // r{id} 格式
-        if let Some(id_str) = inner.strip_prefix('r')
-            && let Ok(id) = id_str.parse::<u64>()
-        {
-            return self.id_to_hash.get(&id).cloned();
-        }
-        // b3:hash 格式（向后兼容）
-        if is_valid_revision(inner) {
-            return Some(inner.to_string());
-        }
-        None
-    }
-
-    /// 将内部 BLAKE3 hash 转换为模型可见的 `r{id}` 格式。
-    pub fn display_revision(&self, hash: &str) -> String {
-        if let Some(&id) = self.hash_to_id.get(hash) {
-            format!("r{id}")
-        } else {
-            // 未注册的 hash（理论上不应发生）：回退到完整 hash。
-            hash.to_string()
-        }
-    }
+    // §5/§6：resolve_token 和 display_revision 已删除——
+    // 模型不再可见 revision token（r{id} / b3:hash）。
+    // 内部 b3:hash 仍用于 CAS 和 journal，但不暴露给模型。
 }
 
 /// read 的窗口输出（§10.2）。
 pub struct ReadWindow {
     pub path: Utf8PathBuf,
-    pub revision: String,
     pub start_line: usize,
     pub returned_lines: usize,
     pub total_lines: usize,
@@ -1907,7 +1803,6 @@ pub fn read_window_from_snapshot(
     let text = lines[start..end.min(total_lines)].join("\n");
     ReadWindow {
         path: snapshot.path.clone(),
-        revision: snapshot.revision.clone(),
         start_line: start + 1,
         returned_lines: end.min(total_lines) - start,
         total_lines,
@@ -1921,70 +1816,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revision_round_trip_header_and_bare() {
+    fn revision_of_produces_b3_prefix() {
         let raw = b"fn main() {}\n";
         let revision = revision_of(raw);
         assert!(revision.starts_with("b3:"));
         assert_eq!(revision.len(), 3 + 64);
-        let header = format_revision_header(&revision);
-        assert_eq!(
-            parse_revision_token(&header).as_deref(),
-            Some(revision.as_str())
-        );
-        assert_eq!(
-            parse_revision_token(&revision).as_deref(),
-            Some(revision.as_str())
-        );
-        assert_eq!(parse_revision_token("bogus"), None);
     }
 
     #[test]
-    fn snapshot_store_revision_id_mapping() {
-        // §模型协议：同一 hash 复用 ID，不同 hash 分配新 ID。
-        let mut store = SnapshotStore::new(64, 8);
+    fn snapshot_store_bounded_eviction() {
+        // §5/§6：SnapshotStore 不再维护 r{id} 映射，只做 bounded snapshot 缓存。
+        let mut store = SnapshotStore::new(2, 2);
         let raw_a = b"fn main() {}\n";
         let raw_b = b"fn test() {}\n";
-        let hash_a = revision_of(raw_a);
-        let hash_b = revision_of(raw_b);
+        let raw_c = b"fn extra() {}\n";
 
-        // record snapshot A
-        let snap_a = build_snapshot(Utf8PathBuf::from("a.rs"), raw_a.to_vec()).unwrap();
-        store.record(snap_a);
-        assert_eq!(store.display_revision(&hash_a), "r1");
+        store.record(build_snapshot(Utf8PathBuf::from("a.rs"), raw_a.to_vec()).unwrap());
+        store.record(build_snapshot(Utf8PathBuf::from("b.rs"), raw_b.to_vec()).unwrap());
+        assert!(store.latest(&Utf8PathBuf::from("a.rs")).is_some());
 
-        // record snapshot B → 新 ID
-        let snap_b = build_snapshot(Utf8PathBuf::from("b.rs"), raw_b.to_vec()).unwrap();
-        store.record(snap_b);
-        assert_eq!(store.display_revision(&hash_b), "r2");
-
-        // record same hash A again → 复用 ID
-        let snap_a2 = build_snapshot(Utf8PathBuf::from("a.rs"), raw_a.to_vec()).unwrap();
-        store.record(snap_a2);
-        assert_eq!(store.display_revision(&hash_a), "r1");
-
-        // resolve_token: r1 → b3:hash
-        assert_eq!(store.resolve_token("r1"), Some(hash_a.clone()));
-        assert_eq!(store.resolve_token("r2"), Some(hash_b.clone()));
-        assert_eq!(store.resolve_token("r999"), None);
-
-        // resolve_token: b3:hash 向后兼容
-        assert_eq!(store.resolve_token(&hash_a), Some(hash_a.clone()));
-
-        // resolve_token: [revision=r1] 带 header 前缀
-        assert_eq!(store.resolve_token("[revision=r1]"), Some(hash_a.clone()));
-
-        // resolve_token: [revision=b3:...] 带 header 前缀
-        let header = format_revision_header(&hash_b);
-        assert_eq!(store.resolve_token(&header), Some(hash_b));
-
-        // 未注册 hash → display_revision 回退
-        assert_eq!(store.display_revision("b3:unknown"), "b3:unknown");
-
-        // clear 重置 ID
-        store.clear();
-        let snap_c = build_snapshot(Utf8PathBuf::from("c.rs"), raw_a.to_vec()).unwrap();
-        store.record(snap_c);
-        assert_eq!(store.display_revision(&hash_a), "r1"); // 重新从 1 开始
+        // 第三个 path 超出 max_paths=2，最早插入的 a.rs 被淘汰。
+        store.record(build_snapshot(Utf8PathBuf::from("c.rs"), raw_c.to_vec()).unwrap());
+        assert!(store.latest(&Utf8PathBuf::from("a.rs")).is_none());
+        assert!(store.latest(&Utf8PathBuf::from("c.rs")).is_some());
     }
 
     #[test]
@@ -2050,10 +1904,8 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("zh.rs")).unwrap();
         let original = "// 标题：旧内容\nfn main() {}\n";
         std::fs::write(path.as_std_path(), original).unwrap();
-        let snapshot = snapshot_file(&path).unwrap();
         let result = apply_edit(
             &path,
-            &snapshot.revision,
             &[Replacement {
                 old_text: "旧内容".into(),
                 new_text: "新内容".into(),
@@ -2068,57 +1920,53 @@ mod tests {
     }
 
     #[test]
-    fn edit_rejects_stale_revision_when_old_text_no_longer_matches() {
-        // §修复 #1：stale 但 old_text 在当前文件不存在/不再唯一 → 仍拒绝。
+    fn edit_rejects_no_match_when_old_text_not_found() {
+        // old_text 在当前文件不存在 → NoMatch 拒绝。
         let dir = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
         std::fs::write(path.as_std_path(), "let x = 1;\n").unwrap();
-        // 外部把文件改成不包含 old_text 的内容（等价 fmt/编辑后 old_text 失效）。
+        // 外部把文件改成不包含 old_text 的内容。
         std::fs::write(path.as_std_path(), "let y = 9;\n").unwrap();
         let error = apply_edit(
             &path,
-            "b3:0000000000000000000000000000000000000000000000000000000000000000",
             &[Replacement {
                 old_text: "x = 1".into(),
                 new_text: "x = 2".into(),
             }],
         )
         .unwrap_err();
-        assert_eq!(error.code(), "stale_revision");
+        assert_eq!(error.code(), "no_match");
         assert!(
             matches!(
                 error,
-                EditError::StaleRevision {
+                EditError::NoMatch {
                     context: Some(_),
                     ..
                 }
             ),
-            "stale 拒绝必须回填当前区域上下文: {error:?}"
+            "no_match 必须回填当前区域上下文: {error:?}"
         );
     }
 
     #[test]
-    fn edit_applies_when_stale_but_old_text_still_unique() {
-        // §修复 #1：revision 过期（如 fmt 改动其他区域）但 old_text 在当前文件
-        // 仍唯一匹配 → 宽松应用，免重新 read。
+    fn edit_applies_when_old_text_still_unique() {
+        // old_text 在当前文件仍唯一匹配 → 正常应用。
         let dir = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
         std::fs::write(path.as_std_path(), "let x = 1;\n").unwrap();
-        let old_revision = revision_of(b"let x = 1;\n");
-        // 外部 fmt 只改动其他区域（缩进/换行），目标 old_text 仍唯一存在。
+        // 外部 fmt 只改动其他区域，目标 old_text 仍唯一存在。
         std::fs::write(path.as_std_path(), "let x = 1;\n\nfn main() {}\n").unwrap();
         let result = apply_edit(
             &path,
-            &old_revision,
             &[Replacement {
                 old_text: "let x = 1".into(),
                 new_text: "let x = 2".into(),
             }],
         )
-        .expect("stale 但唯一匹配应宽松应用");
+        .expect("唯一匹配应正常应用");
         assert_eq!(result.applied, 1);
         let text = String::from_utf8(result.new_raw).unwrap();
-        assert!(text.contains("let x = 2"), "宽松应用必须生效: {text}");
+        assert!(text.contains("let x = 2"), "应用必须生效: {text}");
     }
 
     #[test]
@@ -2128,10 +1976,8 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
         let original = "let a = 1;\nlet b = 2;\n";
         std::fs::write(path.as_std_path(), original).unwrap();
-        let revision = revision_of(original.as_bytes());
         let result = apply_edit(
             &path,
-            &revision,
             &[
                 Replacement {
                     old_text: "a = 1".into(),
@@ -2157,10 +2003,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
         std::fs::write(path.as_std_path(), "let a = 1;\n").unwrap();
-        let revision = revision_of(b"let a = 1;\n");
         let error = apply_edit(
             &path,
-            &revision,
             &[Replacement {
                 old_text: "a = 1".into(),
                 new_text: "a = 1".into(),
@@ -2178,10 +2022,8 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
         let original = "fn main() {\n    work();\n}\n";
         std::fs::write(path.as_std_path(), original).unwrap();
-        let revision = revision_of(original.as_bytes());
         let error = apply_edit(
             &path,
-            &revision,
             &[Replacement {
                 old_text: "helper()".into(),
                 new_text: "helper2()".into(),
@@ -2207,10 +2049,8 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
         let original = "fn old_name() {\n    work();\n}\n";
         std::fs::write(path.as_std_path(), original).unwrap();
-        let revision = revision_of(original.as_bytes());
         let result = apply_edit(
             &path,
-            &revision,
             &[Replacement {
                 old_text: "fn old_name() {".into(),
                 new_text: "fn new_name() {".into(),
@@ -2229,11 +2069,9 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
         let original = "let a = 1;\nlet b = 1;\n";
         std::fs::write(path.as_std_path(), original).unwrap();
-        let revision = revision_of(original.as_bytes());
         // 歧义：整批零变化。
         let error = apply_edit(
             &path,
-            &revision,
             &[Replacement {
                 old_text: "= 1".into(),
                 new_text: "= 2".into(),
@@ -2272,11 +2110,9 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("lib.rs")).unwrap();
         let original = "pub fn add(a: i32, b: i32) -> i32 {\n    a - b\n}\npub fn abs(x: i32) -> i32 {\n    if x < 0 { -x } else { x }\n}\n";
         std::fs::write(path.as_std_path(), original).unwrap();
-        let revision = revision_of(original.as_bytes());
         // 两个相邻 replacement（前一个替换 add 主体，后一个替换 add 尾部 + abs 开头）。
         let result = apply_edit(
             &path,
-            &revision,
             &[
                 Replacement {
                     old_text: "pub fn add(a: i32, b: i32) -> i32 {\n    a - b\n}".into(),
@@ -2318,10 +2154,8 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("order.txt")).unwrap();
         let original = "alpha beta gamma delta\n";
         std::fs::write(path.as_std_path(), original).unwrap();
-        let revision = revision_of(original.as_bytes());
         let result = apply_edit(
             &path,
-            &revision,
             &[
                 Replacement {
                     old_text: "gamma".into(),
@@ -2351,10 +2185,8 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
         let original = "fn main() {\r\n    work();\r\n}\r\n";
         std::fs::write(path.as_std_path(), original).unwrap();
-        let revision = revision_of(original.as_bytes());
         let result = apply_edit(
             &path,
-            &revision,
             &[Replacement {
                 old_text: "work();".into(),
                 new_text: "work();\n    more();".into(),
@@ -2649,10 +2481,8 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).unwrap();
         let content = "fn a() {   \n    work();\n}\n";
         std::fs::write(path.as_std_path(), content).unwrap();
-        let revision = revision_of(content.as_bytes());
         let result = apply_edit(
             &path,
-            &revision,
             &[Replacement {
                 old_text: "fn a() {\n    work();".into(),
                 new_text: "fn a() {\n    run();".into(),
@@ -2673,10 +2503,8 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("f.rs")).unwrap();
         let content = "fn main() {\n        if x {\n            foo();\n        }\n}\n";
         std::fs::write(path.as_std_path(), content).unwrap();
-        let revision = revision_of(content.as_bytes());
         let result = apply_edit(
             &path,
-            &revision,
             &[Replacement {
                 old_text: "if x {\n    foo();\n}".into(),
                 new_text: "if x {\n    bar();\n}".into(),
@@ -2699,10 +2527,8 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("g.rs")).unwrap();
         let content = "fn main() {\n        if x {\n            foo();\n        }\n}\n";
         std::fs::write(path.as_std_path(), content).unwrap();
-        let revision = revision_of(content.as_bytes());
         let err = apply_edit(
             &path,
-            &revision,
             &[Replacement {
                 old_text: "if x {\nfoo();\n}".into(),
                 new_text: "if x {\nbar();\n}".into(),
@@ -2719,11 +2545,9 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("Makefile")).unwrap();
         let content = "target:\n\tcommand\n";
         std::fs::write(path.as_std_path(), content).unwrap();
-        let revision = revision_of(content.as_bytes());
         // 空格版（模型可能给 4 空格）：uniform-indent 被 policy 禁用 → NoMatch。
         let err = apply_edit(
             &path,
-            &revision,
             &[Replacement {
                 old_text: "target:\n    command".into(),
                 new_text: "target:\n    newcmd".into(),
@@ -2734,7 +2558,6 @@ mod tests {
         // 精确 tab 版本正常。
         let ok = apply_edit(
             &path,
-            &revision,
             &[Replacement {
                 old_text: "target:\n\tcommand".into(),
                 new_text: "target:\n\tnewcmd".into(),

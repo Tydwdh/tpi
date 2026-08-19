@@ -24,7 +24,7 @@ pub mod manager;
 pub use tpi_capabilities::tool::scheduler;
 mod tool_runtime;
 use self::tool_runtime::{BatchEnd, ToolBatchExecutor, ToolRuntime};
-use crate::provider::{ChatMessage, ModelRequest, Provider, ProviderEvent, ToolCall};
+use crate::provider::{ChatMessage, ModelRequest, Provider, ProviderEvent};
 use tpi_core::ids::{EventId, RequestId, ToolCallId};
 use tpi_core::outcome::{StoredToolOutcome, ToolStatus};
 use tpi_session::{
@@ -456,9 +456,8 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
             .map_err(|e| RunFailure::Session(format!("read events: {e}")))?,
     )
     .map_err(|e| RunFailure::Session(format!("restore plan: {e}")))?;
-    // 恢复态只补一次并留在本轮 runtime history 中；不能在每次 request 构造时
-    // 都把计划重新追加到尾部，否则即使改成 Tool 角色也会持续抢占最新上下文。
-    ensure_plan_state_messages(&mut messages, initial_plan.as_ref());
+    // §13（TPI_TODO_PLAN_FINAL_STATE_REFACTOR）：不再在恢复/压缩边界注入 plan 系统消息。
+    // plan 通过正常的 assistant(update_plan) → tool result 协议事实进入上下文。
     let manual_retry_continuation = user_message.is_empty()
         && matches!(
             history.last(),
@@ -482,7 +481,6 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
         .await
         {
             Ok(()) => {
-                ensure_plan_state_messages(&mut messages, initial_plan.as_ref());
                 let _ = ui
                     .send(LiveEvent::CompactionNotice {
                         message: "手动压缩完成：旧历史已压缩为摘要，上下文已精简".into(),
@@ -615,8 +613,6 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                 .await
                 {
                     Ok(()) => {
-                        let plan = tool_runtime.plan_snapshot();
-                        ensure_plan_state_messages(&mut messages, plan.as_ref());
                         // P1-4：compaction 成功后若仍无法容纳（窗口过小），
                         // 不再发起普通请求（必然 length error），明确结束并提示用户。
                         let system_prompt =
@@ -642,8 +638,6 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                         tracing::warn!(error = ?error, "compaction failed; not retrying in this band");
                         // 确定性 prune 兜底（§15.3：只影响投影）。
                         messages = crate::context::prune_messages(messages);
-                        let plan = tool_runtime.plan_snapshot();
-                        ensure_plan_state_messages(&mut messages, plan.as_ref());
                         // P1-4：prune 后仍超窗口（如 user 消息本身巨大）→ 明确结束。
                         let system_prompt =
                             system_prompt_text(agent_cfg.system_prompt_extra.as_deref(), None);
@@ -742,7 +736,6 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                     config,
                     &messages,
                     ephemeral_system.as_deref(),
-                    tool_runtime.plan_snapshot().as_ref(),
                     Some(&ws_snapshot),
                     process_snapshot.as_deref(),
                     pending_reports_text.as_deref(),
@@ -1587,31 +1580,13 @@ fn system_prompt_text(system_prompt_extra: Option<&str>, ephemeral_system: Optio
 
 /// 构造上下文 projection（§15.1 顺序：system → 用户目标 → 历史 turns → 当前输入在尾部）。
 ///
-/// §13：计划通过正常的 `assistant(update_plan) → tool result` 协议事实进入上下文，
-/// 但那只保证计划“存在过”，长任务中段 plan 会被后续工具输出挤到注意力边缘。
-/// §用户诉求：每轮在**请求尾部**注入一条 system 角色的当前计划快照（`[当前计划·唯一权威]`）——
-/// 用 system 角色（不是 User 消息）避免模型把计划当“用户再次要求按 Todo 继续”
-/// 而反复确认/复述（旧坑见下）；放**尾部**而非 system 后，保持 system + 全部
-/// 历史这个缓存前缀不变——plan 只在变化那轮打断尾部的一小段，稳定历史仍可命中
-/// provider prompt cache。
-///
-/// 不变量：
-/// - 有 plan 且非空才注入（无 plan 不打扰）；
-/// - 注入内容 = plan_snapshot（§用户诉求：全部活跃项 + 完成计数——模型
-///   每轮看到完整剩余计划才能准确增量更新），与侧边栏展示同一数据源
-///   （tool::plan::plan_snapshot）；
-/// - 不落 session、不进入对话投影（每次请求重建）。
-///
-/// 旧坑：不能把计划伪造成尾部 User 消息，否则模型反复确认/复述计划。
-/// 正常计划轮保持原始时序，由 compaction 在窗口压力下统一归纳。
-///
-/// `ephemeral_system`：本次 request 的 harness control metadata（§4.3 续写指令），
-/// 以 system 指令注入，不进入对话投影。
+/// §13（TPI_TODO_PLAN_FINAL_STATE_REFACTOR）：plan 不再注入为系统消息。
+/// plan 通过正常的 assistant(update_plan) → tool result 协议事实进入上下文，
+/// UI 从 session projection 读取。
 fn build_context(
     config: &Config,
     messages: &[ChatMessage],
     ephemeral_system: Option<&str>,
-    plan: Option<&tpi_core::plan::Plan>,
     workspace: Option<&tpi_capabilities::workspace::ActiveWorkspace>,
     process_snapshot: Option<&str>,
     pending_reports: Option<&str>,
@@ -1647,17 +1622,9 @@ fn build_context(
         )));
     }
     out.extend_from_slice(messages);
-    // 尾部注入当前计划快照（system 角色；无 plan 或空 plan 不注入）。
-    // §用户诉求：明确同步节奏——每完成一个步骤或方向改变就 update_plan。
-    // §注入可靠性（用户反馈）：历史里 update_plan 的 tool result 不再带快照，
-    // 但**必须**让模型区分“当前权威快照”与任何历史计划文本——用专属标记
-    // 前缀 + 明确“以此为准，忽略历史中的任何旧计划”，防止模型引用过期快照。
-    let snapshot = tpi_core::plan::plan_snapshot(plan);
-    if !snapshot.is_empty() {
-        out.push(ChatMessage::System(format!(
-            "[当前计划·唯一权威·完整快照·以此为准]（每次 update_plan 都提交完整显式计划；每完成一项立即单独标记 completed，未完成项保持 pending/in_progress，不要一次性把全部项标记 completed。需要用户决定或外部条件时，先标记 blocked，再提问；忽略对话历史中出现的任何旧计划）：\n{snapshot}"
-        )));
-    }
+    // §13（TPI_TODO_PLAN_FINAL_STATE_REFACTOR）：plan 不再注入为系统消息。
+    // plan 通过正常的 assistant(update_plan) → tool result 协议事实进入上下文，
+    // UI 从 session projection 读取。模型的 working memory 来自自己的 tool-call history。
     // §25/§26/§60：ManagedProcess 快照（system 角色 harness metadata，不是
     // User 指令）；只含 active + 近期状态变化，避免 context 膨胀；跨 turn /
     // compaction 后模型仍知道有后台进程存在（§25：不能彻底忘记 p17）。
@@ -1667,58 +1634,6 @@ fn build_context(
         )));
     }
     out
-}
-
-fn tool_result_succeeded(content: &str) -> bool {
-    content
-        .lines()
-        .any(|line| line.trim() == "status: succeeded")
-}
-
-/// 确保当前 runtime history 至少包含一次成功计划结果。只在恢复/压缩边界调用，
-/// 补入的消息随后随真实 assistant/tool 事实向后增长，不会每轮重新占据尾部。
-fn ensure_plan_state_messages(
-    messages: &mut Vec<ChatMessage>,
-    plan: Option<&tpi_core::plan::Plan>,
-) {
-    let already_present = messages.iter().any(|message| {
-        matches!(
-            message,
-            ChatMessage::Tool { name, content, .. }
-                if tpi_capabilities::tool::BuiltinTool::from_name(name) == Some(tpi_capabilities::tool::BuiltinTool::UpdatePlan)
-                    && tool_result_succeeded(content)
-        )
-    });
-    if already_present {
-        return;
-    }
-    if let Some(plan) = plan {
-        append_restored_plan_round(messages, plan);
-    }
-}
-
-/// Compaction 可能只留下 summary 与独立持久化的 PlanReplaced。此时用合法的
-/// assistant/tool 配对恢复运行时计划，避免重新伪造一条 User 指令。
-fn append_restored_plan_round(messages: &mut Vec<ChatMessage>, plan: &tpi_core::plan::Plan) {
-    let snapshot = tpi_core::plan::plan_snapshot(Some(plan));
-    if snapshot.is_empty() {
-        return;
-    }
-    let provider_id = "tpi-restored-plan".to_string();
-    messages.push(ChatMessage::Assistant {
-        content: String::new(),
-        tool_calls: vec![ToolCall {
-            call_id: ToolCallId::new_v7(),
-            provider_id: provider_id.clone(),
-            name: "update_plan".into(),
-            arguments: serde_json::to_string(plan).unwrap_or_else(|_| "{\"items\":[]}".into()),
-        }],
-    });
-    messages.push(ChatMessage::Tool {
-        tool_call_id: provider_id,
-        name: "update_plan".into(),
-        content: format!("status: succeeded\ntool: update_plan\n{snapshot}"),
-    });
 }
 
 /// 恢复一个中断 session 后继续：把 Interrupted outcome 注入历史（§4.3）。
@@ -1757,8 +1672,8 @@ mod tests {
     }
 
     use super::{
-        build_context, ensure_plan_state_messages, is_transient_transport_error,
-        recoverable_stream_interrupt, recovery_overlap_bytes, wait_retry_backoff,
+        build_context, is_transient_transport_error, recoverable_stream_interrupt,
+        recovery_overlap_bytes, wait_retry_backoff,
     };
     use crate::provider::ChatMessage;
     use tokio_util::sync::CancellationToken;
@@ -1818,53 +1733,14 @@ mod tests {
         };
         let config = unit_config();
         let messages = vec![ChatMessage::User("hello".into())];
-        let ctx = build_context(&config, &messages, None, Some(&plan), None, None, None);
-        // 首条 = system prompt；中间 = 原 messages；尾部 = plan 快照（system 角色）。
+        let ctx = build_context(&config, &messages, None, None, None, None);
+        // 首条 = system prompt；中间 = 原消息；无 plan 注入。
         assert!(
             matches!(&ctx[0], ChatMessage::System(_)),
             "首条是 system prompt"
         );
         assert!(matches!(&ctx[1], ChatMessage::User(_)), "中间是原消息");
-        assert_eq!(ctx.len(), 3, "尾部追加一条 plan 快照");
-        let tail = match &ctx[2] {
-            ChatMessage::System(text) => text.clone(),
-            other => panic!("尾部必须是 system 角色: {other:?}"),
-        };
-        assert!(
-            tail.contains("[当前计划·唯一权威"),
-            "必须带唯一权威标记: {tail}"
-        );
-        assert!(tail.contains("加宽侧边栏"), "快照含计划项: {tail}");
-        assert!(
-            !tail.contains("hello"),
-            "注入不得污染原对话（不是 User 消息）: {tail}"
-        );
-    }
-
-    /// §用户诉求：全部项完成/取消后计划结束，build_context 不再注入尾部。
-    #[test]
-    fn build_context_skips_injection_when_plan_fully_completed() {
-        let plan = Plan {
-            explanation: None,
-            items: vec![PlanItem {
-                text: "done".into(),
-                status: PlanStatus::Completed,
-            }],
-        };
-        let config = unit_config();
-        let messages = vec![ChatMessage::User("hi".into())];
-        let ctx = build_context(&config, &messages, None, Some(&plan), None, None, None);
-        assert_eq!(ctx.len(), 2, "全部完成后的计划不再注入尾部");
-    }
-
-    /// 无 plan 时不注入尾部（不打扰、不增加 token）。
-    #[test]
-    fn build_context_without_plan_injects_nothing() {
-        let config = unit_config();
-        let messages = vec![ChatMessage::User("hi".into())];
-        let ctx = build_context(&config, &messages, None, None, None, None, None);
-        assert_eq!(ctx.len(), 2, "无 plan 时只有 system + 原消息");
-        assert!(matches!(&ctx[1], ChatMessage::User(_)));
+        assert_eq!(ctx.len(), 2, "plan 不再注入尾部");
     }
 
     /// §25/§26/§60：ManagedProcess snapshot 以 system 角色注入（harness
@@ -1874,7 +1750,7 @@ mod tests {
         let config = unit_config();
         let messages = vec![ChatMessage::User("hi".into())];
         let snapshot = "p17 running   python server.py  42.8s\np18 exited 0  wget model.bin";
-        let ctx = build_context(&config, &messages, None, None, None, Some(snapshot), None);
+        let ctx = build_context(&config, &messages, None, None, Some(snapshot), None);
         assert_eq!(ctx.len(), 3, "system + 原消息 + process snapshot");
         let tail = match &ctx[2] {
             ChatMessage::System(text) => text.clone(),
@@ -1894,48 +1770,8 @@ mod tests {
     fn build_context_skips_process_snapshot_when_none() {
         let config = unit_config();
         let messages = vec![ChatMessage::User("hi".into())];
-        let ctx = build_context(&config, &messages, None, None, None, None, None);
+        let ctx = build_context(&config, &messages, None, None, None, None);
         assert_eq!(ctx.len(), 2, "无进程快照时不注入");
-    }
-
-    #[test]
-    fn restored_plan_uses_tool_protocol_instead_of_fake_user_message() {
-        let plan = Plan {
-            explanation: None,
-            items: vec![PlanItem {
-                text: "检查 gcodes".into(),
-                status: PlanStatus::InProgress,
-            }],
-        };
-        let mut messages = Vec::new();
-        ensure_plan_state_messages(&mut messages, Some(&plan));
-        messages.push(ChatMessage::User("继续审查".into()));
-
-        assert_eq!(messages.len(), 3);
-        assert!(
-            matches!(&messages[0], ChatMessage::Assistant { content, tool_calls }
-            if content.is_empty() && tool_calls.len() == 1 && tool_calls[0].name == "update_plan")
-        );
-        assert!(
-            matches!(&messages[1], ChatMessage::Tool { name, content, .. }
-            if name == "update_plan" && content.contains("检查 gcodes"))
-        );
-        assert!(matches!(messages.last(), Some(ChatMessage::User(text)) if text == "继续审查"));
-    }
-
-    #[test]
-    fn restored_plan_is_inserted_only_once() {
-        let plan = Plan {
-            explanation: None,
-            items: vec![PlanItem {
-                text: "检查 gcodes".into(),
-                status: PlanStatus::InProgress,
-            }],
-        };
-        let mut messages = Vec::new();
-        ensure_plan_state_messages(&mut messages, Some(&plan));
-        ensure_plan_state_messages(&mut messages, Some(&plan));
-        assert_eq!(messages.len(), 2, "恢复态不能在每次请求尾部重复注入");
     }
 
     /// §修复：只有"已收到部分内容后截断"（StreamInterrupted）才值得自动续写/

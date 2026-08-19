@@ -477,8 +477,8 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
     // ripgrep 内核：Searcher（memchr 加速逐行搜索 + 行号追踪）逐文件复用。
     // context>0 时配置上下文行（Sink 的 context() 消费）。
     let mut searcher = build_searcher(args.context);
-    // 每文件匹配行（按文件分组，输出 [path#revision] header）。
-    let mut file_groups: Vec<(String, String, Vec<String>)> = Vec::new();
+    // 每文件匹配行（按文件分组，输出 [path] header）。
+    let mut file_groups: Vec<(String, Vec<String>)> = Vec::new();
     'scan: for entry in WalkBuilder::new(&root, None) {
         if ctx.cancel.is_cancelled() {
             stop_reason = StopReason::Cancelled;
@@ -532,19 +532,14 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
             Ok(bytes) => bytes,
             Err(_) => continue,
         };
-        // 计算 revision 并注册 snapshot（edit_range stale 恢复用）。
-        let revision = crate::tool::edit::revision_of(&bytes);
-        // §模型协议：record 先行以分配 r{id}，再用 display_revision 输出。
-        let display_rev = if let Ok(snapshot) = crate::tool::edit::build_snapshot(
+        // 保存 snapshot（内部 CAS / recovery 用），不再向模型输出 revision。
+        if let Ok(snapshot) = crate::tool::edit::build_snapshot(
             Utf8PathBuf::from_path_buf(entry.path().to_path_buf()).unwrap_or_default(),
             bytes.clone(),
         ) {
             let mut store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
             store.record(snapshot);
-            store.display_revision(&revision)
-        } else {
-            revision
-        };
+        }
         // 该文件局部匹配行（跨文件分组，不直接塞全局 items）。
         let mut file_items: Vec<String> = Vec::new();
         let limits = SearchLimits {
@@ -565,21 +560,21 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
             stop_reason = StopReason::ResultLimit;
         }
         if !file_items.is_empty() {
-            file_groups.push((rel.clone(), display_rev, file_items));
+            file_groups.push((rel.clone(), file_items));
         }
         if stop_reason == StopReason::ResultLimit {
             break 'scan;
         }
     }
 
-    // 拼分组文本：每个文件一段，段首 [path#revision]（§anchor）。
-    // 同时把扁平 items 存进 snapshot（供 cursor 翻页，翻页不带 revision）。
+    // 拼分组文本：每个文件一段，段首 [path]。
+    // 同时把扁平 items 存进 snapshot（供 cursor 翻页）。
     let mut grouped_body = String::new();
-    for (rel, display_rev, file_items) in &file_groups {
+    for (rel, file_items) in &file_groups {
         if !grouped_body.is_empty() {
             grouped_body.push('\n');
         }
-        grouped_body.push_str(&format!("[{}#{display_rev}]", display_rel(rel)));
+        grouped_body.push_str(&format!("[{}]", display_rel(rel)));
         for item in file_items {
             grouped_body.push('\n');
             grouped_body.push_str(item);
@@ -587,7 +582,7 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
     }
     let items: Vec<String> = file_groups
         .into_iter()
-        .flat_map(|(_, _, items)| items)
+        .flat_map(|(_, items)| items)
         .collect();
 
     finish_scan(
@@ -601,7 +596,7 @@ pub fn search(args: SearchArgs, ctx: &ToolContext) -> ToolOutcome {
         // context>0：保留 ripgrep 输出顺序（匹配行与上下文行交错），
         // 不按噪音目录重排（否则上下文被拆散）。
         args.context == 0,
-        // 首屏用分组文本（[path#revision] + 行）；翻页仍走扁平 items。
+        // 首屏用分组文本（[path] + 行）；翻页仍走扁平 items。
         Some(grouped_body),
     )
 }
@@ -631,15 +626,11 @@ fn search_single_file(
                 return finish_scan(ctx, items, 1, 0, started, stop_reason, "search", true, None);
             }
         };
-        let revision = crate::tool::edit::revision_of(&bytes);
-        let display_rev =
-            if let Ok(snapshot) = crate::tool::edit::build_snapshot(path.clone(), bytes.clone()) {
-                let mut store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
-                store.record(snapshot);
-                store.display_revision(&revision)
-            } else {
-                revision
-            };
+        // 保存 snapshot（内部 CAS / recovery 用），不再向模型输出 revision。
+        if let Ok(snapshot) = crate::tool::edit::build_snapshot(path.clone(), bytes.clone()) {
+            let mut store = tpi_core::util::lock_mutex(&ctx.snapshot_store, "snapshot_store");
+            store.record(snapshot);
+        }
         let mut searcher = build_searcher(args.context);
         let mut match_count = 0usize;
         let limits = SearchLimits {
@@ -660,8 +651,8 @@ fn search_single_file(
             stop_reason = StopReason::ResultLimit;
         }
         if !items.is_empty() {
-            // 单文件也输出 [path#revision] header（与其他路径一致）。
-            let mut grouped = format!("[{}#{display_rev}]", display_rel(&rel));
+            // 单文件也输出 [path] header（与其他路径一致）。
+            let mut grouped = format!("[{}]", display_rel(&rel));
             for item in &items {
                 grouped.push('\n');
                 grouped.push_str(item);

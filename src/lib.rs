@@ -19,4 +19,3 @@ pub mod app;
 pub mod clipboard;
 pub mod doctor;
 pub mod eval;
-pub mod web;

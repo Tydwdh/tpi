@@ -145,8 +145,6 @@ fn file_write(index: usize, path: &str) -> PreparedCall {
             tool: tpi::tool::BuiltinTool::Edit,
             args: tpi::tool::ValidatedArgs::Edit(tpi::tool::edit::EditArgs {
                 path: path.into(),
-                revision: "b3:0000000000000000000000000000000000000000000000000000000000000000"
-                    .into(),
                 replacements: vec![tpi::tool::edit::Replacement {
                     old_text: "x".into(),
                     new_text: "y".into(),
@@ -337,7 +335,7 @@ async fn update_plan_and_compaction_integration() {
         }
         let current = step.get();
         // §13：计划建立后保持为正常的 assistant → update_plan Tool 协议事实；
-        // 绝不能伪装成每轮最后一条 User 消息，否则模型会持续“回复 Todo”。
+        // compaction 后 update_plan 可能被压缩，但 run 必须正常完成。
         if current > 0 {
             assert!(
                 !request.messages.iter().any(|message| matches!(
@@ -347,25 +345,14 @@ async fn update_plan_and_compaction_integration() {
                 "计划快照不得伪装成 User 消息: {:?}",
                 request.messages
             );
-            // §注入可靠性：update_plan 的 Tool 结果已精简（不再内嵌快照，避免
-            // 历史堆积过期计划文本）——这里只要求 update_plan 以合法 Tool 消息
-            // 存在于历史；当前计划的权威文本由尾部 System 快照提供。
+            // §13（TPI_TODO_PLAN_FINAL_STATE_REFACTOR）：plan 不再注入为 System 消息。
             assert!(
-                request.messages.iter().any(|message| matches!(
-                    message,
-                    tpi::provider::ChatMessage::Tool { name, .. }
-                        if name == "update_plan"
-                )),
-                "update_plan 必须以 Tool 消息保留在历史: {:?}",
-                request.messages
-            );
-            assert!(
-                request.messages.iter().any(|message| matches!(
+                !request.messages.iter().any(|message| matches!(
                     message,
                     tpi::provider::ChatMessage::System(text)
-                        if text.contains("[当前计划·唯一权威") && text.contains("当前计划（完整快照）")
+                        if text.contains("[当前计划")
                 )),
-                "每轮请求尾部必须注入带权威标记的当前计划快照: {:?}",
+                "plan 不再注入为 System 消息（§13：plan 是 session state）: {:?}",
                 request.messages
             );
         }
@@ -600,7 +587,6 @@ fn read_only_external_tools_share_wave_with_reads_but_not_writes() {
             args: tpi::tool::ValidatedArgs::Write(tpi::tool::files::WriteArgs {
                 path: path.into(),
                 content: "x".into(),
-                revision: None,
             }),
         },
         access: ToolAccess::Resources(vec![ResourceLock {

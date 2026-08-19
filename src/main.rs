@@ -16,7 +16,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
@@ -109,17 +108,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// 局域网网页接口（粗糙版）：手机发送/接收消息，不用守在电脑前。
-    /// 无 TLS；同一时刻只处理一条消息；可选 --token 做简单访问控制。
-    Serve {
-        /// 监听端口（默认 8765）。
-        #[arg(long, default_value_t = 8765)]
-        port: u16,
-        /// 访问 token（可选；设置后 API 需要 X-TPI-Token 或 ?token=）。
-        #[arg(long)]
-        token: Option<String>,
-    },
-    /// 多端 `Server（web_desktop.md）：Axum` HTTP + WebSocket，暴露统一
+    /// 多端 Server
     /// Application API（tpi-runtime）。Web UI 与 Desktop 共用此服务。
     Server {
         /// 监听地址（默认 127.0.0.1:8765；显式 --listen 0.0.0.0:8765 才暴露局域网）。
@@ -1102,11 +1091,6 @@ fn run(cli: Cli) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     tracing::info!(workspace = %workspace_root, model = %config.model.name, "tpi starting");
-
-    // 局域网网页接口：手机发送/接收消息（粗糙版，见 src/web.rs）。
-    if let Some(Command::Serve { port, token }) = &cli.command {
-        return runtime.block_on(tpi::web::serve(Arc::new(config), *port, token.clone()));
-    }
 
     // 多端 Server（web_desktop.md Phase 4）：Axum + WebSocket，暴露统一 Application API。
     if let Some(Command::Server {

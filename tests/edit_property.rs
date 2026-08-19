@@ -68,12 +68,10 @@ proptest! {
         } else {
             expected_logical
         };
-        let revision = revision_of(content.as_bytes());
         if expected == content {
             // no-op（old_text == new_text）被拒绝（§10.3 第 5 条）。
             let result = apply_edit(
                 &path,
-                &revision,
                 &[Replacement { old_text: old_text.clone(), new_text: new_text.clone() }],
             );
             prop_assert!(result.is_err(), "no-op 必须被拒绝");
@@ -81,7 +79,6 @@ proptest! {
         }
         let result = apply_edit(
             &path,
-            &revision,
             &[Replacement { old_text, new_text }],
         )
         .unwrap();
@@ -102,7 +99,6 @@ fn batch_with_one_ambiguous_replacement_is_all_or_nothing() {
     let path = Utf8PathBuf::from_path_buf(dir.path().join("f.txt")).unwrap();
     let content = "let a = 1;\nlet b = 1;\n";
     std::fs::write(path.as_std_path(), content).unwrap();
-    let revision = revision_of(content.as_bytes());
     let replacements = vec![
         Replacement {
             old_text: "let a = 1;".into(),
@@ -114,7 +110,7 @@ fn batch_with_one_ambiguous_replacement_is_all_or_nothing() {
             new_text: "= 2".into(),
         },
     ];
-    let result = apply_edit(&path, &revision, &replacements);
+    let result = apply_edit(&path, &replacements);
     assert!(result.is_err(), "歧义 replacement 必须拒绝整批");
     let after = std::fs::read_to_string(path.as_std_path()).unwrap();
     assert_eq!(after, content, "整批零变化");
@@ -127,7 +123,6 @@ fn batch_all_unique_applies_atomically() {
     let path = Utf8PathBuf::from_path_buf(dir.path().join("f.txt")).unwrap();
     let content = "let a = 1;\nlet b = 2;\n";
     std::fs::write(path.as_std_path(), content).unwrap();
-    let revision = revision_of(content.as_bytes());
     let replacements = vec![
         Replacement {
             old_text: "let a = 1;".into(),
@@ -138,7 +133,7 @@ fn batch_all_unique_applies_atomically() {
             new_text: "let b = 20;".into(),
         },
     ];
-    let result = apply_edit(&path, &revision, &replacements).unwrap();
+    let result = apply_edit(&path, &replacements).unwrap();
     assert_eq!(result.applied, 2);
     let plan = prepare_commit(&path);
     commit_edit(&result, &path, &plan).unwrap();
@@ -153,10 +148,8 @@ fn edit_near_brackets_never_deletes_undeclared_tokens() {
     let path = Utf8PathBuf::from_path_buf(dir.path().join("f.rs")).unwrap();
     let content = "fn main() {\n    Name::new(1);\n    work();\n}\n";
     std::fs::write(path.as_std_path(), content).unwrap();
-    let revision = revision_of(content.as_bytes());
     let result = apply_edit(
         &path,
-        &revision,
         &[Replacement {
             old_text: "work();".into(),
             new_text: "work();\n    more();".into(),
@@ -181,12 +174,10 @@ fn mixed_line_endings_untouched_bytes_preserved() {
     // 混合行尾：CRLF 与孤立 LF 并存。
     let content = "fn main() {\r\n    work();\n    more();\r\n}\n";
     std::fs::write(path.as_std_path(), content).unwrap();
-    let revision = revision_of(content.as_bytes());
     // old_text 不含换行 → logical 与 raw 位置一致（§10.5 只替换命中的原始 byte ranges）。
     let old_text = "work();";
     let result = apply_edit(
         &path,
-        &revision,
         &[Replacement {
             old_text: old_text.into(),
             new_text: "work();\n    extra();".into(),
@@ -218,10 +209,8 @@ fn bom_file_untouched_bytes_preserved() {
     let path = Utf8PathBuf::from_path_buf(dir.path().join("f.txt")).unwrap();
     let content = "\u{FEFF}let x = 1;\n";
     std::fs::write(path.as_std_path(), content).unwrap();
-    let revision = revision_of(content.as_bytes());
     let result = apply_edit(
         &path,
-        &revision,
         &[Replacement {
             old_text: "let x = 1;".into(),
             new_text: "let x = 2;".into(),
@@ -253,13 +242,11 @@ proptest! {
         let dir = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("f.rs")).unwrap();
         std::fs::write(path.as_std_path(), &content).unwrap();
-        let revision = revision_of(content.as_bytes());
         // old_text 无 trailing（模型视角）；改 line1（唯一窗口，line1/line2 相邻）。
         let old_text = "line1\nline2".to_string();
         let new_text = "line1\nCHANGED".to_string();
         let result = apply_edit(
             &path,
-            &revision,
             &[Replacement { old_text, new_text }],
         );
         let Ok(result) = result else {

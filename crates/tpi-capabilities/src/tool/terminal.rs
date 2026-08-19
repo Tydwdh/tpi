@@ -1,62 +1,70 @@
 //! Agent-facing operations for the persistent PTY registry.
+//!
+//! §8：六个 terminal_* 工具合并为一个 `terminal` 工具，使用 tagged action schema。
+//! 每个 action 只暴露该 action 合法的字段。
 
 use crate::tool::ToolContext;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tpi_core::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 
+/// §8：统一 terminal 工具参数——tagged action schema。
+///
+/// 每个 action 只暴露该 action 合法的字段；无效组合在反序列化时即被拒绝。
 #[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct TerminalOpenArgs {
-    /// Initial terminal rows; defaults to 24.
-    #[serde(default)]
-    pub rows: Option<u16>,
-    /// Initial terminal columns; defaults to 80.
-    #[serde(default)]
-    pub cols: Option<u16>,
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum TerminalArgs {
+    /// 打开一个新的持久化 PTY 终端。
+    Open {
+        #[serde(default)]
+        rows: Option<u16>,
+        #[serde(default)]
+        cols: Option<u16>,
+    },
+    /// 向终端写入原始字节（不做转义解释）。
+    Write {
+        id: String,
+        /// 原始字节写入（原样传输，不做转义解释）。
+        data: String,
+        /// 写入后追加平台 Enter 字节以触发 shell 执行。
+        #[serde(default)]
+        submit: bool,
+    },
+    /// 读取终端输出（增量读取）。
+    Read {
+        id: String,
+        /// Read only bytes appended after this cursor.
+        #[serde(default)]
+        after: Option<u64>,
+    },
+    /// 调整终端窗口大小。
+    Resize { id: String, rows: u16, cols: u16 },
+    /// 向终端发送中断信号（SIGINT 等效）。
+    Signal { id: String },
+    /// 关闭终端并释放资源。
+    Close { id: String },
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct TerminalWriteArgs {
-    pub id: String,
-    /// 原始字节写入（原样传输，不做转义解释）——含反斜杠的命令/正则/脚本
-    /// 原样保留。需要让 shell 执行时用 `submit`，由 TPI 在 PTY 边界追加 Enter。
-    pub data: String,
-    /// 写入后立即在原 PTY 边界追加一个平台适用的 Enter 字节（交互终端规范行
-    /// 结束符）。这样把"原样输入"与"提交执行"解耦，模型无需用 \r 猜测换行。
-    #[serde(default)]
-    pub submit: bool,
+pub async fn terminal(args: TerminalArgs, ctx: &ToolContext) -> ToolOutcome {
+    match args {
+        TerminalArgs::Open { rows, cols } => do_open(rows, cols, ctx).await,
+        TerminalArgs::Write { id, data, submit } => do_write(&id, &data, submit, ctx).await,
+        TerminalArgs::Read { id, after } => do_read(&id, after, ctx).await,
+        TerminalArgs::Resize { id, rows, cols } => do_resize(&id, rows, cols, ctx).await,
+        TerminalArgs::Signal { id } => do_signal(&id, ctx).await,
+        TerminalArgs::Close { id } => do_close(&id, ctx).await,
+    }
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct TerminalReadArgs {
-    pub id: String,
-    /// Read only bytes appended after this cursor.
-    #[serde(default)]
-    pub after: Option<u64>,
-}
+// ---- 内部实现 ----
 
-#[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct TerminalResizeArgs {
-    pub id: String,
-    pub rows: u16,
-    pub cols: u16,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct TerminalIdArgs {
-    pub id: String,
-}
-
-pub async fn open(args: TerminalOpenArgs, ctx: &ToolContext) -> ToolOutcome {
-    // PTY 终端与 `bash` 工具保持一致：Windows 下定位 Git Bash（§11.2 解析顺序：
-    // shell.path → 随包 Git → Program Files → PATH），而非 cmd.exe。这样终端与
-    // 日常命令执行通道同源，避免 cmd/bash 语法分裂。非 Windows 回退 /bin/sh。
+async fn do_open(rows: Option<u16>, cols: Option<u16>, ctx: &ToolContext) -> ToolOutcome {
     let shell = if cfg!(windows) {
         match crate::tool::command::locate_git_bash(ctx) {
             Some(path) => path,
             None => {
                 return outcome(
-                    "terminal_open",
+                    "terminal",
                     Err(
                         "git_bash_not_found: 未找到 Git Bash（§11.2 解析顺序：shell.path → Program Files\\Git\\bin\\bash.exe → usr\\bin → PATH）。可运行 scripts/install-bash.ps1 或配置 shell.path。".into(),
                     ),
@@ -70,27 +78,25 @@ pub async fn open(args: TerminalOpenArgs, ctx: &ToolContext) -> ToolOutcome {
         match crate::workspace::tracked::TrackedWorkspace::capture(ctx.workspace_root.clone()) {
             Ok(workspace) => workspace,
             Err(error) => {
-                return outcome("terminal_open", Err(format!("workspace_tracking: {error}")));
+                return outcome("terminal", Err(format!("workspace_tracking: {error}")));
             }
         };
     let result = tpi_core::util::lock_mutex(&ctx.terminals, "terminal_registry").open_tracked(
         &shell,
         ctx.workspace_root.as_std_path(),
-        args.rows.unwrap_or(24),
-        args.cols.unwrap_or(80),
+        rows.unwrap_or(24),
+        cols.unwrap_or(80),
         workspace,
         ctx.artifacts_root.clone(),
         ctx.session_id.clone(),
     );
     outcome(
-        "terminal_open",
-        result.map(|id| format!("status: opened\nterminal_id: {id}")),
+        "terminal",
+        result.map(|id| format!("action: open\nstatus: opened\nterminal_id: {id}")),
     )
 }
 
-/// 原样写入的字节序列。`submit` 时追加一个 Enter（交互 TTY 规范模式行结束
-/// 符 CR 0x0D）以触发 shell 执行；`data` 本身不做任何转义解释。把"输入"与
-/// "提交"解耦，模型无需用 \r/\n 猜测换行。
+/// 原样写入的字节序列。`submit` 时追加一个 Enter（CR 0x0D）。
 fn write_bytes(data: &str, submit: bool) -> Vec<u8> {
     let mut bytes = data.as_bytes().to_vec();
     if submit {
@@ -99,82 +105,63 @@ fn write_bytes(data: &str, submit: bool) -> Vec<u8> {
     bytes
 }
 
-pub async fn write(args: TerminalWriteArgs, ctx: &ToolContext) -> ToolOutcome {
+async fn do_write(id: &str, data: &str, submit: bool, ctx: &ToolContext) -> ToolOutcome {
     let mut terminals = tpi_core::util::lock_mutex(&ctx.terminals, "terminal_registry");
-    let bytes = write_bytes(&args.data, args.submit);
+    let bytes = write_bytes(data, submit);
     let result = terminals
-        .checkpoint_workspace(&args.id, &ctx.artifacts_root, &ctx.session_id)
-        .and_then(|_| terminals.write(&args.id, &bytes))
-        .map(|_| format!("status: written\nterminal_id: {}", args.id));
-    outcome("terminal_write", result)
+        .checkpoint_workspace(id, &ctx.artifacts_root, &ctx.session_id)
+        .and_then(|_| terminals.write(id, &bytes))
+        .map(|_| format!("action: write\nstatus: written\nterminal_id: {id}"));
+    outcome("terminal", result)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::write_bytes;
-
-    #[test]
-    fn submit_appends_single_enter_without_mutating_data() {
-        // 原样写入：反斜杠/正则/脚本内容一律不改（不被误解释为控制字节）。
-        assert_eq!(write_bytes(r"echo \d+", false), b"echo \\d+");
-        // submit=true 只追加一个 CR（0x0D），不改写 data 内容。
-        assert_eq!(write_bytes("echo ok", true), b"echo ok\r");
-        assert_eq!(write_bytes("", true), b"\r");
-    }
-}
-
-pub async fn read(args: TerminalReadArgs, ctx: &ToolContext) -> ToolOutcome {
+async fn do_read(id: &str, after: Option<u64>, ctx: &ToolContext) -> ToolOutcome {
     let mut terminals = tpi_core::util::lock_mutex(&ctx.terminals, "terminal_registry");
     let result = terminals
-        .read(&args.id, args.after.unwrap_or(0))
+        .read(id, after.unwrap_or(0))
         .and_then(|read| {
             terminals
-                .checkpoint_workspace(&args.id, &ctx.artifacts_root, &ctx.session_id)
+                .checkpoint_workspace(id, &ctx.artifacts_root, &ctx.session_id)
                 .map(|_| read)
         })
         .map(|read| {
             format!(
-                "status: read\nterminal_id: {}\nnext_cursor: {}\ntruncated: {}\nclosed: {}\n{}",
-                args.id,
+                "action: read\nstatus: read\nterminal_id: {id}\nnext_cursor: {}\ntruncated: {}\nclosed: {}\n{}",
                 read.next_cursor,
                 read.truncated,
                 read.closed,
                 String::from_utf8_lossy(&read.data)
             )
         });
-    outcome("terminal_read", result)
+    outcome("terminal", result)
 }
 
-pub async fn resize(args: TerminalResizeArgs, ctx: &ToolContext) -> ToolOutcome {
+async fn do_resize(id: &str, rows: u16, cols: u16, ctx: &ToolContext) -> ToolOutcome {
     let mut terminals = tpi_core::util::lock_mutex(&ctx.terminals, "terminal_registry");
     let result = terminals
-        .checkpoint_workspace(&args.id, &ctx.artifacts_root, &ctx.session_id)
-        .and_then(|_| terminals.resize(&args.id, args.rows, args.cols))
-        .map(|_| format!("status: resized\nterminal_id: {}", args.id));
-    outcome("terminal_resize", result)
+        .checkpoint_workspace(id, &ctx.artifacts_root, &ctx.session_id)
+        .and_then(|_| terminals.resize(id, rows, cols))
+        .map(|_| format!("action: resize\nstatus: resized\nterminal_id: {id}"));
+    outcome("terminal", result)
 }
 
-pub async fn signal(args: TerminalIdArgs, ctx: &ToolContext) -> ToolOutcome {
+async fn do_signal(id: &str, ctx: &ToolContext) -> ToolOutcome {
     let mut terminals = tpi_core::util::lock_mutex(&ctx.terminals, "terminal_registry");
     let result = terminals
-        .signal(&args.id)
-        .and_then(|_| {
-            terminals.checkpoint_workspace(&args.id, &ctx.artifacts_root, &ctx.session_id)
-        })
-        .map(|_| format!("status: signalled\nterminal_id: {}", args.id));
-    outcome("terminal_signal", result)
+        .signal(id)
+        .and_then(|_| terminals.checkpoint_workspace(id, &ctx.artifacts_root, &ctx.session_id))
+        .map(|_| format!("action: signal\nstatus: signalled\nterminal_id: {id}"));
+    outcome("terminal", result)
 }
 
-pub async fn close(args: TerminalIdArgs, ctx: &ToolContext) -> ToolOutcome {
+async fn do_close(id: &str, ctx: &ToolContext) -> ToolOutcome {
     let mut terminals = tpi_core::util::lock_mutex(&ctx.terminals, "terminal_registry");
     let result = terminals
-        .signal(&args.id)
-        .and_then(|_| {
-            terminals.checkpoint_workspace(&args.id, &ctx.artifacts_root, &ctx.session_id)
-        })
-        .and_then(|_| terminals.close(&args.id))
-        .map(|_| format!("status: closed\nterminal_id: {}", args.id));
-    outcome("terminal_close", result)
+        .signal(id)
+        .and_then(|_| terminals.checkpoint_workspace(id, &ctx.artifacts_root, &ctx.session_id))
+        .and_then(|_| terminals.close(id))
+        .map(|_| format!("action: close\nstatus: closed\nterminal_id: {id}"));
+    outcome("terminal", result)
 }
 
 fn outcome(tool: &str, result: Result<String, String>) -> ToolOutcome {
@@ -192,5 +179,19 @@ fn outcome(tool: &str, result: Result<String, String>) -> ToolOutcome {
                 artifact: None,
             },
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_bytes;
+
+    #[test]
+    fn submit_appends_single_enter_without_mutating_data() {
+        // 原样写入：反斜杠/正则/脚本内容一律不改。
+        assert_eq!(write_bytes(r"echo \d+", false), b"echo \\d+");
+        // submit=true 只追加一个 CR（0x0D），不改写 data 内容。
+        assert_eq!(write_bytes("echo ok", true), b"echo ok\r");
+        assert_eq!(write_bytes("", true), b"\r");
     }
 }

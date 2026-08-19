@@ -27,7 +27,6 @@ pub struct RemoteReadArgs {
 #[derive(Debug, Clone)]
 pub struct RemoteEditArgs {
     pub path: String,
-    pub revision: Option<String>,
     pub replacements: Vec<edit::Replacement>,
 }
 
@@ -36,7 +35,6 @@ pub struct RemoteEditArgs {
 pub struct RemoteWriteArgs {
     pub path: String,
     pub content: String,
-    pub revision: Option<String>,
 }
 
 pub async fn remote_read(
@@ -111,7 +109,6 @@ pub async fn remote_read(
         );
         truncated = true;
     }
-    let revision_header = edit::format_revision_header(&window.revision);
     let line_range = if window.returned_lines == 0 {
         "0".to_string()
     } else {
@@ -123,7 +120,7 @@ pub async fn remote_read(
     };
     let numbered = number_lines(&text, window.start_line);
     let mut output = format!(
-        "{revision_header}\npath: {path}\nlines: {line_range} of {}{}\n\n{}",
+        "path: {path}\nlines: {line_range} of {}{}\n\n{}",
         window.total_lines,
         if truncated { " (truncated)" } else { "" },
         numbered,
@@ -171,9 +168,8 @@ pub async fn remote_edit(
             );
         }
     };
-    // 2. 内存应用（revision 校验 + 原子批 + diff，同一语义 §41）。
-    let revision = args.revision.clone().unwrap_or_default();
-    let result = match edit::apply_edit_bytes(&pathbuf, raw, &revision, &args.replacements) {
+    // 2. 内存应用（原子批 + diff，同一语义 §41）。
+    let result = match edit::apply_edit_bytes(&pathbuf, raw, &args.replacements) {
         Ok(r) => r,
         Err(e) => {
             return failed(
@@ -242,12 +238,11 @@ pub async fn remote_edit(
             },
         );
     }
-    // 5. 结果输出（与本地 edit 同构：diff + revision）。
+    // 5. 结果输出（与本地 edit 同构：diff）。
     let diff = edit::unified_diff(&result);
     let mut output = format!(
-        "status: succeeded\ntool: edit\napplied: {}\n[revision={}]\n{}",
+        "status: succeeded\ntool: edit\napplied: {}\n{}",
         result.applied,
-        result.current_revision,
         if diff.is_empty() {
             String::new()
         } else {
@@ -273,54 +268,13 @@ pub async fn remote_write(
         Err(e) => return path_rejected("write", e),
     };
     // 1. 检查目标是否存在（区分新建/重写）。
-    let exists = match crate::remote::run_with_budget(ctx, client.stat(&path)).await {
+    let _exists = match crate::remote::run_with_budget(ctx, client.stat(&path)).await {
         Ok(_) => true,
         Err(e) if is_no_such_file(&e) => false,
         Err(_) => true, // stat 失败保守视为存在（走重写校验）
     };
     let new_raw = args.content.as_bytes().to_vec();
-    if exists {
-        // 重写：必须提供当前 revision（§write revision-bound）。
-        let raw = match crate::remote::run_with_budget(ctx, client.read_file(&path)).await {
-            Ok(r) => r,
-            Err(e) => {
-                return failed(
-                    "write",
-                    ModelPayload {
-                        status: ToolStatus::Failed,
-                        program: Some("ssh".into()),
-                        exit_code: None,
-                        duration_ms: 0,
-                        output: format!("status: failed\ntool: write\nerror: read_failed\n\n{e}"),
-                        effect: None,
-                        artifact: None,
-                    },
-                );
-            }
-        };
-        let current = edit::revision_of(&raw);
-        let expected = args
-            .revision
-            .clone()
-            .and_then(|r| edit::parse_revision_token(&r))
-            .unwrap_or_default();
-        if expected != current {
-            return failed(
-                "write",
-                ModelPayload {
-                    status: ToolStatus::Failed,
-                    program: None,
-                    exit_code: None,
-                    duration_ms: 0,
-                    output: format!(
-                        "status: failed\ntool: write\nerror: stale_revision\n\n远端文件已存在且 revision 不匹配：当前 {current}，期望 {expected}\n请先 read 获取当前 revision。"
-                    ),
-                    effect: None,
-                    artifact: None,
-                },
-            );
-        }
-    }
+    // exists 分支不再需要 revision 检查——并发保护由 Harness 内部 BLAKE3 CAS 完成。
     // 2. 上传 temp + rename（§44）。
     if let Err(e) = crate::remote::run_with_budget(ctx, client.write_file(&path, &new_raw)).await {
         return failed(
@@ -336,8 +290,7 @@ pub async fn remote_write(
             },
         );
     }
-    let revision = edit::revision_of(&new_raw);
-    let output = format!("status: succeeded\ntool: write\n[revision={revision}]\npath: {path}");
+    let output = format!("status: succeeded\ntool: write\npath: {path}");
     ToolOutcome::succeeded("write", output).with_metadata(ToolMetadata {
         tool: "write".into(),
         target: Some(path),

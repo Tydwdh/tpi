@@ -14,7 +14,7 @@
 //! 策略：builtin 工具始终保留（核心能力）；MCP 工具按「上下文关键词」匹配
 //! name/description 选择；总量有上限，防止 Context 随工具数线性膨胀。
 
-use super::registry::{ToolDescriptor, ToolOrigin};
+use super::registry::{ToolOrigin, ToolSpec};
 
 /// 单轮发给模型的工具数上限（builtin 10 + MCP 精选）。
 pub const MAX_ACTIVE_TOOLS: usize = 32;
@@ -37,10 +37,10 @@ impl ToolSelector {
     /// 选择 ActiveToolSet（README2 §14）。
     ///
     /// `context`：用户消息 + 最近上下文文本（用于关键词匹配）。
-    pub fn select(&self, descriptors: Vec<ToolDescriptor>, context: &str) -> Vec<ToolDescriptor> {
+    pub fn select(&self, descriptors: Vec<ToolSpec>, context: &str) -> Vec<ToolSpec> {
         let keywords = extract_keywords(context);
-        let mut active: Vec<ToolDescriptor> = Vec::new();
-        let mut mcp_candidates: Vec<ToolDescriptor> = Vec::new();
+        let mut active: Vec<ToolSpec> = Vec::new();
+        let mut mcp_candidates: Vec<ToolSpec> = Vec::new();
 
         // builtin 全保留（核心能力，README2 §14：不能因为 MCP 膨胀挤掉）。
         for desc in descriptors {
@@ -80,7 +80,7 @@ fn extract_keywords(context: &str) -> Vec<String> {
 }
 
 /// 工具与关键词的相关度（name 命中权重高；description 命中计数）。
-fn relevance(desc: &ToolDescriptor, keywords: &[String]) -> usize {
+fn relevance(desc: &ToolSpec, keywords: &[String]) -> usize {
     let name = desc.name.to_lowercase();
     let desc_text = desc.description.to_lowercase();
     let mut score = 0usize;
@@ -98,8 +98,8 @@ fn relevance(desc: &ToolDescriptor, keywords: &[String]) -> usize {
 mod tests {
     use super::*;
 
-    fn desc(name: &str, origin: ToolOrigin) -> ToolDescriptor {
-        ToolDescriptor {
+    fn desc(name: &str, origin: ToolOrigin) -> ToolSpec {
+        ToolSpec {
             name: name.into(),
             description: format!("{name} 工具：用于相关操作"),
             parameters: serde_json::json!({"type": "object"}),
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn total_capped_at_max_tools() {
         let selector = ToolSelector { max_tools: 4 };
-        let mut all: Vec<ToolDescriptor> = (0..10)
+        let mut all: Vec<ToolSpec> = (0..10)
             .map(|i| {
                 desc(
                     &format!("mcp::s::t{i}"),

@@ -96,13 +96,11 @@ async fn crash_after_replace_recovers_as_committed() {
     let target = workspace.join("f.txt");
     let content = "hello x world\n";
     std::fs::write(&target, content).unwrap();
-    let expected = revision_of(content.as_bytes());
     let plan = prepare_commit(&workspace.join("f.txt"));
 
     // 真实执行提交（模拟崩溃发生在 commit 后、ToolCompleted 前）。
     let result = apply_edit(
         &workspace.join("f.txt"),
-        &expected,
         &[Replacement {
             old_text: "x".into(),
             new_text: "y".into(),
@@ -110,6 +108,7 @@ async fn crash_after_replace_recovers_as_committed() {
     )
     .unwrap();
     commit_edit(&result, &workspace.join("f.txt"), &plan).unwrap();
+    let expected = revision_of(content.as_bytes());
     let new_content = std::fs::read_to_string(&target).unwrap();
     assert!(new_content.contains('y'));
 
@@ -132,13 +131,11 @@ fn concurrent_external_writer_detected_via_backup_digest() {
     let target = workspace.join("f.txt");
     let original = "hello x world\n";
     std::fs::write(&target, original).unwrap();
-    let expected = revision_of(original.as_bytes());
     let plan = prepare_commit(&target);
 
     // 提交（成功；backup 保留旧内容，由调用方在 ToolCompleted 后删除——这里保留以模拟竞态）。
     let result = apply_edit(
         &target,
-        &expected,
         &[Replacement {
             old_text: "x".into(),
             new_text: "y".into(),
@@ -146,6 +143,7 @@ fn concurrent_external_writer_detected_via_backup_digest() {
     )
     .unwrap();
     commit_edit(&result, &target, &plan).unwrap();
+    let expected = revision_of(original.as_bytes());
 
     // 外部 writer 在 ReplaceFileW 前修改了旧文件：backup 内容 != expected。
     let external = b"external modification\n";
