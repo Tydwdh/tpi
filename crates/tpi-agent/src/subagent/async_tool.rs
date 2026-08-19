@@ -43,6 +43,8 @@ where
     config: Arc<tpi_config::config::Config>,
     make_provider: Arc<dyn Fn() -> P + Send + Sync>,
     manager: SharedAgentManager,
+    /// P8-06：child 完成时发 SubagentReported 的通道（parent TUI summary card）。
+    report_tx: Option<tokio::sync::mpsc::Sender<crate::agent::LiveEvent>>,
     _provider: std::marker::PhantomData<fn() -> P>,
 }
 
@@ -54,6 +56,7 @@ where
         config: Arc<tpi_config::config::Config>,
         make_provider: F,
         manager: SharedAgentManager,
+        report_tx: Option<tokio::sync::mpsc::Sender<crate::agent::LiveEvent>>,
     ) -> Self
     where
         F: Fn() -> P + Send + Sync + 'static,
@@ -62,6 +65,7 @@ where
             config,
             make_provider: Arc::new(make_provider),
             manager,
+            report_tx,
             _provider: std::marker::PhantomData,
         }
     }
@@ -129,6 +133,7 @@ fn spawn_worker<P>(
     cancel: CancellationToken,
     output_tx: Option<tokio::sync::mpsc::Sender<tpi_capabilities::tool::ToolStreamEvent>>,
     parent_call_id: Option<tpi_core::ids::ToolCallId>,
+    report_tx: Option<tokio::sync::mpsc::Sender<crate::agent::LiveEvent>>,
 ) where
     P: Provider + Send + 'static,
 {
@@ -149,7 +154,7 @@ fn spawn_worker<P>(
             child_workspace,
         );
         // P8-06：绑定实时观察通道（child 活动经此通道转发到 parent TUI 卡片）。
-        // async 路径不使用 LiveEvent report_tx（报告通过 AgentManager inbox → context 投影）。
+        child = child.with_report_tx(report_tx);
         if let Some(call_id) = parent_call_id {
             child = child.with_output_tx(output_tx, call_id);
         }
@@ -308,6 +313,7 @@ where
             worker_cancel,
             ctx.output_tx.clone(),
             Some(ctx.call_id),
+            self.report_tx.clone(),
         );
         // worker 已 spawn：标记 Running。
         {
@@ -587,6 +593,7 @@ pub fn register_async_subagent_tools<P, F>(
     config: Arc<tpi_config::config::Config>,
     make_provider: F,
     manager: SharedAgentManager,
+    report_tx: Option<tokio::sync::mpsc::Sender<crate::agent::LiveEvent>>,
 ) where
     P: Provider + Send + 'static,
     F: Fn() -> P + Send + Sync + 'static,
@@ -595,6 +602,7 @@ pub fn register_async_subagent_tools<P, F>(
         config,
         make_provider,
         manager.clone(),
+        report_tx,
     ));
     registry
         .lock()

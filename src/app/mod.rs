@@ -216,6 +216,7 @@ fn register_openai_async_subagent_tools(
     model: &crate::config::ModelConfig,
     api_key: &str,
     manager: Arc<std::sync::Mutex<tpi_agent::agent::manager::AgentManager>>,
+    report_tx: Option<tokio::sync::mpsc::Sender<crate::agent::LiveEvent>>,
 ) {
     let model = model.clone();
     let api_key = api_key.to_string();
@@ -233,6 +234,7 @@ fn register_openai_async_subagent_tools(
             )
         },
         manager,
+        report_tx,
     );
 }
 
@@ -309,6 +311,7 @@ impl AppServices<OpenAiCompatClient> {
             &config.model,
             &api_key,
             agents.clone(),
+            None, // report_tx: run 时由 ToolContext 注入（与 sync subagent 一致）
         );
 
         // 共享的当前取消 token（Ctrl-C 第一次取消 run，空闲时退出）。
@@ -478,6 +481,7 @@ pub async fn run(
             model,
             &api_key,
             subagent_agents.clone(),
+            None, // report_tx: run 时由 ToolContext 注入（与 sync subagent 一致）
         );
         Ok(provider)
     };
