@@ -119,6 +119,89 @@ impl OpenAiCompatClient {
         body.insert("stream_options".into(), json!({ "include_usage": true }));
         serde_json::Value::Object(body)
     }
+
+    /// OpenAI's Responses API is selected by configuring the complete
+    /// `/responses` endpoint.  Keeping this opt-in preserves the existing
+    /// Chat Completions behaviour for compatible gateways.
+    fn build_responses_body(&self, request: &ModelRequest) -> serde_json::Value {
+        let input: Vec<serde_json::Value> = request
+            .messages
+            .iter()
+            .flat_map(response_input_items)
+            .collect();
+        let tools: Vec<serde_json::Value> = request
+            .tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": normalize_parameters(&tool.parameters),
+                })
+            })
+            .collect();
+        let mut body = serde_json::Map::new();
+        body.insert("model".into(), json!(request.model));
+        body.insert("input".into(), json!(input));
+        if !tools.is_empty() {
+            body.insert("tools".into(), json!(tools));
+        }
+        if let Some(reasoning) = &request.reasoning {
+            let effort = if reasoning.eq_ignore_ascii_case("max") {
+                "high"
+            } else {
+                reasoning.as_str()
+            };
+            body.insert("reasoning".into(), json!({ "effort": effort }));
+        }
+        if let Some(max_tokens) = request.max_output_tokens {
+            body.insert("max_output_tokens".into(), json!(max_tokens));
+        }
+        body.insert("stream".into(), json!(true));
+        serde_json::Value::Object(body)
+    }
+}
+
+fn response_input_items(message: &ChatMessage) -> Vec<serde_json::Value> {
+    match message {
+        ChatMessage::System(content) => vec![json!({
+            "role": "system", "content": [{"type": "input_text", "text": content}]
+        })],
+        ChatMessage::User(content) => vec![json!({
+            "role": "user", "content": [{"type": "input_text", "text": content}]
+        })],
+        ChatMessage::Assistant {
+            content,
+            tool_calls,
+        } => {
+            let mut items = Vec::new();
+            if !content.is_empty() {
+                items.push(json!({
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": content}]
+                }));
+            }
+            items.extend(tool_calls.iter().map(|call| {
+                json!({
+                    "type": "function_call",
+                    "call_id": call.provider_id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                })
+            }));
+            items
+        }
+        ChatMessage::Tool {
+            tool_call_id,
+            content,
+            ..
+        } => vec![json!({
+            "type": "function_call_output",
+            "call_id": tool_call_id,
+            "output": content,
+        })],
+    }
 }
 
 fn message_to_json(message: &ChatMessage) -> serde_json::Value {
@@ -265,6 +348,9 @@ struct PromptTokensDetails {
 /// 流中 tool call 的组装状态。
 struct PendingToolCall {
     provider_id: Option<String>,
+    /// Responses API uses `item_id` for argument deltas and `call_id` for
+    /// tool output; they are distinct identifiers for the same call.
+    stream_id: Option<String>,
     name: String,
     arguments: String,
     announced: bool,
@@ -358,8 +444,17 @@ impl Provider for OpenAiCompatClient {
         events: tokio::sync::mpsc::Sender<ProviderEvent>,
         cancel: CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
-        let url = format!("{}/chat/completions", self.base_url);
-        let body = self.build_body(&request);
+        let responses = self.base_url.ends_with("/responses");
+        let url = if responses {
+            self.base_url.clone()
+        } else {
+            format!("{}/chat/completions", self.base_url)
+        };
+        let body = if responses {
+            self.build_responses_body(&request)
+        } else {
+            self.build_body(&request)
+        };
 
         // §8：provider trace（本地调试；TPI_TRACE_PROVIDER=1）。
         if trace::enabled() {
@@ -451,7 +546,12 @@ impl Provider for OpenAiCompatClient {
                         fields.insert("status".into(), json!(status.as_u16()));
                         trace::log("response_status", fields);
                     }
-                    match consume_stream(response, events.clone(), cancel.clone()).await {
+                    let consumed = if responses {
+                        consume_responses_stream(response, events.clone(), cancel.clone()).await
+                    } else {
+                        consume_stream(response, events.clone(), cancel.clone()).await
+                    };
+                    match consumed {
                         ConsumeResult::Ok(response) => return Ok(response),
                         ConsumeResult::Failed { error, retryable } => {
                             if trace::enabled() {
@@ -577,6 +677,263 @@ enum SendResult {
         retry_after: Option<Duration>,
         status: reqwest::StatusCode,
     },
+}
+
+/// Responses API SSE is event-typed rather than Chat Completions' single
+/// `choices[].delta` envelope.  Normalize the small subset needed by the
+/// agent here so the rest of the runtime remains provider-agnostic.
+async fn consume_responses_stream(
+    response: reqwest::Response,
+    events: tokio::sync::mpsc::Sender<ProviderEvent>,
+    cancel: CancellationToken,
+) -> ConsumeResult {
+    let mut frame_guard = SseFrameGuard::default();
+    let guarded = response.bytes_stream().map(move |result| match result {
+        Ok(chunk) => frame_guard.inspect(&chunk).map(|()| chunk),
+        Err(error) => Err(BoundedSseStreamError::Transport(error)),
+    });
+    let mut stream = guarded.eventsource();
+    let mut pending: Vec<PendingToolCall> = Vec::new();
+    let mut usage = Usage::default();
+    let mut received_any = false;
+    let mut completed = false;
+    let mut streamed_text_bytes = 0usize;
+    let mut tool_argument_bytes = 0usize;
+
+    loop {
+        let next = tokio::select! {
+            _ = cancel.cancelled() => return ConsumeResult::Failed { error: ProviderError::Cancelled, retryable: false },
+            next = stream.next() => next,
+        };
+        let Some(event) = next else { break };
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                let detail = format!("responses stream: {error}; events_received={received_any}");
+                return ConsumeResult::Failed {
+                    error: if received_any {
+                        ProviderError::StreamInterrupted(detail)
+                    } else {
+                        ProviderError::Connection(detail)
+                    },
+                    retryable: !received_any,
+                };
+            }
+        };
+        if event.data.trim().is_empty() || event.event == "ping" {
+            continue;
+        }
+        if event.event == "error" {
+            return ConsumeResult::Failed {
+                error: ProviderError::Protocol(format!("provider error event: {}", event.data)),
+                retryable: false,
+            };
+        }
+        let data: serde_json::Value = match serde_json::from_str(&event.data) {
+            Ok(value) => value,
+            Err(error) => {
+                return ConsumeResult::Failed {
+                    error: ProviderError::Protocol(format!("invalid Responses event: {error}")),
+                    retryable: false,
+                };
+            }
+        };
+        match event.event.as_str() {
+            "response.output_text.delta" => {
+                if let Some(delta) = data.get("delta").and_then(|v| v.as_str()) {
+                    streamed_text_bytes = match streamed_text_bytes.checked_add(delta.len()) {
+                        Some(total) if total <= MAX_STREAM_TEXT_BYTES => total,
+                        _ => {
+                            return ConsumeResult::Failed {
+                                error: ProviderError::Protocol(format!(
+                                    "assistant text exceeds {MAX_STREAM_TEXT_BYTES} byte limit"
+                                )),
+                                retryable: false,
+                            };
+                        }
+                    };
+                    received_any = true;
+                    if events
+                        .send(ProviderEvent::TextDelta(delta.to_string()))
+                        .await
+                        .is_err()
+                    {
+                        return ConsumeResult::Failed {
+                            error: ProviderError::Cancelled,
+                            retryable: false,
+                        };
+                    }
+                }
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(delta) = data.get("delta").and_then(|v| v.as_str()) {
+                    received_any = true;
+                    if events
+                        .send(ProviderEvent::ReasoningDelta(delta.to_string()))
+                        .await
+                        .is_err()
+                    {
+                        return ConsumeResult::Failed {
+                            error: ProviderError::Cancelled,
+                            retryable: false,
+                        };
+                    }
+                }
+            }
+            "response.output_item.added" => {
+                let Some(item) = data.get("item") else {
+                    continue;
+                };
+                if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
+                    continue;
+                }
+                let id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if id.is_empty() || name.is_empty() {
+                    return ConsumeResult::Failed {
+                        error: ProviderError::Protocol(
+                            "Responses function call is missing id or name".into(),
+                        ),
+                        retryable: false,
+                    };
+                }
+                pending.push(PendingToolCall {
+                    provider_id: Some(id.to_string()),
+                    stream_id: item
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string),
+                    name: name.to_string(),
+                    arguments: String::new(),
+                    announced: true,
+                });
+                received_any = true;
+                if events
+                    .send(ProviderEvent::ToolCallStarted {
+                        index: (pending.len() - 1) as u32,
+                        id: id.to_string(),
+                        name: name.to_string(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return ConsumeResult::Failed {
+                        error: ProviderError::Cancelled,
+                        retryable: false,
+                    };
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let id = data
+                    .get("item_id")
+                    .or_else(|| data.get("call_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let delta = data
+                    .get("delta")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let Some(index) = pending.iter().position(|call| {
+                    call.provider_id.as_deref() == Some(id) || call.stream_id.as_deref() == Some(id)
+                }) else {
+                    return ConsumeResult::Failed {
+                        error: ProviderError::Protocol(
+                            "Responses tool arguments arrived before function call item".into(),
+                        ),
+                        retryable: false,
+                    };
+                };
+                tool_argument_bytes = match tool_argument_bytes.checked_add(delta.len()) {
+                    Some(total) if total <= MAX_TOOL_ARGUMENT_BYTES => total,
+                    _ => {
+                        return ConsumeResult::Failed {
+                            error: ProviderError::Protocol(format!(
+                                "tool arguments exceed {MAX_TOOL_ARGUMENT_BYTES} byte limit"
+                            )),
+                            retryable: false,
+                        };
+                    }
+                };
+                pending[index].arguments.push_str(delta);
+                received_any = true;
+                if events
+                    .send(ProviderEvent::ToolArgumentsDelta {
+                        index: index as u32,
+                        chunk: delta.to_string(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return ConsumeResult::Failed {
+                        error: ProviderError::Cancelled,
+                        retryable: false,
+                    };
+                }
+            }
+            "response.completed" => {
+                if let Some(value) = data.get("response").and_then(|v| v.get("usage")) {
+                    usage.input_tokens = value
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    usage.output_tokens = value
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                }
+                completed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !completed {
+        return ConsumeResult::Failed {
+            error: if received_any {
+                ProviderError::StreamInterrupted(
+                    "Responses stream ended before response.completed".into(),
+                )
+            } else {
+                ProviderError::Connection("empty Responses stream".into())
+            },
+            retryable: !received_any,
+        };
+    }
+    for call in &pending {
+        if call.arguments.trim().is_empty()
+            || serde_json::from_str::<serde_json::Value>(&call.arguments).is_err()
+        {
+            return ConsumeResult::Failed {
+                error: ProviderError::Protocol("incomplete Responses tool arguments".into()),
+                retryable: false,
+            };
+        }
+    }
+    ConsumeResult::Ok(ProviderResponse {
+        finish_reason: if pending.is_empty() {
+            FinishReason::Stop
+        } else {
+            FinishReason::ToolCalls
+        },
+        usage,
+        tool_calls: pending
+            .into_iter()
+            .enumerate()
+            .map(|(i, call)| crate::provider::ToolCall {
+                call_id: tpi_core::ids::ToolCallId::new_v7(),
+                provider_id: call.provider_id.unwrap_or_default(),
+                name: call.name,
+                arguments: call.arguments,
+            })
+            .collect(),
+    })
 }
 
 impl OpenAiCompatClient {
@@ -715,6 +1072,146 @@ fn reqwest_error_kind(error: &reqwest::Error) -> String {
     }
     parts.join("|")
 }
+/// 处理单个 tool call delta：校验 id/name/arguments、announce 首次可见、
+/// 累积 arguments 并发送 ToolArgumentsDelta。
+/// 返回 `Err(ConsumeResult)` 表示协议/取消错误，`Ok(())` 表示成功。
+async fn process_tool_call_delta(
+    call: &SseToolCallDelta,
+    pending: &mut Vec<PendingToolCall>,
+    tool_argument_bytes: &mut usize,
+    chunk_had_semantic: &mut bool,
+    events: &tokio::sync::mpsc::Sender<ProviderEvent>,
+) -> Result<(), ConsumeResult> {
+    *chunk_had_semantic = true;
+    let index = call.index.unwrap_or(0) as usize;
+    if index >= MAX_STREAM_TOOL_CALLS {
+        return Err(ConsumeResult::Failed {
+            error: ProviderError::Protocol(format!(
+                "tool call index {index} exceeds limit {MAX_STREAM_TOOL_CALLS}"
+            )),
+            retryable: false,
+        });
+    }
+    if pending.len() <= index {
+        pending.resize_with(index + 1, || PendingToolCall {
+            provider_id: None,
+            stream_id: None,
+            name: String::new(),
+            arguments: String::new(),
+            announced: false,
+        });
+    }
+    let slot = &mut pending[index];
+    // Ark emits the id/name only in the first tool delta, then
+    // represents omitted fields as empty strings in following
+    // argument deltas. Treat those placeholders as absent; the
+    // completed call below still requires non-empty values.
+    if let Some(id) = non_empty_delta(call.id.as_deref()) {
+        if id.len() > MAX_PROVIDER_CALL_ID_BYTES || id.chars().any(char::is_control) {
+            return Err(ConsumeResult::Failed {
+                error: ProviderError::Protocol("invalid tool call id".into()),
+                retryable: false,
+            });
+        }
+        if slot
+            .provider_id
+            .as_ref()
+            .is_some_and(|existing| existing != id)
+        {
+            return Err(ConsumeResult::Failed {
+                error: ProviderError::Protocol("tool call id changed while streaming".into()),
+                retryable: false,
+            });
+        }
+        slot.provider_id.get_or_insert_with(|| id.to_string());
+    }
+    if let Some(name) = call
+        .function
+        .as_ref()
+        .and_then(|function| function.name.as_deref())
+        .and_then(|name| non_empty_delta(Some(name)))
+    {
+        if name.len() > MAX_TOOL_NAME_BYTES || name.chars().any(char::is_control) {
+            return Err(ConsumeResult::Failed {
+                error: ProviderError::Protocol("invalid tool call name".into()),
+                retryable: false,
+            });
+        }
+        if !slot.name.is_empty() && slot.name != name {
+            return Err(ConsumeResult::Failed {
+                error: ProviderError::Protocol("tool call name changed while streaming".into()),
+                retryable: false,
+            });
+        }
+        if slot.name.is_empty() {
+            slot.name = name.to_string();
+        }
+    }
+    if !slot.announced
+        && !slot.name.is_empty()
+        && let Some(provider_id) = &slot.provider_id
+    {
+        slot.announced = true;
+        if trace::enabled() {
+            let mut fields = serde_json::Map::new();
+            fields.insert("index".into(), json!(index));
+            fields.insert("name".into(), json!(slot.name));
+            fields.insert("provider_id".into(), json!(provider_id));
+            trace::log("tool_call_started", fields);
+        }
+        if events
+            .send(ProviderEvent::ToolCallStarted {
+                index: index as u32,
+                id: provider_id.clone(),
+                name: slot.name.clone(),
+            })
+            .await
+            .is_err()
+        {
+            return Err(ConsumeResult::Failed {
+                error: ProviderError::Cancelled,
+                retryable: false,
+            });
+        }
+    }
+    if let Some(arguments) = call.function.as_ref().and_then(|f| f.arguments.as_ref())
+        && !arguments.is_empty()
+    {
+        *tool_argument_bytes = match tool_argument_bytes.checked_add(arguments.len()) {
+            Some(total) if total <= MAX_TOOL_ARGUMENT_BYTES => total,
+            _ => {
+                return Err(ConsumeResult::Failed {
+                    error: ProviderError::Protocol(format!(
+                        "tool arguments exceed {MAX_TOOL_ARGUMENT_BYTES} byte limit"
+                    )),
+                    retryable: false,
+                });
+            }
+        };
+        slot.arguments.push_str(arguments);
+        if trace::enabled() {
+            let mut fields = serde_json::Map::new();
+            fields.insert("index".into(), json!(index));
+            fields.insert("arguments_len".into(), json!(arguments.len()));
+            trace::log("tool_arguments_delta", fields);
+        }
+        if events
+            .send(ProviderEvent::ToolArgumentsDelta {
+                index: index as u32,
+                chunk: arguments.clone(),
+            })
+            .await
+            .is_err()
+        {
+            return Err(ConsumeResult::Failed {
+                error: ProviderError::Cancelled,
+                retryable: false,
+            });
+        }
+    }
+    Ok(())
+}
+
 async fn consume_stream(
     response: reqwest::Response,
     events: tokio::sync::mpsc::Sender<ProviderEvent>,
@@ -915,135 +1412,17 @@ async fn consume_stream(
                 }
             }
             for call in &choice.delta.tool_calls {
-                chunk_had_semantic = true;
-                let index = call.index.unwrap_or(0) as usize;
-                if index >= MAX_STREAM_TOOL_CALLS {
-                    return ConsumeResult::Failed {
-                        error: ProviderError::Protocol(format!(
-                            "tool call index {index} exceeds limit {MAX_STREAM_TOOL_CALLS}"
-                        )),
-                        retryable: false,
-                    };
-                }
-                if pending.len() <= index {
-                    pending.resize_with(index + 1, || PendingToolCall {
-                        provider_id: None,
-                        name: String::new(),
-                        arguments: String::new(),
-                        announced: false,
-                    });
-                }
-                let slot = &mut pending[index];
-                // Ark emits the id/name only in the first tool delta, then
-                // represents omitted fields as empty strings in following
-                // argument deltas. Treat those placeholders as absent; the
-                // completed call below still requires non-empty values.
-                if let Some(id) = non_empty_delta(call.id.as_deref()) {
-                    if id.len() > MAX_PROVIDER_CALL_ID_BYTES || id.chars().any(char::is_control) {
-                        return ConsumeResult::Failed {
-                            error: ProviderError::Protocol("invalid tool call id".into()),
-                            retryable: false,
-                        };
-                    }
-                    if slot
-                        .provider_id
-                        .as_ref()
-                        .is_some_and(|existing| existing != id)
-                    {
-                        return ConsumeResult::Failed {
-                            error: ProviderError::Protocol(
-                                "tool call id changed while streaming".into(),
-                            ),
-                            retryable: false,
-                        };
-                    }
-                    slot.provider_id.get_or_insert_with(|| id.to_string());
-                }
-                if let Some(name) = call
-                    .function
-                    .as_ref()
-                    .and_then(|function| function.name.as_deref())
-                    .and_then(|name| non_empty_delta(Some(name)))
+                match process_tool_call_delta(
+                    call,
+                    &mut pending,
+                    &mut tool_argument_bytes,
+                    &mut chunk_had_semantic,
+                    &events,
+                )
+                .await
                 {
-                    if name.len() > MAX_TOOL_NAME_BYTES || name.chars().any(char::is_control) {
-                        return ConsumeResult::Failed {
-                            error: ProviderError::Protocol("invalid tool call name".into()),
-                            retryable: false,
-                        };
-                    }
-                    if !slot.name.is_empty() && slot.name != name {
-                        return ConsumeResult::Failed {
-                            error: ProviderError::Protocol(
-                                "tool call name changed while streaming".into(),
-                            ),
-                            retryable: false,
-                        };
-                    }
-                    if slot.name.is_empty() {
-                        slot.name = name.to_string();
-                    }
-                }
-                if !slot.announced
-                    && !slot.name.is_empty()
-                    && let Some(provider_id) = &slot.provider_id
-                {
-                    slot.announced = true;
-                    if trace::enabled() {
-                        let mut fields = serde_json::Map::new();
-                        fields.insert("index".into(), json!(index));
-                        fields.insert("name".into(), json!(slot.name));
-                        fields.insert("provider_id".into(), json!(provider_id));
-                        trace::log("tool_call_started", fields);
-                    }
-                    if events
-                        .send(ProviderEvent::ToolCallStarted {
-                            index: index as u32,
-                            id: provider_id.clone(),
-                            name: slot.name.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return ConsumeResult::Failed {
-                            error: ProviderError::Cancelled,
-                            retryable: false,
-                        };
-                    }
-                }
-                if let Some(arguments) = call.function.as_ref().and_then(|f| f.arguments.as_ref())
-                    && !arguments.is_empty()
-                {
-                    tool_argument_bytes = match tool_argument_bytes.checked_add(arguments.len()) {
-                        Some(total) if total <= MAX_TOOL_ARGUMENT_BYTES => total,
-                        _ => {
-                            return ConsumeResult::Failed {
-                                error: ProviderError::Protocol(format!(
-                                    "tool arguments exceed {MAX_TOOL_ARGUMENT_BYTES} byte limit"
-                                )),
-                                retryable: false,
-                            };
-                        }
-                    };
-                    slot.arguments.push_str(arguments);
-                    if trace::enabled() {
-                        let mut fields = serde_json::Map::new();
-                        fields.insert("index".into(), json!(index));
-                        fields.insert("arguments_len".into(), json!(arguments.len()));
-                        trace::log("tool_arguments_delta", fields);
-                    }
-                    if events
-                        .send(ProviderEvent::ToolArgumentsDelta {
-                            index: index as u32,
-                            chunk: arguments.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return ConsumeResult::Failed {
-                            error: ProviderError::Cancelled,
-                            retryable: false,
-                        };
-                    }
+                    Ok(()) => {}
+                    Err(result) => return result,
                 }
             }
             if let Some(reason) = &choice.finish_reason {
@@ -1329,7 +1708,11 @@ mod tests {
         // 无字段工具：源 schema 只有 `{"type":"object"}`。
         let bare = serde_json::json!({ "type": "object" });
         let normalized = normalize_parameters(&bare);
-        assert_eq!(normalized["properties"], serde_json::json!({}), "{normalized}");
+        assert_eq!(
+            normalized["properties"],
+            serde_json::json!({}),
+            "{normalized}"
+        );
         assert_eq!(normalized["type"], "object");
 
         // 带字段的 schema：properties 保留，不覆盖。
@@ -1339,8 +1722,7 @@ mod tests {
         });
         let normalized = normalize_parameters(&with_fields);
         assert_eq!(
-            normalized["properties"]["path"]["type"],
-            "string",
+            normalized["properties"]["path"]["type"], "string",
             "已有 properties 不得被覆盖"
         );
 
@@ -1427,6 +1809,37 @@ mod tests {
         assert_eq!(body["model"], "request-model");
         assert!(body.get("max_tokens").is_none(), "{body}");
         assert!(body.get("reasoning_effort").is_none(), "{body}");
+    }
+
+    #[test]
+    fn responses_body_uses_responses_schema() {
+        let client = OpenAiCompatClient::new(
+            "https://opencode.ai/zen/go/v1/responses".into(),
+            "ignored-model".into(),
+            "key".into(),
+            None,
+            None,
+            None,
+        );
+        let request = ModelRequest {
+            model: "muse-spark-1.2".into(),
+            messages: vec![
+                ChatMessage::System("be concise".into()),
+                ChatMessage::User("hi".into()),
+            ],
+            tools: vec![],
+            max_output_tokens: Some(512),
+            reasoning: Some("high".into()),
+            context_window: None,
+        };
+        let body = client.build_responses_body(&request);
+        assert_eq!(body["model"], "muse-spark-1.2");
+        assert!(body.get("messages").is_none(), "{body}");
+        assert_eq!(body["input"][0]["role"], "system");
+        assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["max_output_tokens"], 512);
+        assert_eq!(body["stream"], true);
     }
 }
 

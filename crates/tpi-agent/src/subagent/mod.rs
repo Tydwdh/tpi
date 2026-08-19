@@ -6,9 +6,9 @@
 //!
 //! 本模块定义契约 + fake；P8-04 in-process child 在其上实现。
 
+pub mod async_tool;
 pub mod child;
 pub mod tool;
-pub mod async_tool;
 
 use tpi_core::ids::{SessionId, SpanId, TraceId};
 

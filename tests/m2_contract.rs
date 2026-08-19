@@ -101,6 +101,7 @@ async fn cancellation_kills_entire_process_tree() {
         registry: ctx.registry.clone(),
         interactive: true,
         allow_outside_workspace: ctx.allow_outside_workspace,
+        workspace_session: None,
     };
     let handle = tokio::spawn(async move { bash(args, &run_ctx).await });
 

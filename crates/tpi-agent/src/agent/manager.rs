@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use tpi_core::ids::{AgentId, DelegationId, SessionId};
 use tokio_util::sync::CancellationToken;
+use tpi_core::ids::{AgentId, DelegationId, SessionId};
 
 /// 被托管 agent 的状态机（ADR-007 §2.2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,7 +270,9 @@ impl AgentManager {
         let capacity = MAX_RETAINED_AGENTS.saturating_sub(active_count);
         let mut out = Vec::with_capacity(self.agents.len());
         for id in &self.order {
-            let Some(a) = self.agents.get(id) else { continue };
+            let Some(a) = self.agents.get(id) else {
+                continue;
+            };
             let active = matches!(a.state, AgentState::Starting | AgentState::Running);
             if !active && retained >= capacity {
                 continue;
@@ -403,7 +405,10 @@ mod tests {
         let drained = m.drain_inbox();
         assert_eq!(drained.len(), 1);
         assert!(!m.has_pending());
-        assert_eq!(m.status(aid).unwrap().last_summary.as_deref(), Some("progress"));
+        assert_eq!(
+            m.status(aid).unwrap().last_summary.as_deref(),
+            Some("progress")
+        );
     }
 
     #[tokio::test]
@@ -426,7 +431,9 @@ mod tests {
         let did2 = did;
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            m2.lock().unwrap().settle(did2, a2, AgentState::Stopped, None);
+            m2.lock()
+                .unwrap()
+                .settle(did2, a2, AgentState::Stopped, None);
         });
         let result = AgentManager::wait(&manager, aid, cancel).await;
         assert!(result.is_some());

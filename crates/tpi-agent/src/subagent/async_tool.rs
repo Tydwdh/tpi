@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use tpi_capabilities::tool::registry::{Tool, ToolOrigin};
 use tpi_capabilities::tool::ToolContext;
+use tpi_capabilities::tool::registry::{Tool, ToolOrigin};
 use tpi_core::ids::{AgentId, DelegationId, SessionId};
 use tpi_core::outcome::ToolOutcome;
 use tpi_session::{SessionEvent, SubagentFinishedReason};
@@ -302,7 +302,10 @@ where
             manager.mark_running(agent_id);
         }
 
-        ToolOutcome::succeeded(self.name(), spawn_reply(agent_id, delegation_id, &parsed.instruction))
+        ToolOutcome::succeeded(
+            self.name(),
+            spawn_reply(agent_id, delegation_id, &parsed.instruction),
+        )
     }
 }
 
@@ -429,7 +432,10 @@ where
                     Some(v) => {
                         let mut body = format!(
                             "agent_id: {}\nstate: {}\nchild_session: {}\ninstruction: {}\n",
-                            v.agent_id, v.state.as_str(), v.child_session, v.instruction
+                            v.agent_id,
+                            v.state.as_str(),
+                            v.child_session,
+                            v.instruction
                         );
                         if let Some(s) = &v.last_summary {
                             body.push_str(&format!("last_summary: {}\n", truncate(s, 2000)));
@@ -446,9 +452,8 @@ where
                 let Ok(id) = parse_agent_id(raw) else {
                     return agent_not_found(raw);
                 };
-                let timeout = std::time::Duration::from_millis(
-                    parsed.timeout_ms.unwrap_or(120_000),
-                );
+                let timeout =
+                    std::time::Duration::from_millis(parsed.timeout_ms.unwrap_or(120_000));
                 let wait_cancel = CancellationToken::new();
                 // run 取消传播到 wait。
                 {
@@ -517,7 +522,10 @@ where
                     manager.close(id).map(|_| "closed".to_string())
                 };
                 match result {
-                    Ok(status) => ok_text(&parsed.action, format!("agent_id: {id}\nstatus: {status}\n")),
+                    Ok(status) => ok_text(
+                        &parsed.action,
+                        format!("agent_id: {id}\nstatus: {status}\n"),
+                    ),
                     Err(e) => agent_not_found(&e),
                 }
             }
@@ -530,7 +538,10 @@ where
 }
 
 fn ok_text(action: &str, body: String) -> ToolOutcome {
-    ToolOutcome::succeeded("agent", format!("status: succeeded\naction: {action}\n{body}"))
+    ToolOutcome::succeeded(
+        "agent",
+        format!("status: succeeded\naction: {action}\n{body}"),
+    )
 }
 
 fn args_error(message: String) -> ToolOutcome {
@@ -567,7 +578,11 @@ pub fn register_async_subagent_tools<P, F>(
     P: Provider + Send + 'static,
     F: Fn() -> P + Send + Sync + 'static,
 {
-    let spawn: Arc<dyn Tool> = Arc::new(SpawnAgentTool::<P>::new(config, make_provider, manager.clone()));
+    let spawn: Arc<dyn Tool> = Arc::new(SpawnAgentTool::<P>::new(
+        config,
+        make_provider,
+        manager.clone(),
+    ));
     registry
         .lock()
         .unwrap()
@@ -631,11 +646,7 @@ mod tests {
 
     #[test]
     fn spawn_reply_mentions_nonblocking() {
-        let reply = spawn_reply(
-            AgentId::new_v7(),
-            DelegationId::new_v7(),
-            "调查 parser",
-        );
+        let reply = spawn_reply(AgentId::new_v7(), DelegationId::new_v7(), "调查 parser");
         assert!(reply.contains("status: spawned"));
         assert!(reply.contains("非阻塞"));
     }

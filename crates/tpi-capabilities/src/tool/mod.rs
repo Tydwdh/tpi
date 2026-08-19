@@ -710,6 +710,8 @@ pub struct ToolContext {
     pub registry: std::sync::Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
     /// 交互模式（`-p` 为 false；§11 移除 ask_user 后仅保留供未来交互原语使用）。
     pub interactive: bool,
+    /// Workspace transaction session（§新架构：统一 workspace mutation tracking）。
+    pub workspace_session: Option<std::sync::Arc<crate::workspace::session::WorkspaceSession>>,
 }
 
 /// 路径解析失败（§9.1：禁止 workspace 外访问）。
@@ -1319,6 +1321,7 @@ mod tests {
             )),
             interactive: false,
             allow_outside_workspace: true,
+            workspace_session: None,
         };
         let outcome = execute(
             BuiltinTool::Read,

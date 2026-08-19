@@ -498,6 +498,7 @@ mod tests {
                 crate::tool::registry::ToolRegistry::new(),
             )),
             interactive: false,
+            workspace_session: None,
         };
         // 非法参数 → rejected（不 panic）。
         let outcome = adapter.execute("{", &ctx).await;

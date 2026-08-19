@@ -13,6 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 
+pub mod session;
 pub mod tracked;
 
 use camino::Utf8PathBuf;

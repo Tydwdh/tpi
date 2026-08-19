@@ -431,9 +431,7 @@ async fn update_plan_and_compaction_integration() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -520,9 +518,7 @@ async fn repeated_failing_action_blocked_in_agent_loop() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )

@@ -60,6 +60,7 @@ async fn setup_remote_ctx() -> (tempfile::TempDir, tpi::tool::ToolContext) {
             tpi::tool::registry::builtin_registry(),
         )),
         interactive: false,
+        workspace_session: None,
     };
     (root, ctx)
 }

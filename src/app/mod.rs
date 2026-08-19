@@ -1747,127 +1747,15 @@ fn handle_slash_command(
         // 交互式环境无 registry 传入；McpManager 内部持有运行时状态。
         msg if msg == "/mcp" || msg.starts_with("/mcp ") => {
             let body = render_mcp_status(mcp_manager);
-            ui_state.view.open_modal("/mcp", body);
-            renderer
-                .draw(&mut ui_state.view)
-                .map_err(|e| e.to_string())?;
-            Ok(SlashAction::Consumed)
+            modal_response(ui_state, renderer, "/mcp", body)
         }
-        "/settings" => {
-            let shell = config
-                .shell_path
-                .as_ref()
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "未配置（自动查找 Git Bash）".to_string());
-            // §成熟化：展示 [ui.keymap] 生效绑定（默认 + 自定义合并后）。
-            let mut keymap_text = String::new();
-            for (action, keys) in ui_cfg.keymap.display_bindings() {
-                keymap_text.push_str(&format!("  {action}: {keys}\n"));
-            }
-            ui_state.view.open_modal(
-                "/settings",
-                format!(
-                    "配置来源: {}
-workspace: {}
-sessions: {}
-artifacts: {}
-shell: {shell}
-主题: {}（omp / dark / light / opencode / onedarkpro；/theme 切换）
-web_search: DuckDuckGo（免费，无需 API key）
-自动打开浏览器: {}
-保留 token: {}
-允许访问 workspace 外路径: {}
-模型单价: {}/百万输入 · {}/百万输出（未配置则不在 footer 显示花费）
-
-键位（[ui.keymap]，{}）:
-{keymap_text}",
-                    config.source,
-                    config.workspace_root,
-                    config.sessions_root.display(),
-                    config.artifacts_root.display(),
-                    ui_cfg.theme,
-                    if config.auto_open_browser {
-                        "是"
-                    } else {
-                        "否"
-                    },
-                    config.safety_reserve_tokens,
-                    if config.allow_outside_workspace {
-                        "是（AI 自由模式）"
-                    } else {
-                        "否（严格沙箱）"
-                    },
-                    fmt_price(config.model.price_input),
-                    fmt_price(config.model.price_output),
-                    "未配置时为内建默认",
-                ),
-            );
-            renderer
-                .draw(&mut ui_state.view)
-                .map_err(|e| e.to_string())?;
-            Ok(SlashAction::Consumed)
-        }
-        "/model" => {
-            // 模型切换菜单（P8）：列出全部可用模型（primary + profiles），
-            // 当前模型标记；↑/↓ 选择 Enter 应用（app 重建 provider）。
-            let items: Vec<(String, String)> = config
-                .models
-                .iter()
-                .map(|m| {
-                    let marker = if m.name == config.model.name {
-                        "（当前）"
-                    } else {
-                        ""
-                    };
-                    (m.name.clone(), format!("{}{}", m.provider, marker))
-                })
-                .collect();
-            if items.is_empty() {
-                ui_state.view.open_modal(
-                    "/model",
-                    "没有可用模型（请在配置 [model.primary] 中设置）".to_string(),
-                );
-                renderer
-                    .draw(&mut ui_state.view)
-                    .map_err(|e| e.to_string())?;
-                return Ok(SlashAction::Consumed);
-            }
-            ui_state.view.menu = Some(crate::tui::model::MenuView {
-                items,
-                selected: config
-                    .models
-                    .iter()
-                    .position(|m| m.name == config.model.name)
-                    .unwrap_or(0),
-                kind: crate::tui::model::MenuKind::Model,
-                session_previews: Vec::new(),
-                filter: String::new(),
-            });
-            ui_state.view.open_modal(
-                "/model",
-                format!(
-                    "当前模型: {}（{}）
-
-↑/↓ 选择 · Enter 切换（重建连接）· Esc 取消",
-                    config.model.name, config.model.provider
-                ),
-            );
-            renderer
-                .draw(&mut ui_state.view)
-                .map_err(|e| e.to_string())?;
-            Ok(SlashAction::Consumed)
-        }
+        "/settings" => handle_settings_command(ui_state, renderer, config, &ui_cfg),
+        "/model" => handle_model_command(ui_state, renderer, config),
         "/help" => {
-            let mut text = String::from(
-                "命令：
-",
-            );
+            let mut text = String::from("命令：\n");
             for spec in SLASH_COMMANDS {
                 let (name, desc) = (spec.name, spec.desc);
-                text.push_str(&format!(
-                    "/{name} —— {desc}
-"
-                ));
+                text.push_str(&format!("/{name} —— {desc}\n"));
             }
             text.push_str(
                 "快捷键：Shift+Enter 换行 · ↑/↓ 多行/历史 · Tab 命令补全 ·
@@ -1881,97 +1769,21 @@ web_search: DuckDuckGo（免费，无需 API key）
                         Esc 取消 run · Ctrl+C 复制选区 · Ctrl+D 退出（运行中先取消）
                         键位可在配置 [ui.keymap] 中自定义（/settings 查看当前绑定）",
             );
-            ui_state.view.open_modal("/help", text);
-            renderer
-                .draw(&mut ui_state.view)
-                .map_err(|e| e.to_string())?;
-            Ok(SlashAction::Consumed)
+            modal_response(ui_state, renderer, "/help", text)
         }
         "/session" => {
             let info = match conversation.log() {
                 Some(log) => format!(
-                    "session: {}
-workspace: {}
-事件数: {}",
+                    "session: {}\nworkspace: {}\n事件数: {}",
                     log.session_id(),
                     log.workspace_id(),
                     log.seq()
                 ),
                 None => "尚无 session（第一条消息后创建）".to_string(),
             };
-            ui_state.view.open_modal("/session", info);
-            renderer
-                .draw(&mut ui_state.view)
-                .map_err(|e| e.to_string())?;
-            Ok(SlashAction::Consumed)
+            modal_response(ui_state, renderer, "/session", info)
         }
-        "/sessions" => {
-            // 会话浏览器：列出当前 workspace 的 session，Enter 恢复。
-            let sessions = match list_sessions(&config.sessions_root, &config.workspace_root) {
-                Ok(sessions) => sessions,
-                Err(error) => {
-                    push_system_line(
-                        &mut ui_state.view,
-                        renderer,
-                        format!("无法列出 session: {error}"),
-                    )?;
-                    return Ok(SlashAction::Consumed);
-                }
-            };
-            if sessions.is_empty() {
-                push_system_line(
-                    &mut ui_state.view,
-                    renderer,
-                    "当前 workspace 没有历史 session".to_string(),
-                )?;
-                return Ok(SlashAction::Consumed);
-            }
-            let wid = session::workspace_id_for(config.workspace_root.as_std_path());
-            let sessions_dir = config.sessions_root.join(&wid);
-            let menu_items: Vec<(String, String)> = sessions
-                .iter()
-                .map(|(id, modified, count, preview)| {
-                    // §用户诉求：会话标题 = 首条用户消息（preview）置前；
-                    // 无预览时显示“无标题”兜底，不让用户面对哈希 id。
-                    let title = if preview.is_empty() {
-                        "(无标题)".to_string()
-                    } else {
-                        preview.clone()
-                    };
-                    // §用户诉求：会话名（首条消息）置前；时间带日期
-                    // （MM-DD HH:MM），跨天会话不再难以分辨。
-                    let label =
-                        format!("{} · {} · {} 事件", title, fmt_time_short(*modified), count);
-                    (id.to_string(), label)
-                })
-                .collect();
-            // §用户诉求：/sessions 菜单内预览选中会话的对话（只取 User 与
-            // AI 消息，不含工具输出），帮助分辨会话内容。
-            let session_previews: Vec<Vec<crate::tui::model::MenuPreviewLine>> = sessions
-                .iter()
-                .map(|(id, ..)| session_dialogue_preview(&sessions_dir.join(format!("{id}.jsonl"))))
-                .collect();
-            // §用户诉求：/sessions 悬浮窗（Modal）显示选中会话的对话预览——
-            // 初始为第一个会话；↑/↓ 移动时 reducer 同步更新。
-            let preview_body = crate::tui::model::preview_lines_to_body(
-                session_previews
-                    .first()
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
-            );
-            ui_state.view.menu = Some(crate::tui::model::MenuView {
-                items: menu_items,
-                selected: 0,
-                kind: crate::tui::model::MenuKind::Session,
-                session_previews,
-                filter: String::new(),
-            });
-            ui_state.view.open_modal("/sessions", preview_body);
-            renderer
-                .draw(&mut ui_state.view)
-                .map_err(|e| e.to_string())?;
-            Ok(SlashAction::Consumed)
-        }
+        "/sessions" => handle_sessions_command(ui_state, renderer, config),
         "/theme" => {
             // 主题选择菜单（Modal 说明 + Theme 菜单；↑/↓ 选择 Enter 应用）。
             // 主题名 → 描述（含绑定的代码高亮主题；与 theme.rs 绑定保持一致）。
@@ -2043,42 +1855,28 @@ workspace: {}
                 .reasoning
                 .clone()
                 .unwrap_or_else(|| "未配置（默认）".to_string());
-            ui_state.view.open_modal(
+            modal_response(
+                ui_state,
+                renderer,
                 "/thinking",
                 format!(
-                    "reasoning: {value}
-说明: 透传给 provider 的推理设置（§18.1 [model.primary] reasoning）；
-未配置时使用 provider 默认。",
+                    "reasoning: {value}\n说明: 透传给 provider 的推理设置（§18.1 [model.primary] reasoning）；\n未配置时使用 provider 默认。",
                 ),
-            );
-            renderer
-                .draw(&mut ui_state.view)
-                .map_err(|e| e.to_string())?;
-            Ok(SlashAction::Consumed)
+            )
         }
         "/diff" => {
-            // §19：diff 是查看型内容，走 Modal 不污染 transcript。
             let diff = match conversation.log() {
                 Some(log) => last_edit_diff(log),
                 None => "尚无 session".to_string(),
             };
-            ui_state.view.open_modal("/diff", diff);
-            renderer
-                .draw(&mut ui_state.view)
-                .map_err(|e| e.to_string())?;
-            Ok(SlashAction::Consumed)
+            modal_response(ui_state, renderer, "/diff", diff)
         }
-        "/doctor" => {
-            // §19：环境检查报告走 Modal（此前 push 进 transcript 污染聊天历史）。
-            ui_state.view.open_modal(
-                "/doctor",
-                crate::doctor::render_report(&config.workspace_root),
-            );
-            renderer
-                .draw(&mut ui_state.view)
-                .map_err(|e| e.to_string())?;
-            Ok(SlashAction::Consumed)
-        }
+        "/doctor" => modal_response(
+            ui_state,
+            renderer,
+            "/doctor",
+            crate::doctor::render_report(&config.workspace_root),
+        ),
         "/compact" => {
             // P1-10：手动压缩——在下一次 run 开始时的完整边界执行。
             ui_state.force_compaction = true;
@@ -2089,34 +1887,215 @@ workspace: {}
             )?;
             Ok(SlashAction::Consumed)
         }
-        "/retry" => {
-            // §4.3：重试上一次失败/中断的 ModelTurn——不是重发 User 消息。
-            // 目标消息入 pending_retry，主循环以空 user_message 发起 run，
-            // 不重复记录 UserSubmitted，也不追加 User 消息（不污染对话）。
-            // 去重：相同 target 的连续重试提示只保留一行（用户反复 /retry 时
-            // 不刷屏——失败反馈由 retry run 结束后的分支给出）。
-            match last_failed.clone() {
-                Some(target) => {
-                    ui_state.push_retry(target.message.clone());
-                    let text = format!("⟳ 重试上一次 turn（{}）", target.message);
-                    if ui_state.view.push_line_dedup(LineKind::System, text) {
-                        renderer
-                            .draw(&mut ui_state.view)
-                            .map_err(|e| e.to_string())?;
-                    }
-                }
-                None => {
-                    push_system_line(
-                        &mut ui_state.view,
-                        renderer,
-                        "没有可重试的 turn（上一次 run 成功或尚无 run）".to_string(),
-                    )?;
-                }
-            }
-            Ok(SlashAction::Consumed)
-        }
+        "/retry" => handle_retry_command(ui_state, renderer, last_failed),
         _ => Ok(SlashAction::NotCommand),
     }
+}
+
+/// 打开 modal + draw + Consumed：/mcp /help /session /thinking /diff /doctor 等共用。
+fn modal_response(
+    ui_state: &mut UiState,
+    renderer: &mut Renderer,
+    title: &str,
+    body: String,
+) -> Result<SlashAction, String> {
+    ui_state.view.open_modal(title, body);
+    renderer
+        .draw(&mut ui_state.view)
+        .map_err(|e| e.to_string())?;
+    Ok(SlashAction::Consumed)
+}
+
+/// /settings：展示配置来源、主题、键位等。
+fn handle_settings_command(
+    ui_state: &mut UiState,
+    renderer: &mut Renderer,
+    config: &Config,
+    ui_cfg: &tpi_config::UiConfig,
+) -> Result<SlashAction, String> {
+    let shell = config
+        .shell_path
+        .as_ref()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "未配置（自动查找 Git Bash）".to_string());
+    let mut keymap_text = String::new();
+    for (action, keys) in ui_cfg.keymap.display_bindings() {
+        keymap_text.push_str(&format!("  {action}: {keys}\n"));
+    }
+    modal_response(
+        ui_state,
+        renderer,
+        "/settings",
+        format!(
+            "配置来源: {}
+workspace: {}
+sessions: {}
+artifacts: {}
+shell: {shell}
+主题: {}（omp / dark / light / opencode / onedarkpro；/theme 切换）
+web_search: DuckDuckGo（免费，无需 API key）
+自动打开浏览器: {}
+保留 token: {}
+允许访问 workspace 外路径: {}
+模型单价: {}/百万输入 · {}/百万输出（未配置则不在 footer 显示花费）
+
+键位（[ui.keymap]，{}）:
+{keymap_text}",
+            config.source,
+            config.workspace_root,
+            config.sessions_root.display(),
+            config.artifacts_root.display(),
+            ui_cfg.theme,
+            if config.auto_open_browser {
+                "是"
+            } else {
+                "否"
+            },
+            config.safety_reserve_tokens,
+            if config.allow_outside_workspace {
+                "是（AI 自由模式）"
+            } else {
+                "否（严格沙箱）"
+            },
+            fmt_price(config.model.price_input),
+            fmt_price(config.model.price_output),
+            "未配置时为内建默认",
+        ),
+    )
+}
+
+/// /model：模型切换菜单。
+fn handle_model_command(
+    ui_state: &mut UiState,
+    renderer: &mut Renderer,
+    config: &Config,
+) -> Result<SlashAction, String> {
+    let items: Vec<(String, String)> = config
+        .models
+        .iter()
+        .map(|m| {
+            let marker = if m.name == config.model.name {
+                "（当前）"
+            } else {
+                ""
+            };
+            (m.name.clone(), format!("{}{}", m.provider, marker))
+        })
+        .collect();
+    if items.is_empty() {
+        return modal_response(
+            ui_state,
+            renderer,
+            "/model",
+            "没有可用模型（请在配置 [model.primary] 中设置）".to_string(),
+        );
+    }
+    ui_state.view.menu = Some(crate::tui::model::MenuView {
+        items,
+        selected: config
+            .models
+            .iter()
+            .position(|m| m.name == config.model.name)
+            .unwrap_or(0),
+        kind: crate::tui::model::MenuKind::Model,
+        session_previews: Vec::new(),
+        filter: String::new(),
+    });
+    modal_response(
+        ui_state,
+        renderer,
+        "/model",
+        format!(
+            "当前模型: {}（{}）\n\n↑/↓ 选择 · Enter 切换（重建连接）· Esc 取消",
+            config.model.name, config.model.provider
+        ),
+    )
+}
+
+/// /sessions：会话浏览器。
+fn handle_sessions_command(
+    ui_state: &mut UiState,
+    renderer: &mut Renderer,
+    config: &Config,
+) -> Result<SlashAction, String> {
+    let sessions = match list_sessions(&config.sessions_root, &config.workspace_root) {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            push_system_line(
+                &mut ui_state.view,
+                renderer,
+                format!("无法列出 session: {error}"),
+            )?;
+            return Ok(SlashAction::Consumed);
+        }
+    };
+    if sessions.is_empty() {
+        push_system_line(
+            &mut ui_state.view,
+            renderer,
+            "当前 workspace 没有历史 session".to_string(),
+        )?;
+        return Ok(SlashAction::Consumed);
+    }
+    let wid = session::workspace_id_for(config.workspace_root.as_std_path());
+    let sessions_dir = config.sessions_root.join(&wid);
+    let menu_items: Vec<(String, String)> = sessions
+        .iter()
+        .map(|(id, modified, count, preview)| {
+            let title = if preview.is_empty() {
+                "(无标题)".to_string()
+            } else {
+                preview.clone()
+            };
+            let label = format!("{} · {} · {} 事件", title, fmt_time_short(*modified), count);
+            (id.to_string(), label)
+        })
+        .collect();
+    let session_previews: Vec<Vec<crate::tui::model::MenuPreviewLine>> = sessions
+        .iter()
+        .map(|(id, ..)| session_dialogue_preview(&sessions_dir.join(format!("{id}.jsonl"))))
+        .collect();
+    let preview_body = crate::tui::model::preview_lines_to_body(
+        session_previews
+            .first()
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    );
+    ui_state.view.menu = Some(crate::tui::model::MenuView {
+        items: menu_items,
+        selected: 0,
+        kind: crate::tui::model::MenuKind::Session,
+        session_previews,
+        filter: String::new(),
+    });
+    modal_response(ui_state, renderer, "/sessions", preview_body)
+}
+
+/// /retry：重试上一次失败的 turn。
+fn handle_retry_command(
+    ui_state: &mut UiState,
+    renderer: &mut Renderer,
+    last_failed: &Option<RetryTarget>,
+) -> Result<SlashAction, String> {
+    match last_failed.clone() {
+        Some(target) => {
+            ui_state.push_retry(target.message.clone());
+            let text = format!("⟳ 重试上一次 turn（{}）", target.message);
+            if ui_state.view.push_line_dedup(LineKind::System, text) {
+                renderer
+                    .draw(&mut ui_state.view)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        None => {
+            push_system_line(
+                &mut ui_state.view,
+                renderer,
+                "没有可重试的 turn（上一次 run 成功或尚无 run）".to_string(),
+            )?;
+        }
+    }
+    Ok(SlashAction::Consumed)
 }
 
 /// 输入 crossterm MouseEvent + renderer + 状态机，输出语义化 UiEvent。

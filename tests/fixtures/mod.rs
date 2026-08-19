@@ -92,5 +92,6 @@ pub fn test_tool_context(workspace_root: &Utf8PathBuf) -> tpi::tool::ToolContext
         )),
         interactive: true,
         allow_outside_workspace: true,
+        workspace_session: None,
     }
 }

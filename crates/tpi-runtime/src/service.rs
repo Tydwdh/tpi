@@ -271,9 +271,7 @@ impl<P: Provider + 'static> RuntimeTask<P> {
             terminals: Arc::new(StdMutex::new(
                 tpi_capabilities::terminal::TerminalRegistry::default(),
             )),
-            agents: Arc::new(StdMutex::new(
-                tpi_agent::agent::manager::AgentManager::new(),
-            )),
+            agents: Arc::new(StdMutex::new(tpi_agent::agent::manager::AgentManager::new())),
             status: SessionStatus::Idle,
         };
         let ws = self.workspace_name();
@@ -352,9 +350,7 @@ impl<P: Provider + 'static> RuntimeTask<P> {
             terminals: Arc::new(StdMutex::new(
                 tpi_capabilities::terminal::TerminalRegistry::default(),
             )),
-            agents: Arc::new(StdMutex::new(
-                tpi_agent::agent::manager::AgentManager::new(),
-            )),
+            agents: Arc::new(StdMutex::new(tpi_agent::agent::manager::AgentManager::new())),
             status,
         };
         let ws = self.workspace_name();

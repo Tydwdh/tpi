@@ -1159,6 +1159,7 @@ mod tests {
             )),
             interactive: false,
             allow_outside_workspace: true,
+            workspace_session: None,
         }
     }
 

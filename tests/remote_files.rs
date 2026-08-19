@@ -61,6 +61,7 @@ fn remote_ctx(root_posix: &str) -> tpi::tool::ToolContext {
             tpi::tool::registry::builtin_registry(),
         )),
         interactive: false,
+        workspace_session: None,
     }
 }
 

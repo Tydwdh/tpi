@@ -96,9 +96,7 @@ async fn run_with(
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -453,9 +451,7 @@ async fn cancellation_during_parallel_bash_cancels_all() {
                 )),
 
                 agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                     tpi_agent::agent::manager::AgentManager::new(),
-
                 )),
             },
         )

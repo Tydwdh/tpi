@@ -248,9 +248,7 @@ async fn fake_store_runs_agent_flow() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )

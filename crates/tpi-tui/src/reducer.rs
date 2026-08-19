@@ -520,69 +520,9 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             state.sync_input();
         }
         KeyAction::Submit => {
-            // 命令菜单打开时先补全为选中命令（Claude Code 式菜单交互）。
-            if state.view.menu.is_some()
-                && let Some((label, kind)) = state.view.selected_menu_item()
-            {
-                match kind {
-                    MenuKind::Session => {
-                        // 会话恢复由 app 执行（需要重建 SessionLog/history）。
-                        // /sessions = Modal + 菜单一个整体：选中后一并关闭，
-                        // 不得把“会话列表”留在恢复后的屏幕上。
-                        state.pending_session = Some(label);
-                        state.view.menu = None;
-                        state.view.modal = None;
-                        return effects;
-                    }
-                    MenuKind::Theme => {
-                        // 主题应用由 app 执行（应用 renderer 主题 + 写配置）。
-                        // /theme = Modal + 菜单一个整体：选中后一并关闭。
-                        state.pending_theme = Some(label);
-                        state.view.menu = None;
-                        state.view.modal = None;
-                        return effects;
-                    }
-                    MenuKind::Model => {
-                        // 模型切换由 app 执行（重建 provider + 更新 config.model）。
-                        // /model = Modal + 菜单一个整体：选中后一并关闭。
-                        state.pending_model = Some(label);
-                        state.view.menu = None;
-                        state.view.modal = None;
-                        return effects;
-                    }
-                    _ => state.view.complete_menu_command(),
-                }
+            if handle_submit(state, &mut effects) {
+                return effects;
             }
-            let text = {
-                // P0-5：菜单补全结果先写回 editor（输入事实源），再提交。
-                // 无菜单时 view.input 与 editor 文本一致，set_text 无副作用。
-                state.editor.set_text(state.view.input.clone());
-                state.sync_input();
-                state.editor.submit()
-            };
-            // §用户诉求：提交前把大粘贴占位符展开为全文，一起发送。
-            let text = if text.is_empty() {
-                text
-            } else {
-                crate::paste::expand_paste_placeholders(&text, &state.pasted)
-            };
-            // editor 已提交并清空，旁路内容已展开进消息；及时释放真实粘贴
-            // 文本，避免大剪贴板在整个会话中常驻内存。
-            state.pasted.clear();
-            if !text.is_empty() {
-                // §PointerHit：运行中提交立即在 footer 提示（不写 transcript，
-                // 避免消费时重复显示；实际 User 消息在消费时入 transcript）。
-                if state.running {
-                    state.view.transient_hint = Some(format!(
-                        "已排队：{}",
-                        crate::text::truncate_middle_utf8(&text, 160, "…")
-                    ));
-                }
-                state.push_pending(text);
-            }
-            // 提交后 editor 已清空，必须同步 view.input，否则发送的文本仍显示在输入框。
-            state.sync_input();
-            refresh_menus(state);
         }
         KeyAction::MenuNext => {
             if state.view.menu.is_some() {
@@ -600,50 +540,8 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
             sync_session_preview(state);
         }
         KeyAction::Escape => {
-            // §49：Esc 优先级 = overlay > modal > menu > run 取消。
-            // §oh-my-pi：Modal 型菜单过滤词非空时，Esc 先清空过滤词（回到全列表），
-            // 再按一次才关闭菜单——避免误关（与搜索 Esc 语义一致）。
-            if state.view.menu.is_some()
-                && state
-                    .view
-                    .menu
-                    .as_ref()
-                    .is_some_and(|m| m.is_browser_menu())
-                && state
-                    .view
-                    .menu
-                    .as_ref()
-                    .is_some_and(|m| !m.filter.is_empty())
-            {
-                if let Some(menu) = state.view.menu.as_mut() {
-                    menu.filter.clear();
-                    menu.clamp_selected();
-                }
-                sync_session_preview(state);
+            if handle_escape(state, &mut effects) {
                 return effects;
-            }
-            if state.view.overlay.is_some() {
-                state.view.close_overlay();
-            } else if state.view.modal.is_some() {
-                state.view.close_modal();
-                // /sessions、/theme 浏览器 = Modal + 菜单一个整体：Esc 一次关闭两者。
-                if matches!(
-                    state.view.menu.as_ref().map(|m| m.kind),
-                    Some(MenuKind::Session) | Some(MenuKind::Theme) | Some(MenuKind::Model)
-                ) {
-                    state.view.menu = None;
-                }
-            } else if state.view.menu.is_some() {
-                state.view.menu = None;
-            } else if state.running {
-                // §6.2：Esc 打断当前 run（等价 Ctrl-C，保留 session）。
-                effects.push(UiEffect::CancelRun);
-            } else if !state.editor.text().is_empty() {
-                // 空闲时 Esc 清空当前输入（人体工学：“退出当前输入”的通用假设）。
-                state.editor.clear();
-                state.pasted.clear();
-                state.sync_input();
-                refresh_menus(state);
             }
         }
         KeyAction::Backspace => {
@@ -854,6 +752,107 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Vec<UiEffect> {
         }
     }
     effects
+}
+
+/// Submit 键处理：菜单补全 → 编辑器提交 → 粘贴展开 → 排队。
+/// 返回 true 表示应立即 return effects（菜单选择了 Session/Theme/Model）。
+fn handle_submit(state: &mut UiState, _effects: &mut Vec<UiEffect>) -> bool {
+    // 命令菜单打开时先补全为选中命令（Claude Code 式菜单交互）。
+    if state.view.menu.is_some()
+        && let Some((label, kind)) = state.view.selected_menu_item()
+    {
+        match kind {
+            MenuKind::Session => {
+                state.pending_session = Some(label);
+                state.view.menu = None;
+                state.view.modal = None;
+                return true;
+            }
+            MenuKind::Theme => {
+                state.pending_theme = Some(label);
+                state.view.menu = None;
+                state.view.modal = None;
+                return true;
+            }
+            MenuKind::Model => {
+                state.pending_model = Some(label);
+                state.view.menu = None;
+                state.view.modal = None;
+                return true;
+            }
+            _ => state.view.complete_menu_command(),
+        }
+    }
+    let text = {
+        state.editor.set_text(state.view.input.clone());
+        state.sync_input();
+        state.editor.submit()
+    };
+    let text = if text.is_empty() {
+        text
+    } else {
+        crate::paste::expand_paste_placeholders(&text, &state.pasted)
+    };
+    state.pasted.clear();
+    if !text.is_empty() {
+        if state.running {
+            state.view.transient_hint = Some(format!(
+                "已排队：{}",
+                crate::text::truncate_middle_utf8(&text, 160, "…")
+            ));
+        }
+        state.push_pending(text);
+    }
+    state.sync_input();
+    refresh_menus(state);
+    false
+}
+
+/// Escape 键处理：overlay > modal > menu > run 取消 > 清空输入。
+/// 返回 true 表示应立即 return effects（浏览器菜单过滤词清空）。
+fn handle_escape(state: &mut UiState, effects: &mut Vec<UiEffect>) -> bool {
+    // §oh-my-pi：Modal 型菜单过滤词非空时，Esc 先清空过滤词（回到全列表），
+    // 再按一次才关闭菜单——避免误关（与搜索 Esc 语义一致）。
+    if state.view.menu.is_some()
+        && state
+            .view
+            .menu
+            .as_ref()
+            .is_some_and(|m| m.is_browser_menu())
+        && state
+            .view
+            .menu
+            .as_ref()
+            .is_some_and(|m| !m.filter.is_empty())
+    {
+        if let Some(menu) = state.view.menu.as_mut() {
+            menu.filter.clear();
+            menu.clamp_selected();
+        }
+        sync_session_preview(state);
+        return true;
+    }
+    if state.view.overlay.is_some() {
+        state.view.close_overlay();
+    } else if state.view.modal.is_some() {
+        state.view.close_modal();
+        if matches!(
+            state.view.menu.as_ref().map(|m| m.kind),
+            Some(MenuKind::Session) | Some(MenuKind::Theme) | Some(MenuKind::Model)
+        ) {
+            state.view.menu = None;
+        }
+    } else if state.view.menu.is_some() {
+        state.view.menu = None;
+    } else if state.running {
+        effects.push(UiEffect::CancelRun);
+    } else if !state.editor.text().is_empty() {
+        state.editor.clear();
+        state.pasted.clear();
+        state.sync_input();
+        refresh_menus(state);
+    }
+    false
 }
 
 /// Agent 运行时事件 → 视图状态（reducer 内做纯状态转换）。

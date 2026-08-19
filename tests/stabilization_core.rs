@@ -144,9 +144,7 @@ async fn p0_2_empty_text_tool_call_replays_legal_protocol() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -224,9 +222,7 @@ async fn p0_3_runtime_projection_matches_resume_projection() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -310,9 +306,7 @@ impl ReplayHarness {
                 )),
 
                 agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                     tpi_agent::agent::manager::AgentManager::new(),
-
                 )),
             },
         )
@@ -545,9 +539,7 @@ async fn replay_cancelled_run_matches_runtime() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )

@@ -881,6 +881,7 @@ mod tests {
             )),
             interactive: false,
             allow_outside_workspace: true,
+            workspace_session: None,
         };
         let outcome = read(
             ReadArgs {
@@ -948,6 +949,7 @@ mod tests {
             )),
             interactive: false,
             allow_outside_workspace: true,
+            workspace_session: None,
         };
         let plan = crate::tool::edit::prepare_commit(&path);
         let outcome = write(
@@ -1009,6 +1011,7 @@ mod tests {
             )),
             interactive: false,
             allow_outside_workspace: true,
+            workspace_session: None,
         };
         let plan = crate::tool::edit::prepare_commit(&path);
         let outcome = write(
@@ -1075,6 +1078,7 @@ mod tests {
             )),
             interactive: false,
             allow_outside_workspace: true,
+            workspace_session: None,
         };
         let outcome = read(
             ReadArgs {
@@ -1143,6 +1147,7 @@ mod tests {
             )),
             interactive: false,
             allow_outside_workspace: true,
+            workspace_session: None,
         };
         (ctx, workspace)
     }

@@ -178,8 +178,8 @@ async fn p0_4_request_config_is_authoritative_over_client() {
         "model 必须以 request 为准: {body}"
     );
     assert_eq!(
-        body["reasoning"], "request-reasoning",
-        "reasoning 必须以 request 为准: {body}"
+        body["reasoning_effort"], "request-reasoning",
+        "reasoning_effort 必须以 request 为准: {body}"
     );
 }
 
@@ -710,10 +710,10 @@ async fn deterministic_4xx_and_auth_get_one_defensive_retry() {
         (error.unwrap_err(), hits.load(Ordering::SeqCst))
     }
 
-    // 400：首次防御性重放后仍是 Protocol。
+    // 400：§40 确定性非法请求 → InvalidRequest（不重试）。
     let (error, hits) = run_with_status("400 Bad Request").await;
-    assert!(matches!(error, ProviderError::Protocol(_)), "{error}");
-    assert_eq!(hits, 2, "400 仅允许一次防御性重放");
+    assert!(matches!(error, ProviderError::InvalidRequest(_)), "{error}");
+    assert_eq!(hits, 1, "400 直接拒绝，不重放");
 
     // 401：首次防御性重放后仍是 Auth。
     let (error, hits) = run_with_status("401 Unauthorized").await;
@@ -781,9 +781,7 @@ async fn invalid_tool_args_produce_observation_without_breaking_session() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )

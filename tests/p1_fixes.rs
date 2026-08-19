@@ -85,9 +85,7 @@ async fn p1_1_cancel_keeps_history_consistent_with_session() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -174,9 +172,7 @@ async fn p1_2_max_tool_calls_has_own_reason() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -259,9 +255,7 @@ async fn issue_001_budget_exceeded_persists_all_unexecuted_calls() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -367,9 +361,7 @@ async fn p1_4_context_overflow_stops_run_cleanly() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -477,9 +469,7 @@ async fn p1_10_manual_compaction_runs_at_next_boundary() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -570,9 +560,7 @@ async fn interrupted_attempt_records_partial_and_keeps_session_consistent() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -676,9 +664,7 @@ async fn unavailable_connect_fails_without_recorded_attempt() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -827,9 +813,7 @@ async fn text_only_interrupt_auto_continues_and_merges() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -947,9 +931,7 @@ async fn protocol_error_after_delta_auto_recovers_with_resume() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -1017,9 +999,7 @@ async fn distinct_model_turns_use_distinct_request_ids() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -1103,9 +1083,7 @@ async fn recovery_capped_after_max_attempts() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -1215,9 +1193,7 @@ async fn tool_delta_interrupt_restarts_whole_turn() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -1326,9 +1302,7 @@ async fn tool_delta_restart_is_capped() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -1393,9 +1367,7 @@ async fn retry_with_empty_user_message_does_not_repeat_submission() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -1481,9 +1453,7 @@ async fn retry_after_committed_partial_uses_ephemeral_continue_instruction() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -1587,9 +1557,7 @@ async fn force_compaction_success_notifies_ui() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -1653,9 +1621,7 @@ async fn force_compaction_too_short_notifies_ui() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -1732,9 +1698,7 @@ async fn force_compaction_invalid_summary_notifies_ui() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )

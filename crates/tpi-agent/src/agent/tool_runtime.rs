@@ -43,6 +43,8 @@ pub(super) struct ToolRuntime {
     /// P4-03：当前 Step 的不可变工具快照（reload 构建，Step 内复用）。
     /// Mutex：ToolRuntime 需跨线程（web spawn）；Step 内锁一次 clone 复用。
     active: std::sync::Mutex<Option<ActiveToolSet>>,
+    /// §新架构：统一 workspace mutation tracking session。
+    workspace_session: Option<Arc<tpi_capabilities::workspace::session::WorkspaceSession>>,
 }
 
 /// P4-03：Step 内不可变工具快照（descriptors + external lookup 共用）。
@@ -110,7 +112,16 @@ impl ToolRuntime {
             terminals,
             agents,
             registry,
+            workspace_session: None, // Initialized lazily or by caller.
         }
+    }
+
+    /// Set the workspace session (called during agent init).
+    pub(super) fn set_workspace_session(
+        &mut self,
+        session: Arc<tpi_capabilities::workspace::session::WorkspaceSession>,
+    ) {
+        self.workspace_session = Some(session);
     }
 
     /// ADR-007：drain inbox（pending subagent reports），由 run_inner 在 model
@@ -206,6 +217,7 @@ impl ToolRuntime {
             terminals: self.terminals.clone(),
             registry: self.registry.clone(),
             interactive: self.interactive,
+            workspace_session: self.workspace_session.clone(),
         }
     }
 }

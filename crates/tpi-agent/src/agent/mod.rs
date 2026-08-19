@@ -707,8 +707,16 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                 pending_reports_text = if reports.is_empty() {
                     None
                 } else {
-                    Some(reports.iter().map(|r| format!("- {} (agent: {})", r.summary, r.agent_id)).collect::<Vec<_>>().join("
-"))
+                    Some(
+                        reports
+                            .iter()
+                            .map(|r| format!("- {} (agent: {})", r.summary, r.agent_id))
+                            .collect::<Vec<_>>()
+                            .join(
+                                "
+",
+                            ),
+                    )
                 };
             }
             let process_snapshot = tool_runtime.processes_snapshot();

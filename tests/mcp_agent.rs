@@ -110,9 +110,7 @@ async fn mcp_tool_executes_inside_agent_loop() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -198,9 +196,7 @@ async fn tool_selector_filters_irrelevant_mcp_tools_from_model() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )

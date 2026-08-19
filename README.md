@@ -88,6 +88,21 @@ name = "gpt-4o-mini"
 base_url = "https://api.openai.com/v1"
 ```
 
+OpenAI Responses API 模型也可以直接配置；`base_url` 要填写完整的 `/responses` 端点，
+例如 OpenCode Zen 的 Muse Spark 1.2：
+
+```toml
+[[model.profiles]]
+provider = "opencode-go"
+name = "muse-spark-1.2"
+base_url = "https://opencode.ai/zen/go/v1/responses"
+api_key_env = "OPENCODE_API_KEY"
+```
+
+保存配置后，在 TUI 输入 `/model`，选择 `muse-spark-1.2`；或启动时使用
+`tpi --model muse-spark-1.2`。Responses API 与 Chat Completions 的端点和请求格式不同，
+不要把 `/responses` 改成仅有 `/v1` 的地址。
+
 > 注意：`api_key` 是明文存储，请勿把配置文件提交到版本库
 > （Windows 下建议限制文件权限；或改用 `tpi auth set` 存凭据管理器）。
 

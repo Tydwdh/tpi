@@ -369,6 +369,7 @@ mod tool_tests {
             terminals: Default::default(),
             registry: Default::default(),
             interactive: false,
+            workspace_session: None,
         }
     }
 

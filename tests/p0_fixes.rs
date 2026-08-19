@@ -161,9 +161,7 @@ async fn p0_2_compaction_survives_delta_flood() {
                 )),
 
                 agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                     tpi_agent::agent::manager::AgentManager::new(),
-
                 )),
             },
         ),

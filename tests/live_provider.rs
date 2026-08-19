@@ -68,9 +68,7 @@ async fn live_provider_smoke_opt_in() {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
@@ -150,9 +148,7 @@ async fn live_canary_2_real_tool_call_loop() {
                 )),
 
                 agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                     tpi_agent::agent::manager::AgentManager::new(),
-
                 )),
             },
         ),

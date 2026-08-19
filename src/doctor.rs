@@ -125,6 +125,7 @@ fn doctor_report_with_home(
             crate::tool::registry::builtin_registry(),
         )),
         interactive: false,
+        workspace_session: None,
     };
     let bash = crate::tool::command::locate_git_bash(&ctx);
     checks.push(DoctorCheck {

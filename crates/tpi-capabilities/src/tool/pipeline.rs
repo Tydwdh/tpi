@@ -157,6 +157,7 @@ mod tests {
                 crate::tool::registry::ToolRegistry::new(),
             )),
             interactive: false,
+            workspace_session: None,
         }
     }
 

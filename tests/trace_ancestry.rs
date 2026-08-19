@@ -162,9 +162,7 @@ async fn run_fake(label: &str) -> Result<agent::AgentOutcome, String> {
             )),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
-
                 tpi_agent::agent::manager::AgentManager::new(),
-
             )),
         },
     )
