@@ -707,6 +707,22 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                 pending_reports_text = if reports.is_empty() {
                     None
                 } else {
+                    // ADR-007 §4.2：先 durable 再 model-visible。
+                    // 将 inbox 中的 report 写为 durable SessionEvent（parent session 单写者，
+                    // 此处是 deterministic boundary，安全）。
+                    for report in &reports {
+                        let event = SessionEvent::SubagentReported {
+                            delegation_id: report.delegation_id,
+                            agent_id: report.agent_id,
+                            child_session: tpi_core::ids::SessionId::new_v7(),
+                            summary: report.summary.clone(),
+                            evidence: report.evidence.clone(),
+                            final_report: report.final_report,
+                        };
+                        if let Err(e) = session.commit(&event) {
+                            tracing::warn!(error = %e, "ADR-007: failed to persist SubagentReported");
+                        }
+                    }
                     Some(
                         reports
                             .iter()
@@ -1600,11 +1616,10 @@ fn build_context(
     process_snapshot: Option<&str>,
     pending_reports: Option<&str>,
 ) -> Vec<ChatMessage> {
-    // pending_reports reserved for ADR-007 context projection (injected via pending_reports_text when non-empty).
-    let _ = pending_reports;
     // P1-05：build_context 只读窄视图 AgentConfig。
     let agent_cfg = config.agent_config();
-    let mut out = Vec::with_capacity(messages.len() + 3);
+    // ADR-007 §4.2：子代理 report 在 deterministic boundary 注入 parent context。
+    let mut out = Vec::with_capacity(messages.len() + 4);
     out.push(ChatMessage::System(system_prompt_text(
         agent_cfg.system_prompt_extra.as_deref(),
         ephemeral_system,
@@ -1620,6 +1635,15 @@ fn build_context(
         };
         out.push(ChatMessage::System(format!(
             "[当前 workspace]\nWorkspace: {id}\nShell cwd: {cwd}\n\n（工作区状态由 harness 管理，无需模型自行执行 ssh/cd 确认。）"
+        )));
+    }
+    // ADR-007：子代理 report 注入（先 durable 再 model-visible；
+    // drain_inbox 在此之前已将 report 转为 durable SessionEvent）。
+    if let Some(reports) = pending_reports
+        && !reports.is_empty()
+    {
+        out.push(ChatMessage::System(format!(
+            "[子代理报告]（以下为后台调查的最新结果；用 `agent` 工具查看/等待更多详情）：\n{reports}"
         )));
     }
     out.extend_from_slice(messages);

@@ -208,6 +208,34 @@ fn register_openai_subagent_tool(
     );
 }
 
+/// ADR-007：注册非阻塞 `spawn_agent` + `agent` 控制面工具。
+/// 与同步 `subagent` 共存——模型可按需选择同步或异步子代理。
+fn register_openai_async_subagent_tools(
+    registry: &Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
+    config: &Config,
+    model: &crate::config::ModelConfig,
+    api_key: &str,
+    manager: Arc<std::sync::Mutex<tpi_agent::agent::manager::AgentManager>>,
+) {
+    let model = model.clone();
+    let api_key = api_key.to_string();
+    tpi_agent::subagent::async_tool::register_async_subagent_tools::<OpenAiCompatClient, _>(
+        registry,
+        subagent_config_for_model(config, &model),
+        move || {
+            OpenAiCompatClient::new(
+                model.base_url.clone(),
+                model.name.clone(),
+                api_key.clone(),
+                model.reasoning.clone(),
+                model.max_output_tokens,
+                model.context_window,
+            )
+        },
+        manager,
+    );
+}
+
 impl AppServices<OpenAiCompatClient> {
     /// object construction：真实 provider + 会话恢复 + cancel 全部集中于此。
     ///
@@ -269,7 +297,19 @@ impl AppServices<OpenAiCompatClient> {
         );
         // P8-04 接线：把 `subagent` 工具注册进 registry（模型可发起只读调查）。
         // 每个 child 独立 provider 实例（不与 parent 争用 &mut provider）。
-        register_openai_subagent_tool(&registry, &config, &config.model, api_key);
+        register_openai_subagent_tool(&registry, &config, &config.model, api_key.clone());
+        // ADR-007：session 级共享 AgentManager（跨 run 存活；后台调查注册/查询/取消）。
+        let agents: Arc<std::sync::Mutex<tpi_agent::agent::manager::AgentManager>> = Arc::new(
+            std::sync::Mutex::new(tpi_agent::agent::manager::AgentManager::new()),
+        );
+        // ADR-007：注册非阻塞 `spawn_agent` + `agent` 控制面工具。
+        register_openai_async_subagent_tools(
+            &registry,
+            &config,
+            &config.model,
+            &api_key,
+            agents.clone(),
+        );
 
         // 共享的当前取消 token（Ctrl-C 第一次取消 run，空闲时退出）。
         let current_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
@@ -298,9 +338,7 @@ impl AppServices<OpenAiCompatClient> {
             registry,
             processes,
             terminals,
-            agents: Arc::new(std::sync::Mutex::new(
-                tpi_agent::agent::manager::AgentManager::new(),
-            )),
+            agents,
         })
     }
 }
@@ -412,6 +450,7 @@ pub async fn run(
     // 会继续携带启动时模型的 API key，表现为 parent 正常而 child 立即 401。
     let subagent_registry = services.registry.clone();
     let subagent_config_template = services.config.clone();
+    let subagent_agents = services.agents.clone();
     // /model 切换：重建 provider（run 是非泛型入口，P 具体 = OpenAiCompatClient）。
     let rebuild_provider = move |model: &crate::config::ModelConfig| -> Result<
         crate::provider::openai_compat::OpenAiCompatClient,
@@ -430,7 +469,15 @@ pub async fn run(
             &subagent_registry,
             &subagent_config_template,
             model,
-            api_key,
+            api_key.clone(),
+        );
+        // ADR-007：/model 切换时同步更新 spawn_agent + agent 的 provider 工厂。
+        register_openai_async_subagent_tools(
+            &subagent_registry,
+            &subagent_config_template,
+            model,
+            &api_key,
+            subagent_agents.clone(),
         );
         Ok(provider)
     };
