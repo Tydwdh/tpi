@@ -65,6 +65,7 @@ pub enum DelegationState {
 pub struct PendingReport {
     pub delegation_id: DelegationId,
     pub agent_id: AgentId,
+    pub child_session: SessionId,
     pub summary: String,
     pub evidence: Vec<String>,
     /// false = progress 进度；true = 首个 final 报告。
@@ -396,6 +397,7 @@ mod tests {
             PendingReport {
                 delegation_id: did,
                 agent_id: aid,
+                child_session: SessionId::new_v7(),
                 summary: "progress".into(),
                 evidence: vec![],
                 final_report: false,

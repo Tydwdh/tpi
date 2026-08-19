@@ -118,6 +118,7 @@ instruction: {instruction}\n\
 /// worker：后台执行 child 调查，终态写回 manager（inbox + notify）。
 ///
 /// 不持有 parent session 写权；durable 落盘由 parent run boundary 完成。
+#[allow(clippy::too_many_arguments)]
 fn spawn_worker<P>(
     config: Arc<tpi_config::config::Config>,
     make_provider: Arc<dyn Fn() -> P + Send + Sync>,
@@ -126,9 +127,12 @@ fn spawn_worker<P>(
     delegation_id: DelegationId,
     request: SubagentRequest,
     cancel: CancellationToken,
+    output_tx: Option<tokio::sync::mpsc::Sender<tpi_capabilities::tool::ToolStreamEvent>>,
+    parent_call_id: Option<tpi_core::ids::ToolCallId>,
 ) where
     P: Provider + Send + 'static,
 {
+    let child_session = request.child_session;
     tokio::spawn(async move {
         let child_workspace = tpi_capabilities::workspace::ActiveWorkspace::local(
             tpi_capabilities::workspace::LocalWorkspace::new(
@@ -144,6 +148,11 @@ fn spawn_worker<P>(
             config.clone(),
             child_workspace,
         );
+        // P8-06：绑定实时观察通道（child 活动经此通道转发到 parent TUI 卡片）。
+        // async 路径不使用 LiveEvent report_tx（报告通过 AgentManager inbox → context 投影）。
+        if let Some(call_id) = parent_call_id {
+            child = child.with_output_tx(output_tx, call_id);
+        }
         let outcome = child.run_investigation(request, cancel).await;
         // 终态写回：report（成功）或 Failed/Cancelled。
         let mut guard = manager.lock().unwrap_or_else(|p| p.into_inner());
@@ -156,6 +165,7 @@ fn spawn_worker<P>(
                     Some(PendingReport {
                         delegation_id,
                         agent_id,
+                        child_session,
                         summary: report.summary,
                         evidence: report.evidence,
                         final_report: true,
@@ -180,6 +190,7 @@ fn spawn_worker<P>(
                     PendingReport {
                         delegation_id,
                         agent_id,
+                        child_session,
                         summary: format!("子代理失败: {message}"),
                         evidence: vec![],
                         final_report: true,
@@ -295,6 +306,8 @@ where
                 parent: None,
             },
             worker_cancel,
+            ctx.output_tx.clone(),
+            Some(ctx.call_id),
         );
         // worker 已 spawn：标记 Running。
         {
@@ -604,7 +617,7 @@ pub fn pending_reports_as_events(pending: &[PendingReport]) -> Vec<SessionEvent>
         .map(|p| SessionEvent::SubagentReported {
             delegation_id: p.delegation_id,
             agent_id: p.agent_id,
-            child_session: SessionId::new_v7(), // 占位：由调用方替换真实 child session
+            child_session: p.child_session,
             summary: p.summary.clone(),
             evidence: p.evidence.clone(),
             final_report: p.final_report,

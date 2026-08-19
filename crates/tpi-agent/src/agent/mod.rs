@@ -714,7 +714,7 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                         let event = SessionEvent::SubagentReported {
                             delegation_id: report.delegation_id,
                             agent_id: report.agent_id,
-                            child_session: tpi_core::ids::SessionId::new_v7(),
+                            child_session: report.child_session,
                             summary: report.summary.clone(),
                             evidence: report.evidence.clone(),
                             final_report: report.final_report,
