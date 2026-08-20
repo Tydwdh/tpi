@@ -123,11 +123,11 @@ impl TerminalRegistry {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
-                        sink.lock().expect("terminal output lock").closed = true;
+                        tpi_core::util::lock_mutex(&sink, "terminal_output").closed = true;
                         break;
                     }
                     Ok(n) => {
-                        let mut out = sink.lock().expect("terminal output lock");
+                        let mut out = tpi_core::util::lock_mutex(&sink, "terminal_output");
                         out.total = out.total.saturating_add(n as u64);
                         out.bytes.extend_from_slice(&buf[..n]);
                         if out.bytes.len() > OUTPUT_LIMIT {
@@ -187,10 +187,7 @@ impl TerminalRegistry {
             .terminals
             .get(id)
             .ok_or_else(|| "terminal not found".to_string())?;
-        let out = t
-            .output
-            .lock()
-            .map_err(|_| "terminal output lock poisoned".to_string())?;
+        let out = tpi_core::util::lock_mutex(&t.output, "terminal_output");
         let retained = out.total.saturating_sub(out.bytes.len() as u64);
         let start = after.max(retained);
         let offset = start.saturating_sub(retained) as usize;

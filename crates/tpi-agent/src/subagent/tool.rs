@@ -531,7 +531,7 @@ mod register_tests {
         let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
         let config = tpi_config::config::test_config(&root);
         register_subagent_tool::<FakeP, _>(&registry, Arc::new(config), || FakeP, None);
-        let reg = registry.lock().unwrap();
+        let reg = tpi_core::util::lock_mutex(&registry, "tool_registry");
         assert!(reg.get("subagent").is_some(), "registry 含 subagent 工具");
         let desc = reg
             .descriptors()

@@ -1328,7 +1328,7 @@ mod tests {
             .write(true)
             .open(&lock_path)
             .unwrap();
-        lock.lock().unwrap();
+        lock.lock().expect("file lock must succeed in test");
 
         let active = active_session_ids(&root).unwrap();
         assert!(active.contains(&session_id));

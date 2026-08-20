@@ -397,7 +397,7 @@ pub struct OverlayRegistration {
 
 impl OverlayRegistration {
     pub fn unregister(&mut self) {
-        let mut registry = self.registry.lock().unwrap();
+        let mut registry = tpi_core::util::lock_mutex(&self.registry, "tool_registry");
         registry.unregister_overlay(&self.name, self.id);
     }
 }

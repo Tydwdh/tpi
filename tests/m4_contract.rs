@@ -345,7 +345,7 @@ async fn update_plan_and_compaction_integration() {
                 "计划快照不得伪装成 User 消息: {:?}",
                 request.messages
             );
-            // §13（TPI_TODO_PLAN_FINAL_STATE_REFACTOR）：plan 不再注入为 System 消息。
+            // plan 不再注入为 System 消息（plan 是 session state，见 docs/architecture.md）。
             assert!(
                 !request.messages.iter().any(|message| matches!(
                     message,

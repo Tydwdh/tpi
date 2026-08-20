@@ -54,12 +54,17 @@ fn push_system_line(
 /// 问题与选项直接内联展示在 transcript（无模态弹窗）；用户在输入框
 /// 输入回答或选项编号。`options` 仅在单问题带选项时非空（数字映射用；
 /// 多问题按行回答，不做有歧义的编号映射）。
+///
+/// `dismissed` 与 `answer` 互斥：Esc 拒绝后不应再注入答案（调用方
+/// 在设置 dismissed=true 时应清空 answer，见 `src/app/mod.rs` 的 Esc 分支）。
 struct PendingInput {
     /// 单问题时的选项列表（数字编号 → 选项文本映射；多问题/无选项为空）。
     options: Vec<String>,
     /// `request_input` 模态已提交的答案（Some = 自动 resume，不等待输入框）。
+    /// 与 `dismissed` 互斥：dismissed=true 时必须为 None。
     answer: Option<String>,
     /// 模态被 Esc 拒绝（dismissed 语义）：resume 时给出拒绝反馈。
+    /// 与 `answer` 互斥：dismissed=true 时 answer 必须为 None。
     dismissed: bool,
 }
 

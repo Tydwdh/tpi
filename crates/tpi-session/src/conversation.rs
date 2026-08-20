@@ -14,7 +14,7 @@ use tpi_core::message::ChatMessage;
 use super::projector::ConversationProjector;
 use super::protocol::Plan;
 use super::store::SessionStore;
-use super::{SessionLog, recovery, workspace_id_for};
+use super::{SessionEvent, SessionLog, recovery, workspace_id_for};
 
 /// 一个会话的 durable log 与当前模型上下文投影。
 ///
@@ -70,8 +70,15 @@ impl Conversation {
                     format!("打开 session 失败: {error}")
                 }
             })?;
-        let recovered =
-            recovery::recover(&path).map_err(|error| format!("恢复 session 失败: {error}"))?;
+        // 用已持锁的 log 快照做 recovery（避免无锁读文件的 TOCTOU：open 后到
+        // recover 之间的窗口内另一进程提交 ToolCompleted 会被漏判，导致重复合成 Interrupted）。
+        let events_with_seq = log
+            .events_with_seq()
+            .map_err(|error| format!("恢复 session 失败: {error}"))?;
+        let events_only: Vec<SessionEvent> =
+            events_with_seq.iter().map(|(_, e)| e.clone()).collect();
+        let recovered = recovery::recover_from_events(&events_only)
+            .map_err(|error| format!("恢复 session 失败: {error}"))?;
         for (call_id, _provider_id, outcome) in &recovered.interrupted {
             let call_id = uuid::Uuid::parse_str(call_id)
                 .map(ToolCallId)
@@ -79,11 +86,14 @@ impl Conversation {
             log.complete_tool(call_id, outcome)
                 .map_err(|error| format!("持久化中断工具结果失败: {error}"))?;
         }
-        log.sync_data()
-            .map_err(|error| format!("同步 session 失败: {error}"))?;
+        if !recovered.interrupted.is_empty() {
+            log.sync_data()
+                .map_err(|error| format!("同步 session 失败: {error}"))?;
+        }
 
-        let events =
-            crate::read_events_with_seq(&path).map_err(|error| format!("读取事件失败: {error}"))?;
+        let events = log
+            .events_with_seq()
+            .map_err(|error| format!("读取事件失败: {error}"))?;
         let projector = ConversationProjector::rebuild(&events);
         Ok(Self {
             log: Some(log),

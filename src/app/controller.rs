@@ -36,15 +36,13 @@ impl<P: Provider> AppController<P> {
             }
             AppCommand::CancelRun => {
                 // cancel run：取消当前 run 的 token（若在跑）。
-                if let Some(cancel) = self
-                    .services
-                    .current_cancel
-                    .lock()
-                    .map_err(|e| format!("cancel lock poisoned: {e}"))?
-                    .as_ref()
-                {
+                // 使用 lock_mutex 恢复 poison，避免一次 panic 导致后续所有 Cancel 永久失败。
+                let guard =
+                    tpi_core::util::lock_mutex(&self.services.current_cancel, "current_cancel");
+                if let Some(cancel) = guard.as_ref() {
                     cancel.cancel();
                 }
+                drop(guard);
                 effects.push(AppEffect::Notify("已取消当前 run".into()));
             }
             AppCommand::StartNewSession => {

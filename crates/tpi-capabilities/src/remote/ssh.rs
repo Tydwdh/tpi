@@ -216,25 +216,30 @@ impl client::Handler for ClientHandler {
         );
         match known {
             Ok(true) => {
-                *self.decision.lock().unwrap() = HostKeyDecision::Accepted;
+                *tpi_core::util::lock_mutex(&self.decision, "host_key_decision") =
+                    HostKeyDecision::Accepted;
                 Ok(true)
             }
             // 未知 → 记录 pending，返回 false（连接中断，由调用方询问用户）。
             Ok(false) => {
-                *self.decision.lock().unwrap() = HostKeyDecision::UnknownPending;
-                *self.pending.lock().unwrap() = Some(PendingHostKey {
-                    host: self.host.hostname.clone(),
-                    port: self.host.port,
-                    public_key: server_public_key.clone(),
-                });
+                *tpi_core::util::lock_mutex(&self.decision, "host_key_decision") =
+                    HostKeyDecision::UnknownPending;
+                *tpi_core::util::lock_mutex(&self.pending, "pending_host_key") =
+                    Some(PendingHostKey {
+                        host: self.host.hostname.clone(),
+                        port: self.host.port,
+                        public_key: server_public_key.clone(),
+                    });
                 Ok(false)
             }
             Err(russh::keys::Error::KeyChanged { .. }) => {
-                *self.decision.lock().unwrap() = HostKeyDecision::Changed;
+                *tpi_core::util::lock_mutex(&self.decision, "host_key_decision") =
+                    HostKeyDecision::Changed;
                 Ok(false)
             }
             Err(_) => {
-                *self.decision.lock().unwrap() = HostKeyDecision::Changed;
+                *tpi_core::util::lock_mutex(&self.decision, "host_key_decision") =
+                    HostKeyDecision::Changed;
                 Ok(false)
             }
         }
@@ -262,19 +267,16 @@ impl SshClient {
     }
 
     pub fn connection_state(&self) -> ConnectionState {
-        self.state.lock().unwrap().clone()
+        tpi_core::util::lock_mutex(&self.state, "ssh_connection_state").clone()
     }
 
     pub fn pending_host_key(&self) -> Option<PendingHostKey> {
-        self.pending.lock().unwrap().clone()
+        tpi_core::util::lock_mutex(&self.pending, "pending_host_key").clone()
     }
 
     /// 用户确认未知 host key（§34）：写入 known_hosts。
     pub fn confirm_host_key(&self) -> Result<(), SshError> {
-        let pending = self
-            .pending
-            .lock()
-            .unwrap()
+        let pending = tpi_core::util::lock_mutex(&self.pending, "pending_host_key")
             .take()
             .ok_or_else(|| SshError::Connect("没有待确认的 host key".into()))?;
         if let Some(parent) = self.host.known_hosts_path.parent() {
@@ -296,7 +298,8 @@ impl SshClient {
     /// `UnknownPending` 表示未知 host，调用方应询问用户后 [`confirm_host_key`]
     /// 再重连；`Changed` 表示 host key 变化（拒绝）。
     pub async fn connect(&mut self) -> Result<HostKeyDecision, SshError> {
-        *self.state.lock().unwrap() = ConnectionState::Connecting;
+        *tpi_core::util::lock_mutex(&self.state, "ssh_connection_state") =
+            ConnectionState::Connecting;
         let config = Arc::new(client::Config::default());
         let handler = ClientHandler {
             host: self.host.clone(),
@@ -310,17 +313,19 @@ impl SshClient {
         let mut session = match client::connect(config, addr, handler).await {
             Ok(session) => session,
             Err(e) => {
-                let decision = self.decision.lock().unwrap().clone();
+                let decision =
+                    tpi_core::util::lock_mutex(&self.decision, "host_key_decision").clone();
                 match decision {
                     HostKeyDecision::Accepted => return Err(SshError::Connect(e.to_string())),
                     HostKeyDecision::UnknownPending | HostKeyDecision::Changed => {
-                        *self.state.lock().unwrap() = ConnectionState::Disconnected;
+                        *tpi_core::util::lock_mutex(&self.state, "ssh_connection_state") =
+                            ConnectionState::Disconnected;
                         return Ok(decision);
                     }
                 }
             }
         };
-        let decision = self.decision.lock().unwrap().clone();
+        let decision = tpi_core::util::lock_mutex(&self.decision, "host_key_decision").clone();
         match decision {
             HostKeyDecision::Accepted => {}
             HostKeyDecision::UnknownPending | HostKeyDecision::Changed => {
@@ -332,13 +337,15 @@ impl SshClient {
                         "en",
                     )
                     .await;
-                *self.state.lock().unwrap() = ConnectionState::Disconnected;
+                *tpi_core::util::lock_mutex(&self.state, "ssh_connection_state") =
+                    ConnectionState::Disconnected;
                 return Ok(decision);
             }
         }
         self.authenticate(&mut session).await?;
         self.session = Some(session);
-        *self.state.lock().unwrap() = ConnectionState::Connected;
+        *tpi_core::util::lock_mutex(&self.state, "ssh_connection_state") =
+            ConnectionState::Connected;
         Ok(HostKeyDecision::Accepted)
     }
 
@@ -395,16 +402,19 @@ impl SshClient {
                 .disconnect(russh::Disconnect::ByApplication, "", "en")
                 .await;
         }
-        *self.state.lock().unwrap() = ConnectionState::Disconnected;
+        *tpi_core::util::lock_mutex(&self.state, "ssh_connection_state") =
+            ConnectionState::Disconnected;
     }
 
     /// 重连（§49：reconnect on demand）。
     pub async fn reconnect(&mut self) -> Result<HostKeyDecision, SshError> {
-        *self.state.lock().unwrap() = ConnectionState::Reconnecting;
+        *tpi_core::util::lock_mutex(&self.state, "ssh_connection_state") =
+            ConnectionState::Reconnecting;
         let _ = self.disconnect().await;
         let result = self.connect().await;
         if result.is_ok() {
-            *self.state.lock().unwrap() = ConnectionState::Connected;
+            *tpi_core::util::lock_mutex(&self.state, "ssh_connection_state") =
+                ConnectionState::Connected;
         }
         result
     }

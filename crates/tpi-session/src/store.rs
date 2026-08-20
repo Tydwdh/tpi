@@ -19,11 +19,24 @@ use tpi_core::plan::Plan;
 pub(crate) use protocol::MAX_SESSION_EVENTS;
 
 /// workspace-id 由规范化 workspace path 计算（§14.1；UI/模型不展示该绝对路径）。
+///
+/// 用 `canonicalize` 归一化大小写/符号链接/相对路径；失败时回退到
+/// 绝对化后的原始路径，避免同一物理目录因 `canonicalize` 失败而得到
+/// 不同 ID（会导致 session 孤儿 / --resume 找不到文件）。
 pub fn workspace_id_for(workspace_root: &Path) -> String {
-    let canonical = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let digest = blake3::hash(canonical.to_string_lossy().as_bytes());
+    let canonical = workspace_root.canonicalize().unwrap_or_else(|_| {
+        // 回退：尽量取绝对路径（Windows 大小写折叠由 BLake3 哈希前的
+        // 小写归一覆盖不到，但至少避免相对/绝对路径漂移）。
+        std::path::absolute(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf())
+    });
+    // Windows 大小写不敏感：归一到小写再哈希，避免 C:/Proj vs c:/proj 漂移。
+    let lossy = canonical.to_string_lossy();
+    let normalized = if cfg!(windows) {
+        lossy.to_lowercase()
+    } else {
+        lossy.into_owned()
+    };
+    let digest = blake3::hash(normalized.as_bytes());
     digest.to_hex()[..12].to_string()
 }
 

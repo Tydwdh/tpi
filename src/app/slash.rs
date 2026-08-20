@@ -67,7 +67,7 @@ pub fn command_from_slash(message: &str) -> Option<AppCommand> {
         "/new" => Some(AppCommand::StartNewSession),
         "/compact" => Some(AppCommand::CompactNow),
         "/retry" => Some(AppCommand::RetryLast),
-        "/mcp" if msg.starts_with("/mcp") => Some(AppCommand::OpenModal { name: "mcp".into() }),
+        "/mcp" => Some(AppCommand::OpenModal { name: "mcp".into() }),
         "/settings" => Some(AppCommand::OpenModal {
             name: "settings".into(),
         }),

@@ -21,7 +21,7 @@ pub fn activate_skill(args: ActivateSkillArgs, ctx: &ToolContext) -> ToolOutcome
     // 确保 catalog 已发现（workspace root 来自 ctx）。
     let manager = crate::skills::SkillManager::global();
     {
-        let mut manager = manager.lock().unwrap();
+        let mut manager = tpi_core::util::lock_mutex(&manager, "skill_manager");
         // 每次激活前 refresh（项目 skills 可能新增）；轻量元数据扫描。
         manager.refresh(&ctx.workspace_root);
         match manager.activate(&args.name) {

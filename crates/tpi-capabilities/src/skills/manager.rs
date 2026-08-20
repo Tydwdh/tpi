@@ -147,6 +147,6 @@ impl Default for SkillManager {
 /// 便捷：刷新全局 manager（app 启动时调用一次）。
 pub fn refresh_global(workspace_root: &Utf8PathBuf) {
     let binding = global();
-    let mut manager = binding.lock().unwrap();
+    let mut manager = tpi_core::util::lock_mutex(&binding, "skill_manager");
     manager.refresh(workspace_root);
 }

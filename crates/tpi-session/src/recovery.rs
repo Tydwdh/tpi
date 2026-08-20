@@ -8,6 +8,8 @@
 
 use std::path::Path;
 
+use std::io::Read;
+
 use crate::{RecoveryMetadata, SessionEvent, read_events};
 use tpi_core::outcome::Effect;
 use tpi_core::outcome::{ModelPayload, StoredToolOutcome, ToolMetadata, ToolStatus};
@@ -37,9 +39,14 @@ struct PendingCall {
 /// （§4.3）；调用方不得执行这些工具。
 pub fn recover(path: &Path) -> std::io::Result<RecoveryOutcome> {
     let events = read_events(path)?;
+    recover_from_events(&events)
+}
+
+/// 已持有事件时的恢复（避免 TOCTOU：调用方已持锁/已快照 events，无需二次读文件）。
+pub fn recover_from_events(events: &[SessionEvent]) -> std::io::Result<RecoveryOutcome> {
     let mut pending: Vec<PendingCall> = Vec::new();
 
-    for event in &events {
+    for event in events {
         match event {
             SessionEvent::ToolRequested { call } => {
                 pending.push(PendingCall {
@@ -75,7 +82,7 @@ pub fn recover(path: &Path) -> std::io::Result<RecoveryOutcome> {
         .collect();
 
     Ok(RecoveryOutcome {
-        events,
+        events: events.to_vec(),
         interrupted,
     })
 }
@@ -149,13 +156,24 @@ pub fn classify_effect(tool_name: &str, recovery: Option<&RecoveryMetadata>) -> 
 }
 
 fn revision_of_path(path: &Path) -> std::io::Result<Option<String>> {
-    let mut file = match std::fs::File::open(path) {
+    const MAX_RECOVERY_HASH_BYTES: usize = 64 * 1024 * 1024;
+    let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    if file.metadata()?.len() > MAX_RECOVERY_HASH_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("恢复哈希：文件超过 {MAX_RECOVERY_HASH_BYTES} 字节上限"),
+        ));
+    }
     let mut hasher = blake3::Hasher::new();
-    std::io::copy(&mut file, &mut hasher)?;
+    // 有界拷贝：即使 metadata 与实际长度存在 TOCTOU，也不会无界读。
+    std::io::copy(
+        &mut file.take((MAX_RECOVERY_HASH_BYTES as u64).saturating_add(1)),
+        &mut hasher,
+    )?;
     Ok(Some(format!(
         "{}{}",
         tpi_core::revision::REVISION_PREFIX,

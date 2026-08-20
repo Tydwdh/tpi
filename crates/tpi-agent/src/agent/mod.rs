@@ -456,8 +456,8 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
             .map_err(|e| RunFailure::Session(format!("read events: {e}")))?,
     )
     .map_err(|e| RunFailure::Session(format!("restore plan: {e}")))?;
-    // §13（TPI_TODO_PLAN_FINAL_STATE_REFACTOR）：不再在恢复/压缩边界注入 plan 系统消息。
-    // plan 通过正常的 assistant(update_plan) → tool result 协议事实进入上下文。
+    // plan 不再在恢复/压缩边界注入为系统消息，
+    // 而是通过正常的 assistant(update_plan) → tool result 协议事实进入上下文。
     let manual_retry_continuation = user_message.is_empty()
         && matches!(
             history.last(),
@@ -1580,8 +1580,8 @@ fn system_prompt_text(system_prompt_extra: Option<&str>, ephemeral_system: Optio
 
 /// 构造上下文 projection（§15.1 顺序：system → 用户目标 → 历史 turns → 当前输入在尾部）。
 ///
-/// §13（TPI_TODO_PLAN_FINAL_STATE_REFACTOR）：plan 不再注入为系统消息。
-/// plan 通过正常的 assistant(update_plan) → tool result 协议事实进入上下文，
+/// plan 不再注入为系统消息——plan 是 session state，
+/// 通过正常的 assistant(update_plan) → tool result 协议事实进入上下文，
 /// UI 从 session projection 读取。
 fn build_context(
     config: &Config,
@@ -1605,7 +1605,7 @@ fn build_context(
     if let Some(workspace) = workspace {
         let id = workspace.id().to_string();
         let cwd = {
-            let shell = workspace.shell().lock().unwrap();
+            let shell = tpi_core::util::lock_mutex(workspace.shell(), "workspace_shell");
             shell.cwd.to_string()
         };
         out.push(ChatMessage::System(format!(
@@ -1622,9 +1622,9 @@ fn build_context(
         )));
     }
     out.extend_from_slice(messages);
-    // §13（TPI_TODO_PLAN_FINAL_STATE_REFACTOR）：plan 不再注入为系统消息。
-    // plan 通过正常的 assistant(update_plan) → tool result 协议事实进入上下文，
-    // UI 从 session projection 读取。模型的 working memory 来自自己的 tool-call history。
+    // plan 不再注入为系统消息（plan 是 session state）；
+    // 通过正常的 assistant(update_plan) → tool result 协议事实进入上下文，
+    // UI 从 session projection 读取，模型的 working memory 来自自己的 tool-call history。
     // §25/§26/§60：ManagedProcess 快照（system 角色 harness metadata，不是
     // User 指令）；只含 active + 近期状态变化，避免 context 膨胀；跨 turn /
     // compaction 后模型仍知道有后台进程存在（§25：不能彻底忘记 p17）。

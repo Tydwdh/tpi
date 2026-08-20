@@ -164,18 +164,22 @@ impl<P: Provider + 'static> RuntimeTask<P> {
             }
         }
 
-        // 退出前取消所有 run，等它们结束（最多 5 秒）。
+        // 退出前取消所有 run，等它们结束（最多 5 秒）；超时则 abort，避免句柄泄漏与锁残留。
         for (_, cancel) in self.runs.drain() {
             cancel.cancel();
         }
-        for (sid, handle) in self.run_handles.drain() {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+        for (sid, mut handle) in self.run_handles.drain() {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     warn!(?sid, "run task panicked: {e}");
                 }
                 Err(_) => {
-                    warn!(?sid, "run task did not finish within 5s after cancel");
+                    warn!(
+                        ?sid,
+                        "run task did not finish within 5s after cancel; aborting"
+                    );
+                    handle.abort();
                 }
             }
         }

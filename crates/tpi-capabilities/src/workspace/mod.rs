@@ -131,7 +131,7 @@ mod tests {
         let active = ActiveWorkspace::local(ws);
         assert_eq!(active.kind(), WorkspaceKind::Local);
         assert_eq!(active.id().to_string(), "local:C:/proj");
-        let shell = active.shell().lock().unwrap();
+        let shell = tpi_core::util::lock_mutex(active.shell(), "workspace_shell");
         assert_eq!(shell.cwd.as_str(), "C:/proj");
         assert_eq!(shell.version, 0);
     }
@@ -140,9 +140,13 @@ mod tests {
     fn two_workspaces_do_not_share_shell_state() {
         let a = LocalWorkspace::new(Utf8PathBuf::from("C:/a"), true);
         let b = LocalWorkspace::new(Utf8PathBuf::from("C:/b"), true);
-        a.shell.lock().unwrap().cwd = Utf8PathBuf::from("C:/a/src");
-        let a_cwd = a.shell.lock().unwrap().cwd.clone();
-        let b_cwd = b.shell.lock().unwrap().cwd.clone();
+        tpi_core::util::lock_mutex(&a.shell, "workspace_shell").cwd = Utf8PathBuf::from("C:/a/src");
+        let a_cwd = tpi_core::util::lock_mutex(&a.shell, "workspace_shell")
+            .cwd
+            .clone();
+        let b_cwd = tpi_core::util::lock_mutex(&b.shell, "workspace_shell")
+            .cwd
+            .clone();
         assert_eq!(a_cwd.as_str(), "C:/a/src");
         assert_eq!(b_cwd.as_str(), "C:/b", "workspace B 不得被 A 污染（§9）");
     }
@@ -207,7 +211,10 @@ mod port_tests {
         assert!(!ws.root().as_str().is_empty(), "root 必须存在");
         assert_eq!(ws.kind(), expected_kind);
         assert!(
-            !ws.shell().lock().unwrap().cwd.as_str().is_empty(),
+            !tpi_core::util::lock_mutex(ws.shell(), "workspace_shell")
+                .cwd
+                .as_str()
+                .is_empty(),
             "shell cwd 必须存在"
         );
     }

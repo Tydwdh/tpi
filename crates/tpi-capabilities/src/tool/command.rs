@@ -83,7 +83,6 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
             format!("timeout_ms 必须在 1..={MAX_TIMEOUT_MS} 范围内。"),
         );
     }
-    // §13（TPI_FINAL_STATE_REFACTOR）：删除 shell 关键字黑名单。
     // shell/terminal 的文件系统副作用由统一 mutation tracking 基础设施观测，
     // 而不是在入口拦截特定命令关键词。模型指导：用 edit 做精确编辑，用 bash
     // 做执行/构建/测试/Git/格式化等 shell 工作流。
@@ -412,12 +411,6 @@ fn rejected_bash(code: &str, detail: impl std::fmt::Display) -> ToolOutcome {
         },
     )
 }
-
-/// §13：sed/perl 就地修改黑名单已删除。
-
-/// 本地后台执行器（P2，任务书 §56）：`bash(background=true)`。
-///
-/// 只读取 ShellSessionState 快照（cwd + env overlay）构造启动规格，
 
 /// 本地后台执行器（P2，任务书 §56）：`bash(background=true)`。
 ///

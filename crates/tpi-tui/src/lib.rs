@@ -74,6 +74,7 @@ pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 
 /// 斜杠命令单一来源（P3-03：由 app::slash registry 投影；help/补全共用）。
 /// 内容与 `app::slash::SLASH_COMMANDS` 一致（golden 测试强制同步）。
+/// 增加/删除命令时两处必须同步（`tests/tui_reducer.rs` golden 会失败）。
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("help", "显示帮助与快捷键"),
     ("settings", "查看生效配置及来源"),

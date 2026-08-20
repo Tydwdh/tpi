@@ -87,7 +87,7 @@ impl ToolRuntime {
         // ctx.shell 与 workspace 内 shell 共享同一 Arc。
         let workspace = Arc::new(Mutex::new(active_workspace));
         let shell = {
-            let ws = workspace.lock().unwrap();
+            let ws = tpi_core::util::lock_mutex(&workspace, "workspace");
             ws.shell().clone()
         };
         // P1-05：工具执行策略来自窄视图 ToolPolicy（不直接读 Config 的
@@ -139,7 +139,7 @@ impl ToolRuntime {
     /// P4-03：构建当前 Step 的不可变工具快照并返回 defs（Step 内执行共用）。
     /// 每次 reload 在 Step 边界锁 registry；Step 内执行不再锁。
     pub(super) fn reload(&self, context: &str) -> Vec<crate::provider::ToolDef> {
-        let registry = self.registry.lock().unwrap();
+        let registry = tpi_core::util::lock_mutex(&self.registry, "tool_registry");
         let selector = tpi_capabilities::tool::selector::ToolSelector::default();
         let defs: Vec<crate::provider::ToolDef> = selector
             .select(registry.descriptors(), context)
@@ -159,7 +159,7 @@ impl ToolRuntime {
             .filter(|tool| BuiltinTool::from_name(tool.name()).is_none())
             .map(|tool| (tool.name().to_string(), tool))
             .collect();
-        *self.active.lock().unwrap() = Some(ActiveToolSet {
+        *tpi_core::util::lock_mutex(&self.active, "active_tool_set") = Some(ActiveToolSet {
             defs: defs.clone(),
             external,
         });
@@ -168,9 +168,7 @@ impl ToolRuntime {
 
     /// 当前 Step 快照（reload 后有效；Step 内执行用同一快照，clone 复用）。
     pub(super) fn active_set(&self) -> ActiveToolSet {
-        self.active
-            .lock()
-            .unwrap()
+        tpi_core::util::lock_mutex(&self.active, "active_tool_set")
             .clone()
             .expect("active set 未 reload")
     }
