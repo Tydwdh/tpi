@@ -104,11 +104,11 @@ pub fn recover(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::journal::MutationJournal;
+    use crate::workspace::journal::{JournalEntry, MutationJournal};
     use crate::workspace::mutation::WorkspaceMutation;
     use crate::workspace::policy::Reversibility;
     use crate::workspace::transaction::MutationCause;
-    use crate::workspace::types::{CheckpointId, Timestamp};
+    use crate::workspace::types::{BlobId, CheckpointId, Timestamp};
     use tempfile::tempdir;
 
     fn make_journal_entry(tx_id: &str) -> JournalEntry {
