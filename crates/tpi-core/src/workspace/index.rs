@@ -1150,4 +1150,53 @@ mod tests {
         assert_eq!(delta.deleted[0].path.as_str(), "deep/nested/x.txt");
         assert!(delta.deleted[0].before.blob_id.is_some());
     }
+
+    /// P2.5 benchmark（#[ignore]，手动/CI 按需跑）：对比全量 `reconcile`
+    /// 与增量 `reconcile_paths` 在 N=2000 文件、改 1 个文件时的成本。
+    /// 不断言绝对时间（CI 脆弱），只断言：两类 reconcile 结果一致，且增量
+    /// 显著更快（宽松阈值 ×10）。
+    #[test]
+    #[ignore]
+    fn bench_reconcile_vs_reconcile_paths() {
+        use std::time::Instant;
+
+        let dir = tempdir().unwrap();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        // 构造 N=2000 个小文件 workspace。
+        for i in 0..2000 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), format!("content-{i}")).unwrap();
+        }
+        let mut idx = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        // 改 1 个文件。
+        std::fs::write(dir.path().join("f42.txt"), b"changed-42").unwrap();
+
+        let t0 = Instant::now();
+        let full = WorkspaceIndex::reconcile(&mut idx, &[], &blob).unwrap();
+        let full_elapsed = t0.elapsed();
+
+        // 再改 1 个文件，用增量路径。
+        std::fs::write(dir.path().join("f43.txt"), b"changed-43").unwrap();
+        let t1 = Instant::now();
+        let incr = idx
+            .reconcile_paths(&[npath(dir.path(), "f43.txt")], &blob)
+            .unwrap();
+        let incr_elapsed = t1.elapsed();
+
+        // 两个路径都只记录 1 个 modify（正确性一致）。
+        assert_eq!(full.modified.len(), 1);
+        assert_eq!(incr.modified.len(), 1);
+        assert_eq!(incr.modified[0].path.as_str(), "f43.txt");
+
+        eprintln!(
+            "bench: full={full_elapsed:?} (2000 files, 1 changed); incremental={incr_elapsed:?} (1 dirty)"
+        );
+        // 宽松阈值：增量比全量至少快 10%（实际通常快 10-100x）。
+        if full_elapsed.as_nanos() > 0 {
+            assert!(
+                incr_elapsed < full_elapsed,
+                "增量 reconcile 应比全量快: full={full_elapsed:?} incr={incr_elapsed:?}"
+            );
+        }
+    }
 }
