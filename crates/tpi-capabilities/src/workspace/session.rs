@@ -127,19 +127,27 @@ impl WorkspaceSession {
                 });
             }
         }
-        for (path, entry) in &delta.modified {
-            if let Some(blob_id) = &entry.blob_id {
+        for (path, after, before) in &delta.modified {
+            if let Some(blob_id) = &after.blob_id {
                 mutations.push(WorkspaceMutation::Modify {
                     path: path.clone(),
-                    before: tpi_core::workspace::types::BlobId::new(""),
+                    // preimage = 修改前的旧 blob（来自 index 中已保存的旧 entry）。
+                    before: before
+                        .as_ref()
+                        .and_then(|e| e.blob_id.clone())
+                        .unwrap_or_else(|| tpi_core::workspace::types::BlobId::new("")),
                     after: blob_id.clone(),
                 });
             }
         }
-        for path in &delta.deleted {
+        for (path, before) in &delta.deleted {
             mutations.push(WorkspaceMutation::Delete {
                 path: path.clone(),
-                content: tpi_core::workspace::types::BlobId::new(""),
+                // preimage = 删除前的旧 blob（undo 恢复原内容）。
+                content: before
+                    .as_ref()
+                    .and_then(|e| e.blob_id.clone())
+                    .unwrap_or_else(|| tpi_core::workspace::types::BlobId::new("")),
             });
         }
 

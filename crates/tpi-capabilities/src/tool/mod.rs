@@ -13,6 +13,7 @@ pub mod files;
 pub mod inspect;
 pub mod invariants;
 pub use tpi_core::outcome::{Effect, ModelPayload, ToolOutcome, ToolStatus};
+pub mod goal;
 pub mod pipeline;
 pub mod plan_exec;
 pub mod policy;
@@ -23,7 +24,6 @@ pub mod scheduler;
 pub mod search;
 pub mod selector;
 pub mod terminal;
-pub mod goal;
 pub mod undo;
 pub mod web;
 
@@ -306,8 +306,7 @@ impl BuiltinTool {
             BuiltinTool::Read => {
                 "Read the contents of a file (or an @artifact/... reference) as text, \
 or list a directory's entries when path is a directory. \
-File mode: `[revision=HASH]` header (pass to edit as revision) + `lines: X-Y of N` range + \
-numbered lines `N: text` (precise single-line references). Truncated at 200 lines or 32KiB; \
+File mode: `lines: X-Y of N` range + numbered lines `N: text` (precise single-line references). Truncated at 200 lines or 32KiB; \
 use start_line/line_count to page, and follow the returned 续读 hint. \
 Directory mode: entries with relative paths + scan report (scanned_files/scanned_bytes/elapsed_ms/stop_reason); \
 default depth=1 (direct children), pass depth for recursion; start_line/line_count page entries. \

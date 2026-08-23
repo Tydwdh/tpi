@@ -53,8 +53,11 @@ pub struct WorkspaceIndex {
 #[derive(Debug, Clone)]
 pub struct IndexDelta {
     pub created: Vec<(NormalizedPath, FileEntry)>,
-    pub modified: Vec<(NormalizedPath, FileEntry)>,
-    pub deleted: Vec<NormalizedPath>,
+    /// Modified paths with (before, after) — before 是修改前的旧 entry（含旧
+    /// blob_id），供 undo 恢复 preimage；before 无 blob 时 blob_id 为 None。
+    pub modified: Vec<(NormalizedPath, FileEntry, Option<FileEntry>)>,
+    /// Deleted paths with their last known entry（含旧 blob_id，undo 恢复 preimage）。
+    pub deleted: Vec<(NormalizedPath, Option<FileEntry>)>,
 }
 
 impl WorkspaceIndex {
@@ -248,7 +251,10 @@ impl WorkspaceIndex {
 
                     let mut updated = new_entry.clone();
                     updated.blob_id = Some(blob_id);
-                    delta.modified.push((path.clone(), updated.clone()));
+                    // before = 修改前的旧 entry（携带旧 blob_id，preimage 供 undo）。
+                    delta
+                        .modified
+                        .push((path.clone(), updated.clone(), Some(existing.clone())));
                     self.entries.insert(path.clone(), updated);
                 }
                 None => {
@@ -269,8 +275,10 @@ impl WorkspaceIndex {
 
         for old_path in tracked_old {
             if !current.contains_key(&old_path) {
+                // before = 删除前的最后一个 entry（旧 blob_id，preimage 供 undo）。
+                let before = self.entries.get(&old_path).cloned();
                 self.entries.remove(&old_path);
-                delta.deleted.push(old_path);
+                delta.deleted.push((old_path, before));
             }
         }
 
@@ -487,7 +495,13 @@ mod tests {
         let delta = index.reconcile(&[], &blob).unwrap();
 
         assert_eq!(delta.deleted.len(), 1);
-        assert_eq!(delta.deleted[0].as_str(), "a.txt");
+        assert_eq!(delta.deleted[0].0.as_str(), "a.txt");
+        // preimage 必须携带删除前的 entry（undo 恢复内容的前提）。
+        let (_, before) = &delta.deleted[0];
+        assert!(
+            before.as_ref().and_then(|e| e.blob_id.clone()).is_some(),
+            "deleted delta 必须携带 before blob (preimage)"
+        );
     }
 
     #[test]
@@ -501,6 +515,18 @@ mod tests {
 
         assert_eq!(delta.modified.len(), 1);
         assert_eq!(delta.modified[0].0.as_str(), "a.txt");
+        // preimage 必须携带修改前的旧 entry（含旧 blob_id）。
+        let (_, after, before) = &delta.modified[0];
+        assert!(after.blob_id.is_some(), "after 必须有 blob");
+        assert!(
+            before.as_ref().and_then(|e| e.blob_id.clone()).is_some(),
+            "modified delta 必须携带 before blob (preimage)"
+        );
+        assert_ne!(
+            before.as_ref().and_then(|e| e.blob_id.clone()),
+            after.blob_id,
+            "before 与 after blob 必须不同（内容确实变了）"
+        );
     }
 
     #[test]
@@ -513,5 +539,49 @@ mod tests {
         assert!(delta.created.is_empty());
         assert!(delta.modified.is_empty());
         assert!(delta.deleted.is_empty());
+    }
+
+    /// 端到端：bash 式外部覆盖 a.txt 后 reconcile，before blob 必须 round-trip
+    /// 回原始字节（undo 依赖它恢复 preimage）。这是审查断言的闭环验证。
+    #[test]
+    fn reconcile_modified_preimage_roundtrips_original_bytes() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        // 外部覆盖（模拟 bash echo BBB > a.txt）。
+        std::fs::write(dir.path().join("a.txt"), b"HELLO-CHANGED").unwrap();
+        let delta = index.reconcile(&[], &blob).unwrap();
+
+        let (_, after, before) = &delta.modified[0];
+        let after_id = after.blob_id.clone().unwrap();
+        let before_id = before.clone().unwrap().blob_id.clone().unwrap();
+
+        // before blob 必须能取回原始 "hello" 字节（undo 恢复的内容）。
+        let restored = blob.get(&before_id).unwrap();
+        assert_eq!(restored, b"hello");
+        // after blob 是新内容。
+        let after_bytes = blob.get(&after_id).unwrap();
+        assert_eq!(after_bytes, b"HELLO-CHANGED");
+        // before != after。
+        assert_ne!(before_id, after_id);
+    }
+
+    /// 端到端：外部删除 a.txt 后 reconcile，before blob 取回原始字节。
+    #[test]
+    fn reconcile_deleted_preimage_roundtrips_original_bytes() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        // 外部删除（模拟 bash rm a.txt）。
+        std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+        let delta = index.reconcile(&[], &blob).unwrap();
+
+        let (_, before) = &delta.deleted[0];
+        let before_id = before.clone().unwrap().blob_id.clone().unwrap();
+        // before blob 取回原始 "hello" 字节（undo create 恢复的内容）。
+        let restored = blob.get(&before_id).unwrap();
+        assert_eq!(restored, b"hello");
     }
 }

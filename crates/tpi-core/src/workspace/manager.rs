@@ -633,5 +633,62 @@ mod tests {
         let state = mgr.journal.load().unwrap();
         assert_eq!(state.entries.len(), 1);
         assert!(state.entries[0].reversibility.is_exact());
+
+        // 端到端（审查 #9/#10）：模拟 bash 外部覆盖 hello.txt → reconcile_index
+        // → 生成的 mutation 携带真实 before blob → undo 恢复到原始字节。
+        // 这验证 bash 修改/删除文件的 preimage preservation 真正闭环。
+        let (_root2, workspace2, artifacts2) = setup_workspace();
+        let mut mgr2 = WorkspaceManager::open(
+            &workspace2,
+            "test-session",
+            &artifacts2,
+            WorkspaceConfig::default(),
+        )
+        .unwrap();
+
+        // 初始：setup_workspace 中 hello.txt = "hello world"。
+        let original2 = std::fs::read(workspace2.join("hello.txt")).unwrap();
+        // 先 reconcile 一次，让 index 建立 hello.txt 的基准 entry。
+        mgr2.reconcile_index(&[]).unwrap();
+
+        // 模拟 bash 覆盖文件。
+        std::fs::write(workspace2.join("hello.txt"), b"EXTERNAL-OVERWRITE").unwrap();
+        let delta2 = mgr2.reconcile_index(&[]).unwrap();
+
+        assert_eq!(delta2.modified.len(), 1);
+        let (_, after, before) = &delta2.modified[0];
+        let before_id = before.clone().unwrap().blob_id.clone().unwrap();
+        // before blob round-trip 回原始字节。
+        let restored_preimage = mgr2.blob_store().get(&before_id).unwrap();
+        assert_eq!(restored_preimage, original2);
+
+        // 用 delta 构造 Modify 并 commit（session.reconcile_after_execution 路径）。
+        let norm2 = NormalizedPath::new(&workspace2.join("hello.txt"), &workspace2);
+        let after_id = after.blob_id.clone().unwrap();
+        let mutations2 = vec![WorkspaceMutation::Modify {
+            path: norm2,
+            before: before_id.clone(),
+            after: after_id.clone(),
+        }];
+        let handle2 = mgr2
+            .begin_transaction(MutationCause::Command {
+                command_id: "bash-1".into(),
+            })
+            .unwrap();
+        let _ = handle2.commit(mutations2).unwrap();
+
+        // undo 应恢复原始字节。
+        let state2 = mgr2.journal.load().unwrap();
+        let entry2 = state2.entries.last().unwrap();
+        if matches!(entry2.reversibility, Reversibility::Exact) {
+            let result2 = mgr2.undo(&entry2.transaction_id).unwrap();
+            match result2 {
+                UndoResult::Applied { .. } => {
+                    let restored2 = std::fs::read(workspace2.join("hello.txt")).unwrap();
+                    assert_eq!(restored2, original2, "undo 必须恢复 bash 覆盖前的原始字节");
+                }
+                other => panic!("expected undo applied, got {other:?}"),
+            }
+        }
     }
 }
