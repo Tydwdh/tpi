@@ -37,22 +37,37 @@ pub fn goal(args: GoalArgs, ctx: &ToolContext) -> ToolOutcome {
                         "max_rounds": g.max_rounds,
                     }
                 });
-                ToolOutcome::succeeded("goal", format!("status: succeeded\ntool: goal\nop: get\n\n{}", serde_json::to_string_pretty(&payload).unwrap()))
+                ToolOutcome::succeeded(
+                    "goal",
+                    format!(
+                        "status: succeeded\ntool: goal\nop: get\n\n{}",
+                        serde_json::to_string_pretty(&payload).unwrap()
+                    ),
+                )
             } else {
-                ToolOutcome::succeeded("goal", "status: succeeded\ntool: goal\nop: get\n\ngoal: null\n(no active goal)".to_string())
+                ToolOutcome::succeeded(
+                    "goal",
+                    "status: succeeded\ntool: goal\nop: get\n\ngoal: null\n(no active goal)"
+                        .to_string(),
+                )
             }
         }
         "complete" => {
             let Some(g) = current else {
-                return ToolOutcome::failed("goal", ModelPayload {
-                    status: ToolStatus::Rejected,
-                    program: None,
-                    exit_code: None,
-                    duration_ms: 0,
-                    output: "status: rejected\ntool: goal\nerror: no_goal\n\n当前没有可完成的 goal".into(),
-                    effect: None,
-                    artifact: None,
-                });
+                return ToolOutcome::failed(
+                    "goal",
+                    ModelPayload {
+                        status: ToolStatus::Rejected,
+                        program: None,
+                        exit_code: None,
+                        duration_ms: 0,
+                        output:
+                            "status: rejected\ntool: goal\nerror: no_goal\n\n当前没有可完成的 goal"
+                                .into(),
+                        effect: None,
+                        artifact: None,
+                    },
+                );
             };
             if g.phase == GoalPhase::Complete {
                 return ToolOutcome::failed("goal", ModelPayload {
@@ -70,7 +85,13 @@ pub fn goal(args: GoalArgs, ctx: &ToolContext) -> ToolOutcome {
                 *tpi_core::util::lock_mutex(slot, "current_goal") = Some(next.clone());
             }
             let payload = serde_json::json!({ "goal": { "objective": next.objective, "phase": "complete", "revision": next.revision } });
-            ToolOutcome::succeeded("goal", format!("status: succeeded\ntool: goal\nop: complete\n\n{}", serde_json::to_string_pretty(&payload).unwrap()))
+            ToolOutcome::succeeded(
+                "goal",
+                format!(
+                    "status: succeeded\ntool: goal\nop: complete\n\n{}",
+                    serde_json::to_string_pretty(&payload).unwrap()
+                ),
+            )
         }
         "drop" => {
             let had = current.is_some();
@@ -78,19 +99,30 @@ pub fn goal(args: GoalArgs, ctx: &ToolContext) -> ToolOutcome {
                 *tpi_core::util::lock_mutex(slot, "current_goal") = None;
             }
             if had {
-                ToolOutcome::succeeded("goal", "status: succeeded\ntool: goal\nop: drop\n\ngoal cleared".to_string())
+                ToolOutcome::succeeded(
+                    "goal",
+                    "status: succeeded\ntool: goal\nop: drop\n\ngoal cleared".to_string(),
+                )
             } else {
-                ToolOutcome::succeeded("goal", "status: succeeded\ntool: goal\nop: drop\n\nno goal to drop".to_string())
+                ToolOutcome::succeeded(
+                    "goal",
+                    "status: succeeded\ntool: goal\nop: drop\n\nno goal to drop".to_string(),
+                )
             }
         }
-        _ => ToolOutcome::failed("goal", ModelPayload {
-            status: ToolStatus::Rejected,
-            program: None,
-            exit_code: None,
-            duration_ms: 0,
-            output: format!("status: rejected\ntool: goal\nerror: invalid_op\n\nop 必须是 get | complete | drop（收到 {op}）"),
-            effect: None,
-            artifact: None,
-        }),
+        _ => ToolOutcome::failed(
+            "goal",
+            ModelPayload {
+                status: ToolStatus::Rejected,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: format!(
+                    "status: rejected\ntool: goal\nerror: invalid_op\n\nop 必须是 get | complete | drop（收到 {op}）"
+                ),
+                effect: None,
+                artifact: None,
+            },
+        ),
     }
 }
