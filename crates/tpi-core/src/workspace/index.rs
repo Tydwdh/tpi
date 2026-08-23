@@ -1020,4 +1020,134 @@ mod tests {
         assert_eq!(delta.created.len(), 1, "moved.txt 新建");
         assert_eq!(delta.created[0].0.as_str(), "moved.txt");
     }
+
+    // ── P2.4: adversarial ─────────────────────────────────────────
+
+    /// 批量变更：多个文件同时改/增/删（git checkout / git reset 式）。
+    #[test]
+    fn reconcile_paths_bulk_changes() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        // 同一次“批量 revert”：改 a.txt，删 b.txt，新建 c2.txt。
+        std::fs::write(dir.path().join("a.txt"), b"A-CHANGED").unwrap();
+        std::fs::remove_file(dir.path().join("b.txt")).unwrap();
+        std::fs::write(dir.path().join("c2.txt"), b"nested-content").unwrap();
+
+        let delta = index
+            .reconcile_paths(
+                &[
+                    npath(dir.path(), "a.txt"),
+                    npath(dir.path(), "b.txt"),
+                    npath(dir.path(), "c2.txt"),
+                ],
+                &blob,
+            )
+            .unwrap();
+
+        assert_eq!(delta.modified.len(), 1);
+        assert_eq!(delta.modified[0].path.as_str(), "a.txt");
+        assert_eq!(delta.deleted.len(), 1);
+        assert_eq!(delta.deleted[0].path.as_str(), "b.txt");
+        assert!(
+            delta.deleted[0].before.blob_id.is_some(),
+            "b 删除带 preimage"
+        );
+        assert_eq!(delta.created.len(), 1);
+        assert_eq!(delta.created[0].0.as_str(), "c2.txt");
+    }
+
+    /// atomic-save：编辑器写临时文件再 rename 覆盖（.tmp -> a.txt）。
+    /// 即使 temp 也进 dirty，reconcile 仍正确识别 a.txt 修改 + tmp 新建。
+    #[test]
+    fn reconcile_paths_atomic_save_rename() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        // atomic save：写 .a.txt.tmp，再 rename 到 a.txt。
+        std::fs::write(dir.path().join(".a.txt.tmp"), b"atomic new").unwrap();
+        std::fs::rename(dir.path().join(".a.txt.tmp"), dir.path().join("a.txt")).unwrap();
+
+        // watcher 分别提醒 tmp 与 a.txt。
+        let delta = index
+            .reconcile_paths(
+                &[npath(dir.path(), ".a.txt.tmp"), npath(dir.path(), "a.txt")],
+                &blob,
+            )
+            .unwrap();
+
+        // a.txt 内容变了（Modify，before=原 content）；tmp 不再存在（无 entry→忽略）。
+        assert_eq!(delta.modified.len(), 1);
+        assert_eq!(delta.modified[0].path.as_str(), "a.txt");
+        let restored = blob
+            .get(&delta.modified[0].before.blob_id.clone().unwrap())
+            .unwrap();
+        assert_eq!(restored, b"hello", "before 仍是旧 hello（可 undo）");
+    }
+
+    /// rapid create/delete/create：目录不存在→创建→删除→再创建。
+    /// dirty 去重且以最终文件系统为准。
+    #[test]
+    fn reconcile_paths_rapid_create_delete_create() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        // 快速：删 b → 建 b（不同内容）→ 再删。最终 b 不存在 → Deleted(before 原内容)。
+        std::fs::remove_file(dir.path().join("b.txt")).unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"b-final").unwrap();
+        std::fs::remove_file(dir.path().join("b.txt")).unwrap();
+
+        // 多次 mark 同一 path（去重），只影响最终状态判断。
+        let delta = index
+            .reconcile_paths(
+                &[
+                    npath(dir.path(), "b.txt"),
+                    npath(dir.path(), "b.txt"),
+                    npath(dir.path(), "b.txt"),
+                ],
+                &blob,
+            )
+            .unwrap();
+
+        assert_eq!(delta.deleted.len(), 1, "最终 b 删除");
+        // preimage 是**最初的** world（index 记录的第一个 b 内容）。
+        let restored = blob
+            .get(&delta.deleted[0].before.blob_id.clone().unwrap())
+            .unwrap();
+        assert_eq!(restored, b"world");
+    }
+
+    /// 目录内批量增删 + 目录被删：及时传入被删目录下所有文件时都带 preimage。
+    #[test]
+    fn reconcile_paths_deep_subtree_delete_all_files() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        // 造一层深层目录。
+        std::fs::create_dir_all(dir.path().join("deep").join("nested")).unwrap();
+        std::fs::write(dir.path().join("deep").join("nested").join("x.txt"), b"x").unwrap();
+        index
+            .reconcile_paths(&[npath(dir.path(), "deep/nested/x.txt")], &blob)
+            .unwrap();
+
+        // 删整个 deep/ 下的文件（watcher 可能逐个报）→ 每个都带 preimage。
+        std::fs::remove_file(dir.path().join("deep").join("nested").join("x.txt")).unwrap();
+        let delta = index
+            .reconcile_paths(
+                &[
+                    npath(dir.path(), "deep/nested/x.txt"),
+                    npath(dir.path(), "deep"),
+                    npath(dir.path(), "deep/nested"),
+                ],
+                &blob,
+            )
+            .unwrap();
+        assert_eq!(delta.deleted.len(), 1);
+        assert_eq!(delta.deleted[0].path.as_str(), "deep/nested/x.txt");
+        assert!(delta.deleted[0].before.blob_id.is_some());
+    }
 }

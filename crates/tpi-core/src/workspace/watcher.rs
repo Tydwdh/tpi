@@ -225,6 +225,13 @@ impl WorkspaceWatcher {
         self.state.get()
     }
 
+    /// 测试辅助：强制把 watcher 置为 Uncertain（模拟 overflow / listener error /
+    /// 漏报），验证调用方必须 fallback 全量而非信任增量信号。
+    #[cfg(test)]
+    pub fn force_uncertain_for_test(&self, reason: impl Into<String>) {
+        self.state.set_uncertain(reason);
+    }
+
     /// 取并清空所有 dirty path（相对 workspace 的规范化路径）。
     pub fn take_dirty(&self) -> HashSet<String> {
         self.dirty

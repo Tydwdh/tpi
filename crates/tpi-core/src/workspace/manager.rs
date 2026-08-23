@@ -431,12 +431,24 @@ impl WorkspaceManager {
     fn evaluate_reversibility(&self, mutations: &[WorkspaceMutation]) -> Reversibility {
         let mut issues = Vec::new();
         for m in mutations {
-            for path in m.affected_paths() {
-                let norm = NormalizedPath::new(&self.root.join(path.as_str()), &self.root);
-                if self.index.get_blob_id(&norm).is_none() {
-                    // File is not in the index — preimage may be lost.
+            // undo 依赖 **mutation 自带的 preimage blob 可读**，而非 index 里的
+            // 当前条目——index 在 reconcile 后已更新（delete 的 path 已被移除），
+            // 不能用 index 判断 preimage 是否仍可恢复。Delete 用 content，
+            // Modify 用 before，Create 无 preimage（新建无需恢复旧内容）。
+            let preimage: Option<&super::types::BlobId> = match m {
+                WorkspaceMutation::Create { .. } => None,
+                WorkspaceMutation::Modify { before, .. } => Some(before),
+                WorkspaceMutation::Delete { content, .. } => Some(content),
+                WorkspaceMutation::Rename { content, .. } => Some(content),
+            };
+            if let Some(blob) = preimage {
+                if !blob.as_str().is_empty() && !self.blob_store.contains(blob) {
                     issues.push(ReversibilityIssue::UntrackedPath {
-                        path: path.to_string(),
+                        path: m
+                            .affected_paths()
+                            .first()
+                            .map(|p| p.to_string())
+                            .unwrap_or_default(),
                     });
                 }
             }
@@ -893,5 +905,108 @@ mod tests {
             }),
             "journal 必须记录 config.toml 的修改"
         );
+    }
+
+    // ── P2.4: adversarial / fallback ──────────────────────────────
+
+    /// watcher 变得 Uncertain（overflow/error）时，reconcile_unknown_effect
+    /// 必须 fallback 全量扫描，绝不因“dirty 空 / 信号缺失”而漏掉真实修改
+    /// 或在 journal 里产生错误/缺失条目。
+    #[test]
+    fn reconcile_unknown_effect_fallback_when_watcher_uncertain() {
+        let (_root, workspace, artifacts) = setup_workspace();
+        let mut mgr =
+            WorkspaceManager::open(&workspace, "s3", &artifacts, WorkspaceConfig::default())
+                .unwrap();
+        mgr.reconcile_index(&[]).unwrap();
+        mgr.attach_watcher().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // 人为把 watcher 置为 Uncertain（模拟 overflow/listener error）。
+        if let Some(w) = mgr.watcher.as_mut() {
+            w.force_uncertain_for_test("overflow (forced)");
+        }
+
+        // 在 Uncertain 状态下改文件，事件即便被吞掉，fallback 也必须发现。
+        std::fs::write(workspace.join("config.toml"), b"[section]\nkey = 42").unwrap();
+        std::fs::remove_file(workspace.join("hello.txt")).unwrap();
+
+        let rev = mgr
+            .reconcile_unknown_effect(MutationCause::Command {
+                command_id: "bash-adv".into(),
+            })
+            .unwrap();
+        // Uncertain -> 全量 fallback -> Exact（可 undo）。
+        assert!(rev.is_exact());
+
+        let state = mgr.journal.load().unwrap();
+        // 必须同时记录 config.toml 修改 与 hello.txt 删除。
+        let has_modify = state.entries.iter().any(|e| {
+            e.mutations.iter().any(|m| {
+                matches!(m, WorkspaceMutation::Modify { path, .. } if path.as_str() == "config.toml")
+            })
+        });
+        let has_delete = state.entries.iter().any(|e| {
+            e.mutations.iter().any(|m| {
+                matches!(m, WorkspaceMutation::Delete { path, .. } if path.as_str() == "hello.txt")
+            })
+        });
+        assert!(has_modify, "Uncertain 下修改必须被记录");
+        assert!(has_delete, "Uncertain 下删除必须被记录");
+    }
+
+    /// 大量文件批量变更（git checkout -f / reset --hard 式）：
+    /// 无 watcher（fallback 全量）也必须把每次变更准确记录进 journal，可 undo。
+    #[test]
+    fn reconcile_unknown_effect_bulk_revert_all_recorded() {
+        let (_root, workspace, artifacts) = setup_workspace();
+        let mut mgr =
+            WorkspaceManager::open(&workspace, "s4", &artifacts, WorkspaceConfig::default())
+                .unwrap();
+        mgr.reconcile_index(&[]).unwrap();
+
+        // git checkout 式：同时改 config.toml、删 hello.txt、新建 extra.txt。
+        std::fs::write(workspace.join("config.toml"), b"[section]\nkey = 9").unwrap();
+        std::fs::remove_file(workspace.join("hello.txt")).unwrap();
+        std::fs::write(workspace.join("extra.txt"), b"new").unwrap();
+
+        mgr.reconcile_unknown_effect(MutationCause::Command {
+            command_id: "git-checkout".into(),
+        })
+        .unwrap();
+
+        let state = mgr.journal.load().unwrap();
+        let kinds = state
+            .entries
+            .iter()
+            .flat_map(|e| &e.mutations)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            kinds.iter().any(
+                |m| matches!(m, WorkspaceMutation::Modify { path, .. } if path.as_str() == "config.toml")
+            ),
+            "批量 revert 的 Modify 应记录"
+        );
+        assert!(
+            kinds.iter().any(
+                |m| matches!(m, WorkspaceMutation::Create { path, .. } if path.as_str() == "extra.txt")
+            ),
+            "批量 revert 的 Create 应记录"
+        );
+        // hello.txt 删除带 preimage（undo 能恢复）。
+        let del = kinds.iter().find_map(|m| match m {
+            WorkspaceMutation::Delete { path, content } if path.as_str() == "hello.txt" => {
+                Some(content.clone())
+            }
+            _ => None,
+        });
+        assert!(del.is_some(), "hello.txt 删除应记录且带 preimage");
+
+        // undo 该删除事务后 hello.txt 恢复。
+        let tx = state.entries.last().unwrap().transaction_id.clone();
+        if let Ok(res) = mgr.undo(&tx) {
+            assert!(matches!(res, UndoResult::Applied { .. }));
+        }
     }
 }
