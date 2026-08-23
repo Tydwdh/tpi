@@ -1,10 +1,10 @@
 //! 基于资源访问声明的工具调度（ToolExecutor 的调度层，纯函数）。
 //!
 //! - §12.1 资源访问声明：read/list/search 生成 read lock；edit/write 生成 write lock；
-//!   run/bash 记为 `WorkspaceUnknown`（按源顺序串行）。
+//!   run/bash 记为 `WorkspaceUnknown`（跨 AgentGraph 的全局 barrier）。
 //! - §12.2 batch 调度：先验证全部参数；按原 call index 与资源冲突构建 execution waves；
-//!   同 wave 无冲突 Pure/Read 并行（受 `max_parallel_tools` 限制）；Write/WorkspaceUnknown
-//!   按源顺序执行；结果按原 call index 送回 provider。
+//!   同 wave 无冲突 Pure/Read 并行，实际执行再由 `GlobalEffectScheduler` 跨 agent
+//!   复核；结果按原 call index 送回 provider。
 //! - §12.3 无进展检测：`ActionKey + ObservationKey + StateStamp` 相同才算重复；
 //!   默认连续 2 次后，第 3 次执行前返回 `repeated_without_progress`。
 //!
@@ -13,6 +13,9 @@
 //! 的 ToolBatchExecutor）在 waves 之上编排；AgentLoop 只提供 calls 与预算计数。
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use tokio_util::sync::CancellationToken;
 
 use crate::tool::{BuiltinTool, ToolContext, ToolExecutionClass, ValidatedArgs};
 
@@ -22,6 +25,128 @@ pub enum ToolAccess {
     Pure,
     Resources(Vec<ResourceLock>),
     WorkspaceUnknown,
+}
+
+/// A cross-agent effect submitted to the workspace scheduler.
+///
+/// `ToolAccess` is deliberately independent from an agent's identity.  The
+/// same scheduler can therefore coordinate calls from every runtime sharing a
+/// workspace, while the journal can still retain the caller identity.
+#[derive(Debug, Clone)]
+pub struct EffectRequest {
+    pub agent_id: tpi_core::ids::AgentId,
+    pub tool_call_id: tpi_core::ids::ToolCallId,
+    pub effect: ToolAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectAcquireError {
+    Cancelled,
+}
+
+#[derive(Default)]
+struct EffectState {
+    next_permit: u64,
+    active: Vec<(u64, EffectRequest)>,
+}
+
+/// Workspace-wide effect scheduler.
+///
+/// The existing `build_waves` function remains useful for ordering calls in a
+/// single model response.  This object is the missing global boundary: every
+/// actual tool execution acquires a permit here, so two concurrent agent runs
+/// cannot bypass each other's resource declarations.  A permit is held only
+/// for the tool call itself; spawning an agent does not acquire a workspace
+/// lock.
+pub struct GlobalEffectScheduler {
+    state: Mutex<EffectState>,
+    wake: tokio::sync::Notify,
+}
+
+impl Default for GlobalEffectScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GlobalEffectScheduler {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(EffectState::default()),
+            wake: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn active_requests(&self) -> Vec<EffectRequest> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active
+            .iter()
+            .map(|(_, request)| request.clone())
+            .collect()
+    }
+
+    pub async fn acquire(
+        self: &Arc<Self>,
+        request: EffectRequest,
+        cancel: &CancellationToken,
+    ) -> Result<EffectPermit, EffectAcquireError> {
+        loop {
+            let notified = {
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                if !state
+                    .active
+                    .iter()
+                    .any(|(_, active)| effects_conflict(&active.effect, &request.effect))
+                {
+                    let permit_id = state.next_permit;
+                    state.next_permit = state.next_permit.wrapping_add(1);
+                    state.active.push((permit_id, request.clone()));
+                    return Ok(EffectPermit {
+                        scheduler: self.clone(),
+                        permit_id,
+                    });
+                }
+                self.wake.notified()
+            };
+            tokio::select! {
+                _ = notified => {}
+                _ = cancel.cancelled() => return Err(EffectAcquireError::Cancelled),
+            }
+        }
+    }
+
+    fn release(&self, permit_id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(index) = state.active.iter().position(|(id, _)| *id == permit_id) {
+            state.active.swap_remove(index);
+            self.wake.notify_waiters();
+        }
+    }
+}
+
+pub struct EffectPermit {
+    scheduler: Arc<GlobalEffectScheduler>,
+    permit_id: u64,
+}
+
+impl Drop for EffectPermit {
+    fn drop(&mut self) {
+        self.scheduler.release(self.permit_id);
+    }
+}
+
+fn effects_conflict(a: &ToolAccess, b: &ToolAccess) -> bool {
+    match (a, b) {
+        (ToolAccess::Pure, _) | (_, ToolAccess::Pure) => false,
+        (ToolAccess::WorkspaceUnknown, ToolAccess::WorkspaceUnknown)
+        | (ToolAccess::WorkspaceUnknown, ToolAccess::Resources(_))
+        | (ToolAccess::Resources(_), ToolAccess::WorkspaceUnknown) => true,
+        (ToolAccess::Resources(left), ToolAccess::Resources(right)) => left
+            .iter()
+            .any(|a| right.iter().any(|b| locks_conflict(a, b))),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,9 +237,9 @@ fn file_lock(scope: FileScope, mode: AccessMode) -> ToolAccess {
     }])
 }
 
-/// 只读 workspace 级访问声明（P8-10：External 只读工具，如 `subagent`——
-/// child 白名单仅 read/list/search/glob，无写副作用）。与其他只读工具并行；
-/// 与批内写工具冲突时按 write 独占 wave 串行。
+/// Read-only workspace access declaration for external tools. This is an
+/// effect classification, not an agent capability; it can overlap other
+/// readers and conflicts with writes.
 pub fn read_workspace_lock(
     workspace_root: &camino::Utf8PathBuf,
     allow_outside_workspace: bool,
@@ -437,4 +562,100 @@ pub fn collect_by_source_index<T>(mut results: HashMap<usize, T>, count: usize) 
         ordered.push(results.remove(&index));
     }
     ordered
+}
+
+#[cfg(test)]
+mod global_scheduler_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn write(path: &str) -> ToolAccess {
+        ToolAccess::Resources(vec![ResourceLock {
+            resource: ResourceId::File(FileScope::Exact(path.into())),
+            mode: AccessMode::Write,
+        }])
+    }
+
+    fn request(effect: ToolAccess) -> EffectRequest {
+        EffectRequest {
+            agent_id: tpi_core::ids::AgentId::new_v7(),
+            tool_call_id: tpi_core::ids::ToolCallId::new_v7(),
+            effect,
+        }
+    }
+
+    #[tokio::test]
+    async fn different_file_writes_can_overlap() {
+        let scheduler = Arc::new(GlobalEffectScheduler::new());
+        let cancel = CancellationToken::new();
+        let _a = scheduler
+            .acquire(request(write("a.rs")), &cancel)
+            .await
+            .unwrap();
+        let _b = scheduler
+            .acquire(request(write("b.rs")), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(scheduler.active_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn same_file_write_waits_and_unknown_is_global_barrier() {
+        let scheduler = Arc::new(GlobalEffectScheduler::new());
+        let cancel = CancellationToken::new();
+        let first = scheduler
+            .acquire(request(write("a.rs")), &cancel)
+            .await
+            .unwrap();
+
+        let waiter_scheduler = scheduler.clone();
+        let waiter_cancel = cancel.clone();
+        let mut waiter = tokio::spawn(async move {
+            waiter_scheduler
+                .acquire(request(write("a.rs")), &waiter_cancel)
+                .await
+                .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(first);
+        let _second = waiter.await.unwrap();
+
+        let unknown = scheduler
+            .acquire(request(ToolAccess::WorkspaceUnknown), &cancel)
+            .await
+            .unwrap();
+        let waiter_scheduler = scheduler.clone();
+        let waiter_cancel = cancel.clone();
+        let mut blocked = tokio::spawn(async move {
+            waiter_scheduler
+                .acquire(request(write("different.rs")), &waiter_cancel)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut blocked)
+                .await
+                .is_err()
+        );
+        drop(unknown);
+        assert!(blocked.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_leak_a_permit() {
+        let scheduler = Arc::new(GlobalEffectScheduler::new());
+        let cancel = CancellationToken::new();
+        let _first = scheduler
+            .acquire(request(ToolAccess::WorkspaceUnknown), &cancel)
+            .await
+            .unwrap();
+        let blocked_cancel = CancellationToken::new();
+        let blocked = scheduler.acquire(request(write("a.rs")), &blocked_cancel);
+        blocked_cancel.cancel();
+        assert!(matches!(blocked.await, Err(EffectAcquireError::Cancelled)));
+        assert_eq!(scheduler.active_requests().len(), 1);
+    }
 }

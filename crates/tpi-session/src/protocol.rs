@@ -222,8 +222,6 @@ pub enum SessionEvent {
         child_session: SessionId,
         /// 任务指令（诊断/重放摘要）。
         instruction: String,
-        /// 只读能力白名单快照（工具名）。
-        capabilities: Vec<String>,
     },
     /// ADR-007：child 给出语义 report（可多条 progress / 单条 final）。
     /// 先 durable 再 model-visible：落盘后只在下一个 deterministic boundary 注入。
@@ -364,7 +362,6 @@ pub struct SubagentSpawnedPayload {
     pub agent_id: AgentId,
     pub child_session: SessionId,
     pub instruction: String,
-    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -564,14 +561,12 @@ impl Envelope {
                 agent_id,
                 child_session,
                 instruction,
-                capabilities,
             } => EventBody::SubagentSpawned {
                 payload: SubagentSpawnedPayload {
                     delegation_id: *delegation_id,
                     agent_id: *agent_id,
                     child_session: *child_session,
                     instruction: instruction.clone(),
-                    capabilities: capabilities.clone(),
                 },
             },
             SessionEvent::SubagentReported {
@@ -696,7 +691,6 @@ impl Envelope {
                 agent_id: payload.agent_id,
                 child_session: payload.child_session,
                 instruction: payload.instruction.clone(),
-                capabilities: payload.capabilities.clone(),
             },
             EventBody::SubagentReported { payload } => SessionEvent::SubagentReported {
                 delegation_id: payload.delegation_id,

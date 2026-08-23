@@ -184,38 +184,9 @@ fn subagent_config_for_model(config: &Config, model: &crate::config::ModelConfig
     Arc::new(child_config)
 }
 
-/// 在 registry 中安装（或替换）使用 `model` 的 OpenAI-compatible 子代理。
-///
-/// [`ToolRegistry::register_validated`] 对同名 `subagent` 是 ABA-safe 覆盖，
-/// 所以此函数可同时用于启动和 `/model` 切换。
-fn register_openai_subagent_tool(
-    registry: &Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
-    config: &Config,
-    model: &crate::config::ModelConfig,
-    api_key: String,
-) {
-    let model = model.clone();
-    crate::subagent::tool::register_subagent_tool::<OpenAiCompatClient, _>(
-        registry,
-        subagent_config_for_model(config, &model),
-        move || {
-            OpenAiCompatClient::new(
-                model.base_url.clone(),
-                model.name.clone(),
-                api_key.clone(),
-                model.reasoning.clone(),
-                model.max_output_tokens,
-                model.context_window,
-            )
-        },
-        // P8-06：report 通道在 run 时按 run 注入（此处 None = 不投影
-        // TUI；run_turn 的 ui_tx 不在此作用域）。
-        None,
-    );
-}
-
 /// ADR-007：注册非阻塞 `spawn_agent` + `agent` 控制面工具。
-/// 与同步 `subagent` 共存——模型可按需选择同步或异步子代理。
+/// 生产工具目录只暴露统一的异步 agent graph 控制面；旧同步适配器仅供
+/// 直接兼容测试使用。
 fn register_openai_async_subagent_tools(
     registry: &Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
     config: &Config,
@@ -303,9 +274,10 @@ impl AppServices<OpenAiCompatClient> {
             config.model.max_output_tokens,
             config.model.context_window,
         );
-        // P8-04 接线：把 `subagent` 工具注册进 registry（模型可发起只读调查）。
-        // 每个 child 独立 provider 实例（不与 parent 争用 &mut provider）。
-        register_openai_subagent_tool(&registry, &config, &config.model, api_key.clone());
+        // Agent delegation is exposed through the uniform `spawn_agent` /
+        // `agent` control surface. The old blocking adapter is kept only for
+        // direct compatibility tests and is not part
+        // of a runtime's active tool directory.
         // ADR-007：session 级共享 AgentManager（跨 run 存活；后台调查注册/查询/取消）。
         let agents: Arc<std::sync::Mutex<tpi_agent::agent::manager::AgentManager>> = Arc::new(
             std::sync::Mutex::new(tpi_agent::agent::manager::AgentManager::new()),
@@ -479,12 +451,8 @@ pub async fn run(
             model.max_output_tokens,
             model.context_window,
         );
-        register_openai_subagent_tool(
-            &subagent_registry,
-            &subagent_config_template,
-            model,
-            api_key.clone(),
-        );
+        // Do not re-add the retired blocking `subagent` adapter when the model
+        // changes; the active directory stays uniform for every runtime.
         // ADR-007：/model 切换时同步更新 spawn_agent + agent 的 provider 工厂。
         register_openai_async_subagent_tools(
             &subagent_registry,
@@ -2750,9 +2718,7 @@ fn friendly_provider_failure(error: &str) -> String {
             Some(n) => format!(
                 "模型连接中断（已重试 {n} 次仍失败）；session 已保留，可稍后重试或检查网络/代理"
             ),
-            None => {
-                "模型连接中断；session 已保留，可稍后重试或检查网络/代理".to_string()
-            }
+            None => "模型连接中断；session 已保留，可稍后重试或检查网络/代理".to_string(),
         }
     } else {
         error.to_string()

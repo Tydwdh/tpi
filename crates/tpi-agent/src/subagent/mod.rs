@@ -1,21 +1,13 @@
-//! P8-03：SubagentProvider 契约 + fake（P8 初始规格：只读、隔离上下文、并行调查）。
+//! 子代理 provider 契约、异步 agent 工具和 in-process worker。
 //!
-//! 规格（用户决策 2026-08-14）：默认关闭；depth=1（不递归）；concurrency=1；
-//! fresh child session；只读 capability allowlist；parent 只接收 structured
-//! report；parent cancellation 必须传播；不允许共享 workspace 写入。
-//!
-//! 本模块定义契约 + fake；P8-04 in-process child 在其上实现。
+//! 每个 agent 都使用同一套工具目录；隔离的是 session/context，副作用由
+//! 全局 effect scheduler、workspace CAS 和 agent graph 生命周期统一协调。
 
 pub mod async_tool;
 pub mod child;
 pub mod tool;
 
 use tpi_core::ids::{SessionId, SpanId, TraceId};
-
-/// 子代理只读能力白名单（P8 初始规格：只读调查）。
-/// P7-02 拆 crate：定义在 capabilities（tool::registry），此处 re-export
-/// 保持 `tpi::subagent::ReadOnlyCapability` 路径兼容。
-pub use tpi_capabilities::tool::registry::ReadOnlyCapability;
 
 /// O8（P8-09）：发起子代理的 parent trace 上下文（link 双向引用的 parent 侧）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,15 +16,13 @@ pub struct ParentTraceContext {
     pub span_id: SpanId,
 }
 
-/// 子代理请求（depth=1、concurrency=1、只读）。
+/// 子代理请求。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentRequest {
-    /// 调查指令。
+    /// Agent 的首条 user message。
     pub instruction: String,
-    /// fresh child session id（调用方创建）。
+    /// 独立 session id（调用方创建）。
     pub child_session: SessionId,
-    /// 只读能力白名单。
-    pub capabilities: Vec<ReadOnlyCapability>,
     /// O8（P8-09）：发起方（parent）trace 上下文；None = remote_boundary
     /// （独立测试/诊断路径，无 parent 可链）。
     pub parent: Option<ParentTraceContext>,
@@ -43,7 +33,7 @@ pub struct SubagentRequest {
 pub struct SubagentReport {
     pub child_session: SessionId,
     pub summary: String,
-    /// 引用的文件/证据（只读调查产出）。
+    /// 引用的文件/验证证据。
     pub evidence: Vec<String>,
     /// O8（P8-09）：child run 的 trace id（parent 可据它查询完整 child trace；
     /// 与 parent 侧 link 记录双向引用）。
@@ -56,7 +46,7 @@ pub struct SubagentReport {
 /// SubagentProvider 契约。
 #[async_trait::async_trait]
 pub trait SubagentProvider: Send {
-    /// 执行一次只读调查；返回 structured report。
+    /// 执行一次 agent；返回 structured report。
     async fn run_investigation(
         &mut self,
         request: SubagentRequest,
@@ -98,7 +88,6 @@ mod tests {
                 SubagentRequest {
                     instruction: "检查 src/main.rs".into(),
                     child_session: child,
-                    capabilities: vec![ReadOnlyCapability::Read],
                     parent: None,
                 },
                 tokio_util::sync::CancellationToken::new(),
@@ -110,23 +99,14 @@ mod tests {
         assert!(!report.evidence.is_empty(), "structured report 有证据");
     }
 
-    /// 契约：请求携带只读白名单（depth=1 语义：不递归）。
+    /// 契约：请求携带独立 session 和可选 parent trace。
     #[test]
-    fn request_carries_readonly_capabilities() {
+    fn request_carries_session_identity() {
         let req = SubagentRequest {
             instruction: "调查".into(),
             child_session: SessionId::new_v7(),
-            capabilities: vec![ReadOnlyCapability::Read],
             parent: None,
         };
-        assert_eq!(req.capabilities, vec![ReadOnlyCapability::Read]);
-        // 类型层面保证只读：ReadOnlyCapability 没有写能力变体（读无副作用；
-        // 目录浏览由 read 承担）——编译期即拒绝写工具进入白名单。
-        for cap in req.capabilities {
-            assert!(
-                matches!(cap, ReadOnlyCapability::Read),
-                "白名单只含只读能力"
-            );
-        }
+        assert!(!req.child_session.to_string().is_empty());
     }
 }

@@ -1441,7 +1441,7 @@ fn full_line_hit(target: HitTarget, width: u16) -> Option<HitRange> {
 /// §子代理：subagent 卡永不紧凑——它带 child 活动预览且是独立调查单元，
 /// 与相邻卡片必须保持 1 行间隔（多个并行子代理之间分隔清晰）。
 fn tool_card_compact(card: &ToolCard) -> bool {
-    card.name != "subagent"
+    !matches!(card.name.as_str(), "subagent" | "spawn_agent")
         && card.collapsed_lines == 0
         && !card.expanded
         && (card.diff.is_some() || card.output.is_some() || card.tail.is_some())

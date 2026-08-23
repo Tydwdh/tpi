@@ -86,16 +86,12 @@ fn provider_retry_shows_feedback() {
     );
     let hint2 = state.view.transient_hint.clone();
     assert!(
-        hint2.as_deref().is_some_and(|h| {
-            h.contains("第 3 次") && h.contains("2s")
-        }),
+        hint2
+            .as_deref()
+            .is_some_and(|h| { h.contains("第 3 次") && h.contains("2s") }),
         "后续重试 footer 更新: {hint2:?}"
     );
-    assert_eq!(
-        state.view.transcript.len(),
-        1,
-        "同轮后续重试不得追加提示行"
-    );
+    assert_eq!(state.view.transcript.len(), 1, "同轮后续重试不得追加提示行");
 }
 
 /// §bug 修复：idle 时输入 `/quit` 按 Enter 一次即入队（app 主循环立即消费
@@ -4240,6 +4236,19 @@ mod subagent_view_tests {
             Some("c1"),
             "点击 subagent 卡打开内部视图"
         );
+    }
+
+    #[test]
+    fn spawn_agent_card_opens_internal_view() {
+        let mut state = UiState::new(ViewModel::default());
+        state.view.begin_tool(
+            "spawn",
+            "spawn_agent",
+            Some("调查 src/main.rs".into()),
+            None,
+        );
+        reducer::update(&mut state, UiEvent::ClickTool("spawn".into()));
+        assert_eq!(state.view.subagent.active.as_deref(), Some("spawn"));
     }
 
     #[test]

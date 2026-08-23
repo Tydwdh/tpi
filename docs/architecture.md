@@ -78,16 +78,17 @@ compaction 是独立策略（保留最近完整消息 + 旧 tool 输出 prune + 
 模型 turn 状态机只提供 calls 与预算计数；以下复杂性全部隐藏在其内部：
 
 ```text
-pre-check all args → build waves（tool::scheduler 纯函数）
+pre-check all args → build local waves（tool::scheduler 纯函数）
 → write-ahead（ToolStarted / RecoveryMetadata，崩溃恢复）
-→ execute wave（并行 Pure/Read，串行 Write/WorkspaceUnknown）
+→ acquire GlobalEffectScheduler（跨 AgentGraph 的 Pure/path read/path write/barrier）
+→ execute effect（不同路径可并行，冲突路径或 WorkspaceUnknown 等待）
 → observe（无进展检测）→ persist（ToolCompleted）
 → refill results by source index
 ```
 
-调度原语（资源声明、waves、action_key、ProgressTracker）物理上在
-**src/tool/scheduler.rs**（tool 领域纯函数，无 IO / session / provider 依赖）。
-tool_runtime 在 waves 之上编排执行、持久化与 UI 通知。
+调度原语（资源声明、waves、action_key、ProgressTracker、全局 effect permit）物理上在
+**crates/tpi-capabilities/src/tool/scheduler.rs**；tool_runtime 在其上编排执行、
+持久化与 UI 通知。`spawn_agent` 本身只改变 AgentGraph，不持有 workspace lock。
 
 ## 5. Tool Provider（capability seam）
 

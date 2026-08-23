@@ -233,7 +233,7 @@ fn visible_window(card: &ToolCard, total: usize) -> (usize, usize, Option<String
     );
     let is_running = matches!(&card.state, ToolCardState::Running);
     // §子代理卡片：折叠态预览最新 2 行 child 活动（实时观察的卡片级呈现）。
-    let is_subagent = card.name == "subagent";
+    let is_subagent = matches!(card.name.as_str(), "subagent" | "spawn_agent");
     // 折叠态：collapsed_lines==0 → 只显示主行，不显示任何正文（overflow=true）；
     // 否则正文超折叠线才折叠。空正文（total==0）不折叠、不显示提示行。
     let overflow = total > 0 && (collapsed == 0 || total > collapsed);

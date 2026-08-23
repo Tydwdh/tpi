@@ -180,8 +180,25 @@ impl<P: Provider + 'static> RuntimeTask<P> {
                         "run task did not finish within 5s after cancel; aborting"
                     );
                     handle.abort();
+                    let _ = handle.await;
                 }
             }
+        }
+        // Session-scoped agents outlive an individual run, but never outlive
+        // the runtime that owns their graph. Cancel and join them after all
+        // parent runs have quiesced so no worker can race a closing session.
+        let agent_managers: Vec<_> = self
+            .sessions
+            .values()
+            .filter_map(|session| {
+                session
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|state| state.agents.clone()))
+            })
+            .collect();
+        for agents in agent_managers {
+            tpi_agent::agent::manager::AgentManager::shutdown_and_join(agents).await;
         }
         info!("tpi-runtime 已停止");
     }

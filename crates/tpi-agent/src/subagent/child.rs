@@ -1,10 +1,5 @@
-//! P8-04：in-process read-only child——复用进程内 agent run 执行只读调查。
-//!
-//! - concurrency 1 / depth 1（每次 run_investigation 一个 child，不递归）；
-//! - 只读 registry（read/list/search/glob 白名单，P8-03 类型保证）；
-//! - 独立 child session（`config.sessions_root/child` 下，隔离 parent）；
-//! - parent cancel 传播（同一 CancellationToken 传给 child run）；
-//! - parent 只接收 structured report（summary + evidence）。
+//! In-process agent worker: isolated session/context, shared tool directory,
+//! graph-routed cancellation and interaction resume.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +9,7 @@ use crate::agent::{self, LiveEvent, RunInput};
 use crate::provider::Provider;
 use crate::subagent::{SubagentProvider, SubagentReport, SubagentRequest};
 use tpi_capabilities::tool::ToolStreamEvent;
-use tpi_capabilities::tool::registry::{ToolRegistry, read_only_registry};
+use tpi_capabilities::tool::registry::{ToolRegistry, builtin_registry};
 use tpi_capabilities::workspace::ActiveWorkspace;
 use tpi_core::ids::{RunId, ToolCallId};
 use tpi_session::store::SessionLog;
@@ -35,6 +30,12 @@ pub struct InProcessChildProvider<P, F> {
     /// parent 视角的调用 id：转发 ToolStreamEvent 时用它匹配 parent 的卡片
     ///（child 内部事件的 call_id 是 child 命名空间，TUI 无法匹配）。
     parent_call_id: Option<ToolCallId>,
+    /// Shared session registry. When present, this runtime gets the same
+    /// tool surface as its parent; the legacy fallback is retained only for
+    /// isolated compatibility tests.
+    registry: Option<Arc<Mutex<ToolRegistry>>>,
+    /// Shared agent graph for recursive delegation and tree cancellation.
+    agents: Option<Arc<Mutex<crate::agent::manager::AgentManager>>>,
     _provider: std::marker::PhantomData<P>,
 }
 
@@ -51,6 +52,8 @@ impl<P, F> InProcessChildProvider<P, F> {
             report_tx: None,
             output_tx: None,
             parent_call_id: None,
+            registry: None,
+            agents: None,
             _provider: std::marker::PhantomData,
         }
     }
@@ -76,9 +79,22 @@ impl<P, F> InProcessChildProvider<P, F> {
         self.parent_call_id = Some(parent_call_id);
         self
     }
+
+    pub fn with_registry(mut self, registry: Arc<Mutex<ToolRegistry>>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    pub fn with_agent_manager(
+        mut self,
+        agents: Arc<Mutex<crate::agent::manager::AgentManager>>,
+    ) -> Self {
+        self.agents = Some(agents);
+        self
+    }
 }
 
-/// 从 assistant 文本提取证据引用（`@artifact/...`；只读调查的产出）。
+/// 从 assistant 文本提取证据引用（`@artifact/...`）。
 fn evidence_from(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -136,9 +152,6 @@ impl<P: Provider + Send, F: Fn() -> P + Send> SubagentProvider for InProcessChil
         request: SubagentRequest,
         cancel: CancellationToken,
     ) -> Result<SubagentReport, String> {
-        // depth 1：child 不再产生 child（不递归；P9-05 延后）。
-        // concurrency 1：调用方每次一个 child（P8-05 信号量之前）。
-
         // 独立 child provider 实例（不与 parent 争用 &mut provider）。
         let mut child_provider = (self.make_provider)();
 
@@ -154,9 +167,17 @@ impl<P: Provider + Send, F: Fn() -> P + Send> SubagentProvider for InProcessChil
         )
         .map_err(|e| format!("创建 child session 失败: {e}"))?;
 
-        // 只读 registry（白名单之外的工具不存在 → 不可调用）。
-        let registry: Arc<Mutex<ToolRegistry>> =
-            Arc::new(Mutex::new(read_only_registry(&request.capabilities)));
+        // Every normal runtime supplies the same full registry to root and child
+        // agents. Keep a full built-in fallback for direct provider tests; a
+        // child must never silently receive a reduced capability directory.
+        let registry: Arc<Mutex<ToolRegistry>> = self
+            .registry
+            .clone()
+            .unwrap_or_else(|| Arc::new(Mutex::new(builtin_registry())));
+        let agents = self
+            .agents
+            .clone()
+            .unwrap_or_else(|| Arc::new(Mutex::new(crate::agent::manager::AgentManager::new())));
 
         // §子代理实时观察：child 的 LiveEvent 转发为文本行经 output_tx 送出
         //（ToolOutputDelta，call_id 换成 parent 视角）——TUI 的 subagent 卡片
@@ -185,38 +206,88 @@ impl<P: Provider + Send, F: Fn() -> P + Send> SubagentProvider for InProcessChil
             }
         });
 
-        let outcome = agent::run(
-            &mut child_provider,
-            &mut child_session,
-            &self.config,
-            RunInput {
-                history: &[],
-                user_message: request.instruction.clone(),
-                ui: ui_tx,
-                cancel,
-                interactive: false,
-                force_compaction: false,
-                workspace: Some(self.workspace.clone()),
-                registry,
-                // Subagent 是只读调查（read/search/glob 白名单），不共享父进程的
-                // session 级注册表，也不允许生成后台进程/PTY（各自独立会话）。
-                processes: Arc::new(Mutex::new(
-                    tpi_capabilities::process::managed::ProcessRegistry::new(),
-                )),
-                terminals: Arc::new(Mutex::new(
-                    tpi_capabilities::terminal::TerminalRegistry::default(),
-                )),
-                agents: Arc::new(Mutex::new(crate::agent::manager::AgentManager::new())),
-            },
-        )
-        .await;
+        let processes = Arc::new(Mutex::new(
+            tpi_capabilities::process::managed::ProcessRegistry::new(),
+        ));
+        let terminals = Arc::new(Mutex::new(
+            tpi_capabilities::terminal::TerminalRegistry::default(),
+        ));
+        let mut user_message = request.instruction.clone();
+        let outcome = loop {
+            let history = tpi_session::store::replay_messages(
+                tpi_session::store::SessionStore::path(&child_session),
+            )
+            .map_err(|e| format!("读取 child history 失败: {e}"))?;
+            let outcome = agent::run(
+                &mut child_provider,
+                &mut child_session,
+                &self.config,
+                RunInput {
+                    history: &history,
+                    user_message,
+                    ui: ui_tx.clone(),
+                    cancel: cancel.clone(),
+                    interactive: true,
+                    force_compaction: false,
+                    workspace: Some(self.workspace.clone()),
+                    registry: registry.clone(),
+                    // Child is a normal runtime: it shares the graph and tool
+                    // registry, while its conversation/session remains isolated.
+                    processes: processes.clone(),
+                    terminals: terminals.clone(),
+                    agents: agents.clone(),
+                },
+            )
+            .await
+            .map_err(|e| format!("child run 失败: {e}"))?;
+            let Some(awaiting) = outcome.awaiting_input.as_ref() else {
+                break outcome;
+            };
+            let Some(agent_id) = agents
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent_for_session(request.child_session)
+            else {
+                return Err("child requested input without an agent graph owner".into());
+            };
+            let (interaction, answer) = agents
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .request_input(agent_id, awaiting.text.clone())?;
+            tracing::info!(
+                %agent_id,
+                request_id = %interaction.request_id,
+                "agent waiting for routed input"
+            );
+            // The report channel is the existing UI boundary for child
+            // activity. Mark this as progress; the actual answer is routed by
+            // `agent action=message` and never leaks into a parent prompt.
+            if let Some(report_tx) = &self.report_tx {
+                let _ = report_tx
+                    .send(crate::agent::LiveEvent::SubagentReported {
+                        child_session: request.child_session,
+                        summary: format!(
+                            "agent {} waiting for input (request {}): {}",
+                            agent_id, interaction.request_id, awaiting.text
+                        ),
+                        evidence: vec![],
+                    })
+                    .await;
+            }
+            user_message = tokio::select! {
+                answer = answer => answer.map_err(|_| "input request cancelled".to_string())?,
+                _ = cancel.cancelled() => return Err("child run cancelled（parent cancel 传播）".into()),
+            };
+        };
+        // No further child run can send UI events after the loop. Close the
+        // producer before joining the forwarder; otherwise the forwarder
+        // would wait forever on its receiver.
+        drop(ui_tx);
         // child run 结束 → child 的 ui sender 已 drop → 转发任务 flush 后退出。
         let _ = forward.await;
 
-        let outcome = outcome.map_err(|e| format!("child run 失败: {e}"))?;
-
         // O8（P8-09）：child trace 与 parent 的双向引用（link 事件）。child run
-        // 总是新 TraceId（depth 1 语义：不继承 parent trace）；parent 侧上下文
+        // 总是新 TraceId（context 隔离，不继承 parent trace）；parent 侧上下文
         // 存在时记录双向 id，否则记 remote_boundary（无 parent 上下文，如独立
         // 测试/诊断路径）。
         if let Some(parent) = &request.parent {
@@ -272,7 +343,6 @@ mod tests {
     use super::*;
     use crate::agent::LiveEvent;
     use crate::provider::{Provider, ProviderResponse};
-    use crate::subagent::ReadOnlyCapability;
     use tpi_capabilities::workspace::LocalWorkspace;
     use tpi_config::config::Config;
     use tpi_core::ids::RequestId;
@@ -397,7 +467,6 @@ mod tests {
                 SubagentRequest {
                     instruction: "调查 src/main.rs".into(),
                     child_session: child,
-                    capabilities: vec![ReadOnlyCapability::Read],
                     parent: None,
                 },
                 CancellationToken::new(),
@@ -435,7 +504,6 @@ mod tests {
                 SubagentRequest {
                     instruction: "调查".into(),
                     child_session: tpi_core::ids::SessionId::new_v7(),
-                    capabilities: vec![ReadOnlyCapability::Read],
                     parent: None,
                 },
                 cancel,
@@ -447,16 +515,15 @@ mod tests {
         );
     }
 
-    /// 只读 registry：白名单之外的工具不可用（无写/进程工具）。
+    /// Direct provider construction still receives the complete built-in tool
+    /// directory, matching the production composition root.
     #[test]
-    fn read_only_registry_excludes_writers() {
-        let caps = vec![ReadOnlyCapability::Read];
-        let registry = read_only_registry(&caps);
+    fn fallback_registry_matches_full_agent_directory() {
+        let registry = builtin_registry();
         assert!(registry.get("read").is_some(), "read 可用");
-        assert!(registry.get("bash").is_none(), "bash 不可用");
-        assert!(registry.get("edit").is_none(), "edit 不可用");
-        assert!(registry.get("write").is_none(), "write 不可用");
-        assert!(registry.get("web_fetch").is_none(), "网络工具不可用");
+        assert!(registry.get("bash").is_some(), "bash 可用");
+        assert!(registry.get("edit").is_some(), "edit 可用");
+        assert!(registry.get("write").is_some(), "write 可用");
     }
 }
 
@@ -465,7 +532,7 @@ mod tests {
 mod o8_tests {
     use super::tests::{ChildFake, test_config};
     use super::*;
-    use crate::subagent::{ParentTraceContext, ReadOnlyCapability};
+    use crate::subagent::ParentTraceContext;
     use tpi_capabilities::workspace::LocalWorkspace;
 
     /// child run 总是新 TraceId；report 携带（parent 可查询）。
@@ -484,7 +551,6 @@ mod o8_tests {
                 SubagentRequest {
                     instruction: "调查".into(),
                     child_session: tpi_core::ids::SessionId::new_v7(),
-                    capabilities: vec![ReadOnlyCapability::Read],
                     parent: None,
                 },
                 CancellationToken::new(),
@@ -529,7 +595,6 @@ mod o8_tests {
                 SubagentRequest {
                     instruction: "调查".into(),
                     child_session: tpi_core::ids::SessionId::new_v7(),
-                    capabilities: vec![ReadOnlyCapability::Read],
                     parent: Some(ParentTraceContext {
                         trace_id: tpi_core::ids::TraceId::new_v7(),
                         span_id: tpi_core::ids::SpanId::new_v7(),
@@ -548,7 +613,6 @@ mod p8_06_tests {
     use super::tests::{ChildFake, test_config};
     use super::*;
     use crate::agent::LiveEvent;
-    use crate::subagent::ReadOnlyCapability;
     use tpi_capabilities::workspace::ActiveWorkspace;
     use tpi_capabilities::workspace::LocalWorkspace;
 
@@ -569,7 +633,6 @@ mod p8_06_tests {
                 SubagentRequest {
                     instruction: "调查".into(),
                     child_session: tpi_core::ids::SessionId::new_v7(),
-                    capabilities: vec![ReadOnlyCapability::Read],
                     parent: None,
                 },
                 CancellationToken::new(),

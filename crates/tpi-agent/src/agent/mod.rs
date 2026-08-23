@@ -1749,7 +1749,6 @@ mod tests {
     };
     use crate::provider::ChatMessage;
     use tokio_util::sync::CancellationToken;
-    use tpi_core::plan::{Plan, PlanItem, PlanStatus};
 
     /// 最小可用 Config（build_context 只读 system_prompt_extra 等字段）。
     /// P1 Exit gate：经 config::test_config 构造（tui 依赖收敛在 config），
@@ -1796,13 +1795,6 @@ mod tests {
     /// 缓存语义：plan 不变时注入文本稳定，不破坏前缀缓存。
     #[test]
     fn build_context_appends_current_plan_as_system_role() {
-        let plan = Plan {
-            explanation: Some("修复侧边栏".into()),
-            items: vec![PlanItem {
-                text: "加宽侧边栏".into(),
-                status: PlanStatus::InProgress,
-            }],
-        };
         let config = unit_config();
         let messages = vec![ChatMessage::User("hello".into())];
         let ctx = build_context(&config, &messages, None, None, None, None);

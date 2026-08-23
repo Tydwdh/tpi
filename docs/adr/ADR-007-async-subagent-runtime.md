@@ -1,6 +1,6 @@
 # ADR-007：Durable Async Subagent Runtime（multi-agent delegation）
 
-- 状态：**Proposed（草案，待落地确认）**
+- 状态：**Accepted / implemented baseline (2026-08-24)**
 - 关联：`docs/architecture.md` §7 Suspend/Resume、crates/tpi-runtime、crates/tpi-agent、crates/tpi-session
 - 替代：ADR-006 的"parent cancellation"模型继续有效，本 ADR 在其上扩展 agent 生命周期的协作语义
 
@@ -8,10 +8,10 @@
 
 ## 0. 目标
 
-把 TPI 的子代理从"**工具执行**"升级为"**runtime-managed resource**"：
+把 TPI 的 agent delegation 从"**工具执行**"升级为"**runtime-managed resource**"：
 
 > Process 是 managed resource，Terminal 是 managed resource，Agent 也应该是 managed resource；
-> Subagent tool 只负责**控制 Agent resource**，而不负责执行完整的 child 生命周期。
+> parent/child 只是 AgentGraph 的边，不是权限等级或不同 runtime 类型。
 
 核心行为变化：
 
@@ -66,12 +66,8 @@ id_type!(DelegationId);
 
 ```rust
 enum AgentState {
-    Starting,     // 已注册，child task 尚未进入 Loop
-    Running,      // child AgentLoop 执行中
-    // （同 parent 一致的协作终态）
-    Stopped,      // 正常完成（有 report 或 settlement）
-    Failed,       // 不可恢复失败
-    Cancelled,    // 被 cancel / 父 session 关闭
+    Created, Starting, Running, WaitingTool, WaitingInput,
+    Completed, Failed, Cancelled,
 }
 ```
 
@@ -81,11 +77,11 @@ enum AgentState {
 struct AgentRecord {
     agent_id: AgentId,
     state: AgentState,
-    /// child 的独立 session id（child 拥有自己的 SessionLog）。
+    /// 独立 session id（每个 AgentRuntime 拥有自己的 SessionLog/context）。
     child_session: SessionId,
     /// 委托来源（供 Trace/Audit/ContextProjection 使用）。
     origin: ParentTraceContext,       // parent trace/span
-    /// worker JoinHandle + cancel —— worker 生命周期由 AgentManager 拥有。
+    /// worker JoinHandle + cancel —— worker 生命周期由 AgentGraph 拥有。
     cancel: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
     /// 最后已知状态/进度的朗视投影（跨 run 存活）。
@@ -149,7 +145,7 @@ impl AgentManager {
 
     // 控制
     fn cancel(&mut self, agent_id: AgentId);       // cancel token
-    fn close(&mut self, agent_id: AgentId);        // cancel + 清理记录
+    fn close(&mut self, agent_id: AgentId);        // 仅终态可清理，避免孤儿 worker
 
     // 唤醒（wait/wake 用）
     fn wait(&mut self, agent_id: AgentId) -> WaitGuard; // 挂起直到 notify/终态
@@ -163,8 +159,8 @@ impl AgentManager {
 ```text
 AgentManager::spawn
   ├─ 分配 AgentId
-  ├─ 创建 child 独立 session（SessionLog::create_with_id）
-  ├─ 创建只读 registry（reuse read_only_registry(capabilities)）
+    ├─ 创建 child 独立 session/context（SessionLog::create_with_id）
+    ├─ 绑定与 parent 相同的 ToolRegistry / GlobalEffectScheduler
   ├─ 绑定 parent report_tx / output_tx（实时观察）
   ├─ tokio::spawn(child worker)
   └─ 返回 agent_id（立即）
@@ -182,12 +178,20 @@ child worker（独立 task）
   └─ 结束（AgentState → Stopped/Settled）
 ```
 
-### 3.3 默认状态保留（V1 语义）
+### 3.3 统一 runtime 语义
 
-- 默认 `context mode = Fresh`（child 只拿任务指令 + 只读能力，无 parent 历史）。
-- **V1 只读**（child 白名单 read；search/glob 已下线，目录浏览/检索由 read 与 bash 承担）。
+- 默认 `context mode = Fresh`（child 只拿任务指令，无 parent 历史）。
+- parent 与 child 是同一种 `AgentRuntime`，共享完整工具目录；工具副作用由全局
+  scheduler/CAS/journal 协调，而不是通过 agent 权限白名单限制。
+- 每个 session root 也注册为一个稳定的 `AgentRuntime`；child 的
+  `parent_agent_id` 不再因 root 没有记录而丢失。
 - 允许同一 assistant step **并行 spawn 多个 child**（每个独立 AgentId，互不阻塞）。
-- `depth = 1`（child 不递归）。
+- 递归由 `max_depth`、`max_concurrent_agents`、`max_total_agents` 等 graph policy
+  控制；达到限制返回 runtime error，不删除 agent 工具。
+- `request_input` 由 `InteractionRouter` 路由到具体 agent，可由 parent/UI 定向回答。
+- `agent action=message` 在目标等待输入时回答该请求，否则写入目标的独立 mailbox；
+  `agent action=mailbox` 显式 drain 消息。mailbox 不会自动拼接到对话上下文，避免
+  sibling context 泄漏。
 
 ---
 
@@ -205,7 +209,6 @@ enum SessionEvent {
         agent_id: AgentId,
         child_session: SessionId,
         instruction: String,          // 任务摘要（诊断/重放）
-        capabilities: Vec<String>,    // 只读白名单快照
     },
 
     /// child 给出了语义 report（可能多条 progress / 一条 final）。
@@ -316,17 +319,18 @@ enum ReportDelivery {
 ## 7. 主代理 turn 不再阻塞：`spawn_agent` 如何返回
 
 关键改动点在 `ToolBatchExecutor`：**新增** `spawn_agent`（注册类操作，毫秒级返回），
-**保留现有同步 `subagent` 工具并存**（决策 1：新增保留并存，不改既有调用与测试）。
+生产路径使用非阻塞 `spawn_agent`；旧同步 `subagent` 仅作为兼容性适配器，
+不参与 agent graph 的主 wiring。
 
 - 现状：`subagent`（同步）的 `join_all(futures)` 同步等全部工具——保留不动。
 - 目标：`spawn_agent` 的 execute 只调 `AgentManager::spawn`（同步锁内注册 + `tokio::spawn`，
   本身不 await child），立刻返回 `{ agent_id, status: running }` 作为 `ChatMessage::Tool`。
-- 它**不进入 ReadOnly 并行 wave 的阻塞等待**（注册本身极快；作为独立操作类）。
+- `spawn_agent` 只产生 graph effect；child 内部的每一次工具调用才提交 workspace effect。
 
 这样，`spawn_agent` 在 wave 里与其它工具一样"瞬时完成"，主 agent 的 turn 照常继续，
 不受 child 是否完成影响。
 
-### 7.1 新增工具集（V1 final 形态）
+### 7.1 工具集
 
 | 工具 | 语义 | 阻塞? |
 |---|---|---|
@@ -400,15 +404,12 @@ AgentManager 生命周期绑定 **session**（`SessionRuntime.agents`），与 p
 
 ---
 
-## 10. 多 agent 写竞争（V2+，本 ADR 不实现）
+## 10. 多 agent 写竞争
 
-V1 保持只读，天然无跨 agent 写冲突。V2 起：
-
-```text
-Subagent Write = global WorkspaceMutation lock → isolated worktree → merge/reconcile
-```
-
-本 ADR 只保证 V1 只读，不引入跨 Agent 写调度（未来独立 ADR）。
+所有 agent 的 edit/write/bash 都进入同一个 `GlobalEffectScheduler` 与
+`WorkspaceCoordinator`：精确文件读/写按 normalized path 锁定，未知 workspace
+effect 才使用全局 barrier；写入仍由内部 CAS 拒绝 stale state。Git worktree
+不是生命周期或并发模型的一部分。
 
 ---
 
@@ -431,8 +432,8 @@ Subagent Write = global WorkspaceMutation lock → isolated worktree → merge/r
 ### Commit 3 — 非阻塞工具集
 - `spawn_agent` / `list_agents` / `agent_status` / `wait_agent` / `cancel_agent` 工具
   （Wire InputSchema + execute 只操作 AgentManager，本身不阻塞）
-- **新增** `SpawnAgentTool` + `AgentControlTool`（或一个工具多命令），**保留现有同步
-  `subagent` 工具并存**（决策 1：不删不替代，两者 namespace 不同，无冲突）
+- **新增** `SpawnAgentTool` + `AgentControlTool`（或一个工具多命令）；同步适配器不进入
+  production registry，避免两套 agent 生命周期语义
 - registry 接线：composition root 注入 `AgentManager`
 
 ### Commit 4 — worker 终态自报到 ParentInbox + durable event
@@ -462,7 +463,7 @@ Subagent Write = global WorkspaceMutation lock → isolated worktree → merge/r
 
 - Fork context（从 parent 历史创建 child）→ 未来
 - continuable agent / nested subagent → 未来
-- child 写 workspace / 跨 agent 写竞争 → V2+
+- Git worktree / fork context → 本轮不引入；context 仍按 AgentRuntime 隔离
 - wait 成为默认工作流 → 明确不鼓励
 - orphan/detached agent → 明确避免
 

@@ -1,9 +1,7 @@
-//! P8-03/P8-04 接线：把 in-process child 调查暴露为 `subagent` 工具。
+//! 兼容性的同步 subagent 适配器。
 //!
-//! 模型可调用 `subagent` 发起一次**只读调查**（depth=1、concurrency=1）：
-//! child 拥有独立 session/trace，只读工具白名单（read），
-//! 完成返回 structured report（summary + evidence）。parent 只接收 report，
-//! 不接收 child 的流式事件（raw stream 不灌主 transcript）。
+//! Production wiring uses `spawn_agent`/`agent`; this adapter remains for
+//! direct provider tests and therefore follows the same full tool directory.
 
 use std::sync::Arc;
 
@@ -18,9 +16,9 @@ use tpi_core::outcome::ToolOutcome;
 use crate::agent::LiveEvent;
 use crate::provider::Provider;
 use crate::subagent::child::InProcessChildProvider;
-use crate::subagent::{ReadOnlyCapability, SubagentProvider, SubagentRequest};
+use crate::subagent::{SubagentProvider, SubagentRequest};
 
-/// `subagent` 工具：发起只读调查（parent 侧接线）。
+/// `subagent` 工具：兼容性的同步 agent 调用。
 ///
 /// `P` = provider 类型；工厂用 `Arc<dyn Fn() -> P>` 持有——并行执行时每个
 /// child 需要独立 provider 实例，Arc 工厂可重复调用（P8-10 多指令并行）。
@@ -59,35 +57,9 @@ where
 /// `subagent` 工具参数（JSON schema 与 execute 解析一致）。
 #[derive(Debug, serde::Deserialize)]
 struct SubagentArgs {
-    /// 调查指令（child 的 user message；只读调查，不修改 workspace）。
-    /// §去重（A/B 单选）：一次调用 = 一个 child = 一张 TUI 卡片；并行调查
-    /// 由模型在同一 wave 发多个 `subagent` 调用（ReadOnly 类别批内并行）。
+    /// Agent 的 user message。
     #[serde(default)]
     instruction: String,
-    /// 只读能力白名单（默认 read；显式传则覆盖）。
-    #[serde(default)]
-    capabilities: Option<Vec<String>>,
-}
-
-impl SubagentArgs {
-    fn parse_capabilities(&self) -> Result<Vec<ReadOnlyCapability>, String> {
-        let Some(caps) = &self.capabilities else {
-            return Ok(vec![ReadOnlyCapability::Read]);
-        };
-        let mut out = Vec::new();
-        for name in caps {
-            let cap = match name.as_str() {
-                "read" => ReadOnlyCapability::Read,
-                other => {
-                    return Err(format!("未知只读能力: {other:?}（可用: read）"));
-                }
-            };
-            if !out.contains(&cap) {
-                out.push(cap);
-            }
-        }
-        Ok(out)
-    }
 }
 
 #[async_trait]
@@ -100,10 +72,8 @@ where
     }
 
     fn description(&self) -> &str {
-        "发起一次只读子代理调查：child 拥有独立 session/trace，只能调用只读工具 \
-         (read)，返回结构化报告（summary + 证据引用）。适合并行 \
-         独立调查、问题定位、代码审计：一次调用 = 一个 child；需要并行时在同一 \
-         wave 发起多个 subagent 调用（每个独立卡片、独立观察）。depth=1（child 不再发起 child）。"
+        "发起一次同步 agent：child 拥有独立 session/trace，并使用与 parent 相同的工具目录，\
+         返回结构化报告（summary + 证据引用）。生产路径请使用非阻塞 spawn_agent。"
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -112,15 +82,10 @@ where
             "properties": {
                 "instruction": {
                     "type": "string",
-                    "description": "单条调查指令（child 的 user message；只读调查，不修改 workspace）"
-                },
-                "capabilities": {
-                    "type": "array",
-                    "items": { "type": "string", "enum": ["read"] },
-                    "description": "只读能力白名单（默认 read；目录浏览走 read depth）"
+                    "description": "单条 agent 指令；child 使用与 parent 相同的工具目录"
                 }
             },
-            "description": "发起一次只读子代理调查：child 拥有独立 session/trace，只能调用只读工具 (read)，返回结构化报告（summary + 证据引用）。适合并行独立调查、问题定位、代码审计：一次调用 = 一个 child；需要并行时在同一 wave 发起多个 subagent 调用（每个独立卡片、独立观察）。depth=1（child 不再发起 child）。"
+            "description": "发起一次同步 agent，使用与 parent 相同的工具目录并返回结构化报告"
         })
     }
 
@@ -128,11 +93,10 @@ where
         ToolOrigin::Builtin
     }
 
-    /// P8-10：`subagent` 是只读工具（child 白名单仅 read，
-    /// 无写副作用）——声明 `ReadOnly` 使其与批内 read 并行执行
-    ///（默认 WorkspaceUnknown 会按独立 wave 串行）。
+    /// The synchronous adapter may execute any workspace effect, so it is
+    /// conservatively serialized by the global effect scheduler.
     fn access_class(&self) -> tpi_capabilities::tool::registry::ToolAccessClass {
-        tpi_capabilities::tool::registry::ToolAccessClass::ReadOnly
+        tpi_capabilities::tool::registry::ToolAccessClass::WorkspaceUnknown
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
@@ -167,38 +131,6 @@ where
                 },
             );
         }
-        let capabilities = match parsed.parse_capabilities() {
-            Ok(c) => c,
-            Err(e) => {
-                return ToolOutcome::failed(
-                    self.name(),
-                    tpi_core::outcome::ModelPayload {
-                        status: tpi_core::outcome::ToolStatus::Failed,
-                        program: None,
-                        exit_code: Some(2),
-                        duration_ms: 0,
-                        output: e,
-                        effect: None,
-                        artifact: None,
-                    },
-                );
-            }
-        };
-        if capabilities.is_empty() {
-            return ToolOutcome::failed(
-                self.name(),
-                tpi_core::outcome::ModelPayload {
-                    status: tpi_core::outcome::ToolStatus::Failed,
-                    program: None,
-                    exit_code: Some(2),
-                    duration_ms: 0,
-                    output: "subagent capabilities 不能为空（至少一项只读能力）".into(),
-                    effect: None,
-                    artifact: None,
-                },
-            );
-        }
-
         // §去重（A/B 单选）：一次调用 = 一个 child。child 独立 session/trace/
         // provider 实例；取消用 ctx.cancel（= 当前 run 的 token），用户 Esc /
         // Ctrl-C / watchdog 超时能中止 child。child 活动事件（assistant 文本 /
@@ -226,7 +158,6 @@ where
         let request = SubagentRequest {
             instruction: parsed.instruction.clone(),
             child_session: SessionId::new_v7(),
-            capabilities,
             parent: None, // 工具路径无 parent trace（child 自己起新 trace）
         };
         // §bug 修复：测量 child 全部完成的实际耗时并写入结果——此前直接
@@ -270,7 +201,7 @@ where
 }
 
 /// 供 registry 注册使用的类型擦除构造（composition root 调用）。
-/// P8-04：parent 侧把 `subagent` 工具注入 registry，模型即可发起只读调查。
+/// Compatibility-only registration for the synchronous agent adapter.
 pub fn register_subagent_tool<P, F>(
     registry: &Arc<std::sync::Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
     config: Arc<tpi_config::config::Config>,
@@ -396,17 +327,6 @@ mod tool_tests {
     }
 
     #[tokio::test]
-    async fn subagent_tool_rejects_unknown_capability() {
-        let tool = SubagentTool::new(test_config(), || ChildFake, None);
-        let ctx = minimal_ctx();
-        let outcome = tool
-            .execute(r#"{"instruction": "x", "capabilities": ["write"]}"#, &ctx)
-            .await;
-        assert_eq!(outcome.status, tpi_core::outcome::ToolStatus::Failed);
-        assert!(outcome.model_text().contains("未知只读能力"));
-    }
-
-    #[tokio::test]
     async fn subagent_tool_name_and_schema() {
         let tool = SubagentTool::new(test_config(), || ChildFake, None);
         assert_eq!(tool.name(), "subagent");
@@ -417,10 +337,7 @@ mod tool_tests {
             schema["properties"].get("instructions").is_none(),
             "instructions 数组已移除（一次调用 = 一个 child）"
         );
-        assert_eq!(
-            schema["properties"]["capabilities"]["items"]["enum"][0],
-            "read"
-        );
+        assert!(schema["properties"].get("capabilities").is_none());
     }
 
     /// §去重（A/B 单选）：instructions 数组已移除——传它应失败（未知参数
@@ -533,6 +450,6 @@ mod register_tests {
             .into_iter()
             .find(|d| d.name == "subagent")
             .expect("subagent descriptor");
-        assert!(desc.description.contains("只读子代理调查"));
+        assert!(desc.description.contains("同步 agent"));
     }
 }

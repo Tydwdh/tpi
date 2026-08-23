@@ -2,11 +2,11 @@
 //!
 //! - [`SpawnAgentTool`]：`spawn_agent` --注册 + 启动 worker，**毫秒级返回**
 //!   agent_id（不等待 child 完成；主代理 turn 不阻塞）。
-//! - [`AgentControlTool`]：`agent` 控制面（list/status/wait/cancel），
+//! - [`AgentControlTool`]：`agent` 控制面（list/status/wait/cancel/message/mailbox），
 //!   镜像 `process` 工具的多 action 模式。
 //!
-//! worker（child AgentLoop）由 `tokio::spawn` 后台执行，复用
-//! [`InProcessChildProvider`]（独立 child session + 只读 registry + Fresh context）。
+//! worker（child AgentLoop）由后台 task 执行，复用
+//! [`InProcessChildProvider`]（独立 child session + shared tool registry + Fresh context）。
 //! 完成时把 report/settlement 写回 [`AgentManager`]（inbox + notify）。
 //!
 //! durable 语义（ADR-007 §4.2）：worker **不直接写 parent SessionLog**（parent
@@ -30,12 +30,12 @@ use tpi_session::{SessionEvent, SubagentFinishedReason};
 use crate::agent::manager::{AgentManager, AgentState, Delegation, DelegationState, PendingReport};
 use crate::provider::Provider;
 use crate::subagent::child::InProcessChildProvider;
-use crate::subagent::{ReadOnlyCapability, SubagentProvider, SubagentRequest};
+use crate::subagent::{SubagentProvider, SubagentRequest};
 
 /// session 级共享 AgentManager 句柄（composition root 创建，跨 run 存活）。
 pub type SharedAgentManager = Arc<Mutex<AgentManager>>;
 
-/// `spawn_agent`：发起一次非阻塞只读调查（ADR-007）。
+/// `spawn_agent`：发起一次非阻塞 agent delegation（ADR-007）。
 pub struct SpawnAgentTool<P>
 where
     P: Provider + Send + 'static,
@@ -76,31 +76,6 @@ where
 struct SpawnAgentArgs {
     #[serde(default)]
     instruction: String,
-    /// 只读能力白名单（默认 read）。
-    #[serde(default)]
-    capabilities: Option<Vec<String>>,
-}
-
-fn parse_capabilities(names: Option<&Vec<String>>) -> Result<Vec<ReadOnlyCapability>, String> {
-    let Some(names) = names else {
-        return Ok(vec![ReadOnlyCapability::Read]);
-    };
-    let mut out = Vec::new();
-    for name in names {
-        let cap = match name.as_str() {
-            "read" => ReadOnlyCapability::Read,
-            other => {
-                return Err(format!("未知只读能力: {other:?}（可用: read）"));
-            }
-        };
-        if !out.contains(&cap) {
-            out.push(cap);
-        }
-    }
-    if out.is_empty() {
-        return Err("capabilities 不能为空（至少一项只读能力）".into());
-    }
-    Ok(out)
 }
 
 /// 组装 spawn_agent 的立即返回文本（模型可见）。
@@ -125,10 +100,12 @@ fn spawn_worker<P>(
     delegation_id: DelegationId,
     request: SubagentRequest,
     cancel: CancellationToken,
+    registry: Arc<Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
     output_tx: Option<tokio::sync::mpsc::Sender<tpi_capabilities::tool::ToolStreamEvent>>,
     parent_call_id: Option<tpi_core::ids::ToolCallId>,
     report_tx: Option<tokio::sync::mpsc::Sender<crate::agent::LiveEvent>>,
-) where
+) -> tokio::task::JoinHandle<()>
+where
     P: Provider + Send + 'static,
 {
     let child_session = request.child_session;
@@ -146,7 +123,9 @@ fn spawn_worker<P>(
             },
             config.clone(),
             child_workspace,
-        );
+        )
+        .with_registry(registry)
+        .with_agent_manager(manager.clone());
         // P8-06：绑定实时观察通道（child 活动经此通道转发到 parent TUI 卡片）。
         child = child.with_report_tx(report_tx);
         if let Some(call_id) = parent_call_id {
@@ -160,6 +139,9 @@ fn spawn_worker<P>(
                 guard.settle(
                     delegation_id,
                     agent_id,
+                    // Keep the stable external settlement spelling for the
+                    // existing protocol; `Completed` remains available in
+                    // the unified runtime state machine for newer callers.
                     AgentState::Stopped,
                     Some(PendingReport {
                         delegation_id,
@@ -173,16 +155,6 @@ fn spawn_worker<P>(
             }
             Err(message) => {
                 let cancelled = message.contains("cancelled");
-                guard.settle(
-                    delegation_id,
-                    agent_id,
-                    if cancelled {
-                        AgentState::Cancelled
-                    } else {
-                        AgentState::Failed
-                    },
-                    None,
-                );
                 // 失败也留一条 pending notice，让 parent boundary 可见失败原因。
                 guard.report(
                     delegation_id,
@@ -195,9 +167,22 @@ fn spawn_worker<P>(
                         final_report: true,
                     },
                 );
+                // Report must precede settlement: report() marks a delegation
+                // as Reported, while the runtime terminal state is Settled.
+                guard.settle(
+                    delegation_id,
+                    agent_id,
+                    if cancelled {
+                        AgentState::Cancelled
+                    } else {
+                        AgentState::Failed
+                    },
+                    None,
+                );
             }
         }
-    });
+        guard.complete_worker(agent_id);
+    })
 }
 
 #[async_trait]
@@ -210,10 +195,10 @@ where
     }
 
     fn description(&self) -> &str {
-        "发起一次**非阻塞**只读子代理调查：立即返回 agent_id（不等待完成），child 拥有独立 \
-         session/trace，只能调用只读工具(read)。主代理应继续其他工作，之后用 \
+        "发起一次**非阻塞** agent：立即返回 agent_id（不等待完成），child 拥有独立 \
+         session/trace 和隔离上下文，但使用与当前 agent 相同的工具目录。主代理应继续其他工作，之后用 \
          `agent` 工具查询/等待结果；已完成的报告会在下一次模型输入边界自动注入。需要并行 \
-         调查时连续发起多个 spawn_agent（每个独立 agent）。depth=1。"
+         工作时连续发起多个 spawn_agent（每个独立 agent）；递归深度由 runtime policy 控制。"
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -222,12 +207,7 @@ where
             "properties": {
                 "instruction": {
                     "type": "string",
-                    "description": "单条调查指令（child 的 user message；只读调查，不修改 workspace）"
-                },
-                "capabilities": {
-                    "type": "array",
-                    "items": { "type": "string", "enum": ["read"] },
-                    "description": "只读能力白名单（默认 read）"
+                    "description": "单条 agent 指令；child 使用与 parent 相同的工具目录"
                 }
             },
             "required": ["instruction"]
@@ -238,9 +218,9 @@ where
         ToolOrigin::Builtin
     }
 
-    /// spawn 是注册类操作（毫秒级），声明 ReadOnly 与批内其他读工具并行。
+    /// spawn 只修改 agent graph，不访问 workspace。
     fn access_class(&self) -> tpi_capabilities::tool::registry::ToolAccessClass {
-        tpi_capabilities::tool::registry::ToolAccessClass::ReadOnly
+        tpi_capabilities::tool::registry::ToolAccessClass::Pure
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
@@ -251,33 +231,35 @@ where
         if parsed.instruction.trim().is_empty() {
             return args_error("spawn_agent 需要非空 instruction".into());
         }
-        let capabilities = match parse_capabilities(parsed.capabilities.as_ref()) {
-            Ok(c) => c,
-            Err(e) => return args_error(e),
-        };
-
         let delegation_id = DelegationId::new_v7();
         let child_session = SessionId::new_v7();
-        let child_cancel = CancellationToken::new();
-        // run 级取消传播：parent run 取消时 child 一并取消（worker 额外监听
-        // ctx.cancel，两者任一触发即停）。
-        let worker_cancel = CancellationToken::new();
-        {
-            let run_cancel = ctx.cancel.clone();
-            let worker_cancel = worker_cancel.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = run_cancel.cancelled() => worker_cancel.cancel(),
-                    _ = worker_cancel.cancelled() => {}
-                }
+        // A child token is linked to the parent run and is also the exact
+        // token stored in AgentManager. Cancelling through either path now
+        // reaches the worker (the previous code registered a different token).
+        let child_cancel = ctx.cancel.child_token();
+
+        let parent_agent_id = SessionId::parse_str(&ctx.session_id)
+            .ok()
+            .and_then(|session| {
+                self.manager
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .agent_for_session(session)
             });
-        }
 
         let instruction = parsed.instruction.clone();
         // 注册（Starting）+ 委托记录。
         let agent_id = {
             let mut manager = self.manager.lock().unwrap_or_else(|p| p.into_inner());
-            match manager.register(child_session, instruction.clone(), child_cancel.clone()) {
+            // The graph records the exact active directory used by the parent
+            // runtime, so descendants receive the same tool surface.
+            manager.set_tool_registry(ctx.registry.clone());
+            match manager.register_child(
+                child_session,
+                instruction.clone(),
+                child_cancel.clone(),
+                parent_agent_id,
+            ) {
                 Ok(id) => {
                     manager.add_delegation(Delegation {
                         id: delegation_id,
@@ -292,7 +274,7 @@ where
         };
 
         // 启动 worker（后台；不 await）。
-        spawn_worker(
+        let worker = spawn_worker(
             self.config.clone(),
             self.make_provider.clone(),
             self.manager.clone(),
@@ -301,18 +283,36 @@ where
             SubagentRequest {
                 instruction,
                 child_session,
-                capabilities,
                 parent: None,
             },
-            worker_cancel,
+            child_cancel.clone(),
+            ctx.registry.clone(),
             ctx.output_tx.clone(),
             Some(ctx.call_id),
             self.report_tx.clone(),
         );
         // worker 已 spawn：标记 Running。
-        {
+        let unowned_worker = {
             let mut manager = self.manager.lock().unwrap_or_else(|p| p.into_inner());
             manager.mark_running(agent_id);
+            if let Err((error, worker)) = manager.register_worker(agent_id, worker) {
+                tracing::error!(%error, %agent_id, "agent worker could not be registered");
+                // The task has already started; cancellation is the safe
+                // fallback when ownership registration unexpectedly fails.
+                let _ = manager.cancel(agent_id);
+                Some(worker)
+            } else {
+                None
+            }
+        };
+        if let Some(worker) = unowned_worker {
+            child_cancel.cancel();
+            // The graph was closed between registration and ownership handoff.
+            // Keep a join owner until the task observes cancellation; never
+            // silently detach a worker whose process tree may still be alive.
+            tokio::spawn(async move {
+                let _ = worker.await;
+            });
         }
 
         ToolOutcome::succeeded(
@@ -345,9 +345,11 @@ where
 
 #[derive(Debug, serde::Deserialize)]
 struct AgentControlArgs {
-    /// list / status / wait / cancel / close。
+    /// list / status / wait / cancel / close / message / mailbox。
     pub action: String,
     pub agent_id: Option<String>,
+    /// Answer for a graph-routed request_input or a mailbox message.
+    pub message: Option<String>,
     /// wait 的超时毫秒（默认 120_000；0 = 不限时）。
     #[serde(default)]
     pub timeout_ms: Option<u64>,
@@ -382,10 +384,11 @@ where
     }
 
     fn description(&self) -> &str {
-        "控制/查询后台子代理（spawn_agent 启动的调查）。action: \
+        "控制/查询 agent graph 中的后台 agent。action: \
          list=列出全部agent与状态；status=查询单个agent（含最近报告）；wait=等待 \
          agent 终态（**仅在下一步必须依赖该结果时使用**，可带 timeout_ms；正常应 \
-         继续其他工作）；cancel=取消；close=取消并清理记录。示例：\
+         继续其他工作）；cancel=取消；close=在终态后清理记录；message=向 agent \
+         投递 mailbox 或回答 request_input；mailbox=读取指定 agent 的 mailbox。示例：\
          agent action=list / agent action=status agent_id=\"...\""
     }
 
@@ -393,8 +396,9 @@ where
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["list", "status", "wait", "cancel", "close"] },
-                "agent_id": { "type": "string", "description": "目标 agent id（status/wait/cancel/close 必填）" },
+                "action": { "type": "string", "enum": ["list", "status", "wait", "cancel", "close", "message", "mailbox"] },
+                "agent_id": { "type": "string", "description": "目标 agent id（status/wait/cancel/close/message 必填；mailbox 省略时读取当前 agent）" },
+                "message": { "type": "string", "description": "message action 的投递内容" },
                 "timeout_ms": { "type": "integer", "description": "wait 超时毫秒（默认 120000；0=不限时）" }
             },
             "required": ["action"]
@@ -406,7 +410,7 @@ where
     }
 
     fn access_class(&self) -> tpi_capabilities::tool::registry::ToolAccessClass {
-        tpi_capabilities::tool::registry::ToolAccessClass::ReadOnly
+        tpi_capabilities::tool::registry::ToolAccessClass::Pure
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
@@ -456,6 +460,89 @@ where
                         ok_text("status", body)
                     }
                     None => return agent_not_found(raw),
+                }
+            }
+            "message" => {
+                let Some(raw) = &parsed.agent_id else {
+                    return args_error("agent message 需要 agent_id".into());
+                };
+                let Ok(id) = parse_agent_id(raw) else {
+                    return agent_not_found(raw);
+                };
+                let Some(message) = parsed.message.clone() else {
+                    return args_error("agent message 需要 message".into());
+                };
+                if message.trim().is_empty() {
+                    return args_error("agent message 需要非空 message".into());
+                }
+                let mut manager = self.manager.lock().unwrap_or_else(|p| p.into_inner());
+                if manager.pending_input(id).is_some() {
+                    match manager.answer_agent(id, message) {
+                        Ok(request) => ok_text(
+                            "message",
+                            format!(
+                                "agent_id: {}\nrequest_id: {}\nstatus: input_answered\n",
+                                request.agent_id, request.request_id
+                            ),
+                        ),
+                        Err(error) => args_error(error),
+                    }
+                } else {
+                    let from_agent_id = tpi_core::ids::SessionId::parse_str(&ctx.session_id)
+                        .ok()
+                        .and_then(|session| manager.agent_for_session(session));
+                    match manager.send_message(from_agent_id, id, message) {
+                        Ok(message) => ok_text(
+                            "message",
+                            format!(
+                                "agent_id: {}\nmessage_id: {}\nstatus: queued\n",
+                                message.to_agent_id, message.message_id
+                            ),
+                        ),
+                        Err(error) => args_error(error),
+                    }
+                }
+            }
+            "mailbox" => {
+                let target = match &parsed.agent_id {
+                    Some(raw) => match parse_agent_id(raw) {
+                        Ok(id) => id,
+                        Err(_) => return agent_not_found(raw),
+                    },
+                    None => {
+                        let manager = self.manager.lock().unwrap_or_else(|p| p.into_inner());
+                        let Some(session) =
+                            tpi_core::ids::SessionId::parse_str(&ctx.session_id).ok()
+                        else {
+                            return args_error("当前 runtime 没有关联 agent".into());
+                        };
+                        let Some(id) = manager.agent_for_session(session) else {
+                            return args_error("当前 runtime 没有关联 agent".into());
+                        };
+                        id
+                    }
+                };
+                let mut manager = self.manager.lock().unwrap_or_else(|p| p.into_inner());
+                match manager.drain_mailbox(target) {
+                    Ok(messages) => {
+                        let mut body = String::from("messages:\n");
+                        if messages.is_empty() {
+                            body.push_str("  (none)\n");
+                        } else {
+                            for message in messages {
+                                let sender = message
+                                    .from_agent_id
+                                    .map(|id| id.to_string())
+                                    .unwrap_or_else(|| "root".into());
+                                body.push_str(&format!(
+                                    "  {} from={} {}\n",
+                                    message.message_id, sender, message.body
+                                ));
+                            }
+                        }
+                        ok_text("mailbox", body)
+                    }
+                    Err(error) => args_error(error),
                 }
             }
             "wait" => {
@@ -543,7 +630,7 @@ where
                 }
             }
             other => args_error(format!(
-                "未知 action: {other:?}（可用: list/status/wait/cancel/close）"
+                "未知 action: {other:?}（可用: list/status/wait/cancel/close/message/mailbox）"
             )),
         };
         outcome.with_timing(started.elapsed().as_millis() as u64)
@@ -649,18 +736,6 @@ pub fn settled_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn capabilities_parse_defaults_and_errors() {
-        assert_eq!(
-            parse_capabilities(None).unwrap(),
-            vec![ReadOnlyCapability::Read]
-        );
-        let caps = parse_capabilities(Some(&vec!["read".into()])).unwrap();
-        assert_eq!(caps, vec![ReadOnlyCapability::Read]);
-        assert!(parse_capabilities(Some(&vec![])).is_err());
-        assert!(parse_capabilities(Some(&vec!["bash".into()])).is_err());
-    }
 
     #[test]
     fn spawn_reply_mentions_nonblocking() {

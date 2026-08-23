@@ -38,6 +38,8 @@ pub(super) struct ToolRuntime {
     terminals: Arc<Mutex<tpi_capabilities::terminal::TerminalRegistry>>,
     /// ADR-007：AgentManager（drain inbox 供 build_context 注入 pending reports）。
     agents: Arc<std::sync::Mutex<crate::agent::manager::AgentManager>>,
+    /// Session/workspace-wide effect scheduler shared by every agent runtime.
+    effect_scheduler: Arc<tpi_capabilities::tool::scheduler::GlobalEffectScheduler>,
     /// ToolRegistry（builtin + MCP；agent 工具目录，README2 Phase 5）。
     /// Mutex：Phase 3 的 McpManager 运行时注册 MCP 工具。
     registry: Arc<std::sync::Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
@@ -94,6 +96,59 @@ impl ToolRuntime {
         // P1-05：工具执行策略来自窄视图 ToolPolicy（不直接读 Config 的
         // allow_outside_workspace/artifacts_root/shell_path）。
         let policy = config.tool_policy();
+        let (effect_scheduler, workspace_session) = {
+            let mut manager = tpi_core::util::lock_mutex(&agents, "agent_manager");
+            // Bind the graph to the composition root's active directory before
+            // projecting any runtime. `AgentManager::new()` keeps a builtin
+            // fallback for isolated tests, but production sessions may also
+            // contain MCP and overlay tools.
+            manager.set_tool_registry(registry.clone());
+            if let Ok(root_session) = tpi_core::ids::SessionId::parse_str(&session_id) {
+                manager
+                    .ensure_root(root_session, cancel.clone())
+                    .unwrap_or_else(|error| panic!("root agent registration failed: {error}"));
+            }
+            let scheduler = manager.effect_scheduler();
+            let owner_agent_id = tpi_core::ids::SessionId::parse_str(&session_id)
+                .ok()
+                .and_then(|session| manager.agent_for_session(session))
+                .or_else(|| {
+                    tpi_core::ids::SessionId::parse_str(&session_id)
+                        .ok()
+                        .map(|id| tpi_core::ids::AgentId::from_u128(id.0.as_u128()))
+                })
+                .unwrap_or_else(tpi_core::ids::AgentId::new_v7);
+            let provenance = {
+                let runtime = manager.runtime(owner_agent_id);
+                tpi_core::workspace::transaction::MutationProvenance {
+                    agent_id: owner_agent_id.to_string(),
+                    parent_agent_id: runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.parent_agent_id)
+                        .map(|id| id.to_string()),
+                    delegation_id: manager
+                        .delegation_for_agent(owner_agent_id)
+                        .map(|id| id.to_string()),
+                }
+            };
+            let workspace_session = manager.workspace_session().or_else(|| {
+                let shared = tpi_capabilities::workspace::session::create_workspace_manager(
+                    config.workspace_root.as_std_path(),
+                    &session_id,
+                    &policy.artifacts_root,
+                )
+                .ok()
+                .map(tpi_capabilities::workspace::session::WorkspaceSession::new)
+                .map(Arc::new);
+                if let Some(session) = &shared {
+                    manager.set_workspace_session(session.clone());
+                }
+                shared
+            });
+            let workspace_session = workspace_session
+                .map(|session| Arc::new(session.as_ref().clone().with_provenance(provenance)));
+            (scheduler, workspace_session)
+        };
         Self {
             config: RuntimeConfig {
                 workspace_root: config.workspace_root.clone(),
@@ -114,8 +169,9 @@ impl ToolRuntime {
             processes,
             terminals,
             agents,
+            effect_scheduler,
             registry,
-            workspace_session: None, // Initialized lazily or by caller.
+            workspace_session,
         }
     }
 
@@ -132,6 +188,22 @@ impl ToolRuntime {
     /// request boundary 调用，结果传给 build_context 注入 system message。
     pub(super) fn drain_reports(&self) -> Vec<crate::agent::manager::PendingReport> {
         tpi_core::util::lock_mutex(&self.agents, "agent_manager").drain_inbox()
+    }
+
+    fn owner_agent_id(&self) -> tpi_core::ids::AgentId {
+        if let Ok(session) = tpi_core::ids::SessionId::parse_str(&self.session_id)
+            && let Some(agent_id) =
+                tpi_core::util::lock_mutex(&self.agents, "agent_manager").agent_for_session(session)
+        {
+            return agent_id;
+        }
+        // The root runtime is not a child registration, but still needs a
+        // stable scheduler identity. Deriving it from the session keeps
+        // concurrent calls from the same root runtime grouped without adding
+        // an agent-only field to the model protocol.
+        tpi_core::ids::SessionId::parse_str(&self.session_id)
+            .map(|id| tpi_core::ids::AgentId::from_u128(id.0.as_u128()))
+            .unwrap_or_else(|_| tpi_core::ids::AgentId::new_v7())
     }
 
     pub(super) fn plan_snapshot(&self) -> Option<Plan> {
@@ -155,8 +227,8 @@ impl ToolRuntime {
             .select(registry.descriptors(), context)
             .into_iter()
             // §tool-surface：主 agent 模型不再暴露 `read`（判死刑）。
-            // 内部实现（ReadTool / files::read / ReadOnlyCapability::Read）保留：
-            // subagent 只读 registry 与 @artifact 读取机制仍依赖它。模型改由
+            // 内部实现（ReadTool / files::read）保留：artifact 读取机制仍依赖
+            // 它。模型改由
             // `bash`(rg/cat/sed/nl) 读取文件内容。
             .filter(|d| d.name != "read")
             .map(|d| crate::provider::ToolDef {
@@ -387,10 +459,10 @@ async fn execute_batch<P: Provider, S: tpi_session::store::SessionStore>(
         let Some(tool) = BuiltinTool::from_name(&call.name) else {
             // 外部工具（MCP adapter）？P4-03：用 Step 快照（不锁 registry）。
             if let Some(adapter) = tool_runtime.active_set().external.get(&call.name).cloned() {
-                // P8-10：External 工具的调度访问类别——`ReadOnly`（subagent 等
-                // 只读工具）与批内 read/search 并行；默认 `WorkspaceUnknown`
-                //（MCP 等未知副作用）保持串行保守。
+                // External tools declare an effect class. ReadOnly here means
+                // workspace read access, not a reduced agent tool directory.
                 let access = match adapter.access_class() {
+                    tpi_capabilities::tool::registry::ToolAccessClass::Pure => ToolAccess::Pure,
                     tpi_capabilities::tool::registry::ToolAccessClass::ReadOnly => {
                         tpi_capabilities::tool::scheduler::read_workspace_lock(
                             &config.workspace_root,
@@ -583,6 +655,12 @@ error: invalid_arguments
             // 工具真正启动前通知（语义事实 + 原始参数；P1-03：target/command 展示
             // 摘要由 app projector 生成，agent 不再产生 view 字段）。
             let kind_name = kind.name().to_string();
+            let effect_scheduler = tool_runtime.effect_scheduler.clone();
+            let effect_request = tpi_capabilities::tool::scheduler::EffectRequest {
+                agent_id: tool_runtime.owner_agent_id(),
+                tool_call_id: calls[source_index].call_id,
+                effect: access.clone(),
+            };
             // P4-07：typed 分类（BuiltinTool enum，不再 string 比较）。
             let is_plan_tool = BuiltinTool::from_name(kind.name()) == Some(BuiltinTool::UpdatePlan);
             if !is_plan_tool {
@@ -601,20 +679,49 @@ error: invalid_arguments
             if let Some(backup) = plan.as_ref().and_then(|p| p.backup_path.as_ref()) {
                 backup_cleanup.insert(source_index, backup.clone());
             }
+            let owner_agent_id = effect_request.agent_id;
+            let agent_manager = tool_runtime.agents.clone();
             futures.push(async move {
                 if blocked {
                     let outcome = repeated_outcome(&kind_name, &action_key);
                     (source_index, outcome.into_stored())
                 } else {
-                    let outcome = match kind {
-                        tpi_capabilities::tool::scheduler::PreparedKind::Builtin { tool, args } => {
-                            tool::execute(tool, args, &ctx, plan.as_ref()).await
+                    if let Ok(mut manager) = agent_manager.lock() {
+                        let _ = manager.mark_waiting_tool(owner_agent_id);
+                    }
+                    let outcome = match effect_scheduler.acquire(effect_request, &ctx.cancel).await
+                    {
+                        Ok(_permit) => {
+                            if let Ok(mut manager) = agent_manager.lock() {
+                                let _ = manager.mark_running(owner_agent_id);
+                            }
+                            match kind {
+                                tpi_capabilities::tool::scheduler::PreparedKind::Builtin {
+                                    tool,
+                                    args,
+                                } => tool::execute(tool, args, &ctx, plan.as_ref()).await,
+                                tpi_capabilities::tool::scheduler::PreparedKind::External {
+                                    name: _,
+                                    args_json,
+                                    adapter,
+                                } => adapter.execute(&args_json, &ctx).await,
+                            }
                         }
-                        tpi_capabilities::tool::scheduler::PreparedKind::External {
-                            name: _,
-                            args_json,
-                            adapter,
-                        } => adapter.execute(&args_json, &ctx).await,
+                        Err(tpi_capabilities::tool::scheduler::EffectAcquireError::Cancelled) => {
+                            ToolOutcome::failed(
+                                &kind_name,
+                                tpi_core::outcome::ModelPayload {
+                                    status: ToolStatus::Cancelled,
+                                    program: None,
+                                    exit_code: None,
+                                    duration_ms: 0,
+                                    output: "status: cancelled\nerror: effect_wait_cancelled"
+                                        .into(),
+                                    effect: None,
+                                    artifact: None,
+                                },
+                            )
+                        }
                     };
                     (source_index, outcome.into_stored())
                 }

@@ -10,16 +10,6 @@ use std::sync::Arc;
 use crate::tool::ToolContext;
 use tpi_core::outcome::ToolOutcome;
 
-/// 子代理只读能力白名单（P7-02 拆 crate：从 subagent 下沉到 capabilities——
-/// 它本就是"只读调查工具白名单"，属 capabilities 概念；subagent crate
-/// re-export 保持 `tpi::subagent::ReadOnlyCapability` 路径兼容）。
-/// search/glob 已删除（改由 bash + rg/find/ls 承担）；仅保留 Read；
-/// 目录浏览由 read depth 承担。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadOnlyCapability {
-    Read,
-}
-
 /// 工具来源（README2 §2.1：只能作为 metadata，Agent Loop 不据此分支执行）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolOrigin {
@@ -30,13 +20,15 @@ pub enum ToolOrigin {
     },
 }
 
-/// External 工具可声明的调度访问类别（P8-10 subagent 并行）。
+/// External 工具可声明的调度访问类别。
 ///
-/// 默认 `WorkspaceUnknown`：批内串行执行（MCP 等未知副作用工具保持保守）。
-/// 只读工具（如 `subagent`：child 白名单仅 read/search/glob）可声明
-/// `ReadOnly`，与同批 read/search 进入同一 wave 并行执行。
+/// 这是副作用声明，不是 agent 权限。`Pure` 适用于只注册/查询调度
+/// 资源的工具（例如 agent spawn/status）；child 是否拥有某个工具由统一
+/// ToolRegistry 决定，而不是由 parent/child 类型决定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolAccessClass {
+    /// 不访问 workspace（例如 agent graph 控制操作）。
+    Pure,
     /// 未知副作用：按源顺序串行（默认；MCP 等 External 工具现状）。
     WorkspaceUnknown,
     /// 只读访问 workspace：可与其他只读工具并行；与写工具冲突时串行。
@@ -727,21 +719,4 @@ async fn setup_transaction_rolls_back_on_fault() {
     let reg = registry.lock().unwrap();
     assert!(!reg.overlay_has("read"), "事务失败后不得留下 read overlay");
     assert!(!reg.overlay_has("bash"), "事务失败后不得留下 bash overlay");
-}
-
-/// P8-04：只读 registry——只注册只读调查工具（read；search/glob 已删除，
-/// 目录浏览由 read 承担）。
-/// child subagent 用它限制能力（写/进程/网络工具不存在于 registry → 不可调用）。
-pub fn read_only_registry(caps: &[ReadOnlyCapability]) -> ToolRegistry {
-    let mut registry = ToolRegistry::new();
-    for tool in crate::tool::implemented_tools() {
-        let allowed = match tool.name() {
-            "read" => caps.contains(&ReadOnlyCapability::Read),
-            _ => false,
-        };
-        if allowed {
-            registry.register(Arc::new(BuiltinToolAdapter::new(tool)));
-        }
-    }
-    registry
 }

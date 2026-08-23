@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use tpi_core::workspace::manager::{WorkspaceConfig, WorkspaceManager};
 use tpi_core::workspace::mutation::WorkspaceMutation;
 use tpi_core::workspace::policy::{MutationSafetyPolicy, Reversibility, TrackingPolicy};
-use tpi_core::workspace::transaction::MutationCause;
+use tpi_core::workspace::transaction::{MutationCause, MutationProvenance};
 use tpi_core::workspace::types::{BlobId, TransactionId};
 
 /// Shared handle to the workspace manager — passed through ToolContext.
@@ -30,13 +30,40 @@ pub fn create_workspace_manager(
 }
 
 /// High-level session API for tool integration.
+#[derive(Clone)]
 pub struct WorkspaceSession {
     shared: SharedWorkspaceManager,
+    provenance: Option<MutationProvenance>,
 }
 
 impl WorkspaceSession {
     pub fn new(shared: SharedWorkspaceManager) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            provenance: None,
+        }
+    }
+
+    /// Bind this lightweight view to one AgentRuntime. The underlying manager
+    /// and journal remain global; only transaction provenance is per runtime.
+    pub fn with_provenance(mut self, provenance: MutationProvenance) -> Self {
+        self.provenance = Some(provenance);
+        self
+    }
+
+    fn cause(&self, cause: MutationCause) -> MutationCause {
+        let tool_call_id = match &cause {
+            MutationCause::Edit { tool_call_id } | MutationCause::Write { tool_call_id } => {
+                Some(tool_call_id.clone())
+            }
+            MutationCause::Command { command_id } => Some(command_id.clone()),
+            MutationCause::Terminal { terminal_id } => Some(terminal_id.clone()),
+            MutationCause::Job { process_id } => Some(process_id.clone()),
+            _ => None,
+        };
+        self.provenance.clone().map_or(cause.clone(), |provenance| {
+            cause.with_provenance(provenance, tool_call_id)
+        })
     }
 
     /// Store content in the blob store and return its id.
@@ -53,7 +80,9 @@ impl WorkspaceSession {
         mutation: WorkspaceMutation,
     ) -> Result<Reversibility, String> {
         let mut mgr = self.shared.lock().map_err(|e| e.to_string())?;
-        let handle = mgr.begin_transaction(cause).map_err(|e| e.to_string())?;
+        let handle = mgr
+            .begin_transaction(self.cause(cause))
+            .map_err(|e| e.to_string())?;
         let tx_id = handle.tx_id().clone();
         drop(handle);
         mgr.record_mutation(&tx_id, mutation.clone())
@@ -66,7 +95,9 @@ impl WorkspaceSession {
     /// Returns a TransactionGuard that must be committed or aborted.
     pub fn begin_transaction(&self, cause: MutationCause) -> Result<TransactionGuard, String> {
         let mut mgr = self.shared.lock().map_err(|e| e.to_string())?;
-        let handle = mgr.begin_transaction(cause).map_err(|e| e.to_string())?;
+        let handle = mgr
+            .begin_transaction(self.cause(cause))
+            .map_err(|e| e.to_string())?;
         let tx_id = handle.tx_id().clone();
         drop(handle);
         Ok(TransactionGuard {
@@ -93,7 +124,7 @@ impl WorkspaceSession {
         _workspace_root: &std::path::Path,
     ) -> Result<Reversibility, String> {
         let mut mgr = self.shared.lock().map_err(|e| e.to_string())?;
-        mgr.reconcile_unknown_effect(cause)
+        mgr.reconcile_unknown_effect(self.cause(cause))
             .map_err(|e| e.to_string())
     }
 }
@@ -175,6 +206,48 @@ mod tests {
             .unwrap();
 
         assert!(rev.is_exact());
+    }
+
+    #[test]
+    fn session_journal_records_agent_provenance() {
+        let (_root, ws, art) = setup();
+        let shared = create_workspace_manager(&ws, "s-agent", &art).unwrap();
+        let session = WorkspaceSession::new(shared).with_provenance(MutationProvenance {
+            agent_id: "agent-a".into(),
+            parent_agent_id: Some("agent-root".into()),
+            delegation_id: Some("delegation-1".into()),
+        });
+        let before = session.store_blob(b"hello").unwrap();
+        let after = session.store_blob(b"HELLO").unwrap();
+        let path = tpi_core::workspace::types::NormalizedPath::new(&ws.join("hello.txt"), &ws);
+        session
+            .record_single_mutation(
+                MutationCause::Edit {
+                    tool_call_id: "call-1".into(),
+                },
+                WorkspaceMutation::Modify {
+                    path,
+                    before,
+                    after,
+                },
+            )
+            .unwrap();
+        let state = tpi_core::workspace::journal::MutationJournal::new(&art, "s-agent")
+            .load()
+            .unwrap();
+        assert!(matches!(
+            state.entries[0].cause,
+            MutationCause::Agent {
+                ref agent_id,
+                ref parent_agent_id,
+                ref delegation_id,
+                ref tool_call_id,
+                ..
+            } if agent_id == "agent-a"
+                && parent_agent_id.as_deref() == Some("agent-root")
+                && delegation_id.as_deref() == Some("delegation-1")
+                && tool_call_id.as_deref() == Some("call-1")
+        ));
     }
 
     #[test]

@@ -15,6 +15,10 @@ use tpi_core::outcome::ToolStatus;
 use tpi_core::plan::Plan;
 use tpi_session::Usage;
 
+fn is_agent_card_name(name: &str) -> bool {
+    matches!(name, "subagent" | "spawn_agent")
+}
+
 /// 右侧边栏（§用户诉求：todo + 用户消息大纲，opencode 式）。
 ///
 /// 布局：主区（transcript/input/footer）右侧固定宽度竖栏；内容为
@@ -1624,13 +1628,13 @@ impl ViewModel {
                 self.live
                     .tools
                     .get(*id)
-                    .is_some_and(|t| t.card.name == "subagent")
+                    .is_some_and(|t| is_agent_card_name(&t.card.name))
             })
             .cloned()
             .collect();
         for entry in &self.transcript {
             if let Entry::Tool { card, .. } = entry
-                && card.name == "subagent"
+                && is_agent_card_name(&card.name)
                 && !ids.contains(&card.id)
             {
                 ids.push(card.id.clone());
@@ -1653,7 +1657,7 @@ impl ViewModel {
     /// §子代理：指定 id 是否为 subagent 卡片。
     pub fn is_subagent_card(&self, id: &str) -> bool {
         self.find_subagent_card(id)
-            .is_some_and(|card| card.name == "subagent")
+            .is_some_and(|card| is_agent_card_name(&card.name))
     }
 
     /// §子代理：打开内部视图（重置滚动；无 subagent 卡时不动作）。
