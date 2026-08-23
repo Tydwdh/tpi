@@ -656,15 +656,15 @@ mod tests {
         let delta2 = mgr2.reconcile_index(&[]).unwrap();
 
         assert_eq!(delta2.modified.len(), 1);
-        let (_, after, before) = &delta2.modified[0];
-        let before_id = before.clone().unwrap().blob_id.clone().unwrap();
+        let m = &delta2.modified[0];
+        let before_id = m.before.blob_id.clone().unwrap();
         // before blob round-trip 回原始字节。
         let restored_preimage = mgr2.blob_store().get(&before_id).unwrap();
         assert_eq!(restored_preimage, original2);
 
         // 用 delta 构造 Modify 并 commit（session.reconcile_after_execution 路径）。
         let norm2 = NormalizedPath::new(&workspace2.join("hello.txt"), &workspace2);
-        let after_id = after.blob_id.clone().unwrap();
+        let after_id = m.after.blob_id.clone().unwrap();
         let mutations2 = vec![WorkspaceMutation::Modify {
             path: norm2,
             before: before_id.clone(),

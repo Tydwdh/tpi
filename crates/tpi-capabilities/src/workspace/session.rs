@@ -127,28 +127,37 @@ impl WorkspaceSession {
                 });
             }
         }
-        for (path, after, before) in &delta.modified {
-            if let Some(blob_id) = &after.blob_id {
+        for m in &delta.modified {
+            if let (Some(before_blob), Some(after_blob)) = (&m.before.blob_id, &m.after.blob_id) {
                 mutations.push(WorkspaceMutation::Modify {
-                    path: path.clone(),
-                    // preimage = 修改前的旧 blob（来自 index 中已保存的旧 entry）。
-                    before: before
-                        .as_ref()
-                        .and_then(|e| e.blob_id.clone())
-                        .unwrap_or_else(|| tpi_core::workspace::types::BlobId::new("")),
-                    after: blob_id.clone(),
+                    path: m.path.clone(),
+                    // preimage = 修改前的旧 blob。类型上 modify 必有 before，
+                    // 不再需要 BlobId("") sentinel。
+                    before: before_blob.clone(),
+                    after: after_blob.clone(),
                 });
+            } else {
+                tracing::warn!(
+                    path = %m.path,
+                    "workspace reconcile: 跳过一个无 blob 的 modified entry (kind={:?})",
+                    m.before.kind,
+                );
             }
         }
-        for (path, before) in &delta.deleted {
-            mutations.push(WorkspaceMutation::Delete {
-                path: path.clone(),
-                // preimage = 删除前的旧 blob（undo 恢复原内容）。
-                content: before
-                    .as_ref()
-                    .and_then(|e| e.blob_id.clone())
-                    .unwrap_or_else(|| tpi_core::workspace::types::BlobId::new("")),
-            });
+        for d in &delta.deleted {
+            if let Some(content) = &d.before.blob_id {
+                mutations.push(WorkspaceMutation::Delete {
+                    path: d.path.clone(),
+                    // preimage = 删除前的旧 blob（undo 恢复原内容）。
+                    content: content.clone(),
+                });
+            } else {
+                tracing::warn!(
+                    path = %d.path,
+                    "workspace reconcile: 跳过一个无 blob 的 deleted entry (kind={:?})",
+                    d.before.kind,
+                );
+            }
         }
 
         // Begin and commit a transaction.
