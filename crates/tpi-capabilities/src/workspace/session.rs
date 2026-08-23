@@ -75,24 +75,6 @@ impl WorkspaceSession {
         })
     }
 
-    /// Get a preimage blob id for a file (for pre-execution capture).
-    pub fn get_preimage(&self, path: &Path) -> Option<BlobId> {
-        let mgr = self.shared.lock().ok()?;
-        let root = mgr.root().to_path_buf();
-        let norm = tpi_core::workspace::types::NormalizedPath::new(path, &root);
-        mgr.index().get_blob_id(&norm).cloned()
-    }
-
-    /// Store file content as preimage and return its blob id.
-    pub fn capture_preimage(&self, path: &Path) -> Result<Option<BlobId>, String> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content = std::fs::read(path).map_err(|e| e.to_string())?;
-        let blob_id = self.store_blob(&content)?;
-        Ok(Some(blob_id))
-    }
-
     /// Access the underlying shared manager.
     pub fn shared(&self) -> &SharedWorkspaceManager {
         &self.shared
@@ -218,7 +200,6 @@ mod tests {
 
         let blob_id = session.store_blob(b"test content").unwrap();
         assert!(!blob_id.as_str().is_empty());
-        assert!(session.get_preimage(&ws.join("hello.txt")).is_some());
     }
 
     #[test]
@@ -275,26 +256,5 @@ mod tests {
         guard.record(mutation.clone()).unwrap();
         let rev = guard.commit(vec![mutation]).unwrap();
         assert!(rev.is_exact());
-    }
-
-    #[test]
-    fn capture_preimage_existing() {
-        let (_root, ws, art) = setup();
-        let shared = create_workspace_manager(&ws, "s1", &art).unwrap();
-        let session = WorkspaceSession::new(shared);
-
-        let blob = session.capture_preimage(&ws.join("hello.txt")).unwrap();
-        assert!(blob.is_some());
-        assert!(!blob.unwrap().as_str().is_empty());
-    }
-
-    #[test]
-    fn capture_preimage_nonexistent() {
-        let (_root, ws, art) = setup();
-        let shared = create_workspace_manager(&ws, "s1", &art).unwrap();
-        let session = WorkspaceSession::new(shared);
-
-        let blob = session.capture_preimage(&ws.join("nope.txt")).unwrap();
-        assert!(blob.is_none());
     }
 }

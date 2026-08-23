@@ -362,6 +362,131 @@ impl WorkspaceIndex {
         Ok(delta)
     }
 
+    /// 增量 reconcile：只处理给定的一批 dirty path（K 个），不扫描整个 workspace。
+    ///
+    /// 语义：每个 dirty path 都是“可能变化”而非“一定变化”——存在性/元数据以
+    /// 文件系统为准。对每个 path：
+    /// - 存在且为目录：确保 index 有目录 entry（不产 change，不 hash）
+    /// - 存在且为文件：与 index 比对，mtime+size 相同则跳过，否则 read+hash
+    ///   → Created / Modified
+    /// - 不存在：index 若有 tracked 文件 → Deleted（带 preimage）；否则忽略
+    ///
+    /// DirtySet 只缩小候选范围；无误报/漏报记录差异，复杂度 O(K metadata + changed bytes)。
+    pub fn reconcile_paths(
+        &mut self,
+        paths: &[NormalizedPath],
+        blob_store: &BlobStore,
+    ) -> Result<IndexDelta, IndexError> {
+        // 去重：一个 path 可能被 watcher 多次 mark dirty。
+        let mut seen = std::collections::HashSet::new();
+        let mut delta = IndexDelta {
+            created: Vec::new(),
+            modified: Vec::new(),
+            deleted: Vec::new(),
+        };
+
+        for path in paths {
+            if !seen.insert(path.clone()) {
+                continue; // 重复 dirty path 只处理一次。
+            }
+            self.reconcile_one_path(path, blob_store, &mut delta)?;
+        }
+        Ok(delta)
+    }
+
+    /// 单个 dirty path 的 reconcile（内部共享逻辑，见 [`reconcile_paths`]）。
+    fn reconcile_one_path(
+        &mut self,
+        path: &NormalizedPath,
+        blob_store: &BlobStore,
+        delta: &mut IndexDelta,
+    ) -> Result<(), IndexError> {
+        let abs = self.root.join(path.as_str());
+        let meta = match std::fs::metadata(&abs) {
+            Ok(m) => m,
+            Err(_) => {
+                // 不存在（或权限错误）：若是 index 里的 tracked 文件 → Deleted。
+                if let Some(before) = self.entries.remove(path) {
+                    if before.kind == EntryKind::File {
+                        delta.deleted.push(DeletedEntry {
+                            path: path.clone(),
+                            before,
+                        });
+                    }
+                }
+                return Ok(());
+            }
+        };
+
+        if meta.is_dir() {
+            // 目录：确保 index 有目录 entry（不产 change、不 hash）。
+            self.entries
+                .entry(path.clone())
+                .or_insert_with(|| FileEntry {
+                    kind: EntryKind::Directory,
+                    size: 0,
+                    mtime_secs: 0,
+                    mtime_nanos: 0,
+                    blob_id: None,
+                    tracked: true,
+                });
+            return Ok(());
+        }
+        if !meta.is_file() {
+            return Ok(()); // symlink / other：跳过。
+        }
+
+        let (mtime_secs, mtime_nanos) = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| (d.as_secs(), d.subsec_nanos()))
+            .unwrap_or((0, 0));
+        let size = meta.len();
+
+        match self.entries.get(path) {
+            Some(existing) => {
+                // mtime + size 相同 → 未变，跳过 hash。
+                if existing.size == size
+                    && existing.mtime_secs == mtime_secs
+                    && existing.mtime_nanos == mtime_nanos
+                    && existing.kind == EntryKind::File
+                {
+                    return Ok(());
+                }
+                let blob_id = Self::hash_file_into_blob(&abs, blob_store)?;
+                let updated = FileEntry {
+                    kind: EntryKind::File,
+                    size,
+                    mtime_secs,
+                    mtime_nanos,
+                    blob_id: Some(blob_id.clone()),
+                    tracked: true,
+                };
+                delta.modified.push(ModifiedEntry {
+                    path: path.clone(),
+                    before: existing.clone(),
+                    after: updated.clone(),
+                });
+                self.entries.insert(path.clone(), updated);
+            }
+            None => {
+                let blob_id = Self::hash_file_into_blob(&abs, blob_store)?;
+                let new_entry = FileEntry {
+                    kind: EntryKind::File,
+                    size,
+                    mtime_secs,
+                    mtime_nanos,
+                    blob_id: Some(blob_id),
+                    tracked: true,
+                };
+                self.entries.insert(path.clone(), new_entry.clone());
+                delta.created.push((path.clone(), new_entry));
+            }
+        }
+        Ok(())
+    }
+
     /// Get the blob_id for a file's current content.
     pub fn get_blob_id(&self, path: &NormalizedPath) -> Option<&BlobId> {
         self.entries.get(path).and_then(|e| e.blob_id.as_ref())
@@ -757,5 +882,142 @@ mod tests {
             before + 1,
             "只应新增被改文件的 1 个 after blob"
         );
+    }
+
+    // ── P2.1: reconcile_paths ──────────────────────────────────────
+
+    fn npath(root: &Path, rel: &str) -> NormalizedPath {
+        NormalizedPath::new(root, root).join(rel)
+    }
+
+    #[test]
+    fn reconcile_paths_detects_modify() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), b"CHANGED").unwrap();
+        let delta = index
+            .reconcile_paths(&[npath(dir.path(), "a.txt")], &blob)
+            .unwrap();
+        assert_eq!(delta.modified.len(), 1);
+        assert_eq!(delta.modified[0].path.as_str(), "a.txt");
+        // 只有 a.txt 被 hash：不改的 b.txt / sub/c.txt 不动。
+        assert!(delta.created.is_empty() && delta.deleted.is_empty());
+    }
+
+    #[test]
+    fn reconcile_paths_detects_create() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        std::fs::write(dir.path().join("new.txt"), b"new").unwrap();
+        let delta = index
+            .reconcile_paths(&[npath(dir.path(), "new.txt")], &blob)
+            .unwrap();
+        assert_eq!(delta.created.len(), 1);
+        assert_eq!(delta.created[0].0.as_str(), "new.txt");
+    }
+
+    #[test]
+    fn reconcile_paths_detects_delete_with_preimage() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+        let delta = index
+            .reconcile_paths(&[npath(dir.path(), "a.txt")], &blob)
+            .unwrap();
+        assert_eq!(delta.deleted.len(), 1);
+        assert_eq!(delta.deleted[0].path.as_str(), "a.txt");
+        // preimage 取回原始 "hello"。
+        let restored = blob
+            .get(&delta.deleted[0].before.blob_id.clone().unwrap())
+            .unwrap();
+        assert_eq!(restored, b"hello");
+    }
+
+    #[test]
+    fn reconcile_paths_directory_subtree_delete_keeps_preimages() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        // rm -rf sub/。watcher 可能只报 sub/ 一个 path，也可能报子文件。
+        std::fs::remove_dir_all(dir.path().join("sub")).unwrap();
+        // 只传 dirty 目录自身（树删除的常见 watcher 通知）。
+        let delta = index
+            .reconcile_paths(&[npath(dir.path(), "sub")], &blob)
+            .unwrap();
+        // 目录自身不产出 Delete；其内文件在 index 中仍是 stale（本次调用不递归）。
+        // reconcile_paths 是逐 path 的补齐信号，不隐式递归——由调用方决定
+        // 是否也用全量 fallback。这里只验证：目录 path 不产生无 preimage 的 Delete。
+        assert!(
+            delta
+                .deleted
+                .iter()
+                .all(|d| d.before.kind == EntryKind::File),
+            "目录删除不应产生无 preimage 的 Delete"
+        );
+    }
+
+    #[test]
+    fn reconcile_paths_ignores_nonexistent_and_duplicates() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        // 不存在的 path + 重复的 dirty path。
+        let delta = index
+            .reconcile_paths(
+                &[
+                    npath(dir.path(), "no-such.txt"),
+                    npath(dir.path(), "a.txt"),
+                    npath(dir.path(), "a.txt"), // duplicate
+                ],
+                &blob,
+            )
+            .unwrap();
+        assert!(delta.created.is_empty() && delta.deleted.is_empty());
+        assert!(
+            delta.modified.is_empty(),
+            "未变化的 a.txt 因重复也不重 hash"
+        );
+    }
+
+    #[test]
+    fn reconcile_paths_unchanged_skips_hash() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+        let before = blob.count().unwrap();
+
+        // 传一个未变化的 path → 不产 change、不新增 blob。
+        let delta = index
+            .reconcile_paths(&[npath(dir.path(), "a.txt")], &blob)
+            .unwrap();
+        assert!(delta.modified.is_empty());
+        assert_eq!(blob.count().unwrap(), before, "未变化不重 hash");
+    }
+
+    #[test]
+    fn reconcile_paths_rename_as_delete_plus_create() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        std::fs::rename(dir.path().join("a.txt"), dir.path().join("moved.txt")).unwrap();
+        // watcher 通常发出 old 删除 + new 创建两个 dirty event。
+        let delta = index
+            .reconcile_paths(
+                &[npath(dir.path(), "a.txt"), npath(dir.path(), "moved.txt")],
+                &blob,
+            )
+            .unwrap();
+        assert_eq!(delta.deleted.len(), 1, "a.txt 删除（带 preimage）");
+        assert_eq!(delta.created.len(), 1, "moved.txt 新建");
+        assert_eq!(delta.created[0].0.as_str(), "moved.txt");
     }
 }

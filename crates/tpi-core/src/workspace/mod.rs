@@ -23,7 +23,6 @@
 //! ```
 
 pub mod blob;
-pub mod boundary;
 pub mod checkpoint;
 pub mod coordinator;
 pub mod index;

@@ -3,9 +3,17 @@
 use serde::{Deserialize, Serialize};
 
 /// Whether a transaction can be undone, partially, or not at all.
+///
+/// 契约（§workspace）：`Exact` 表示 **tracked regular files 的路径与字节内容**
+/// 可以精确恢复——不保证空目录、或目录的权限/mtime 等 metadata。TPI 通过恢复
+/// 文件内容顺带重建父目录（create_dir_all），但空目录与目录 metadata 不会被
+/// 快照/恢复。刻意不做目录级 snapshot（`CreateDir/DeleteDir`），保持模型简单
+/// （代码任务关心的是文件内容）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Reversibility {
-    /// All affected files have preimages in CAS — exact undo is possible.
+    /// All affected tracked regular files have preimages in CAS — their paths
+    /// and byte contents can be restored exactly. Empty dirs and dir metadata
+    /// are NOT guaranteed (by design).
     Exact,
     /// Some files cannot be undone (e.g. untracked paths changed).
     Partial { reasons: Vec<ReversibilityIssue> },

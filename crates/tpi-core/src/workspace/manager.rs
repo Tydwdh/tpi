@@ -472,6 +472,17 @@ impl WorkspaceManager {
             .map_err(|e| ManagerError::IndexInit(e.to_string()))
     }
 
+    /// 增量 reconcile：只处理给定 dirty paths（Watcher/DirtySet 驱动）。
+    /// 不扫描整个 workspace；复杂度 O(K metadata + changed bytes)。
+    pub fn reconcile_paths(
+        &mut self,
+        paths: &[super::types::NormalizedPath],
+    ) -> Result<super::index::IndexDelta, ManagerError> {
+        self.index
+            .reconcile_paths(paths, &self.blob_store)
+            .map_err(|e| ManagerError::IndexInit(e.to_string()))
+    }
+
     /// Workspace root directory.
     pub fn root(&self) -> &Path {
         &self.root
