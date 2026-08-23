@@ -10,6 +10,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// 判断 `child` 是否等于 `ancestor` 或位于其子树内（path component 边界匹配，
+/// 兼容 `/` 与 `\` 两种 separator）。用于 dirty scope 展开/prefix collapse。
+fn is_same_or_under(child: &str, ancestor: &str) -> bool {
+    if child == ancestor {
+        return true;
+    }
+    let direct = format!("{ancestor}/");
+    let win = format!("{ancestor}\\");
+    child.starts_with(&direct) || child.starts_with(&win)
+}
+
 /// A single tracked file entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -372,29 +383,48 @@ impl WorkspaceIndex {
     /// - 不存在：index 若有 tracked 文件 → Deleted（带 preimage）；否则忽略
     ///
     /// DirtySet 只缩小候选范围；无误报/漏报记录差异，复杂度 O(K metadata + changed bytes)。
+    /// 增量 reconcile：只处理给定的一批 dirty path（可能含目录），并做 prefix
+    /// collapse——若 dirty 同时含 `src/` 与其 descendants，subtree reconcile 一次
+    /// 覆盖全部，避免重复扫描。复杂度 O(dirty scopes metadata + changed bytes)。
     pub fn reconcile_paths(
         &mut self,
         paths: &[NormalizedPath],
         blob_store: &BlobStore,
     ) -> Result<IndexDelta, IndexError> {
-        // 去重：一个 path 可能被 watcher 多次 mark dirty。
-        let mut seen = std::collections::HashSet::new();
         let mut delta = IndexDelta {
             created: Vec::new(),
             modified: Vec::new(),
             deleted: Vec::new(),
         };
 
-        for path in paths {
-            if !seen.insert(path.clone()) {
-                continue; // 重复 dirty path 只处理一次。
+        // 按 path 字符串排序，便于 prefix collapse（目录 scope 覆盖其 descendants）。
+        let mut unique = paths.to_vec();
+        unique.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        unique.dedup();
+
+        let mut processed: Vec<String> = Vec::new();
+        for path in unique {
+            // 若某个已处理 path（通常是目录 scope）是本 path 的祖先，本 path 由
+            // 那次 subtree reconcile 覆盖，跳过（prefix collapse）。边界用
+            // `prefix/`，避免把 `src` 误当 `src2/x` 的祖先。
+            let s = path.as_str();
+            let covered = processed.iter().any(|anc| is_same_or_under(s, anc));
+            if covered {
+                continue;
             }
-            self.reconcile_one_path(path, blob_store, &mut delta)?;
+            self.reconcile_one_path(&path, blob_store, &mut delta)?;
+            processed.push(path.as_str().to_string());
         }
         Ok(delta)
     }
 
-    /// 单个 dirty path 的 reconcile（内部共享逻辑，见 [`reconcile_paths`]）。
+    /// 单个 dirty path 的 reconcile。
+    /// 语义（P2.6）：dirty path 代表“此 filesystem scope 必须重新验证”——
+    /// - 存在文件 → reconcile_file（mtime+size fast path，只 hash changed/new）
+    /// - 存在目录 → reconcile_subtree（递归 subtree，与 full reconcile 在最终状态
+    ///   语义上等价，但只扫 subtree，复杂度 O(subtree metadata + changed bytes)）
+    /// - 不存在 → 若 index 有该 path 的 descendants，全部产出 Delete（用已存 before
+    ///   blob，无需 scan filesystem）；否则单文件 Delete
     fn reconcile_one_path(
         &mut self,
         path: &NormalizedPath,
@@ -402,40 +432,41 @@ impl WorkspaceIndex {
         delta: &mut IndexDelta,
     ) -> Result<(), IndexError> {
         let abs = self.root.join(path.as_str());
-        let meta = match std::fs::metadata(&abs) {
-            Ok(m) => m,
+        match std::fs::metadata(&abs) {
+            Ok(meta) if meta.is_dir() => self.reconcile_subtree(path, blob_store, delta),
+            Ok(meta) if meta.is_file() => self.reconcile_file(path, &meta, blob_store, delta),
+            Ok(_) => Ok(()), // symlink / other：跳过。
             Err(_) => {
-                // 不存在（或权限错误）：若是 index 里的 tracked 文件 → Deleted。
-                if let Some(before) = self.entries.remove(path) {
-                    if before.kind == EntryKind::File {
-                        delta.deleted.push(DeletedEntry {
-                            path: path.clone(),
-                            before,
-                        });
+                // 不存在（或权限错误）。
+                // 目录：删除 index 下所有 descendants（带 before preimage），无需 scan。
+                // 文件：单删。
+                let descendants: Vec<NormalizedPath> = self
+                    .entries
+                    .keys()
+                    .filter(|k| is_same_or_under(k.as_str(), path.as_str()))
+                    .cloned()
+                    .collect();
+                for d in descendants {
+                    let before = self.entries.remove(&d);
+                    if let Some(before) = before {
+                        if before.kind == EntryKind::File {
+                            delta.deleted.push(DeletedEntry { path: d, before });
+                        }
                     }
                 }
-                return Ok(());
+                Ok(())
             }
-        };
-
-        if meta.is_dir() {
-            // 目录：确保 index 有目录 entry（不产 change、不 hash）。
-            self.entries
-                .entry(path.clone())
-                .or_insert_with(|| FileEntry {
-                    kind: EntryKind::Directory,
-                    size: 0,
-                    mtime_secs: 0,
-                    mtime_nanos: 0,
-                    blob_id: None,
-                    tracked: true,
-                });
-            return Ok(());
         }
-        if !meta.is_file() {
-            return Ok(()); // symlink / other：跳过。
-        }
+    }
 
+    /// 单文件 reconcile：mtime+size 匹配则跳过 hash，否则 read+hash → Modified/Created。
+    fn reconcile_file(
+        &mut self,
+        path: &NormalizedPath,
+        meta: &std::fs::Metadata,
+        blob_store: &BlobStore,
+        delta: &mut IndexDelta,
+    ) -> Result<(), IndexError> {
         let (mtime_secs, mtime_nanos) = meta
             .modified()
             .ok()
@@ -443,10 +474,10 @@ impl WorkspaceIndex {
             .map(|d| (d.as_secs(), d.subsec_nanos()))
             .unwrap_or((0, 0));
         let size = meta.len();
+        let abs = self.root.join(path.as_str());
 
         match self.entries.get(path) {
             Some(existing) => {
-                // mtime + size 相同 → 未变，跳过 hash。
                 if existing.size == size
                     && existing.mtime_secs == mtime_secs
                     && existing.mtime_nanos == mtime_nanos
@@ -482,6 +513,72 @@ impl WorkspaceIndex {
                 };
                 self.entries.insert(path.clone(), new_entry.clone());
                 delta.created.push((path.clone(), new_entry));
+            }
+        }
+        Ok(())
+    }
+
+    /// 子树 reconcile：递归扫描 `path` 下的 metadata，与 index 中该 prefix 的
+    /// entries 比对，产出 created/modified/deleted。删除的 descendants 携带
+    /// before preimage。只读 changed/new file bytes。
+    fn reconcile_subtree(
+        &mut self,
+        path: &NormalizedPath,
+        blob_store: &BlobStore,
+        delta: &mut IndexDelta,
+    ) -> Result<(), IndexError> {
+        // path 保证是存在目录；先确保目录 entry 本身存在（不产 change）。
+        self.entries
+            .entry(path.clone())
+            .or_insert_with(|| FileEntry {
+                kind: EntryKind::Directory,
+                size: 0,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+                blob_id: None,
+                tracked: true,
+            });
+
+        // metadata-only scan subtree。
+        let abs = self.root.join(path.as_str());
+        let mut subtree_metas = HashMap::new();
+        Self::scan_metadata_recursive(&abs, &self.root, &mut subtree_metas, &[])?;
+
+        // 1) created / modified：subtree 内现有条目。目录只确保 entry 存在（不产 change，
+        //   与 full reconcile 语义一致）；文件走 reconcile_file。
+        for (p, meta) in &subtree_metas {
+            if meta.is_dir() {
+                self.entries.entry(p.clone()).or_insert_with(|| FileEntry {
+                    kind: EntryKind::Directory,
+                    size: 0,
+                    mtime_secs: 0,
+                    mtime_nanos: 0,
+                    blob_id: None,
+                    tracked: true,
+                });
+            } else if meta.is_file() {
+                self.reconcile_file(p, meta, blob_store, delta)?;
+            }
+        }
+
+        // 2) deleted：index 中该 path 子树内（不含树根自身——树根 entry 由上面 entry()
+        //    保证存在）、但 filesystem 已不存在的 tracked 文件。
+        let stale: Vec<NormalizedPath> = self
+            .entries
+            .keys()
+            .filter(|k| {
+                k.as_str() != path.as_str()
+                    && is_same_or_under(k.as_str(), path.as_str())
+                    && !subtree_metas.contains_key(*k)
+            })
+            .cloned()
+            .collect();
+        for d in stale {
+            let before = self.entries.remove(&d);
+            if let Some(before) = before {
+                if before.kind == EntryKind::File {
+                    delta.deleted.push(DeletedEntry { path: d, before });
+                }
             }
         }
         Ok(())
@@ -887,7 +984,9 @@ mod tests {
     // ── P2.1: reconcile_paths ──────────────────────────────────────
 
     fn npath(root: &Path, rel: &str) -> NormalizedPath {
-        NormalizedPath::new(root, root).join(rel)
+        // 走绝对路径 + NormalizedPath::new（会 normalize separator / 大小写），
+        // 与 scan_metadata_recursive 产出的 index key 一致。
+        NormalizedPath::new(&root.join(rel), root)
     }
 
     #[test]
@@ -1147,7 +1246,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(delta.deleted.len(), 1);
-        assert_eq!(delta.deleted[0].path.as_str(), "deep/nested/x.txt");
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            delta.deleted[0].path.as_str(),
+            &format!("deep{sep}nested{sep}x.txt")
+        );
         assert!(delta.deleted[0].before.blob_id.is_some());
     }
 
@@ -1198,5 +1301,244 @@ mod tests {
                 "增量 reconcile 应比全量快: full={full_elapsed:?} incr={incr_elapsed:?}"
             );
         }
+    }
+
+    // ── P2.6: directory dirty = subtree invalidation ──────────────
+
+    /// 1) rm -rf tree，只提供 `tree/` 一个 dirty event：所有 tracked descendants
+    ///    都必须产生 Delete + preimage，且 index 不再残留任何 stale entries。
+    #[test]
+    fn reconcile_paths_rm_rf_tree_single_dir_event_clears_index() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        // 构造一个多级子树。
+        std::fs::create_dir_all(dir.path().join("tree").join("inner")).unwrap();
+        std::fs::write(dir.path().join("tree").join("a.rs"), b"a").unwrap();
+        std::fs::write(dir.path().join("tree").join("b.rs"), b"b").unwrap();
+        std::fs::write(dir.path().join("tree").join("inner").join("c.rs"), b"c").unwrap();
+        index
+            .reconcile_paths(&[npath(dir.path(), "tree")], &blob)
+            .unwrap();
+
+        // rm -rf tree/，只报一个 dirty：`tree`。
+        std::fs::remove_dir_all(dir.path().join("tree")).unwrap();
+        let delta = index
+            .reconcile_paths(&[npath(dir.path(), "tree")], &blob)
+            .unwrap();
+
+        // 所有 descendants 都产生 Delete 且带 preimage。
+        let mut deleted = delta
+            .deleted
+            .iter()
+            .map(|d| d.path.as_str().to_string())
+            .collect::<Vec<_>>();
+        deleted.sort();
+        assert_eq!(
+            deleted,
+            vec!["tree\\a.rs", "tree\\b.rs", "tree\\inner\\c.rs"],
+            "整个 subtree 的文件都必须 Deleted (normalized path)"
+        );
+        for d in &delta.deleted {
+            assert!(d.before.blob_id.is_some(), "{} preimage", d.path);
+        }
+        // index 不再残留任何 tree/ descendants。
+        let leftover = index
+            .paths()
+            .map(|p| p.as_str().to_string())
+            .filter(|p| p.starts_with("tree"))
+            .collect::<Vec<_>>();
+        assert!(leftover.is_empty(), "index 不应残留 tree /*: {leftover:?}");
+    }
+
+    /// 2) 目录 rename，只提供 old/new 两个顶层 path：old subtree 无 stale entries，
+    ///    new subtree 完整进入 index。
+    #[test]
+    fn reconcile_paths_directory_rename_old_removed_new_added() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        std::fs::create_dir_all(dir.path().join("old")).unwrap();
+        std::fs::write(dir.path().join("old").join("a.rs"), b"aa").unwrap();
+        std::fs::write(dir.path().join("old").join("b.rs"), b"bb").unwrap();
+        index
+            .reconcile_paths(&[npath(dir.path(), "old")], &blob)
+            .unwrap();
+
+        // mv old new
+        std::fs::rename(dir.path().join("old"), dir.path().join("new")).unwrap();
+        let delta = index
+            .reconcile_paths(&[npath(dir.path(), "old"), npath(dir.path(), "new")], &blob)
+            .unwrap();
+
+        // old 的两个文件 Deleted（preimage），new 的两个 Created。
+        let deleted = delta
+            .deleted
+            .iter()
+            .map(|d| d.path.as_str().to_string())
+            .collect::<Vec<_>>();
+        let created = delta
+            .created
+            .iter()
+            .map(|(p, _)| p.as_str().to_string())
+            .collect::<Vec<_>>();
+        let sep = std::path::MAIN_SEPARATOR;
+        assert!(
+            deleted.contains(&format!("old{sep}a.rs"))
+                && deleted.contains(&format!("old{sep}b.rs"))
+        );
+        assert!(
+            created.contains(&format!("new{sep}a.rs"))
+                && created.contains(&format!("new{sep}b.rs"))
+        );
+
+        // index 无 old/ descendants 残留，且 new/ 完整收录。
+        let leftover_old = index
+            .paths()
+            .map(|p| p.as_str().to_string())
+            .filter(|p| p.starts_with("old"))
+            .collect::<Vec<_>>();
+        assert!(leftover_old.is_empty(), "old 不应残留: {leftover_old:?}");
+        for f in ["new/a.rs", "new/b.rs"] {
+            let e = index.get_entry(&npath(dir.path(), f)).expect(f);
+            assert_eq!(e.kind, super::EntryKind::File);
+        }
+    }
+
+    /// 3) 新建整个 directory tree，只提供 parent dirty：所有 files 进入 index。
+    #[test]
+    fn reconcile_paths_create_tree_single_parent_event_indexes_all() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+
+        std::fs::create_dir_all(dir.path().join("gen").join("sub")).unwrap();
+        std::fs::write(dir.path().join("gen").join("x.rs"), b"x").unwrap();
+        std::fs::write(dir.path().join("gen").join("sub").join("y.rs"), b"y").unwrap();
+
+        // 只报 parent `gen`。
+        let delta = index
+            .reconcile_paths(&[npath(dir.path(), "gen")], &blob)
+            .unwrap();
+
+        let created = delta
+            .created
+            .iter()
+            .map(|(p, _)| p.as_str().to_string())
+            .collect::<Vec<_>>();
+        let sep = std::path::MAIN_SEPARATOR;
+        assert!(created.contains(&format!("gen{sep}x.rs")), "x.rs created");
+        assert!(
+            created.contains(&format!("gen{sep}sub{sep}y.rs")),
+            "y.rs created"
+        );
+        for f in ["gen/x.rs", "gen/sub/y.rs"] {
+            assert!(index.get_entry(&npath(dir.path(), f)).is_some());
+        }
+    }
+
+    /// 4) dirty 同时含 `src/`、`src/a.rs`、`src/sub/b.rs`：prefix collapse，
+    ///    只 hash 一次子树，不重复。
+    #[test]
+    fn reconcile_paths_prefix_collapse_no_double_scan() {
+        let dir = make_root();
+        let blob = BlobStore::new(dir.path().join("blob"));
+        let mut index = WorkspaceIndex::initial_scan(dir.path(), &[], 100_000, &blob).unwrap();
+        std::fs::create_dir_all(dir.path().join("src").join("sub")).unwrap();
+        std::fs::write(dir.path().join("src").join("a.rs"), b"A1").unwrap();
+        std::fs::write(dir.path().join("src").join("sub").join("b.rs"), b"B1").unwrap();
+        index
+            .reconcile_paths(&[npath(dir.path(), "src")], &blob)
+            .unwrap();
+        let before = blob.count().unwrap();
+
+        // 改 a.rs，同时 dirty 报 src/ + src/a.rs + src/sub/b.rs（冗余）。
+        std::fs::write(dir.path().join("src").join("a.rs"), b"A2").unwrap();
+        let delta = index
+            .reconcile_paths(
+                &[
+                    npath(dir.path(), "src"),
+                    npath(dir.path(), "src/a.rs"),
+                    npath(dir.path(), "src/sub/b.rs"),
+                ],
+                &blob,
+            )
+            .unwrap();
+
+        // prefix collapse 后只新增 1 个 blob（a.rs 的 after）；b.rs 未变不重 hash。
+        assert_eq!(delta.modified.len(), 1);
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(delta.modified[0].path.as_str(), &format!("src{sep}a.rs"));
+        assert_eq!(
+            blob.count().unwrap(),
+            before + 1,
+            "只 hash 一个 changed file"
+        );
+    }
+
+    /// 5) INVARIANT：同一 final FS 上，incremental reconcile_paths(dirty scopes)
+    ///    与 full reconcile() 在最终 index 语义上等价。
+    fn assert_index_equivalent(a: &WorkspaceIndex, b: &WorkspaceIndex) {
+        let pa = index_snapshot(a);
+        let pb = index_snapshot(b);
+        assert_eq!(pa.len(), pb.len(), "index 条目数应一致");
+        for (p, (k, b)) in pa {
+            let (kb, bb) = pb.get(&p).unwrap_or_else(|| panic!("missing {p}"));
+            assert_eq!(k, *kb, "kind {p}");
+            // BlobId 无 PartialEq，比 as_str。
+            assert_eq!(
+                b.as_ref().map(|x| x.as_str()),
+                bb.as_ref().map(|x| x.as_str()),
+                "blob {p}"
+            );
+        }
+    }
+
+    fn index_snapshot(
+        idx: &WorkspaceIndex,
+    ) -> std::collections::BTreeMap<String, (super::EntryKind, Option<BlobId>)> {
+        let mut m = std::collections::BTreeMap::new();
+        for p in idx.paths() {
+            let e = idx.get_entry(p).unwrap();
+            m.insert(p.as_str().to_string(), (e.kind.clone(), e.blob_id.clone()));
+        }
+        m
+    }
+
+    #[test]
+    fn reconcile_incremental_equals_full_invariant() {
+        // blob store 放在 workspace 之外（否则会被扫进 index，污染 invariant）。
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("a.txt"), b"hello").unwrap();
+        std::fs::write(ws.join("b.txt"), b"world").unwrap();
+        std::fs::create_dir(ws.join("sub")).unwrap();
+        std::fs::write(ws.join("sub/c.txt"), b"nested").unwrap();
+
+        let blob_full = BlobStore::new(dir.path().join("blob-full"));
+        let blob_incr = BlobStore::new(dir.path().join("blob-incr"));
+        let mut full = WorkspaceIndex::initial_scan(&ws, &[], 100_000, &blob_full).unwrap();
+        let mut incr = WorkspaceIndex::initial_scan(&ws, &[], 100_000, &blob_incr).unwrap();
+
+        // 同一个未来 FS：改、删、增混合。
+        std::fs::create_dir_all(ws.join("mix")).unwrap();
+        std::fs::write(ws.join("a.txt"), b"A-CHANGED").unwrap();
+        std::fs::write(ws.join("mix/new.rs"), b"n").unwrap();
+        std::fs::remove_file(ws.join("b.txt")).unwrap();
+
+        // full reconcile 一个 index。
+        let _ = full.reconcile(&[], &blob_full).unwrap();
+        // incremental reconcile 另一个。
+        let _ = incr
+            .reconcile_paths(
+                &[npath(&ws, "a.txt"), npath(&ws, "b.txt"), npath(&ws, "mix")],
+                &blob_incr,
+            )
+            .unwrap();
+
+        assert_index_equivalent(&full, &incr);
     }
 }
