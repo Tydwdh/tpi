@@ -385,7 +385,7 @@ error: process_execution_failed
         }
     };
     // §8.4：opaque 引用必须同时进入结构化字段与模型可见文本
-    //（模型读完整输出的唯一入口是 `read @artifact/...`）。
+    //（模型读完整输出的入口是 `artifact_read @artifact/...`；`read` 已从模型面移除）。
     if let Some(reference) = &artifact_ref {
         outcome.model_payload.artifact = Some(reference.clone());
         outcome

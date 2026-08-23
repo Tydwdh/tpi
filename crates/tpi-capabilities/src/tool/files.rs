@@ -40,6 +40,112 @@ pub struct ReadArgs {
     pub depth: Option<usize>,
 }
 
+/// `artifact_read` 工具参数：只读取 `@artifact/<session>/<id>` 引用的完整大输出。
+/// 不做文件/目录浏览（那由 `bash` 承担）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct ArtifactReadArgs {
+    /// `@artifact/<session>/<id>` 引用（来自 bash 等工具的 artifact 引用）。
+    pub path: String,
+    /// 起始行号（1-indexed）。
+    #[serde(default = "default_start_line")]
+    pub start_line: usize,
+    /// 最多返回行数（默认 200，最大 1000）。分段读取用 `start_line`/`line_count`。
+    #[serde(default)]
+    pub line_count: Option<usize>,
+}
+
+/// `artifact_read` 执行入口：解析 `@artifact/<session>/<id>`，有界读完整大输出。
+pub fn artifact_read(args: ArtifactReadArgs, ctx: &ToolContext) -> ToolOutcome {
+    if args.start_line == 0 {
+        return ToolOutcome::failed(
+            "artifact_read",
+            ModelPayload {
+                status: ToolStatus::Rejected,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: "status: rejected\ntool: artifact_read\nerror: invalid_start_line\n\nstart_line 必须是 ≥1 的整数（行号 1-indexed）；从开头读请省略该参数或填 1。"
+                    .into(),
+                effect: None,
+                artifact: None,
+            },
+        );
+    }
+    let Some(reference) = args.path.strip_prefix("@artifact/") else {
+        return ToolOutcome::failed(
+            "artifact_read",
+            ModelPayload {
+                status: ToolStatus::Rejected,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: format!(
+                    "status: rejected\ntool: artifact_read\nerror: invalid_artifact_reference\n\n传入的 path 必须是 `@artifact/<session>/<id>` 形式（来自工具输出的 artifact 引用），收到: {}",
+                    args.path
+                ),
+                effect: None,
+                artifact: None,
+            },
+        );
+    };
+    let Some((session_id, id)) = reference.split_once('/') else {
+        return ToolOutcome::failed(
+            "artifact_read",
+            ModelPayload {
+                status: ToolStatus::Rejected,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: format!(
+                    "status: rejected\ntool: artifact_read\nerror: invalid_artifact_reference\n\n{reference}"
+                ),
+                effect: None,
+                artifact: None,
+            },
+        );
+    };
+    if !validate_artifact_component(session_id) || !validate_artifact_component(id) {
+        return ToolOutcome::failed(
+            "artifact_read",
+            ModelPayload {
+                status: ToolStatus::Rejected,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: format!(
+                    "status: rejected\ntool: artifact_read\nerror: invalid_artifact_reference\n\n@artifact/{session_id}/{id}"
+                ),
+                effect: None,
+                artifact: None,
+            },
+        );
+    }
+    if session_id != ctx.session_id {
+        return ToolOutcome::failed(
+            "artifact_read",
+            ModelPayload {
+                status: ToolStatus::Rejected,
+                program: None,
+                exit_code: None,
+                duration_ms: 0,
+                output: format!(
+                    "status: rejected\ntool: artifact_read\nerror: cross_session_artifact\n\n只能读取本 session 的 artifact：@{session_id}"
+                ),
+                effect: None,
+                artifact: None,
+            },
+        );
+    }
+    read_artifact(
+        ctx,
+        session_id,
+        id,
+        args.start_line,
+        args.line_count.unwrap_or(DEFAULT_READ_LINES),
+    )
+}
+
+/// 起始行号默认值。
 fn default_start_line() -> usize {
     1
 }
@@ -292,17 +398,29 @@ fn read_artifact(
     start_line: usize,
     line_count: usize,
 ) -> ToolOutcome {
+    read_artifact_as("artifact_read", ctx, session_id, id, start_line, line_count)
+}
+
+/// 以 `tool_name` 标签执行 artifact 有界读取（artifact_read 专用）。
+fn read_artifact_as(
+    tool_name: &str,
+    ctx: &ToolContext,
+    session_id: &str,
+    id: &str,
+    start_line: usize,
+    line_count: usize,
+) -> ToolOutcome {
     const MAX_ARTIFACT_READ_BYTES: usize = 48 * 1024;
     let Some(record) = tpi_session::artifact::find(&ctx.artifacts_root, session_id, id) else {
         return ToolOutcome::failed(
-            "read",
+            tool_name,
             ModelPayload {
                 status: ToolStatus::Failed,
                 program: None,
                 exit_code: None,
                 duration_ms: 0,
                 output: format!(
-                    "status: failed\ntool: read\nerror: artifact_not_found\n\n@artifact/{session_id}/{id}"
+                    "status: failed\ntool: {tool_name}\nerror: artifact_not_found\n\n@artifact/{session_id}/{id}"
                 ),
                 effect: None,
                 artifact: None,
@@ -319,13 +437,13 @@ fn read_artifact(
         Ok(window) => window,
         Err(error) => {
             return ToolOutcome::failed(
-                "read",
+                tool_name,
                 ModelPayload {
                     status: ToolStatus::Failed,
                     program: None,
                     exit_code: None,
                     duration_ms: 0,
-                    output: format!("status: failed\ntool: read\nerror: io\n\n{error}"),
+                    output: format!("status: failed\ntool: {tool_name}\nerror: io\n\n{error}"),
                     effect: None,
                     artifact: None,
                 },
@@ -350,8 +468,8 @@ fn read_artifact(
         if window.truncated { " (truncated)" } else { "" },
         numbered,
     );
-    ToolOutcome::succeeded("read", output).with_metadata(ToolMetadata {
-        tool: "read".into(),
+    ToolOutcome::succeeded(tool_name, output).with_metadata(ToolMetadata {
+        tool: tool_name.into(),
         target: Some(format!("@artifact/{session_id}/{id}")),
         ..Default::default()
     })
@@ -1249,5 +1367,71 @@ mod tests {
             std::fs::read_to_string(path.as_std_path()).unwrap(),
             "line1\nline2\nline3\n"
         );
+    }
+
+    /// artifact_read：只解析 `@artifact/<session>/<id>` 引用并返回完整输出片段；
+    /// 非 artifact 引用必须被拒绝（不承担文件读取，那是 bash 的职责）。
+    #[test]
+    fn artifact_read_reads_artifact_and_rejects_file_path() {
+        use tpi_session::artifact::ArtifactWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _ws) = range_ctx(&dir);
+
+        // 写一个 artifact 并 finish。
+        let mut w =
+            ArtifactWriter::create(&ctx.artifacts_root, &ctx.session_id, "bash", "text/plain")
+                .unwrap();
+        w.write("", b"line1\nline2\nline3\n").unwrap();
+        let record = w.finish().unwrap();
+
+        // artifact_read 用 @artifact 引用成功读取。
+        let outcome = artifact_read(
+            ArtifactReadArgs {
+                path: format!("@artifact/{}/{}", ctx.session_id, record.id),
+                start_line: 1,
+                line_count: None,
+            },
+            &ctx,
+        );
+        assert_eq!(
+            outcome.status,
+            ToolStatus::Succeeded,
+            "{} texts",
+            outcome.model_payload.output
+        );
+        assert!(
+            outcome.model_payload.output.contains("line2"),
+            "artifact_read 应返回 artifact 内容: {}",
+            outcome.model_payload.output
+        );
+
+        // 传普通文件路径 → 拒绝（artifact_read 不读文件）。
+        let rejected = artifact_read(
+            ArtifactReadArgs {
+                path: "src/main.rs".to_string(),
+                start_line: 1,
+                line_count: None,
+            },
+            &ctx,
+        );
+        assert_eq!(rejected.status, ToolStatus::Rejected);
+        assert!(
+            rejected
+                .model_payload
+                .output
+                .contains("invalid_artifact_reference")
+        );
+
+        // 跨 session 引用 → 拒绝。
+        let cross = artifact_read(
+            ArtifactReadArgs {
+                path: format!("@artifact/other-session/{}", record.id),
+                start_line: 1,
+                line_count: None,
+            },
+            &ctx,
+        );
+        assert_eq!(cross.status, ToolStatus::Rejected);
     }
 }

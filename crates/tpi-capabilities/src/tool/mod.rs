@@ -206,6 +206,9 @@ pub enum BuiltinTool {
     Undo,
     /// Goal：跨轮 objective（模型侧 get/complete/drop）。
     Goal,
+    /// 只读 @artifact/<session>/<id> 引用的完整大输出（§tool-surface：`read`
+    /// 从模型面移除后，这是模型读 bash 截断之外完整内容的唯一入口）。
+    ArtifactRead,
 }
 
 /// 工具对调度器和崩溃恢复真正重要的执行语义。
@@ -245,6 +248,7 @@ impl BuiltinTool {
             BuiltinTool::ActivateSkill => "activate_skill",
             BuiltinTool::Undo => "undo",
             BuiltinTool::Goal => "goal",
+            BuiltinTool::ArtifactRead => "artifact_read",
         }
     }
 
@@ -265,6 +269,7 @@ impl BuiltinTool {
             "activate_skill" => Some(Self::ActivateSkill),
             "undo" => Some(Self::Undo),
             "goal" => Some(Self::Goal),
+            "artifact_read" => Some(Self::ArtifactRead),
             _ => None,
         }
     }
@@ -293,6 +298,8 @@ impl BuiltinTool {
             // 与其它写隔离；不参与 path 资源锁（无 args.path）。
             Self::Undo => ToolExecutionClass::WorkspaceUnknown,
             Self::Goal => ToolExecutionClass::Pure,
+            // 只读 artifact 引用（无文件/workspace 副作用）。
+            Self::ArtifactRead => ToolExecutionClass::Pure,
         }
     }
 
@@ -452,6 +459,14 @@ Ops: get (current goal), complete (mark achieved, must evidence), drop (clear). 
 Do not use for trivial single-turn work. Use get before complete. \
 Example: goal op=get; goal op=complete"
             }
+            BuiltinTool::ArtifactRead => {
+                "Read the FULL original output behind an `@artifact/<session>/<id>` reference \
+(returned by bash etc. when output is truncated). Truncated at 200 lines / 48KiB; \
+use start_line/line_count to page. `path` MUST be an `@artifact/<session>/<id>` reference \
+from a tool result — do not pass a filesystem path. \
+For reading workspace files/directories use bash (`sed -n`, `nl -ba`, `ls`, `rg`) instead. \
+Example: artifact_read path=@artifact/<session>/<id>"
+            }
         }
     }
 
@@ -478,6 +493,7 @@ Example: goal op=get; goal op=complete"
             }
             BuiltinTool::Undo => schema_value::<undo::UndoArgs>("undo"),
             BuiltinTool::Goal => schema_value::<crate::tool::goal::GoalArgs>("goal"),
+            BuiltinTool::ArtifactRead => schema_value::<files::ArtifactReadArgs>("artifact_read"),
         };
         ToolDef {
             name: self.name().to_string(),
@@ -517,6 +533,9 @@ Example: goal op=get; goal op=complete"
             }
             BuiltinTool::Undo => parse_args_typed("undo", arguments, ValidatedArgs::Undo),
             BuiltinTool::Goal => parse_args_typed("goal", arguments, ValidatedArgs::Goal),
+            BuiltinTool::ArtifactRead => {
+                parse_args_typed("artifact_read", arguments, ValidatedArgs::ArtifactRead)
+            }
         }
     }
 }
@@ -538,6 +557,7 @@ pub enum ValidatedArgs {
     ActivateSkill(crate::skills::activate::ActivateSkillArgs),
     Undo(undo::UndoArgs),
     Goal(crate::tool::goal::GoalArgs),
+    ArtifactRead(files::ArtifactReadArgs),
 }
 
 impl ValidatedArgs {
@@ -559,6 +579,7 @@ impl ValidatedArgs {
             Self::ActivateSkill(_) => BuiltinTool::ActivateSkill,
             Self::Undo(_) => BuiltinTool::Undo,
             Self::Goal(_) => BuiltinTool::Goal,
+            Self::ArtifactRead(_) => BuiltinTool::ArtifactRead,
         }
     }
 
@@ -579,7 +600,8 @@ impl ValidatedArgs {
             | Self::WebFetch(_)
             | Self::ActivateSkill(_)
             | Self::Undo(_)
-            | Self::Goal(_) => None,
+            | Self::Goal(_)
+            | Self::ArtifactRead(_) => None,
         }
     }
 }
@@ -974,6 +996,9 @@ pub async fn execute(
                 // §13：update_plan 是原生同步控制操作。
                 (BuiltinTool::UpdatePlan, ValidatedArgs::UpdatePlan(args)) => plan_exec::update_plan(args, &ctx),
                 (BuiltinTool::Goal, ValidatedArgs::Goal(args)) => goal::goal(args, &ctx),
+                (BuiltinTool::ArtifactRead, ValidatedArgs::ArtifactRead(args)) => {
+                    files::artifact_read(args, &ctx)
+                }
                 (tool, args) => {
                     // 内部不变量：ValidatedArgs 由同工具解析产生；异常组合按失败上报。
                     tracing::error!(
@@ -1033,6 +1058,7 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
         BuiltinTool::WebFetch,
         BuiltinTool::ActivateSkill,
         BuiltinTool::Goal,
+        BuiltinTool::ArtifactRead,
     ]
 }
 

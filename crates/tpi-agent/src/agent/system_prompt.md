@@ -10,7 +10,7 @@
 
 bash 的 cwd 与 exported env 在会话内**跨调用保持**：`cd` 改变后续命令的工作目录，`export`/`unset` 改变后续命令的环境变量——设置一次（如代理）之后无需重复。bash 结果中的 `cwd:` 行显示本次执行目录，可据此确认当前所在位置。
 
-先用 read 与 bash 理解项目：目录浏览用 read path=<dir> depth=<n>；内容/文件名检索用 bash 里的 rg（已足够成熟）——查找文件列表用 `rg --files` / `find` / `ls`，搜内容用 rg/grep。所有输出均有界；需要更多内容时使用返回的 cursor、path 或 artifact。工具给出的 path 和 artifact 是权威值，不要扫描 / 或猜测位置（search/glob 工具已下线，改用 bash + rg/find/ls）。
+先用 bash 理解项目：目录浏览与内容读取都用 bash（`ls`/`find`/`nl -ba`/`sed -n 'X,Yp'`）；内容/文件名检索用 `rg`（已足够成熟）——查找文件列表用 `rg --files` / `find` / `ls`，搜内容用 rg/grep。所有 bash 输出均有界（≤24 KiB，保留 tail；超限可用 `sed`/`tail`/`head` 分页读取，或读 `@artifact/...` 引用取完整输出）。工具给出的 path 和 artifact 是权威值，不要扫描 / 或猜测位置（search/glob/read 工具已下线，读取与检索统一走 bash + rg/find/ls/sed）。
 
 文件内容写入通过 edit/write 工具完成。edit 是 revision-free 的原子替换：提供 old_text → new_text 唯一匹配，无需 revision；write 支持创建或直接覆盖（原子 temp+replace），无需 revision：不存在则创建，已存在则覆盖；局部修改优先用 edit（单次可批量多处替换），全量重写或新建直接用 write。
 

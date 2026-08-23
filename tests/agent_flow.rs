@@ -1126,3 +1126,68 @@ async fn suspend_persists_rejected_outcomes_for_later_waves() {
         "assistant tool_calls 与 tool result 必须一一对应（否则 resume 序列非法）: {history:?}"
     );
 }
+
+/// §tool-surface：主 agent 模型可见的工具集**不包含 `read`**（判死刑），
+/// 但包含 `artifact_read`（读 @artifact 完整大输出的唯一入口），且 `edit`/
+/// `write`/`bash` 仍可用。
+#[tokio::test]
+async fn model_visible_tools_exclude_read_include_artifact_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = FakeProvider::new(vec![FakeResponse::text("done")]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, mut rx) = mpsc::channel(16);
+
+    agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "hi".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+            workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
+            processes: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::process::managed::ProcessRegistry::new(),
+            )),
+            terminals: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::terminal::TerminalRegistry::default(),
+            )),
+            agents: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi_agent::agent::manager::AgentManager::new(),
+            )),
+        },
+    )
+    .await
+    .expect("run succeeds");
+
+    let first = &provider.requests[0];
+    let tool_names: Vec<&str> = first.tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        !tool_names.iter().any(|n| *n == "read"),
+        "模型可见工具不得包含 read: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"artifact_read"),
+        "模型可见工具必须包含 artifact_read: {tool_names:?}"
+    );
+    for keep in ["edit", "write", "bash"] {
+        assert!(
+            tool_names.contains(&keep),
+            "核心工具 {keep} 必须保留: {tool_names:?}"
+        );
+    }
+    let _ = rx.try_recv();
+}

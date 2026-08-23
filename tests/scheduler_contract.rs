@@ -516,6 +516,9 @@ async fn active_set_is_stable_within_step() {
         .iter()
         .map(|d| d.name.clone())
         .collect();
+    // registry 层（registry.descriptors()）保留 read——它同时服务 subagent 只读
+    // 与 @artifact 内部机制；模型可见面的过滤在 agent 层 reload（见 agent_flow
+    // model_visible_tools_exclude_read_include_artifact_read）。
     assert!(defs.contains(&"read".to_string()));
 
     // Step 内 registry 变化：注销 read（模拟 MCP reload 移除工具）。

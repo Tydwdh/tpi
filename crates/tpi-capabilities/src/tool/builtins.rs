@@ -68,6 +68,38 @@ Example: read src/main.rs; read src depth=2"
     }
 }
 
+/// `artifact_read`：只读 @artifact/<session>/<id> 引用的完整大输出。
+/// `read` 从模型面移除（判死刑）后，这是模型读取 bash 截断之外完整内容的唯一入口；
+/// 文件/目录读取由 `bash` 承担。
+pub struct ArtifactReadTool;
+#[async_trait]
+impl Tool for ArtifactReadTool {
+    fn name(&self) -> &str {
+        "artifact_read"
+    }
+    fn description(&self) -> &str {
+        "Read the FULL original output behind an `@artifact/<session>/<id>` reference \
+(returned by bash etc. when its output is truncated). Truncated at 200 lines / 48KiB; \
+use start_line/line_count to page. `path` MUST be an `@artifact/<session>/<id>` reference \
+from a tool result — do not pass a filesystem path here. Example: artifact_read path=@artifact/<session>/<id>\n\nFor reading workspace files/directories, use bash (`sed -n`, `nl -ba`, `ls`, `rg`) instead."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        crate::tool::schema_value::<crate::tool::files::ArtifactReadArgs>("artifact_read")
+    }
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+    fn access_class(&self) -> ToolAccessClass {
+        ToolAccessClass::ReadOnly
+    }
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
+        match serde_json::from_str::<crate::tool::files::ArtifactReadArgs>(args) {
+            Ok(a) => crate::tool::files::artifact_read(a, ctx),
+            Err(e) => rejected("artifact_read", e),
+        }
+    }
+}
+
 pub struct EditTool;
 #[async_trait]
 impl Tool for EditTool {
@@ -452,6 +484,7 @@ pub fn register_all_builtin(registry: &mut crate::tool::registry::ToolRegistry) 
         Arc::new(WebFetchTool),
         Arc::new(ActivateSkillTool),
         Arc::new(UndoTool),
+        Arc::new(ArtifactReadTool),
     ];
     for tool in tools {
         let _ = registry.register_validated(tool);

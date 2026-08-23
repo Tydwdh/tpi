@@ -217,8 +217,9 @@ async fn tool_selector_filters_irrelevant_mcp_tools_from_model() {
         !tool_names.iter().any(|n| n == &"mcp::ctx-b::add"),
         "无关 MCP 工具被过滤：{tool_names:?}"
     );
-    // builtin 始终保留。
-    assert!(tool_names.contains(&"read") && tool_names.contains(&"bash"));
+    // builtin 始终保留；`read` 已从模型面移除（判死刑），`bash` 仍保留。
+    assert!(tool_names.contains(&"bash"));
+    assert!(!tool_names.iter().any(|n| *n == "read"));
 
     // 清理。
     {

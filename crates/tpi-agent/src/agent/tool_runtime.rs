@@ -154,6 +154,11 @@ impl ToolRuntime {
         let defs: Vec<crate::provider::ToolDef> = selector
             .select(registry.descriptors(), context)
             .into_iter()
+            // §tool-surface：主 agent 模型不再暴露 `read`（判死刑）。
+            // 内部实现（ReadTool / files::read / ReadOnlyCapability::Read）保留：
+            // subagent 只读 registry 与 @artifact 读取机制仍依赖它。模型改由
+            // `bash`(rg/cat/sed/nl) 读取文件内容。
+            .filter(|d| d.name != "read")
             .map(|d| crate::provider::ToolDef {
                 name: d.name,
                 description: d.description,
