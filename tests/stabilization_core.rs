@@ -136,12 +136,7 @@ async fn p0_2_empty_text_tool_call_replays_legal_protocol() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -214,12 +209,7 @@ async fn p0_3_runtime_projection_matches_resume_projection() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -298,12 +288,7 @@ impl ReplayHarness {
                 registry: std::sync::Arc::new(std::sync::Mutex::new(
                     tpi::tool::registry::builtin_registry(),
                 )),
-                processes: std::sync::Arc::new(std::sync::Mutex::new(
-                    tpi::process::managed::ProcessRegistry::new(),
-                )),
-                terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                    tpi::terminal::TerminalRegistry::default(),
-                )),
+                resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
                 agents: std::sync::Arc::new(std::sync::Mutex::new(
                     tpi_agent::agent::manager::AgentManager::new(),
@@ -531,12 +516,7 @@ async fn replay_cancelled_run_matches_runtime() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),

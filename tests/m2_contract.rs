@@ -34,6 +34,7 @@ async fn bash_pipefail_makes_pipeline_failure_visible() {
             cwd: None,
             timeout_ms: 30_000,
             background: false,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -52,6 +53,7 @@ async fn bash_pipefail_makes_pipeline_failure_visible() {
             cwd: None,
             timeout_ms: 30_000,
             background: false,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -81,6 +83,7 @@ async fn cancellation_kills_entire_process_tree() {
         cwd: None,
         timeout_ms: 60_000,
         background: false,
+        lifetime: Default::default(),
     };
     let run_ctx = ToolContext {
         workspace_root: ctx.workspace_root.clone(),
@@ -98,6 +101,8 @@ async fn cancellation_kills_entire_process_tree() {
         workspace: ctx.workspace.clone(),
         processes: ctx.processes.clone(),
         terminals: Default::default(),
+        resources: None,
+        resource_identity: None,
         registry: ctx.registry.clone(),
         interactive: true,
         allow_outside_workspace: ctx.allow_outside_workspace,
@@ -140,6 +145,7 @@ async fn is_process_alive(pid: u32, _ctx: &ToolContext) -> bool {
             cwd: None,
             timeout_ms: 10_000,
             background: false,
+            lifetime: Default::default(),
         };
         let outcome = bash(args, &check_ctx).await;
         match outcome.model_payload.exit_code {
@@ -231,6 +237,7 @@ async fn bash_output_lands_in_artifact_and_readable_via_opaque_ref() {
         cwd: None,
         timeout_ms: 30_000,
         background: false,
+        lifetime: Default::default(),
     };
     let outcome = bash(args, &ctx).await;
     assert_eq!(outcome.status, ToolStatus::Succeeded);
@@ -284,6 +291,7 @@ async fn bash_streams_live_output_through_output_tx() {
         cwd: None,
         timeout_ms: 30_000,
         background: false,
+        lifetime: Default::default(),
     };
     let call_id = ctx.call_id;
     let mut handle = tokio::spawn(async move { bash(args, &ctx).await });
@@ -337,6 +345,7 @@ async fn bash_does_not_block_when_stream_channel_full() {
         cwd: None,
         timeout_ms: 30_000,
         background: false,
+        lifetime: Default::default(),
     };
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), bash(args, &ctx))
         .await

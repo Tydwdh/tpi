@@ -123,11 +123,9 @@ pub struct RunInput<'a> {
     /// P4-02/P4 gate：工具注册表由 composition root 注入（builtin + MCP 同一
     /// registry；禁止 global registry）。
     pub registry: std::sync::Arc<std::sync::Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
-    /// Session 级共享 ManagedProcess registry（跨 run 存活，任务书 §8）。
-    pub processes:
-        std::sync::Arc<std::sync::Mutex<tpi_capabilities::process::managed::ProcessRegistry>>,
-    /// Session 级共享 Persistent PTY terminal registry（跨 run 存活）。
-    pub terminals: std::sync::Arc<std::sync::Mutex<tpi_capabilities::terminal::TerminalRegistry>>,
+    /// SessionRuntime-owned process/terminal resource boundary. Child runs
+    /// receive this same manager; they do not construct local registries.
+    pub resources: std::sync::Arc<tpi_capabilities::resource::ResourceManager>,
     /// ADR-007：AgentManager（ToolRuntime drain inbox 供 build_context 注入 pending reports）。
     pub agents: std::sync::Arc<std::sync::Mutex<crate::agent::manager::AgentManager>>,
 }
@@ -332,8 +330,7 @@ pub async fn run<P: Provider, S: tpi_session::store::SessionStore>(
         force_compaction,
         workspace,
         registry,
-        processes,
-        terminals,
+        resources,
         agents,
     } = input;
     let run_id = session.begin_run();
@@ -355,13 +352,27 @@ pub async fn run<P: Provider, S: tpi_session::store::SessionStore>(
             force_compaction,
             workspace,
             registry,
-            processes,
-            terminals,
+            resources,
             agents,
         },
     )
     .instrument(span)
     .await
+}
+
+/// Cleanup is kept at the agent boundary so every terminal RunCompleted path
+/// uses the same owner/lifetime rule.
+async fn cleanup_resources_before_terminal(
+    runtime: &ToolRuntime,
+    state: crate::agent::manager::AgentState,
+) {
+    if let Err(error) = runtime.cleanup_agent_resources().await {
+        // The terminal fact is still written so the session remains
+        // recoverable, but the error is explicit: callers must not interpret
+        // this as proof that an unconfirmed external process stopped.
+        tracing::error!(%error, "agent resource cleanup was not fully confirmed");
+    }
+    runtime.finish_agent_state(state);
 }
 
 /// `run` 的实际执行体（由 `run` 以 `.instrument(span)` 包裹，见 O0）。
@@ -382,8 +393,7 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
         force_compaction,
         workspace,
         registry,
-        processes,
-        terminals,
+        resources,
         agents,
     } = input;
     // P1-05：run_inner 只读窄视图 AgentConfig。
@@ -561,9 +571,8 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
         active_workspace,
         // P4-02/P4 gate：registry 由 composition root 注入（无全局）。
         registry,
-        // session 级共享注册表由 RunInput 注入（跨 run 存活）。
-        processes,
-        terminals,
+        // session 级资源管理器由 RunInput 注入（跨 run / child 存活）。
+        resources,
         agents,
     )
     .map_err(RunFailure::ToolInfrastructure)?;
@@ -585,6 +594,11 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
     let final_reason: CompletionReason = 'run_loop: loop {
         // §用户诉求：max_model_turns=0 = 不限制（默认）。
         if agent_cfg.limits.max_model_turns > 0 && turn >= agent_cfg.limits.max_model_turns {
+            cleanup_resources_before_terminal(
+                &tool_runtime,
+                crate::agent::manager::AgentState::Completed,
+            )
+            .await;
             session
                 .commit_terminal(&SessionEvent::RunCompleted {
                     reason: CompletionReason::MaxTurns,
@@ -647,6 +661,11 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                         let after =
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
+                            cleanup_resources_before_terminal(
+                                &tool_runtime,
+                                crate::agent::manager::AgentState::Completed,
+                            )
+                            .await;
                             session
                                 .commit_terminal(&SessionEvent::RunCompleted {
                                     reason: CompletionReason::ContextOverflow,
@@ -671,6 +690,11 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                         let after =
                             crate::context::estimate_request(&system_prompt, &messages, &tool_defs);
                         if after > usable {
+                            cleanup_resources_before_terminal(
+                                &tool_runtime,
+                                crate::agent::manager::AgentState::Completed,
+                            )
+                            .await;
                             session
                                 .commit_terminal(&SessionEvent::RunCompleted {
                                     reason: CompletionReason::ContextOverflow,
@@ -862,6 +886,7 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                                 let cause = cancel_cause.load(std::sync::atomic::Ordering::SeqCst);
                                 let cancel_reason =
                                     crate::agent::limits::cancel_reason_for_cause(cause);
+                            cleanup_resources_before_terminal(&tool_runtime, crate::agent::manager::AgentState::Cancelled).await;
                                 session.commit_terminal(&SessionEvent::RunCompleted {
                                         reason: cancel_reason,
                                         usage: usage_total,
@@ -1001,6 +1026,7 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                                             saw_tool_calls,
                                         })
                                         .map_err(|e2| RunFailure::Session(e2.to_string()))?;
+                            cleanup_resources_before_terminal(&tool_runtime, crate::agent::manager::AgentState::Failed).await;
                                     session.commit_terminal(&SessionEvent::RunCompleted {
                                             reason: CompletionReason::ProviderInterrupted,
                                             usage: usage_total,
@@ -1010,6 +1036,7 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                                     assistant_text = content.clone();
                                     break 'run_loop CompletionReason::ProviderInterrupted;
                                 }
+                                cleanup_resources_before_terminal(&tool_runtime, crate::agent::manager::AgentState::Failed).await;
                                 session.commit_terminal(&SessionEvent::RunCompleted {
                                         reason: CompletionReason::ProviderUnavailable,
                                         usage: usage_total,
@@ -1130,6 +1157,11 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                         prompt: text.clone(),
                     })
                     .map_err(|e| RunFailure::Session(e.to_string()))?;
+                cleanup_resources_before_terminal(
+                    &tool_runtime,
+                    crate::agent::manager::AgentState::WaitingInput,
+                )
+                .await;
                 session
                     .commit_terminal(&SessionEvent::RunCompleted {
                         reason: CompletionReason::AwaitingUserInput,
@@ -1142,6 +1174,11 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
             if batch == BatchEnd::BudgetExceeded {
                 // P1-2：工具预算超限用独立 reason（此前归为 Error，
                 // 用户/模型会误以为是协议错误）。
+                cleanup_resources_before_terminal(
+                    &tool_runtime,
+                    crate::agent::manager::AgentState::Completed,
+                )
+                .await;
                 session
                     .commit_terminal(&SessionEvent::RunCompleted {
                         reason: CompletionReason::MaxToolCalls,
@@ -1161,6 +1198,11 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
             | crate::provider::FinishReason::ContentFilter
             | crate::provider::FinishReason::Error => CompletionReason::Error,
         };
+        cleanup_resources_before_terminal(
+            &tool_runtime,
+            crate::agent::manager::AgentState::Completed,
+        )
+        .await;
         session
             .commit_terminal(&SessionEvent::RunCompleted {
                 reason,

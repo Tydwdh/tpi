@@ -88,12 +88,7 @@ async fn run_with(
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -466,12 +461,7 @@ async fn cancellation_during_parallel_bash_cancels_all() {
                 registry: std::sync::Arc::new(std::sync::Mutex::new(
                     tpi::tool::registry::builtin_registry(),
                 )),
-                processes: std::sync::Arc::new(std::sync::Mutex::new(
-                    tpi::process::managed::ProcessRegistry::new(),
-                )),
-                terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                    tpi::terminal::TerminalRegistry::default(),
-                )),
+                resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
                 agents: std::sync::Arc::new(std::sync::Mutex::new(
                     tpi_agent::agent::manager::AgentManager::new(),

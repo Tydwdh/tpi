@@ -7,6 +7,7 @@ use crate::tool::ToolContext;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tpi_core::outcome::{ModelPayload, ToolOutcome, ToolStatus};
+use tpi_core::resource::{ResourceLifetime, WorkspaceAccess};
 
 /// §8：统一 terminal 工具参数——tagged action schema。
 ///
@@ -20,6 +21,10 @@ pub enum TerminalArgs {
         rows: Option<u16>,
         #[serde(default)]
         cols: Option<u16>,
+        /// Resource lifetime; owner is assigned by the runtime, never by the
+        /// model.
+        #[serde(default)]
+        lifetime: ResourceLifetime,
     },
     /// 向终端写入原始字节（不做转义解释）。
     Write {
@@ -47,7 +52,11 @@ pub enum TerminalArgs {
 
 pub async fn terminal(args: TerminalArgs, ctx: &ToolContext) -> ToolOutcome {
     match args {
-        TerminalArgs::Open { rows, cols } => do_open(rows, cols, ctx).await,
+        TerminalArgs::Open {
+            rows,
+            cols,
+            lifetime,
+        } => do_open(rows, cols, lifetime, ctx).await,
         TerminalArgs::Write { id, data, submit } => do_write(&id, &data, submit, ctx).await,
         TerminalArgs::Read { id, after } => do_read(&id, after, ctx).await,
         TerminalArgs::Resize { id, rows, cols } => do_resize(&id, rows, cols, ctx).await,
@@ -58,7 +67,12 @@ pub async fn terminal(args: TerminalArgs, ctx: &ToolContext) -> ToolOutcome {
 
 // ---- 内部实现 ----
 
-async fn do_open(rows: Option<u16>, cols: Option<u16>, ctx: &ToolContext) -> ToolOutcome {
+async fn do_open(
+    rows: Option<u16>,
+    cols: Option<u16>,
+    lifetime: ResourceLifetime,
+    ctx: &ToolContext,
+) -> ToolOutcome {
     let shell = if cfg!(windows) {
         match crate::tool::command::locate_git_bash(ctx) {
             Some(path) => path,
@@ -81,7 +95,7 @@ async fn do_open(rows: Option<u16>, cols: Option<u16>, ctx: &ToolContext) -> Too
                 return outcome("terminal", Err(format!("workspace_tracking: {error}")));
             }
         };
-    let result = tpi_core::util::lock_mutex(&ctx.terminals, "terminal_registry").open_tracked(
+    let result = ctx.resource_manager().open_terminal(
         &shell,
         ctx.workspace_root.as_std_path(),
         rows.unwrap_or(24),
@@ -89,6 +103,7 @@ async fn do_open(rows: Option<u16>, cols: Option<u16>, ctx: &ToolContext) -> Too
         workspace,
         ctx.artifacts_root.clone(),
         ctx.session_id.clone(),
+        ctx.resource_meta(lifetime, WorkspaceAccess::ExternallyMutable),
     );
     outcome(
         "terminal",
@@ -106,22 +121,24 @@ fn write_bytes(data: &str, submit: bool) -> Vec<u8> {
 }
 
 async fn do_write(id: &str, data: &str, submit: bool, ctx: &ToolContext) -> ToolOutcome {
-    let mut terminals = tpi_core::util::lock_mutex(&ctx.terminals, "terminal_registry");
+    let resources = ctx.resource_manager();
+    let identity = ctx.resource_identity();
     let bytes = write_bytes(data, submit);
-    let result = terminals
-        .checkpoint_workspace(id, &ctx.artifacts_root, &ctx.session_id)
-        .and_then(|_| terminals.write(id, &bytes))
+    let result = resources
+        .checkpoint_terminal(&identity, id, &ctx.artifacts_root, &ctx.session_id)
+        .and_then(|_| resources.write_terminal(&identity, id, &bytes))
         .map(|_| format!("action: write\nstatus: written\nterminal_id: {id}"));
     outcome("terminal", result)
 }
 
 async fn do_read(id: &str, after: Option<u64>, ctx: &ToolContext) -> ToolOutcome {
-    let mut terminals = tpi_core::util::lock_mutex(&ctx.terminals, "terminal_registry");
-    let result = terminals
-        .read(id, after.unwrap_or(0))
+    let resources = ctx.resource_manager();
+    let identity = ctx.resource_identity();
+    let result = resources
+        .read_terminal(&identity, id, after.unwrap_or(0))
         .and_then(|read| {
-            terminals
-                .checkpoint_workspace(id, &ctx.artifacts_root, &ctx.session_id)
+            resources
+                .checkpoint_terminal(&identity, id, &ctx.artifacts_root, &ctx.session_id)
                 .map(|_| read)
         })
         .map(|read| {
@@ -137,29 +154,36 @@ async fn do_read(id: &str, after: Option<u64>, ctx: &ToolContext) -> ToolOutcome
 }
 
 async fn do_resize(id: &str, rows: u16, cols: u16, ctx: &ToolContext) -> ToolOutcome {
-    let mut terminals = tpi_core::util::lock_mutex(&ctx.terminals, "terminal_registry");
-    let result = terminals
-        .checkpoint_workspace(id, &ctx.artifacts_root, &ctx.session_id)
-        .and_then(|_| terminals.resize(id, rows, cols))
+    let resources = ctx.resource_manager();
+    let identity = ctx.resource_identity();
+    let result = resources
+        .checkpoint_terminal(&identity, id, &ctx.artifacts_root, &ctx.session_id)
+        .and_then(|_| resources.resize_terminal(&identity, id, rows, cols))
         .map(|_| format!("action: resize\nstatus: resized\nterminal_id: {id}"));
     outcome("terminal", result)
 }
 
 async fn do_signal(id: &str, ctx: &ToolContext) -> ToolOutcome {
-    let mut terminals = tpi_core::util::lock_mutex(&ctx.terminals, "terminal_registry");
-    let result = terminals
-        .signal(id)
-        .and_then(|_| terminals.checkpoint_workspace(id, &ctx.artifacts_root, &ctx.session_id))
+    let resources = ctx.resource_manager();
+    let identity = ctx.resource_identity();
+    let result = resources
+        .signal_terminal(&identity, id)
+        .and_then(|_| {
+            resources.checkpoint_terminal(&identity, id, &ctx.artifacts_root, &ctx.session_id)
+        })
         .map(|_| format!("action: signal\nstatus: signalled\nterminal_id: {id}"));
     outcome("terminal", result)
 }
 
 async fn do_close(id: &str, ctx: &ToolContext) -> ToolOutcome {
-    let mut terminals = tpi_core::util::lock_mutex(&ctx.terminals, "terminal_registry");
-    let result = terminals
-        .signal(id)
-        .and_then(|_| terminals.checkpoint_workspace(id, &ctx.artifacts_root, &ctx.session_id))
-        .and_then(|_| terminals.close(id))
+    let resources = ctx.resource_manager();
+    let identity = ctx.resource_identity();
+    let result = resources
+        .signal_terminal(&identity, id)
+        .and_then(|_| {
+            resources.checkpoint_terminal(&identity, id, &ctx.artifacts_root, &ctx.session_id)
+        })
+        .and_then(|_| resources.close_terminal(&identity, id))
         .map(|_| format!("action: close\nstatus: closed\nterminal_id: {id}"));
     outcome("terminal", result)
 }

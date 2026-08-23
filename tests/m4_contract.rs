@@ -420,12 +420,7 @@ async fn update_plan_and_compaction_integration() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -511,12 +506,7 @@ async fn repeated_failing_action_blocked_in_agent_loop() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),

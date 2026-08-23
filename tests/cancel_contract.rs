@@ -24,6 +24,7 @@ async fn cancellation_terminates_running_command_with_cancelled_status() {
         cwd: None,
         timeout_ms: 60_000,
         background: false,
+        lifetime: Default::default(),
     };
 
     let handle = tokio::spawn(async move { bash(args, &ctx).await });
@@ -52,6 +53,7 @@ async fn timeout_terminates_command_with_timed_out_status() {
         cwd: None,
         timeout_ms: 500,
         background: false,
+        lifetime: Default::default(),
     };
 
     let outcome = bash(args, &ctx).await;

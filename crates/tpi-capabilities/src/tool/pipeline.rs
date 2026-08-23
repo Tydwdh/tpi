@@ -154,6 +154,8 @@ mod tests {
                 )),
             )),
             terminals: Default::default(),
+            resources: None,
+            resource_identity: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::tool::registry::ToolRegistry::new(),
             )),

@@ -36,6 +36,10 @@ pub struct InProcessChildProvider<P, F> {
     registry: Option<Arc<Mutex<ToolRegistry>>>,
     /// Shared agent graph for recursive delegation and tree cancellation.
     agents: Option<Arc<Mutex<crate::agent::manager::AgentManager>>>,
+    /// Session-scoped process/terminal owner. Production child runs always
+    /// receive the parent's manager; `None` is only for isolated provider
+    /// compatibility tests.
+    resources: Option<Arc<tpi_capabilities::resource::ResourceManager>>,
     _provider: std::marker::PhantomData<P>,
 }
 
@@ -54,6 +58,7 @@ impl<P, F> InProcessChildProvider<P, F> {
             parent_call_id: None,
             registry: None,
             agents: None,
+            resources: None,
             _provider: std::marker::PhantomData,
         }
     }
@@ -90,6 +95,14 @@ impl<P, F> InProcessChildProvider<P, F> {
         agents: Arc<Mutex<crate::agent::manager::AgentManager>>,
     ) -> Self {
         self.agents = Some(agents);
+        self
+    }
+
+    pub fn with_resource_manager(
+        mut self,
+        resources: Arc<tpi_capabilities::resource::ResourceManager>,
+    ) -> Self {
+        self.resources = Some(resources);
         self
     }
 }
@@ -206,12 +219,10 @@ impl<P: Provider + Send, F: Fn() -> P + Send> SubagentProvider for InProcessChil
             }
         });
 
-        let processes = Arc::new(Mutex::new(
-            tpi_capabilities::process::managed::ProcessRegistry::new(),
-        ));
-        let terminals = Arc::new(Mutex::new(
-            tpi_capabilities::terminal::TerminalRegistry::default(),
-        ));
+        let resources = self
+            .resources
+            .clone()
+            .unwrap_or_else(|| Arc::new(tpi_capabilities::resource::ResourceManager::new()));
         let mut user_message = request.instruction.clone();
         let outcome = loop {
             let history = tpi_session::store::replay_messages(
@@ -231,10 +242,10 @@ impl<P: Provider + Send, F: Fn() -> P + Send> SubagentProvider for InProcessChil
                     force_compaction: false,
                     workspace: Some(self.workspace.clone()),
                     registry: registry.clone(),
-                    // Child is a normal runtime: it shares the graph and tool
-                    // registry, while its conversation/session remains isolated.
-                    processes: processes.clone(),
-                    terminals: terminals.clone(),
+                    // Child is a normal runtime: it shares graph, tool
+                    // registry, and managed resources, while its
+                    // conversation/session remains isolated.
+                    resources: resources.clone(),
                     agents: agents.clone(),
                 },
             )

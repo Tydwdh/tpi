@@ -21,6 +21,7 @@ struct Terminal {
     output: Arc<Mutex<Output>>,
     workspace: Option<crate::workspace::tracked::TrackedWorkspace>,
     journal: Option<(std::path::PathBuf, String)>,
+    resource_meta: Option<tpi_core::resource::ResourceMeta>,
 }
 #[derive(Default)]
 pub struct TerminalRegistry {
@@ -42,7 +43,7 @@ impl TerminalRegistry {
         rows: u16,
         cols: u16,
     ) -> Result<String, String> {
-        self.open_inner(program, cwd, rows, cols, None, None)
+        self.open_inner(program, cwd, rows, cols, None, None, None)
     }
 
     /// Open a PTY with a workspace snapshot owned for the whole terminal
@@ -66,9 +67,36 @@ impl TerminalRegistry {
             cols,
             Some(workspace),
             Some((artifacts_root, session_id)),
+            None,
         )
     }
 
+    /// Agent-facing tracked terminal creation with explicit owner/lifetime
+    /// metadata. The older `open_tracked` remains for low-level callers only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_tracked_with_meta(
+        &mut self,
+        program: &str,
+        cwd: &std::path::Path,
+        rows: u16,
+        cols: u16,
+        workspace: crate::workspace::tracked::TrackedWorkspace,
+        artifacts_root: std::path::PathBuf,
+        session_id: String,
+        resource_meta: tpi_core::resource::ResourceMeta,
+    ) -> Result<String, String> {
+        self.open_inner(
+            program,
+            cwd,
+            rows,
+            cols,
+            Some(workspace),
+            Some((artifacts_root, session_id)),
+            Some(resource_meta),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn open_inner(
         &mut self,
         program: &str,
@@ -77,6 +105,7 @@ impl TerminalRegistry {
         cols: u16,
         workspace: Option<crate::workspace::tracked::TrackedWorkspace>,
         journal: Option<(std::path::PathBuf, String)>,
+        resource_meta: Option<tpi_core::resource::ResourceMeta>,
     ) -> Result<String, String> {
         if self.terminals.len() >= MAX_TERMINALS {
             return Err(format!(
@@ -149,9 +178,24 @@ impl TerminalRegistry {
                 output,
                 workspace,
                 journal,
+                resource_meta,
             },
         );
         Ok(id)
+    }
+
+    pub fn resource_ids(&self) -> Vec<String> {
+        self.terminals.keys().cloned().collect()
+    }
+
+    pub fn resource_meta(&self, id: &str) -> Option<tpi_core::resource::ResourceMeta> {
+        self.terminals
+            .get(id)
+            .and_then(|terminal| terminal.resource_meta)
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.terminals.contains_key(id)
     }
     pub fn write(&mut self, id: &str, data: &[u8]) -> Result<(), String> {
         let t = self
@@ -228,6 +272,20 @@ impl TerminalRegistry {
         let _ = t.child.kill();
         self.terminals.remove(id);
         Ok(())
+    }
+
+    /// Close a terminal while preserving the final workspace checkpoint. This
+    /// is the cleanup path used by `ResourceManager`; a raw `close` remains a
+    /// low-level operation for callers that already checkpointed explicitly.
+    pub fn close_with_checkpoint(&mut self, id: &str) -> Result<(), String> {
+        let journal = self
+            .terminals
+            .get(id)
+            .and_then(|terminal| terminal.journal.clone());
+        if let Some((artifacts_root, session_id)) = journal {
+            self.checkpoint_workspace(id, &artifacts_root, &session_id)?;
+        }
+        self.close(id)
     }
 }
 impl Drop for TerminalRegistry {

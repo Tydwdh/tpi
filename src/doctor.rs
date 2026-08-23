@@ -121,6 +121,8 @@ fn doctor_report_with_home(
             crate::process::managed::ProcessRegistry::new(),
         )),
         terminals: Default::default(),
+        resources: None,
+        resource_identity: None,
         registry: std::sync::Arc::new(std::sync::Mutex::new(
             crate::tool::registry::builtin_registry(),
         )),

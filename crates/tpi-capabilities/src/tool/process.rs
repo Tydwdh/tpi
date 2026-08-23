@@ -16,7 +16,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::process::managed::{ManagedProcessState, ProcessId, wait_process};
+use crate::process::managed::{ManagedProcessState, ProcessId};
 use crate::tool::ToolContext;
 use tpi_core::outcome::{ModelPayload, ToolOutcome, ToolStatus};
 
@@ -106,8 +106,13 @@ fn parse_id(args: &ProcessArgs) -> Option<ProcessId> {
 }
 
 fn list_processes(ctx: &ToolContext) -> ToolOutcome {
-    let reg = tpi_core::util::lock_mutex(&ctx.processes, "process_registry");
-    let lines: Vec<String> = reg.iter().map(|p| p.status_line()).collect();
+    let resources = ctx.resource_manager();
+    let identity = ctx.resource_identity();
+    let lines: Vec<String> = resources
+        .list_processes(&identity)
+        .iter()
+        .map(|p| p.status_line())
+        .collect();
     let body = if lines.is_empty() {
         "（当前无 managed process）".to_string()
     } else {
@@ -120,8 +125,9 @@ fn list_processes(ctx: &ToolContext) -> ToolOutcome {
 }
 
 fn status_process(ctx: &ToolContext, id: ProcessId) -> ToolOutcome {
-    let reg = tpi_core::util::lock_mutex(&ctx.processes, "process_registry");
-    let Some(process) = reg.get(id) else {
+    let resources = ctx.resource_manager();
+    let identity = ctx.resource_identity();
+    let Some(process) = resources.process(&identity, id) else {
         return not_found(id);
     };
     let runtime = match process.finished_at {
@@ -150,8 +156,9 @@ fn status_process(ctx: &ToolContext, id: ProcessId) -> ToolOutcome {
 }
 
 fn output_process(ctx: &ToolContext, id: ProcessId, after: Option<u64>) -> ToolOutcome {
-    let reg = tpi_core::util::lock_mutex(&ctx.processes, "process_registry");
-    let Some(process) = reg.get(id) else {
+    let resources = ctx.resource_manager();
+    let identity = ctx.resource_identity();
+    let Some(process) = resources.process(&identity, id) else {
         return not_found(id);
     };
     // tail 是有界环形缓冲；`total_bytes - tail.len()` 是仍可读取的最早 offset。
@@ -194,18 +201,20 @@ fn output_process(ctx: &ToolContext, id: ProcessId, after: Option<u64>) -> ToolO
 
 /// wait（任务书 §20）：最多等 `timeout`；完成返回终态，仍运行返回 running。
 async fn wait_process_tool(ctx: &ToolContext, id: ProcessId, timeout: Duration) -> ToolOutcome {
-    let Some(state) = wait_process(&ctx.processes, id, timeout).await else {
+    let resources = ctx.resource_manager();
+    let identity = ctx.resource_identity();
+    let Some(state) = resources.wait_process(&identity, id, timeout).await else {
         return not_found(id);
     };
-    let reg = tpi_core::util::lock_mutex(&ctx.processes, "process_registry");
-    let process = reg.get(id);
+    let process = resources.process(&identity, id);
     let runtime = process
+        .as_ref()
         .map(|p| match p.finished_at {
             Some(end) => end.duration_since(p.started_at),
             None => p.started_at.elapsed(),
         })
         .unwrap_or_default();
-    let exit_code = process.and_then(|p| p.exit_code);
+    let exit_code = process.as_ref().and_then(|p| p.exit_code);
     let mut out = format!(
         "status: {}\nprocess_id: {}\nruntime: {:.1}s",
         state.name(),
@@ -215,7 +224,7 @@ async fn wait_process_tool(ctx: &ToolContext, id: ProcessId, timeout: Duration) 
     if let Some(code) = exit_code {
         out.push_str(&format!("\nexit_code: {code}"));
     }
-    if let Some(reference) = process.and_then(|p| p.artifact.clone()) {
+    if let Some(reference) = process.as_ref().and_then(|p| p.artifact.clone()) {
         out.push_str(&format!("\nartifact: {reference}"));
     }
     if !state.is_terminal() {
@@ -227,12 +236,16 @@ async fn wait_process_tool(ctx: &ToolContext, id: ProcessId, timeout: Duration) 
 /// cancel（任务书 §22）：请求取消 → drain task 执行 TerminateJobObject。
 /// 等待状态实际迁移（最多 3 秒）后返回真实结果；无法确认时如实 Unknown。
 async fn cancel_process(ctx: &ToolContext, id: ProcessId) -> ToolOutcome {
-    let requested = tpi_core::util::lock_mutex(&ctx.processes, "process_registry").cancel(id);
+    let resources = ctx.resource_manager();
+    let identity = ctx.resource_identity();
+    let requested = resources.cancel_process(&identity, id);
     if !requested {
         return not_found_or_ended(id);
     }
     // 等待 drain task 完成终止并迁移状态（TerminateJobObject + EOF + 状态补丁）。
-    let state = wait_process(&ctx.processes, id, Duration::from_secs(3)).await;
+    let state = resources
+        .wait_process(&identity, id, Duration::from_secs(3))
+        .await;
     match state {
         Some(ManagedProcessState::Cancelled) => ToolOutcome::succeeded(
             "process",

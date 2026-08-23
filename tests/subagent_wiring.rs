@@ -134,8 +134,7 @@ async fn spawn_worker_report_lands_in_shared_manager_inbox() {
             force_compaction: false,
             workspace: None,
             registry: registry.clone(),
-            processes: Arc::new(Mutex::new(tpi::process::managed::ProcessRegistry::new())),
-            terminals: Arc::new(Mutex::new(tpi::terminal::TerminalRegistry::default())),
+            resources: Arc::new(tpi::resource::ResourceManager::new()),
             // 关键：与 register_async_subagent_tools 注入的是同一实例。
             agents: manager.clone(),
         },

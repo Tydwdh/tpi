@@ -11,6 +11,7 @@ use crate::tool::ToolContext;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tpi_core::outcome::{ModelPayload, ToolMetadata, ToolOutcome, ToolStatus};
+use tpi_core::resource::{ResourceLifetime, WorkspaceAccess};
 
 /// 命令输出的模型预算（§8.4：24 KiB，保留错误相关 tail）。
 pub const DEFAULT_RUN_MAX_BYTES: usize = 24 * 1024;
@@ -46,6 +47,10 @@ pub struct BashArgs {
     /// 不要用 shell `&`/`nohup` 代替本字段。
     #[serde(default)]
     pub background: bool,
+    /// Lifetime of a background managed process. The runtime supplies the
+    /// owner identity; the model can only choose this lifetime.
+    #[serde(default)]
+    pub lifetime: ResourceLifetime,
 }
 
 /// bash 工具内部使用的启动规格（由 `command::bash` 构造，不暴露为工具 schema）。
@@ -500,7 +505,8 @@ async fn local_bash_background(args: BashArgs, ctx: &ToolContext) -> ToolOutcome
         artifacts_root: ctx.artifacts_root.clone(),
         session_id: ctx.session_id.clone(),
         workspace_tracker: Some(workspace_tracker),
-        registry: ctx.processes.clone(),
+        resources: ctx.resource_manager(),
+        resource_meta: ctx.resource_meta(args.lifetime, WorkspaceAccess::ExternallyMutable),
     };
     match crate::process::managed::start_background(request).await {
         Ok(id) => ToolOutcome::succeeded(

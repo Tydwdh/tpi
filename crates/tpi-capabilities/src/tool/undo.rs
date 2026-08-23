@@ -231,6 +231,8 @@ mod tests {
                 crate::process::managed::ProcessRegistry::new(),
             )),
             terminals: Default::default(),
+            resources: None,
+            resource_identity: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::tool::registry::ToolRegistry::new(),
             )),

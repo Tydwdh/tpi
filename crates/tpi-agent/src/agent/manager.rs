@@ -677,6 +677,19 @@ impl AgentManager {
             .find_map(|delegation| (delegation.child_agent == agent_id).then_some(delegation.id))
     }
 
+    /// Snapshot the graph descendants controlled by a caller. The capability
+    /// layer receives this immutable authorization projection instead of
+    /// depending on `AgentManager` internals.
+    pub fn descendants_of(&self, agent_id: AgentId) -> Vec<AgentId> {
+        let mut result = Vec::new();
+        let mut pending = self.children.get(&agent_id).cloned().unwrap_or_default();
+        while let Some(current) = pending.pop() {
+            result.push(current);
+            pending.extend(self.children.get(&current).cloned().unwrap_or_default());
+        }
+        result
+    }
+
     pub fn register_worker(
         &mut self,
         agent_id: AgentId,
@@ -730,6 +743,17 @@ impl AgentManager {
             r.state = AgentState::WaitingTool;
             r.updated_at = Self::now();
         }
+        Some(())
+    }
+
+    /// Mark the runtime node at the same boundary at which its resource
+    /// cleanup has completed. `ensure_root`/the child resume path may move a
+    /// WaitingInput node back to Running for a later run.
+    pub fn finish_runtime(&mut self, agent_id: AgentId, state: AgentState) -> Option<()> {
+        let record = self.agents.get_mut(&agent_id)?;
+        record.state = state;
+        record.updated_at = Self::now();
+        record.notify.notify_waiters();
         Some(())
     }
 

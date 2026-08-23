@@ -36,6 +36,9 @@ pub(super) struct ToolRuntime {
     /// ManagedProcess registry（session 级；background bash + process 工具共享）。
     processes: Arc<Mutex<tpi_capabilities::process::managed::ProcessRegistry>>,
     terminals: Arc<Mutex<tpi_capabilities::terminal::TerminalRegistry>>,
+    /// Session-level resource boundary shared with every descendant runtime.
+    resources: Arc<tpi_capabilities::resource::ResourceManager>,
+    resource_identity: tpi_core::resource::AgentIdentity,
     /// ADR-007：AgentManager（drain inbox 供 build_context 注入 pending reports）。
     agents: Arc<std::sync::Mutex<crate::agent::manager::AgentManager>>,
     /// Session/workspace-wide effect scheduler shared by every agent runtime.
@@ -117,21 +120,28 @@ impl ToolRuntime {
         initial_plan: Option<Plan>,
         active_workspace: tpi_capabilities::workspace::ActiveWorkspace,
         registry: Arc<std::sync::Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
-        processes: Arc<std::sync::Mutex<tpi_capabilities::process::managed::ProcessRegistry>>,
-        terminals: Arc<std::sync::Mutex<tpi_capabilities::terminal::TerminalRegistry>>,
+        resources: Arc<tpi_capabilities::resource::ResourceManager>,
         agents: Arc<std::sync::Mutex<crate::agent::manager::AgentManager>>,
     ) -> Result<Self, String> {
         // §W0/R4：workspace 由调用方注入（默认 Local；测试可传 remote）。
         // ctx.shell 与 workspace 内 shell 共享同一 Arc。
+        let processes = resources.processes();
+        let terminals = resources.terminals();
         let workspace = Arc::new(Mutex::new(active_workspace));
         let shell = {
             let ws = tpi_core::util::lock_mutex(&workspace, "workspace");
             ws.shell().clone()
         };
+        let resources = Arc::new(
+            tpi_capabilities::resource::ResourceManager::from_registries(
+                processes.clone(),
+                terminals.clone(),
+            ),
+        );
         // P1-05：工具执行策略来自窄视图 ToolPolicy（不直接读 Config 的
         // allow_outside_workspace/artifacts_root/shell_path）。
         let policy = config.tool_policy();
-        let (effect_scheduler, workspace_session) = {
+        let (effect_scheduler, workspace_session, resource_identity) = {
             let mut manager = tpi_core::util::lock_mutex(&agents, "agent_manager");
             // Bind the graph to the composition root's active directory before
             // projecting any runtime. `AgentManager::new()` keeps a builtin
@@ -165,6 +175,13 @@ impl ToolRuntime {
                         .delegation_for_agent(owner_agent_id)
                         .map(|id| id.to_string()),
                 }
+            };
+            let runtime = manager.runtime(owner_agent_id);
+            let resource_identity = tpi_core::resource::AgentIdentity {
+                agent_id: owner_agent_id,
+                parent_agent_id: runtime.as_ref().and_then(|runtime| runtime.parent_agent_id),
+                delegation_id: manager.delegation_for_agent(owner_agent_id),
+                managed_agent_ids: manager.descendants_of(owner_agent_id),
             };
             let workspace_session = match manager.workspace_session() {
                 Some(session) => session,
@@ -205,7 +222,7 @@ impl ToolRuntime {
                     .clone()
                     .with_provenance(provenance),
             );
-            (scheduler, workspace_session)
+            (scheduler, workspace_session, resource_identity)
         };
         Ok(Self {
             config: RuntimeConfig {
@@ -226,6 +243,8 @@ impl ToolRuntime {
             workspace,
             processes,
             terminals,
+            resources,
+            resource_identity,
             agents,
             effect_scheduler,
             registry,
@@ -248,6 +267,20 @@ impl ToolRuntime {
         tpi_core::util::lock_mutex(&self.agents, "agent_manager").drain_inbox()
     }
 
+    /// Enforce the Agent-lifetime boundary before the session writes a
+    /// terminal RunCompleted fact. Cleanup is idempotent and waits outside
+    /// registry mutexes for managed processes to acknowledge cancellation.
+    pub(super) async fn cleanup_agent_resources(&self) -> Result<(), String> {
+        self.resources
+            .cleanup_agent(self.resource_identity.agent_id)
+            .await
+    }
+
+    pub(super) fn finish_agent_state(&self, state: crate::agent::manager::AgentState) {
+        let _ = tpi_core::util::lock_mutex(&self.agents, "agent_manager")
+            .finish_runtime(self.resource_identity.agent_id, state);
+    }
+
     fn owner_agent_id(&self) -> tpi_core::ids::AgentId {
         if let Ok(session) = tpi_core::ids::SessionId::parse_str(&self.session_id)
             && let Some(agent_id) =
@@ -262,6 +295,13 @@ impl ToolRuntime {
         tpi_core::ids::SessionId::parse_str(&self.session_id)
             .map(|id| tpi_core::ids::AgentId::from_u128(id.0.as_u128()))
             .unwrap_or_else(|_| tpi_core::ids::AgentId::new_v7())
+    }
+
+    fn current_resource_identity(&self) -> tpi_core::resource::AgentIdentity {
+        let mut identity = self.resource_identity.clone();
+        identity.managed_agent_ids = tpi_core::util::lock_mutex(&self.agents, "agent_manager")
+            .descendants_of(identity.agent_id);
+        identity
     }
 
     pub(super) fn plan_snapshot(&self) -> Option<Plan> {
@@ -311,8 +351,19 @@ impl ToolRuntime {
     /// 空 = 无活跃进程（不注入，避免 context 膨胀）。返回文本由 build_context
     /// 以 system 角色注入（harness metadata，非 User 消息，§26）。
     pub(super) fn processes_snapshot(&self) -> Option<String> {
-        let reg = tpi_core::util::lock_mutex(&self.processes, "process_registry");
-        let lines = reg.snapshot_lines(&[]);
+        let processes = self
+            .resources
+            .list_processes(&self.current_resource_identity());
+        let lines: Vec<String> = processes
+            .iter()
+            .filter(|process| {
+                !process.state.is_terminal()
+                    || process
+                        .finished_at
+                        .is_some_and(|end| end.elapsed() < std::time::Duration::from_secs(60))
+            })
+            .map(|process| process.status_line())
+            .collect();
         if lines.is_empty() {
             return None;
         }
@@ -344,6 +395,8 @@ impl ToolRuntime {
             workspace: self.workspace.clone(),
             processes: self.processes.clone(),
             terminals: self.terminals.clone(),
+            resources: Some(self.resources.clone()),
+            resource_identity: Some(self.current_resource_identity()),
             registry: self.registry.clone(),
             interactive: self.interactive,
             workspace_session: self.workspace_session.clone(),
@@ -1396,6 +1449,9 @@ mod tests {
         let terminals = std::sync::Arc::new(std::sync::Mutex::new(
             tpi_capabilities::terminal::TerminalRegistry::default(),
         ));
+        let resources = std::sync::Arc::new(
+            tpi_capabilities::resource::ResourceManager::from_registries(processes, terminals),
+        );
         let agents = std::sync::Arc::new(std::sync::Mutex::new(
             crate::agent::manager::AgentManager::new(),
         ));
@@ -1409,8 +1465,7 @@ mod tests {
             None,
             active_workspace,
             registry,
-            processes,
-            terminals,
+            resources,
             agents,
         );
         let error = match result {

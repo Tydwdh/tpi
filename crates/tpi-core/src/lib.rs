@@ -9,6 +9,7 @@ pub mod ids;
 pub mod message;
 pub mod outcome;
 pub mod plan;
+pub mod resource;
 pub mod revision;
 pub mod util;
 pub mod workspace;

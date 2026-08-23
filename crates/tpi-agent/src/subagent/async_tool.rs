@@ -101,6 +101,7 @@ fn spawn_worker<P>(
     request: SubagentRequest,
     cancel: CancellationToken,
     registry: Arc<Mutex<tpi_capabilities::tool::registry::ToolRegistry>>,
+    resources: Arc<tpi_capabilities::resource::ResourceManager>,
     output_tx: Option<tokio::sync::mpsc::Sender<tpi_capabilities::tool::ToolStreamEvent>>,
     parent_call_id: Option<tpi_core::ids::ToolCallId>,
     report_tx: Option<tokio::sync::mpsc::Sender<crate::agent::LiveEvent>>,
@@ -125,13 +126,17 @@ where
             child_workspace,
         )
         .with_registry(registry)
-        .with_agent_manager(manager.clone());
+        .with_agent_manager(manager.clone())
+        .with_resource_manager(resources.clone());
         // P8-06：绑定实时观察通道（child 活动经此通道转发到 parent TUI 卡片）。
         child = child.with_report_tx(report_tx);
         if let Some(call_id) = parent_call_id {
             child = child.with_output_tx(output_tx, call_id);
         }
         let outcome = child.run_investigation(request, cancel).await;
+        if let Err(error) = resources.cleanup_delegation(delegation_id).await {
+            tracing::error!(%error, %delegation_id, "delegation resource cleanup was not fully confirmed");
+        }
         // 终态写回：report（成功）或 Failed/Cancelled。
         let mut guard = manager.lock().unwrap_or_else(|p| p.into_inner());
         match outcome {
@@ -287,6 +292,7 @@ where
             },
             child_cancel.clone(),
             ctx.registry.clone(),
+            ctx.resource_manager(),
             ctx.output_tx.clone(),
             Some(ctx.call_id),
             self.report_tx.clone(),

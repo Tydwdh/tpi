@@ -55,6 +55,10 @@ pub struct SessionRuntime<P: Provider> {
     pub processes: Arc<StdMutex<tpi_capabilities::process::managed::ProcessRegistry>>,
     /// session 级共享 Persistent PTY terminal registry（跨 run 存活）。
     pub terminals: Arc<StdMutex<tpi_capabilities::terminal::TerminalRegistry>>,
+    /// Sole session-level process/terminal boundary shared by root and child
+    /// runtimes. The raw arcs remain only as a compatibility projection for
+    /// existing RunInput construction.
+    pub resources: Arc<tpi_capabilities::resource::ResourceManager>,
     /// ADR-007：session 级共享 AgentManager（跨 run 存活；后台调查注册/查询/取消）。
     pub agents: Arc<StdMutex<tpi_agent::agent::manager::AgentManager>>,
     pub status: SessionStatus,
@@ -200,6 +204,21 @@ impl<P: Provider + 'static> RuntimeTask<P> {
         for agents in agent_managers {
             tpi_agent::agent::manager::AgentManager::shutdown_and_join(agents).await;
         }
+        let resource_managers: Vec<_> = self
+            .sessions
+            .values()
+            .filter_map(|session| {
+                session
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|state| state.resources.clone()))
+            })
+            .collect();
+        for resources in resource_managers {
+            if let Err(error) = resources.shutdown().await {
+                warn!(%error, "session resource shutdown was not fully confirmed");
+            }
+        }
         info!("tpi-runtime 已停止");
     }
 
@@ -282,16 +301,21 @@ impl<P: Provider + 'static> RuntimeTask<P> {
             .map_err(|e| AppError::new(ErrorCode::InternalError, e))?;
         let conversation = Conversation::new();
         let sid = SessionId::new_v7();
+        let processes = Arc::new(StdMutex::new(
+            tpi_capabilities::process::managed::ProcessRegistry::new(),
+        ));
+        let terminals = Arc::new(StdMutex::new(
+            tpi_capabilities::terminal::TerminalRegistry::default(),
+        ));
         let session = SessionRuntime {
             conversation,
             provider,
             registry: self.registry.clone(),
-            processes: Arc::new(StdMutex::new(
-                tpi_capabilities::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: Arc::new(StdMutex::new(
-                tpi_capabilities::terminal::TerminalRegistry::default(),
-            )),
+            processes: processes.clone(),
+            terminals: terminals.clone(),
+            resources: Arc::new(
+                tpi_capabilities::resource::ResourceManager::from_registries(processes, terminals),
+            ),
             agents: Arc::new(StdMutex::new(tpi_agent::agent::manager::AgentManager::new())),
             status: SessionStatus::Idle,
         };
@@ -361,16 +385,21 @@ impl<P: Provider + 'static> RuntimeTask<P> {
                 SessionStatus::Idle
             }
         };
+        let processes = Arc::new(StdMutex::new(
+            tpi_capabilities::process::managed::ProcessRegistry::new(),
+        ));
+        let terminals = Arc::new(StdMutex::new(
+            tpi_capabilities::terminal::TerminalRegistry::default(),
+        ));
         let session = SessionRuntime {
             conversation,
             provider,
             registry: self.registry.clone(),
-            processes: Arc::new(StdMutex::new(
-                tpi_capabilities::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: Arc::new(StdMutex::new(
-                tpi_capabilities::terminal::TerminalRegistry::default(),
-            )),
+            processes: processes.clone(),
+            terminals: terminals.clone(),
+            resources: Arc::new(
+                tpi_capabilities::resource::ResourceManager::from_registries(processes, terminals),
+            ),
             agents: Arc::new(StdMutex::new(tpi_agent::agent::manager::AgentManager::new())),
             status,
         };
@@ -911,8 +940,6 @@ async fn execute_agent_run<P: Provider + 'static>(
     ));
 
     let registry = session.registry.clone();
-    let processes = session.processes.clone();
-    let terminals = session.terminals.clone();
     let result = agent::run(
         &mut session.provider,
         session_log,
@@ -926,8 +953,7 @@ async fn execute_agent_run<P: Provider + 'static>(
             force_compaction: false,
             workspace: None,
             registry,
-            processes,
-            terminals,
+            resources: session.resources.clone(),
             agents: session.agents.clone(),
         },
     )

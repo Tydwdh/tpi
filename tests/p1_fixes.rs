@@ -77,12 +77,7 @@ async fn p1_1_cancel_keeps_history_consistent_with_session() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -164,12 +159,7 @@ async fn p1_2_max_tool_calls_has_own_reason() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -247,12 +237,7 @@ async fn issue_001_budget_exceeded_persists_all_unexecuted_calls() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -353,12 +338,7 @@ async fn p1_4_context_overflow_stops_run_cleanly() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -461,12 +441,7 @@ async fn p1_10_manual_compaction_runs_at_next_boundary() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -552,12 +527,7 @@ async fn interrupted_attempt_records_partial_and_keeps_session_consistent() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -656,12 +626,7 @@ async fn unavailable_connect_fails_without_recorded_attempt() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -805,12 +770,7 @@ async fn text_only_interrupt_auto_continues_and_merges() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -923,12 +883,7 @@ async fn protocol_error_after_delta_auto_recovers_with_resume() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -991,12 +946,7 @@ async fn distinct_model_turns_use_distinct_request_ids() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -1075,12 +1025,7 @@ async fn recovery_capped_after_max_attempts() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -1189,12 +1134,7 @@ async fn tool_delta_interrupt_restarts_whole_turn() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -1299,12 +1239,7 @@ async fn tool_delta_restart_is_capped() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -1369,12 +1304,7 @@ async fn retry_with_empty_user_message_does_not_repeat_submission() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -1455,12 +1385,7 @@ async fn retry_after_committed_partial_uses_ephemeral_continue_instruction() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -1559,12 +1484,7 @@ async fn force_compaction_success_notifies_ui() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -1623,12 +1543,7 @@ async fn force_compaction_too_short_notifies_ui() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -1700,12 +1615,7 @@ async fn force_compaction_invalid_summary_notifies_ui() {
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi::tool::registry::builtin_registry(),
             )),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),

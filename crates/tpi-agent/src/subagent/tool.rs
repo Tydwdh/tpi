@@ -154,7 +154,8 @@ where
             child_workspace,
         )
         .with_report_tx(report_tx)
-        .with_output_tx(output_tx, parent_call_id);
+        .with_output_tx(output_tx, parent_call_id)
+        .with_resource_manager(ctx.resource_manager());
         let request = SubagentRequest {
             instruction: parsed.instruction.clone(),
             child_session: SessionId::new_v7(),
@@ -292,6 +293,8 @@ mod tool_tests {
             ))),
             processes: Default::default(),
             terminals: Default::default(),
+            resources: None,
+            resource_identity: None,
             registry: Default::default(),
             interactive: false,
             current_goal: None,

@@ -59,6 +59,7 @@ async fn background_bash_returns_immediately_and_process_keeps_running() {
             cwd: None,
             timeout_ms: 120_000,
             background: true,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -145,6 +146,7 @@ async fn background_bash_reports_exit_code() {
             cwd: None,
             timeout_ms: 120_000,
             background: true,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -190,6 +192,7 @@ async fn background_bash_completes_pipeline() {
             cwd: None,
             timeout_ms: 120_000,
             background: true,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -238,6 +241,7 @@ async fn background_bash_commits_workspace_delta_after_exit() {
             cwd: None,
             timeout_ms: 120_000,
             background: true,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -286,6 +290,7 @@ async fn process_tool_reports_status_and_output() {
             cwd: None,
             timeout_ms: 120_000,
             background: true,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -390,6 +395,7 @@ async fn process_cancel_terminates_tree_and_marks_cancelled() {
             cwd: None,
             timeout_ms: 120_000,
             background: true,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -472,6 +478,7 @@ async fn process_list_and_unknown_id() {
             cwd: None,
             timeout_ms: 120_000,
             background: true,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -548,6 +555,7 @@ async fn process_wait_timeout_returns_running_not_error() {
             cwd: None,
             timeout_ms: 120_000,
             background: true,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -611,6 +619,7 @@ async fn background_inherits_snapshot_and_never_commits_shell_state() {
             cwd: None,
             timeout_ms: 60_000,
             background: false,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -628,6 +637,7 @@ async fn background_inherits_snapshot_and_never_commits_shell_state() {
             cwd: None,
             timeout_ms: 120_000,
             background: true,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -700,6 +710,7 @@ async fn background_inner_cd_export_are_isolated() {
             cwd: None,
             timeout_ms: 120_000,
             background: true,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -747,6 +758,7 @@ async fn start_background(ctx: &tpi::tool::ToolContext, command: &str) -> Proces
             cwd: None,
             timeout_ms: 120_000,
             background: true,
+            lifetime: Default::default(),
         },
         ctx,
     )
@@ -795,6 +807,7 @@ async fn web_server_background_lifecycle() {
                 cwd: None,
                 timeout_ms: 10_000,
                 background: false,
+                lifetime: Default::default(),
             },
             &ctx,
         )
@@ -833,6 +846,7 @@ async fn web_server_background_lifecycle() {
                 cwd: None,
                 timeout_ms: 10_000,
                 background: false,
+                lifetime: Default::default(),
             },
             &ctx,
         )
@@ -857,6 +871,7 @@ async fn web_server_background_lifecycle() {
                 cwd: None,
                 timeout_ms: 10_000,
                 background: false,
+                lifetime: Default::default(),
             },
             &ctx,
         )
@@ -997,6 +1012,7 @@ async fn foreground_and_background_cancel_both_cancelled() {
             cwd: None,
             timeout_ms: 10_000,
             background: false,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -1014,6 +1030,7 @@ async fn foreground_and_background_cancel_both_cancelled() {
             cwd: None,
             timeout_ms: 10_000,
             background: true,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -1046,6 +1063,7 @@ async fn hundred_spawn_cancel_cycles_leave_no_leak() {
                 cwd: None,
                 timeout_ms: 120_000,
                 background: true,
+                lifetime: Default::default(),
             },
             &ctx,
         )

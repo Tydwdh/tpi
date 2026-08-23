@@ -659,12 +659,64 @@ pub struct ToolContext {
     pub processes: std::sync::Arc<std::sync::Mutex<crate::process::managed::ProcessRegistry>>,
     /// Persistent PTY terminal registry. Separate lifecycle from ManagedProcess.
     pub terminals: std::sync::Arc<std::sync::Mutex<crate::terminal::TerminalRegistry>>,
+    /// Session-scoped managed resource boundary. `None` is a compatibility
+    /// bridge for low-level tool fixtures; production runtimes always set it.
+    pub resources: Option<std::sync::Arc<crate::resource::ResourceManager>>,
+    /// Graph identity used by owner-aware resource operations.
+    pub resource_identity: Option<tpi_core::resource::AgentIdentity>,
     /// ToolRegistry（builtin + MCP；runtime_inspect 枚举能力用；与 ToolRuntime 共享）。
     pub registry: std::sync::Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
     /// 交互模式（`-p` 为 false；§11 移除 ask_user 后仅保留供未来交互原语使用）。
     pub interactive: bool,
     /// Workspace transaction session（§新架构：统一 workspace mutation tracking）。
     pub workspace_session: Option<std::sync::Arc<crate::workspace::session::WorkspaceSession>>,
+}
+
+impl ToolContext {
+    /// Return the shared resource boundary, constructing a view over the
+    /// injected legacy arcs only for compatibility fixtures.
+    pub fn resource_manager(&self) -> std::sync::Arc<crate::resource::ResourceManager> {
+        self.resources.clone().unwrap_or_else(|| {
+            std::sync::Arc::new(crate::resource::ResourceManager::from_registries(
+                self.processes.clone(),
+                self.terminals.clone(),
+            ))
+        })
+    }
+
+    pub fn resource_identity(&self) -> tpi_core::resource::AgentIdentity {
+        if let Some(identity) = &self.resource_identity {
+            return identity.clone();
+        }
+        let agent_id = tpi_core::ids::SessionId::parse_str(&self.session_id)
+            .map(|id| tpi_core::ids::AgentId::from_u128(id.0.as_u128()))
+            .unwrap_or_else(|_| {
+                let digest = blake3::hash(self.session_id.as_bytes());
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(&digest.as_bytes()[..16]);
+                tpi_core::ids::AgentId::from_u128(u128::from_be_bytes(bytes))
+            });
+        tpi_core::resource::AgentIdentity {
+            agent_id,
+            parent_agent_id: None,
+            delegation_id: None,
+            managed_agent_ids: Vec::new(),
+        }
+    }
+
+    pub fn resource_meta(
+        &self,
+        lifetime: tpi_core::resource::ResourceLifetime,
+        workspace_access: tpi_core::resource::WorkspaceAccess,
+    ) -> tpi_core::resource::ResourceMeta {
+        let identity = self.resource_identity();
+        tpi_core::resource::ResourceMeta {
+            owner: identity.owner(),
+            lifetime,
+            created_by: self.call_id,
+            workspace_access,
+        }
+    }
 }
 
 /// 路径解析失败（§9.1：禁止 workspace 外访问）。
@@ -1267,6 +1319,8 @@ mod tests {
                 crate::process::managed::ProcessRegistry::new(),
             )),
             terminals: Default::default(),
+            resources: None,
+            resource_identity: None,
             registry: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::tool::registry::ToolRegistry::new(),
             )),

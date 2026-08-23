@@ -113,6 +113,9 @@ impl ManagedProcessState {
 #[derive(Debug, Clone)]
 pub struct ManagedProcess {
     pub id: ProcessId,
+    /// Owner/lifetime metadata. `None` is retained only for low-level legacy
+    /// registry tests; all agent-facing creation paths set it explicitly.
+    pub resource_meta: Option<tpi_core::resource::ResourceMeta>,
     /// Workspace identity（`local:...` / `ssh:host:root`，任务书 §8）。
     pub workspace: String,
     /// 用户命令原文（诊断/展示用）。
@@ -146,6 +149,7 @@ impl ManagedProcess {
     ) -> Self {
         Self {
             id,
+            resource_meta: None,
             workspace,
             command,
             cwd,
@@ -159,6 +163,11 @@ impl ManagedProcess {
             artifact: None,
             pid: None,
         }
+    }
+
+    pub fn with_resource_meta(mut self, resource_meta: tpi_core::resource::ResourceMeta) -> Self {
+        self.resource_meta = Some(resource_meta);
+        self
     }
 
     /// 当前状态文本（status 工具 / snapshot 用）。
@@ -439,9 +448,11 @@ pub struct BackgroundStartRequest {
     /// only after the child reaches a terminal state, so long-running jobs do
     /// not bypass the mutation journal.
     pub workspace_tracker: Option<crate::workspace::tracked::TrackedWorkspace>,
-    /// registry 由整个 session 共享（Arc<Mutex>）；drain task 与 process 工具
-    /// 通过它更新/读取状态。
-    pub registry: Arc<std::sync::Mutex<ProcessRegistry>>,
+    /// Session-scoped resource owner. The request deliberately does not accept
+    /// a child-local registry, so background processes cannot escape the
+    /// session resource lifecycle.
+    pub resources: Arc<crate::resource::ResourceManager>,
+    pub resource_meta: tpi_core::resource::ResourceMeta,
 }
 
 /// 启动后台进程（P2，任务书 §56）：
@@ -460,10 +471,13 @@ pub async fn start_background(request: BackgroundStartRequest) -> Result<Process
         artifacts_root,
         session_id,
         workspace_tracker,
-        registry,
+        resources,
+        resource_meta,
     } = request;
     let id = ProcessId::next();
-    let process = ManagedProcess::new(id, workspace, command, args.cwd.clone(), args.env.clone());
+    let process = ManagedProcess::new(id, workspace, command, args.cwd.clone(), args.env.clone())
+        .with_resource_meta(resource_meta);
+    let registry = resources.processes();
     {
         let mut reg = tpi_core::util::lock_mutex(&registry, "process_registry");
         reg.insert(process).map_err(|error| {
@@ -480,7 +494,8 @@ pub async fn start_background(request: BackgroundStartRequest) -> Result<Process
             artifacts_root,
             session_id,
             workspace_tracker,
-            registry: registry.clone(),
+            resources,
+            resource_meta,
         },
         id,
         started_tx,
@@ -508,8 +523,10 @@ fn spawn_drain(
             artifacts_root,
             session_id,
             workspace_tracker,
-            registry,
+            resources,
+            resource_meta: _resource_meta,
         } = request;
+        let registry = resources.processes();
         if let Err(error) = drain_loop(
             &args,
             &registry,

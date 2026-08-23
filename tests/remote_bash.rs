@@ -57,6 +57,8 @@ async fn setup_remote_ctx() -> (tempfile::TempDir, tpi::tool::ToolContext) {
         workspace: Arc::new(Mutex::new(active)),
         processes: Arc::new(Mutex::new(tpi::process::managed::ProcessRegistry::new())),
         terminals: Default::default(),
+        resources: None,
+        resource_identity: None,
         registry: std::sync::Arc::new(std::sync::Mutex::new(
             tpi::tool::registry::builtin_registry(),
         )),
@@ -79,6 +81,7 @@ async fn run_bash(
             cwd: None,
             timeout_ms: 60_000,
             background: false,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -217,6 +220,7 @@ async fn remote_explicit_cwd_is_one_shot() {
             cwd: Some(root_posix),
             timeout_ms: 60_000,
             background: false,
+            lifetime: Default::default(),
         },
         &ctx2,
     )

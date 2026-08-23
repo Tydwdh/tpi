@@ -6,6 +6,7 @@
 pub mod mcp;
 pub mod process;
 pub mod remote;
+pub mod resource;
 pub mod shell;
 pub mod skills;
 pub mod terminal;

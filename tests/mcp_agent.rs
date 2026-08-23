@@ -102,12 +102,7 @@ async fn mcp_tool_executes_inside_agent_loop() {
             force_compaction: false,
             workspace: None,
             registry: registry.clone(),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),
@@ -188,12 +183,7 @@ async fn tool_selector_filters_irrelevant_mcp_tools_from_model() {
             force_compaction: false,
             workspace: None,
             registry: registry.clone(),
-            processes: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                tpi::terminal::TerminalRegistry::default(),
-            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
 
             agents: std::sync::Arc::new(std::sync::Mutex::new(
                 tpi_agent::agent::manager::AgentManager::new(),

@@ -696,12 +696,7 @@ pub async fn run_prompt_once_with_agents<P: Provider>(
             workspace: None,
             registry,
             // `-p` 单次 run：不经 session 级共享，每次新建（无跨 run 需求）。
-            processes: Arc::new(std::sync::Mutex::new(
-                crate::process::managed::ProcessRegistry::new(),
-            )),
-            terminals: Arc::new(std::sync::Mutex::new(
-                crate::terminal::TerminalRegistry::default(),
-            )),
+            resources: Arc::new(crate::resource::ResourceManager::new()),
             agents,
         },
     )
@@ -2801,8 +2796,9 @@ async fn run_interactive<P: Provider>(
             force_compaction: force,
             workspace: None,
             registry,
-            processes,
-            terminals,
+            resources: Arc::new(crate::resource::ResourceManager::from_registries(
+                processes, terminals,
+            )),
             // ADR-007：session 级共享实例——worker report 与 run boundary
             // drain 的 inbox 必须是同一对象（否则自动注入失效）。
             agents,

@@ -31,6 +31,7 @@ async fn run_bash(
             cwd: None,
             timeout_ms,
             background: false,
+            lifetime: Default::default(),
         },
         &ctx,
     )
@@ -261,6 +262,7 @@ async fn explicit_cwd_is_one_shot_override() {
             cwd: Some(".".into()),
             timeout_ms: 60_000,
             background: false,
+            lifetime: Default::default(),
         },
         &ctx2,
     )

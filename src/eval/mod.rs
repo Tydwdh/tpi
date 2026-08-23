@@ -439,7 +439,9 @@ fn stats_from_events(events: &[(i128, SessionEvent)]) -> EvalStats {
                 stats.input_tokens = stats.input_tokens.saturating_add(usage.input_tokens);
                 stats.output_tokens = stats.output_tokens.saturating_add(usage.output_tokens);
             }
-            SessionEvent::PlanReplaced { .. } | SessionEvent::GoalSet { .. } | SessionEvent::GoalCleared => {}
+            SessionEvent::PlanReplaced { .. }
+            | SessionEvent::GoalSet { .. }
+            | SessionEvent::GoalCleared => {}
             // ADR-007：subagent 委托/报告/终态事件是 trace/审计事实，不计入
             // 本轮 eval 统计（child 自身运行指标由其独立 session 的 eval 承担）。
             SessionEvent::SubagentSpawned { .. }
@@ -524,12 +526,7 @@ pub async fn run_task(
                     crate::tool::registry::builtin_registry(),
                 )),
                 // 单次 run 诊断：不经 session 级共享，每次新建。
-                processes: std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::process::managed::ProcessRegistry::new(),
-                )),
-                terminals: std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::terminal::TerminalRegistry::default(),
-                )),
+                resources: std::sync::Arc::new(crate::resource::ResourceManager::new()),
                 agents: std::sync::Arc::new(std::sync::Mutex::new(
                     tpi_agent::agent::manager::AgentManager::new(),
                 )),
