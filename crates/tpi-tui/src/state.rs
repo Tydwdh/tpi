@@ -39,6 +39,11 @@ pub struct UiState {
     /// 待重试的上一次失败 turn（`/retry`；app 消费时以空 user_message 发起 run，
     /// 不重复记录 UserSubmitted，也不追加 User 消息）。
     pub pending_retry: Option<String>,
+    /// goal 自动续跑信号：非空表示应无用户输入自动再跑一轮（下一轮 round 号）。
+    /// 与 pending_retry 相同语义——以空 user_message 发 run，**不追加 User 消息**、
+    /// 不写入 history，避免每轮 goal_round 文本累积污染上下文（参考 Claude Code：
+    /// 目标作为每 turn 紧凑 condition 注入，绝不进入对话历史）。
+    pub pending_goal_continue: Option<u32>,
     /// 是否正在 run（Esc 取消语义、spinner 状态）。
     pub running: bool,
     /// P1-10：手动 /compact 请求（下一次 run 开始时在完整边界压缩一次）。
@@ -69,6 +74,7 @@ impl UiState {
             pending_theme: None,
             pending_model: None,
             pending_retry: None,
+            pending_goal_continue: None,
             running: false,
             force_compaction: false,
             pasted: HashMap::new(),
@@ -94,6 +100,16 @@ impl UiState {
         self.pending_retry.take()
     }
 
+    /// 请求 goal 自动续跑一轮（下一轮 round 号）。不产生用户消息、不写 history。
+    pub fn request_goal_continue(&mut self, round: u32) {
+        self.pending_goal_continue = Some(round);
+    }
+
+    /// 取出待执行的 goal 续跑信号（消费一次）。
+    pub fn take_goal_continue(&mut self) -> Option<u32> {
+        self.pending_goal_continue.take()
+    }
+
     /// 是否存在待消费的排队输入（app 主循环据此决定是否可跳过键盘阻塞等待；
     /// BUG-003：`tpi "prompt"` 与 run 结束后排队的消息必须无需按键即可执行）。
     /// §13 修复：/model 菜单选中结果（pending_model）也是待消费输入——
@@ -106,6 +122,7 @@ impl UiState {
             || self.pending_theme.is_some()
             || self.pending_retry.is_some()
             || self.pending_model.is_some()
+            || self.pending_goal_continue.is_some()
     }
 
     /// 入队一条待提交消息（Enter 提交）。超上限时丢弃最旧并写入系统行提示

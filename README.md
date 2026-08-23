@@ -6,7 +6,7 @@
 
 - 交互式 TUI 会话与 `-p` 非交互模式（stdout 只输出最终答案）
 - Durable session：JSONL 事件流是唯一事实源，支持 `--continue` / `--resume` 恢复
-- 内置工具：read / list / search / glob / edit / write / bash / request_input 等
+- 内置工具：read / edit / write / bash / request_input 等（内容/文件名检索用 bash + rg）
 - MCP 与 Skills 扩展（工具注册表 + SKILL.md 渐进式披露）
 - 托管后台进程（`bash background=true` + process 工具）
 - Remote workspace：经 SSH 操作远端工程（russh）

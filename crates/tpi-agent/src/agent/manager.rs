@@ -94,6 +94,15 @@ struct AgentRecord {
     updated_at: u64,
     /// child 取消 token：由 external worker 在 spawn 时登记，cancel 用。
     cancel: CancellationToken,
+    /// **per-agent** 唤醒原语：settle/report 时 `notify_waiters`。wait 侧在
+    /// 短暂锁内快照此 Arc，释放锁后再 `notified().await`——若唤醒发生在
+    /// 快照之后、注册 waiter 之前，`notify_waiters()` 会丢失（无 waiter 可醒），
+    /// 但共享单 Notify 同样丢失且会误醒其他 agent 的 waiter；per-agent 实例
+    /// 至少保证不会因其他 agent 的 settle 而虚假返回，配合 wait 循环顶部重查
+    /// 终态（check → await → re-check）消除丢失唤醒：只要状态变化发生在
+    /// 快照前，循环顶部的终态检查就能直接返回；发生在快照后则 notify_waiters
+    /// 必然命中已注册的 waiter（快照与注册之间无 await 点）。
+    notify: Arc<tokio::sync::Notify>,
 }
 
 /// 一次委托记录（不一定每委托一个独立 agent 复用，但保留以支持未来的
@@ -110,6 +119,7 @@ pub struct Delegation {
 ///
 /// 由 `SessionRuntime.agents`（或 composition root）以 `Arc<StdMutex<AgentManager>>`
 /// 持有，跨 run 存活。生命周期绑定 **session**（session 关闭 → 清理全部 agent）。
+#[derive(Default)]
 pub struct AgentManager {
     /// 按插入顺序记录 AgentId（展示顺序稳定）。
     order: Vec<AgentId>,
@@ -118,28 +128,20 @@ pub struct AgentManager {
     /// 已落盘 durable event、但尚未投影到任何 parent model context 的 report。
     /// 易失唤醒缓存：durable SessionEvent 才是真相，崩溃后从事件流重建。
     inbox: Vec<PendingReport>,
-    notify: Arc<tokio::sync::Notify>,
 }
 
 /// 内存中保留的终态 agent 记录上限（防无界增长；参照 ProcessRegistry 的
 /// MAX_RETAINED_PROCESSES）。active agent 永不淘汰。
 pub const MAX_RETAINED_AGENTS: usize = 64;
 
-impl Default for AgentManager {
-    fn default() -> Self {
+impl AgentManager {
+    pub fn new() -> Self {
         Self {
             order: Vec::new(),
             agents: HashMap::new(),
             delegations: HashMap::new(),
             inbox: Vec::new(),
-            notify: Arc::new(tokio::sync::Notify::new()),
         }
-    }
-}
-
-impl AgentManager {
-    pub fn new() -> Self {
-        Self::default()
     }
 
     fn now() -> u64 {
@@ -179,6 +181,7 @@ impl AgentManager {
                 last_summary: None,
                 updated_at: Self::now(),
                 cancel,
+                notify: Arc::new(tokio::sync::Notify::new()),
             },
         );
         self.order.push(agent_id);
@@ -202,6 +205,7 @@ impl AgentManager {
 
     /// 登记一次 report（已落盘 durable event 后调用）。写入 inbox 并唤醒 wait。
     pub fn report(&mut self, delegation_id: DelegationId, report: PendingReport) {
+        let notify = self.notify_of(report.agent_id);
         if let Some(d) = self.delegations.get_mut(&delegation_id) {
             d.state = DelegationState::Reported;
         }
@@ -210,7 +214,9 @@ impl AgentManager {
             r.updated_at = Self::now();
         }
         self.inbox.push(report);
-        self.notify.notify_waiters();
+        // 持有锁时调用：notify_waiters 只唤醒已注册 waiter，无 waiter 时无害。
+        // wait 侧在锁内快照同一 Arc 后才释放锁去 await，不会在此间隙错过。
+        notify.notify_waiters();
     }
 
     /// AgentLoop 达到终态（runtime truth）。state 迁移。
@@ -225,6 +231,7 @@ impl AgentManager {
         end_state: AgentState,
         final_report: Option<PendingReport>,
     ) {
+        let notify = self.notify_of(agent_id);
         if let Some(d) = self.delegations.get_mut(&delegation_id) {
             d.state = DelegationState::Settled;
         }
@@ -238,7 +245,16 @@ impl AgentManager {
         if let Some(rep) = final_report {
             self.inbox.push(rep);
         }
-        self.notify.notify_waiters();
+        // 持锁调用（见 report）：唤醒该 agent 的 waiter，不误醒其他 agent。
+        notify.notify_waiters();
+    }
+
+    /// 取指定 agent 的 per-agent Notify（agent 不存在时返回孤立实例，无害）。
+    fn notify_of(&self, agent_id: AgentId) -> Arc<tokio::sync::Notify> {
+        self.agents
+            .get(&agent_id)
+            .map(|r| r.notify.clone())
+            .unwrap_or_default()
     }
 
     /// 取消一个 agent（cancel token；等待 worker 协作退出，非强行 kill）。
@@ -328,6 +344,10 @@ impl AgentManager {
         cancel: CancellationToken,
     ) -> Option<()> {
         loop {
+            // 短暂锁内完成：终态检查 + per-agent notify 快照。释放锁后立即
+            // 注册 waiter（无中间 await），settle/report 的持锁 notify_waiters
+            // 要么发生在快照前（循环顶部终态检查已覆盖），要么命中本 waiter——
+            // 丢失唤醒窗口不存在。
             let notify = {
                 let guard = manager.lock().ok()?;
                 match guard.agents.get(&agent_id) {
@@ -342,24 +362,32 @@ impl AgentManager {
                     None => return None,
                     _ => {}
                 }
-                guard.notify.clone()
+                guard.notify_of(agent_id)
             };
             tokio::select! {
                 _ = notify.notified() => {}
                 _ = cancel.cancelled() => return None,
             }
-            // 醒来后回到循环顶部重新检查是否终态。
+            // 醒来后回到循环顶部重新检查是否终态（report 唤醒 ≠ 终态）。
         }
     }
 
     /// 会话关闭：取消全部 active agent（SessionScoped 生命周期终结）。
     pub fn shutdown(&mut self) {
-        for r in self.agents.values_mut() {
-            if matches!(r.state, AgentState::Starting | AgentState::Running) {
+        // 先取消全部 active（worker 协作退出），再逐 agent 唤醒 waiter
+        //（wait 侧循环顶部重查终态：cancel 后 settle(Cancelled) 也会 notify）。
+        let notifies: Vec<Arc<tokio::sync::Notify>> = self
+            .agents
+            .values()
+            .filter(|r| matches!(r.state, AgentState::Starting | AgentState::Running))
+            .map(|r| {
                 r.cancel.cancel();
-            }
+                r.notify.clone()
+            })
+            .collect();
+        for notify in notifies {
+            notify.notify_waiters();
         }
-        self.notify.notify_waiters();
     }
 }
 
@@ -439,6 +467,42 @@ mod tests {
         });
         let result = AgentManager::wait(&manager, aid, cancel).await;
         assert!(result.is_some());
+    }
+
+    /// 回归：wait 先进入（终态未发生）→ settle 在“释放锁后、注册 waiter 前”
+    /// 的窗口完成 → wait 仍必须在有陘时间内返回（丢失唤醒竞态，修复前
+    /// notify_waiters 蒸发后挂到超时）。并发压力下循环验证。
+    #[tokio::test]
+    async fn wait_wakes_even_when_settle_races_before_waiter_registration() {
+        for _ in 0..50 {
+            let mut m = AgentManager::new();
+            let aid = m
+                .register(SessionId::new_v7(), "竞态".into(), CancellationToken::new())
+                .unwrap();
+            let did = DelegationId::new_v7();
+            m.add_delegation(Delegation {
+                id: did,
+                child_agent: aid,
+                child_session: SessionId::new_v7(),
+                state: DelegationState::Running,
+            });
+            let manager = Arc::new(std::sync::Mutex::new(m));
+            let m2 = manager.clone();
+            let worker = tokio::spawn(async move {
+                // 立即 settle：大概率落在 wait 侧快照与注册 waiter 的窗口。
+                m2.lock()
+                    .unwrap()
+                    .settle(did, aid, AgentState::Stopped, None);
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                AgentManager::wait(&manager, aid, CancellationToken::new()),
+            )
+            .await
+            .expect("wait 必须在 2s 内返回（丢失唤醒）");
+            assert!(result.is_some());
+            worker.await.unwrap();
+        }
     }
 
     #[test]

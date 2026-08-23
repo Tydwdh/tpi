@@ -42,6 +42,7 @@ pub const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     spec("doctor", "环境检查（config/模型/API key/Git Bash）", false),
     spec("compact", "手动压缩上下文", true),
     spec("retry", "重试上一次失败/中断的 turn", true),
+    spec("goal", "设置/查看跨轮目标（自动续跑）", false),
     spec("quit", "退出 TPI", true),
 ];
 
@@ -61,6 +62,11 @@ pub fn is_registered(name: &str) -> bool {
 #[must_use]
 pub fn command_from_slash(message: &str) -> Option<AppCommand> {
     let msg = message.trim();
+    if msg == "/goal" || msg.starts_with("/goal ") {
+        return Some(AppCommand::OpenModal {
+            name: "goal".into(),
+        });
+    }
     match msg {
         "/quit" | "/exit" => Some(AppCommand::Quit),
         "/cancel" => Some(AppCommand::CancelRun),

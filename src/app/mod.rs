@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent;
+use crate::agent::goal_controller::{GoalController, GoalVerdict, SessionEventEvaluator};
 use crate::config::Config;
 use crate::ids::SessionId;
 use crate::provider::openai_compat::OpenAiCompatClient;
@@ -379,7 +380,7 @@ where
         registry,
         processes,
         terminals,
-        agents: _,
+        agents,
     } = services;
 
     if non_interactive {
@@ -396,7 +397,7 @@ where
         conversation.ensure_started(&sessions_root, &workspace_root)?;
         let outcome = {
             let (session, history) = conversation.parts_for_run()?;
-            run_prompt_once(
+            run_prompt_once_with_agents(
                 &mut provider,
                 session,
                 &config,
@@ -404,6 +405,7 @@ where
                 message,
                 current_cancel.clone(),
                 registry.clone(),
+                agents.clone(),
             )
             .await?
         };
@@ -436,6 +438,10 @@ where
         registry,
         processes,
         terminals,
+        // ADR-007：共享 AgentManager 必须与 spawn_agent/agent 工具持有的是
+        // 同一实例——否则 worker report 写入 A，run boundary drain 的是 B，
+        // “报告自动注入”失效（模型被迫轮询）。
+        agents,
     )
     .await?;
     Ok(None)
@@ -575,6 +581,13 @@ pub fn project_live_event(event: crate::agent::LiveEvent) -> Option<crate::agent
         LiveEvent::PlanUpdated { plan } => Some(RuntimeEvent::PlanUpdated { plan }),
         LiveEvent::StreamRecovering { attempt } => Some(RuntimeEvent::StreamRecovering { attempt }),
         LiveEvent::TurnRestarting { attempt } => Some(RuntimeEvent::TurnRestarting { attempt }),
+        LiveEvent::ProviderRetrying {
+            attempt,
+            backoff_ms,
+        } => Some(RuntimeEvent::ProviderRetrying {
+            attempt,
+            backoff_ms,
+        }),
         LiveEvent::CompactionNotice { message } => Some(RuntimeEvent::CompactionNotice { message }),
         LiveEvent::SubagentReported {
             child_session,
@@ -663,6 +676,36 @@ pub async fn run_prompt_once<P: Provider>(
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
 ) -> Result<agent::AgentOutcome, String> {
+    // `-p` 单次 run：不经 session 级共享，每次新建 AgentManager（无跨 run 需求）。
+    run_prompt_once_with_agents(
+        provider,
+        session,
+        config,
+        history,
+        message,
+        current_cancel,
+        registry,
+        Arc::new(std::sync::Mutex::new(
+            tpi_agent::agent::manager::AgentManager::new(),
+        )),
+    )
+    .await
+}
+
+/// [`run_prompt_once`] 的完整形态：允许调用方注入 session 级共享
+/// `AgentManager`（`run_with_services` 路径必须传共享实例，否则 spawn_agent
+/// worker 的 report 与 run boundary drain 的 inbox 分裂）。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_prompt_once_with_agents<P: Provider>(
+    provider: &mut P,
+    session: &mut SessionLog,
+    config: &Config,
+    history: &[ChatMessage],
+    message: String,
+    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
+    agents: Arc<std::sync::Mutex<tpi_agent::agent::manager::AgentManager>>,
+) -> Result<agent::AgentOutcome, String> {
     let cancel = CancellationToken::new();
     *crate::util::lock_mutex(&current_cancel, "current_cancel") = Some(cancel.clone());
     let (ui_tx, mut ui_rx) = mpsc::channel(128);
@@ -691,9 +734,7 @@ pub async fn run_prompt_once<P: Provider>(
             terminals: Arc::new(std::sync::Mutex::new(
                 crate::terminal::TerminalRegistry::default(),
             )),
-            agents: Arc::new(std::sync::Mutex::new(
-                tpi_agent::agent::manager::AgentManager::new(),
-            )),
+            agents,
         },
     )
     .await;
@@ -736,6 +777,8 @@ async fn interactive_loop<P: Provider, R>(
     registry: Arc<std::sync::Mutex<crate::tool::registry::ToolRegistry>>,
     processes: Arc<std::sync::Mutex<crate::process::managed::ProcessRegistry>>,
     terminals: Arc<std::sync::Mutex<crate::terminal::TerminalRegistry>>,
+    // ADR-007：与 spawn_agent/agent 工具同一共享实例（见 run_with_services）。
+    agents: Arc<std::sync::Mutex<tpi_agent::agent::manager::AgentManager>>,
 ) -> Result<(), String>
 where
     R: FnMut(&crate::config::ModelConfig) -> Result<P, String> + Send,
@@ -1442,6 +1485,7 @@ where
                         registry: registry.clone(),
                         processes: processes.clone(),
                         terminals: terminals.clone(),
+                        agents: agents.clone(),
                     },
                 )
                 .await
@@ -1514,6 +1558,86 @@ where
             continue;
         }
 
+        // goal 自动续跑：以空 user_message 发起下一轮（不追加 User 消息、不写
+        // history；目标已由 build_context 每 turn 注入）。语义同 retry 的
+        // “空消息继续”，但独立于失败重试——goal 续跑是正常推进，不设 last_failed。
+        if let Some(goal_round) = ui_state.take_goal_continue() {
+            conversation.ensure_started(&config.sessions_root, &config.workspace_root)?;
+            let goal_obj = conversation.goal().map(|g| g.objective).unwrap_or_default();
+            ui_state.view.push_line(
+                LineKind::System,
+                format!("▶ Goal 自动续跑 Round {goal_round}"),
+            );
+            renderer
+                .draw(&mut ui_state.view)
+                .map_err(|e| e.to_string())?;
+            let run_result = {
+                let (session_log, history) = conversation.parts_for_run()?;
+                run_interactive(
+                    provider,
+                    session_log,
+                    config,
+                    history,
+                    String::new(),
+                    false,
+                    InteractiveIo {
+                        ui_state: &mut ui_state,
+                        renderer: &mut renderer,
+                        key_rx: &mut key_rx,
+                        current_cancel: current_cancel.clone(),
+                        registry: registry.clone(),
+                        processes: processes.clone(),
+                        terminals: terminals.clone(),
+                        agents: agents.clone(),
+                    },
+                )
+                .await
+            };
+            let outcome = match run_result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    conversation.refresh_from_log()?;
+                    ui_state.view.status = crate::tui::model::StatusLine::Idle;
+                    ui_state.view.step = 0;
+                    ui_state.view.push_line_dedup(
+                        LineKind::System,
+                        format!(
+                            "goal 续跑失败，session 已保留：{}",
+                            friendly_provider_failure(&error)
+                        ),
+                    );
+                    renderer
+                        .draw(&mut ui_state.view)
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
+            };
+            conversation.refresh_from_log()?;
+            ui_state.view.goal = conversation
+                .goal()
+                .map(|g| format!("{} [{}]", g.objective, g.phase));
+            // 目标取回后保留供诊断；此处主要作用与上面的注入一致。
+            let _ = goal_obj;
+            // 续跑完成：若仍 active 且未超轮次，继续调度下一轮（与 pop_pending
+            // 分支的 auto_continue 同样逻辑，链式推进直到完成/暂停/超限）。
+            if outcome.reason == crate::session::CompletionReason::Stop
+                && let Some(goal) = conversation.goal()
+                && goal.phase == tpi_core::goal::GoalPhase::Active
+                && goal.rounds < goal.max_rounds
+            {
+                let next_round = goal.rounds + 1;
+                let mut next = goal.clone();
+                next.rounds = next_round;
+                if let Some(log) = conversation.log_mut() {
+                    let _ = log.commit(&SessionEvent::GoalSet { goal: next.clone() });
+                }
+                let _ = conversation.refresh_from_log();
+                ui_state.request_goal_continue(next_round);
+            }
+            ui_state.view.push_line(LineKind::System, "─".repeat(40));
+            continue;
+        }
+
         // §bug 修复：/ 命令优先于排队的普通消息——队列中任意位置有 / 命令
         // 就提到队首（本地即时操作，不被 agent 消息阻塞；如 /quit 不排队）。
         ui_state.promote_pending_slash();
@@ -1577,6 +1701,7 @@ where
                         registry: registry.clone(),
                         processes: processes.clone(),
                         terminals: terminals.clone(),
+                        agents: agents.clone(),
                     },
                 )
                 .await
@@ -1612,6 +1737,42 @@ where
             // P0-3：统一从 durable log 重建 history——Cancel/ProviderInterrupted/
             // 正常完成都由 session 事实源投影，杜绝 runtime 与 log 分叉。
             conversation.refresh_from_log()?;
+            ui_state.view.goal = conversation
+                .goal()
+                .map(|g| format!("{} [{}]", g.objective, g.phase));
+            // Goal 自动续跑：GoalController 评估是否需要续跑（替代分散的条件判断）。
+            let goal_controller = GoalController::new(Box::new(SessionEventEvaluator));
+            let should_auto_continue = outcome.reason == crate::session::CompletionReason::Stop
+                && matches!(
+                    goal_controller.evaluate(&conversation.log_mut().unwrap().state()),
+                    GoalVerdict::Unmet { .. }
+                )
+                && ui_state.pending_messages.is_empty();
+            if should_auto_continue {
+                let goal = conversation.goal().unwrap();
+                let round = goal.rounds + 1;
+                let mut next = goal.clone();
+                next.rounds = round;
+                // 先 durable increment rounds（防崩溃重放重复 round）
+                if let Some(log) = conversation.log_mut() {
+                    let _ = log.commit(&SessionEvent::GoalSet { goal: next.clone() });
+                }
+                let _ = conversation.refresh_from_log();
+                ui_state.view.goal = conversation
+                    .goal()
+                    .map(|g| format!("{} [{}]", g.objective, g.phase));
+                // 目标已由 build_context 每 turn 注入（<goal_context>，紧凑 condition）。
+                // 续跑不再 push 一条 User 消息（否则每轮 goal_round 都写进 history、
+                // 随自动续跑累积大量重复文本污染上下文）。改为无输入信号：以空
+                // user_message 触发下一轮（同 /retry 语义，不新增 UserSubmitted），
+                // 模型凭已注入的目标 + 现有 history 继续推进。
+                ui_state.request_goal_continue(round);
+                ui_state.view.push_line(
+                    LineKind::System,
+                    format!("▶ Goal 自动续跑 Round {}/{}", round, goal.max_rounds),
+                );
+                // 本轮已刷；下次循环顶部消费 goal continue 信号并以空消息起下一轮。
+            }
             // §13（AGENTS.md）：request_input 挂起 → 记录待回答问题与选项
             //（内联展示，输入框直接回答；单问题带选项支持数字编号选择）。
             if outcome.reason == crate::session::CompletionReason::AwaitingUserInput {
@@ -1646,6 +1807,8 @@ where
                 _ => last_failed = None,
             }
             ui_state.view.push_line(LineKind::System, "─".repeat(40));
+            // 尊重自动续跑：不立即 continue，让顶层循环消费 pending_goal_continue
+            // 信号并以空消息起下一轮；若无续跑则照常主循环（下一轮 select 阻塞等键盘）。
         }
 
         // `request_input` 模态已提交答案（QuestionSubmitted/Rejected）：自动
@@ -1698,6 +1861,7 @@ where
                         registry: registry.clone(),
                         processes: processes.clone(),
                         terminals: terminals.clone(),
+                        agents: agents.clone(),
                     },
                 )
                 .await
@@ -1944,6 +2108,19 @@ fn handle_slash_command(
             Ok(SlashAction::Consumed)
         }
         "/retry" => handle_retry_command(ui_state, renderer, last_failed),
+        msg if msg == "/goal" || msg.starts_with("/goal ") => {
+            let result = handle_goal_command(msg, conversation)?;
+            push_system_line(&mut ui_state.view, renderer, result.body.clone())?;
+            ui_state.view.goal = conversation
+                .goal()
+                .map(|g| format!("{} [{}]", g.objective, g.phase));
+            // 设置/恢复 goal 后立即自动开工第一轮（跨轮目标驱动；用户无需手动
+            // 再发一条消息——参考 goal-round-driver 的“初轮自动启动”）。
+            if let Some(prompt) = result.auto_start {
+                ui_state.push_pending(prompt);
+            }
+            Ok(SlashAction::Consumed)
+        }
         _ => Ok(SlashAction::NotCommand),
     }
 }
@@ -2124,6 +2301,160 @@ fn handle_sessions_command(
         filter: String::new(),
     });
     modal_response(ui_state, renderer, "/sessions", preview_body)
+}
+
+/// `/goal` 处理结果：`body` 是展示给用户的提示行；`auto_start` 非空表示
+/// 该操作使 goal 处于 active，应立即自动开工（推入首条初始消息）。
+struct GoalCommandResult {
+    body: String,
+    auto_start: Option<String>,
+}
+
+impl GoalCommandResult {
+    fn new(body: String, auto_start: Option<String>) -> Self {
+        Self { body, auto_start }
+    }
+}
+
+fn handle_goal_command(
+    message: &str,
+    conversation: &mut Conversation,
+) -> Result<GoalCommandResult, String> {
+    let raw = message.trim();
+    let arg = raw.strip_prefix("/goal").unwrap_or("").trim();
+    if arg.is_empty() {
+        // /goal 展示当前
+        if let Some(g) = conversation.goal() {
+            return Ok(GoalCommandResult::new(
+                format!(
+                    "Goal [{}] r{}: {}\n用法: /goal <objective> | /goal clear | /goal pause | /goal resume",
+                    g.phase, g.revision, g.objective
+                ),
+                None,
+            ));
+        }
+        return Ok(GoalCommandResult::new(
+            "当前无 goal。用法: /goal <objective> | /goal clear | /goal pause | /goal resume"
+                .to_string(),
+            None,
+        ));
+    }
+    // 组装自动开工的初始消息（goal-round 语义，round 1）。
+    let start_prompt = |g: &tpi_core::goal::Goal, round: u32| -> String {
+        format!(
+            "<goal_round>\nObjective: \"{}\"\nRound: {round}/{}\n\n开始为该目标推进（同一 session）。以当前 workspace、工具结果与 durable 状态为准，做实质进展并验证。达成后调用 goal complete，仍有工作则保持 active。\n</goal_round>",
+            g.objective, g.max_rounds
+        )
+    };
+    let lower = arg.to_lowercase();
+    if lower == "clear" {
+        conversation.ensure_started(
+            &crate::config::tpi_home().join("sessions"),
+            &conversation_workspace_fallback(),
+        )?;
+        // 直接写 GoalCleared
+        if let Some(log) = conversation.log_mut() {
+            log.commit(&SessionEvent::GoalCleared)
+                .map_err(|e| e.to_string())?;
+        }
+        conversation.refresh_from_log().map_err(|e| e.to_string())?;
+        return Ok(GoalCommandResult::new("Goal 已清除".to_string(), None));
+    }
+    if lower == "pause" {
+        let Some(mut g) = conversation.goal() else {
+            return Ok(GoalCommandResult::new(
+                "当前无 goal 可暂停".to_string(),
+                None,
+            ));
+        };
+        g.phase = tpi_core::goal::GoalPhase::Paused;
+        g.revision += 1;
+        if let Some(log) = conversation.log_mut() {
+            log.commit(&SessionEvent::GoalSet { goal: g.clone() })
+                .map_err(|e| e.to_string())?;
+        }
+        conversation.refresh_from_log().map_err(|e| e.to_string())?;
+        return Ok(GoalCommandResult::new(
+            format!("Goal 已暂停: {}", g.objective),
+            None,
+        ));
+    }
+    if lower == "resume" {
+        let Some(mut g) = conversation.goal() else {
+            return Ok(GoalCommandResult::new(
+                "当前无 goal 可恢复".to_string(),
+                None,
+            ));
+        };
+        g.phase = tpi_core::goal::GoalPhase::Active;
+        g.revision += 1;
+        g.rounds += 1;
+        let auto_start = Some(start_prompt(&g, g.rounds));
+        if let Some(log) = conversation.log_mut() {
+            log.commit(&SessionEvent::GoalSet { goal: g.clone() })
+                .map_err(|e| e.to_string())?;
+        }
+        conversation.refresh_from_log().map_err(|e| e.to_string())?;
+        return Ok(GoalCommandResult::new(
+            format!("Goal 已恢复: {}", g.objective),
+            auto_start,
+        ));
+    }
+    if lower.starts_with("edit ") {
+        let obj = arg[5..].trim();
+        let validated = tpi_core::goal::validate_objective(obj).map_err(|e| e.to_string())?;
+        let mut g = conversation.goal().ok_or("当前无 goal，无法 edit")?;
+        g.objective = validated;
+        g.revision += 1;
+        g.phase = tpi_core::goal::GoalPhase::Active;
+        g.rounds += 1;
+        let auto_start = Some(start_prompt(&g, g.rounds));
+        if let Some(log) = conversation.log_mut() {
+            log.commit(&SessionEvent::GoalSet { goal: g.clone() })
+                .map_err(|e| e.to_string())?;
+        }
+        conversation.refresh_from_log().map_err(|e| e.to_string())?;
+        return Ok(GoalCommandResult::new(
+            format!("Goal 已更新: {}", g.objective),
+            auto_start,
+        ));
+    }
+    // create：剩余整体为 objective
+    let validated = tpi_core::goal::validate_objective(arg).map_err(|e| e.to_string())?;
+    let existing = conversation.goal();
+    let goal =
+        tpi_core::goal::build_goal(&validated, existing.as_ref()).map_err(|e| e.to_string())?;
+    conversation.ensure_started(
+        &crate::config::tpi_home().join("sessions"),
+        &conversation_workspace_fallback(),
+    )?;
+    let auto_goal = tpi_core::goal::Goal {
+        rounds: 1,
+        ..goal.clone()
+    };
+    if let Some(log) = conversation.log_mut() {
+        log.commit(&SessionEvent::GoalSet {
+            goal: auto_goal.clone(),
+        })
+        .map_err(|e| e.to_string())?;
+    }
+    conversation.refresh_from_log().map_err(|e| e.to_string())?;
+    // 新建 goal：round 从 1 开始（rounds 字段与自动续跑一致地预拨到 1）。
+    let auto_start = Some(start_prompt(&auto_goal, auto_goal.rounds));
+    Ok(GoalCommandResult::new(
+        format!(
+            "Goal 已创建 [{}] r{}: {}",
+            auto_goal.phase, auto_goal.revision, auto_goal.objective
+        ),
+        auto_start,
+    ))
+}
+
+fn conversation_workspace_fallback() -> camino::Utf8PathBuf {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| camino::Utf8PathBuf::from_path_buf(p).ok())
+        .unwrap_or_else(|| camino::Utf8PathBuf::from("."))
 }
 
 /// /retry：重试上一次失败的 turn。
@@ -2402,9 +2733,27 @@ fn execute_ui_effect(
 /// §修复：run 失败的错误文案——连接类失败（Connection/StreamInterrupted）对
 /// 用户显示可操作提示而非裸露内部错误（"stream ended before [DONE]..." 等），
 /// 完整错误仍在 tracing 日志与 session 记录中可诊断；非连接类保留原文。
+/// §用户诉求：provider 重试预算耗尽时（retry budget exhausted after N attempts），
+/// 把真实的已尝试次数带进提示（此前硬编码"重试后仍失败"，用户误以为没有重试）。
 fn friendly_provider_failure(error: &str) -> String {
     if error.contains("connection failed") || error.contains("stream interrupted") {
-        "模型连接中断（重试后仍失败）；session 已保留，可稍后重试或检查网络/代理".to_string()
+        // 提取 provider 层的实际重试次数（如 "retry budget exhausted after 10 attempts"）。
+        let attempts = if let Some(pos) = error.find("after ") {
+            error[pos + "after ".len()..]
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u32>().ok())
+        } else {
+            None
+        };
+        match attempts {
+            Some(n) => format!(
+                "模型连接中断（已重试 {n} 次仍失败）；session 已保留，可稍后重试或检查网络/代理"
+            ),
+            None => {
+                "模型连接中断；session 已保留，可稍后重试或检查网络/代理".to_string()
+            }
+        }
     } else {
         error.to_string()
     }
@@ -2430,6 +2779,8 @@ struct InteractiveIo<'a> {
     /// Session 级共享托管进程 / PTY 注册表（跨 run 存活）。
     processes: Arc<std::sync::Mutex<crate::process::managed::ProcessRegistry>>,
     terminals: Arc<std::sync::Mutex<crate::terminal::TerminalRegistry>>,
+    /// ADR-007：与 spawn_agent/agent 工具同一共享 AgentManager（跨 run 存活）。
+    agents: Arc<std::sync::Mutex<tpi_agent::agent::manager::AgentManager>>,
 }
 
 async fn run_interactive<P: Provider>(
@@ -2455,6 +2806,7 @@ async fn run_interactive<P: Provider>(
         registry,
         processes,
         terminals,
+        agents,
     } = io;
     let cancel = CancellationToken::new();
     *crate::util::lock_mutex(&current_cancel, "current_cancel") = Some(cancel.clone());
@@ -2485,9 +2837,9 @@ async fn run_interactive<P: Provider>(
             registry,
             processes,
             terminals,
-            agents: Arc::new(std::sync::Mutex::new(
-                tpi_agent::agent::manager::AgentManager::new(),
-            )),
+            // ADR-007：session 级共享实例——worker report 与 run boundary
+            // drain 的 inbox 必须是同一对象（否则自动注入失效）。
+            agents,
         },
     );
     tokio::pin!(run_future);

@@ -1026,6 +1026,14 @@ fn forward_live_event(ev: LiveEvent, emitter: &Emitter, session_id: SessionId, r
             session_id,
             attempt,
         }),
+        LiveEvent::ProviderRetrying {
+            attempt,
+            backoff_ms,
+        } => Some(RuntimeEvent::ProviderRetrying {
+            session_id,
+            attempt,
+            backoff_ms,
+        }),
         LiveEvent::CompactionNotice { message } => Some(RuntimeEvent::CompactionNotice {
             session_id,
             message,

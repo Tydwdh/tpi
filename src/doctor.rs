@@ -112,6 +112,7 @@ fn doctor_report_with_home(
             crate::tool::edit::SnapshotStore::new(64, 8),
         )),
         current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        current_goal: None,
         shell: local.shell.clone(),
         workspace: std::sync::Arc::new(std::sync::Mutex::new(
             crate::workspace::ActiveWorkspace::local(local),

@@ -21,9 +21,10 @@ fn auto_recovery_shows_footer_progress_every_attempt() {
     );
     let hint1 = state.view.transient_hint.clone();
     assert!(
-        hint1
-            .as_deref()
-            .is_some_and(|h| h.contains("自动续写") && h.contains("1/10")),
+        hint1.as_deref().is_some_and(|h| {
+            h.contains("自动续写")
+                && h.contains(&format!("1/{}", tpi_agent::agent::MAX_STREAM_RECOVERIES))
+        }),
         "第一次续写 footer 提示: {hint1:?}"
     );
     // 第二次续写：footer 提示更新（不追加新系统行——刷屏防护保留）。
@@ -33,7 +34,9 @@ fn auto_recovery_shows_footer_progress_every_attempt() {
     );
     let hint2 = state.view.transient_hint.clone();
     assert!(
-        hint2.as_deref().is_some_and(|h| h.contains("2/10")),
+        hint2
+            .as_deref()
+            .is_some_and(|h| h.contains(&format!("2/{}", tpi_agent::agent::MAX_STREAM_RECOVERIES))),
         "第二次续写 footer 提示更新: {hint2:?}"
     );
     // TurnRestarting 同理。
@@ -43,10 +46,55 @@ fn auto_recovery_shows_footer_progress_every_attempt() {
     );
     let hint3 = state.view.transient_hint.clone();
     assert!(
-        hint3
-            .as_deref()
-            .is_some_and(|h| h.contains("自动重试") && h.contains("3/10")),
+        hint3.as_deref().is_some_and(|h| {
+            h.contains("自动重试")
+                && h.contains(&format!("3/{}", tpi_agent::agent::MAX_TURN_RESTARTS))
+        }),
         "重生成 footer 提示: {hint3:?}"
+    );
+}
+
+/// §用户诉求：provider 内部重试对用户可见——footer 提示，首次追加系统行。
+#[test]
+fn provider_retry_shows_feedback() {
+    let mut state = UiState::new(ViewModel::default());
+    // 第一次重试：footer 提示 + 追加一条系统行（等待时长向下取整到秒）。
+    reducer::update(
+        &mut state,
+        UiEvent::Agent(tpi_agent::agent::RuntimeEvent::ProviderRetrying {
+            attempt: 1,
+            backoff_ms: 1500,
+        }),
+    );
+    let hint = state.view.transient_hint.clone();
+    assert!(
+        hint.as_deref().is_some_and(|h| {
+            h.contains("网络重试中") && h.contains("第 1 次") && h.contains("1s")
+        }),
+        "首次重试 footer 提示: {hint:?}"
+    );
+    assert_eq!(state.view.transcript.len(), 1, "首次重试追加一条系统行");
+    assert!(entry_text(&state.view.transcript[0]).contains("自动重试"));
+
+    // 第二次重试：footer 更新，不追加新系统行（刷屏防护）。
+    reducer::update(
+        &mut state,
+        UiEvent::Agent(tpi_agent::agent::RuntimeEvent::ProviderRetrying {
+            attempt: 3,
+            backoff_ms: 2300,
+        }),
+    );
+    let hint2 = state.view.transient_hint.clone();
+    assert!(
+        hint2.as_deref().is_some_and(|h| {
+            h.contains("第 3 次") && h.contains("2s")
+        }),
+        "后续重试 footer 更新: {hint2:?}"
+    );
+    assert_eq!(
+        state.view.transcript.len(),
+        1,
+        "同轮后续重试不得追加提示行"
     );
 }
 
@@ -205,7 +253,10 @@ fn reconnect_prompt_shows_time_and_attempt_count() {
         "系统行必须带 [HH:MM:SS] 时间戳: {text}"
     );
     assert!(
-        text.contains("第 1/10 次"),
+        text.contains(&format!(
+            "第 1/{} 次",
+            tpi_agent::agent::MAX_STREAM_RECOVERIES
+        )),
         "必须显示第 N/MAX 次（MAX=MAX_STREAM_RECOVERIES）: {text}"
     );
 
@@ -216,7 +267,10 @@ fn reconnect_prompt_shows_time_and_attempt_count() {
     );
     assert_eq!(state.view.reconnect_count, 3);
     let text2 = entry_text(&state.view.transcript[1]);
-    assert!(text2.contains("第 1/10 次"), "{text2}");
+    assert!(
+        text2.contains(&format!("第 1/{} 次", tpi_agent::agent::MAX_TURN_RESTARTS)),
+        "{text2}"
+    );
     assert!(text2.contains("重新生成"), "{text2}");
     // 同轮后续 TurnRestarting（attempt > 1）：静默。
     reducer::update(

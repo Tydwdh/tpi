@@ -773,6 +773,8 @@ pub struct ViewModel {
     /// 过渡提示（footer 显示；下一次键盘/鼠标操作清除）。
     pub transient_hint: Option<String>,
     pub plan: Option<Plan>,
+    /// 当前 durable goal（/goal 设置；与 plan 同为 harness state）。
+    pub goal: Option<String>,
     pub status: StatusLine,
     pub model_name: String,
     /// workspace 目录名（footer 展示）。
@@ -863,6 +865,7 @@ impl Default for ViewModel {
             input_cursor: 0,
             transient_hint: None,
             plan: None,
+            goal: None,
             status: StatusLine::Idle,
             model_name: "?".into(),
             workspace: String::new(),
@@ -939,6 +942,7 @@ impl ViewModel {
         self.transcript.clear();
         self.live = LiveTurnState::default();
         self.plan = None;
+        self.goal = None;
         self.status = StatusLine::Idle;
         self.step = 0;
         self.reasoning_expanded.clear();

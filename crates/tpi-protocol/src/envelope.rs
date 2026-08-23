@@ -79,6 +79,7 @@ impl EventEnvelope {
             RuntimeEvent::BudgetWarning { session_id } => (Some(*session_id), None),
             RuntimeEvent::StreamRecovering { session_id, .. } => (Some(*session_id), None),
             RuntimeEvent::TurnRestarting { session_id, .. } => (Some(*session_id), None),
+            RuntimeEvent::ProviderRetrying { session_id, .. } => (Some(*session_id), None),
             RuntimeEvent::CompactionNotice { session_id, .. } => (Some(*session_id), None),
             RuntimeEvent::SubagentReported { child_session, .. } => (Some(*child_session), None),
             RuntimeEvent::MutationRecorded { session_id, .. } => (Some(*session_id), None),

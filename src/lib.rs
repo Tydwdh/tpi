@@ -6,7 +6,7 @@
 //! P7-02 拆 crate：core 层（ids/message/plan/outcome/util）已拆为 `tpi-core`
 //! crate；此处 re-export 保持 `tpi::ids` 等路径兼容（逐步迁移引用后再移除）。
 
-pub use tpi_core::{ids, message, outcome, plan, revision, util};
+pub use tpi_core::{goal, ids, message, outcome, plan, revision, util};
 // session crate 顶层即 session 模块（module alias 保持 `crate::session` 路径）。
 pub use tpi_agent::{agent, context, provider, subagent, trace};
 // tui crate 顶层即 tui 模块（module alias 保持 `crate::tui` 路径）。

@@ -22,6 +22,7 @@ struct InMemoryStore {
     seq: u64,
     session_id: SessionId,
     run_id: RunId,
+    state: tpi::session::SessionState,
 }
 
 impl InMemoryStore {
@@ -31,6 +32,7 @@ impl InMemoryStore {
             seq: 0,
             session_id: SessionId::new_v7(),
             run_id: RunId::new_v7(),
+            state: tpi::session::SessionState::default(),
         }
     }
     fn events(&self) -> &[SessionEvent] {
@@ -56,6 +58,7 @@ impl SessionStore for InMemoryStore {
     fn append_event(&mut self, event: &SessionEvent) -> std::io::Result<u64> {
         self.events.push(event.clone());
         self.seq = self.seq.saturating_add(1);
+        self.state.apply(event);
         Ok(self.seq)
     }
     fn sync_data(&mut self) -> std::io::Result<()> {
@@ -88,6 +91,9 @@ impl SessionStore for InMemoryStore {
             .enumerate()
             .map(|(i, e)| (i as u64 + 1, e))
             .collect())
+    }
+    fn state(&self) -> &tpi::session::SessionState {
+        &self.state
     }
 }
 

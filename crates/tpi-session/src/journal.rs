@@ -41,6 +41,11 @@ pub fn append_mutation(
     let line = serde_json::to_string(payload)?;
     use std::io::Write;
     writeln!(file, "{line}")?;
+    // §fix：与 edit 提交的 durability 屏障对齐——编辑文件实体已原子落盘，
+    // journal 行若不 fsync，崩溃后可能出现“文件已改但 journal 缺该行”的
+    // 窗口（undo/恢复无快照可回滚）。追加内容刷盘后再返回。
+    file.sync_data()?;
+    drop(file);
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 //! M2 验收契约（§21 M2）。
 //!
 //! - §20.2 场景 8：Bash pipeline 前段失败在 pipefail 下可见；
-//! - §20.2 场景 22：list/search 达到 scan budget 返回统计；cursor 翻页不重新扫描；
+//! - §20.2 场景 22：read 目录模式达到 scan budget 返回统计；窗口分页；
 //! - §20.2 场景 23：Windows target 启动后立即派生 child，取消仍能终止 host、target 与 child；
 //! - §8.4：run 完整输出进 artifact，模型经 `@artifact/...` 有界读取。
 
@@ -12,7 +12,6 @@ use fixtures::{point_host_at_real_tpi, test_config, test_tool_context};
 use tokio_util::sync::CancellationToken;
 use tpi::outcome::ToolStatus;
 use tpi::tool::command::{BashArgs, bash};
-use tpi::tool::search::{SearchArgs, search};
 use tpi::tool::{ToolContext, files};
 
 #[tokio::test]
@@ -93,6 +92,7 @@ async fn cancellation_kills_entire_process_tree() {
         scan_snapshots: ctx.scan_snapshots.clone(),
         shell_path: ctx.shell_path.clone(),
         snapshot_store: ctx.snapshot_store.clone(),
+        current_goal: None,
         current_plan: ctx.current_plan.clone(),
         shell: ctx.shell.clone(),
         workspace: ctx.workspace.clone(),
@@ -182,25 +182,6 @@ async fn list_and_search_respect_budget_and_cursor() {
     assert!(text.contains("stop_reason: complete"));
     assert!(!text.contains("ignored.txt"), ".gitignore 必须生效: {text}");
     assert!(text.contains("a.txt"));
-
-    // search：regex 匹配 + 行号；ignore 同样生效。
-    let outcome = search(
-        SearchArgs {
-            pattern: "needle".into(),
-            path: ".".into(),
-            cursor: None,
-            exclude: Vec::new(),
-            max_results: 100,
-            include: Vec::new(),
-            context: 0,
-            literal: false,
-        },
-        &ctx,
-    );
-    let text = outcome.model_text();
-    assert!(text.contains("a.txt:1: needle-one"), "{text}");
-    assert!(text.contains("b.txt:1: needle-two"), "{text}");
-    assert!(!text.contains("ignored.txt"), "{text}");
 
     // 目录条目窗口分页（§20.2 场景 22 的 list 语义并入 read）：
     // 250 个文件 → 第一页 200 条 + 续读指引 → start_line 续读第二页 50 条。

@@ -23,6 +23,8 @@ pub mod scheduler;
 pub mod search;
 pub mod selector;
 pub mod terminal;
+pub mod goal;
+pub mod undo;
 pub mod web;
 
 use camino::Utf8PathBuf;
@@ -32,7 +34,7 @@ use tpi_core::message::ToolDef;
 
 /// 工具 schema 的 JSON 序列化（schemars 生成，理论上不会失败）。
 /// 失败时记录日志并返回 null（模型将看到无参数 schema，但进程不崩溃）。
-fn schema_value<T: schemars::JsonSchema>(tool: &'static str) -> serde_json::Value {
+pub(crate) fn schema_value<T: schemars::JsonSchema>(tool: &'static str) -> serde_json::Value {
     match serde_json::to_value(schemars::schema_for!(T)) {
         Ok(value) => normalize_tool_parameters(value),
         Err(error) => {
@@ -185,8 +187,6 @@ fn render_schema_node(node: &serde_json::Value, definitions: &serde_json::Value)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinTool {
     Read,
-    Search,
-    Glob,
     Edit,
     Write,
     Bash,
@@ -201,6 +201,11 @@ pub enum BuiltinTool {
     WebSearch,
     WebFetch,
     ActivateSkill,
+    /// §B1：基于 Mutation Journal 撤销/重做本 session 的文件变更（模型侧
+    /// `tpi undo`；CAS 语义，与 CLI 共用 journal 数据源）。
+    Undo,
+    /// Goal：跨轮 objective（模型侧 get/complete/drop）。
+    Goal,
 }
 
 /// 工具对调度器和崩溃恢复真正重要的执行语义。
@@ -212,7 +217,6 @@ pub enum BuiltinTool {
 pub(crate) enum ToolExecutionClass {
     Pure,
     FileReadExact,
-    FileReadRecursive,
     FileWriteExact,
     WorkspaceUnknown,
 }
@@ -228,8 +232,6 @@ impl BuiltinTool {
     pub fn name(&self) -> &'static str {
         match self {
             BuiltinTool::Read => "read",
-            BuiltinTool::Search => "search",
-            BuiltinTool::Glob => "glob",
             BuiltinTool::Edit => "edit",
             BuiltinTool::Write => "write",
             BuiltinTool::Bash => "bash",
@@ -241,6 +243,8 @@ impl BuiltinTool {
             BuiltinTool::WebSearch => "web_search",
             BuiltinTool::WebFetch => "web_fetch",
             BuiltinTool::ActivateSkill => "activate_skill",
+            BuiltinTool::Undo => "undo",
+            BuiltinTool::Goal => "goal",
         }
     }
 
@@ -248,8 +252,6 @@ impl BuiltinTool {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "read" => Some(Self::Read),
-            "search" => Some(Self::Search),
-            "glob" => Some(Self::Glob),
             "edit" => Some(Self::Edit),
             "write" => Some(Self::Write),
             "bash" => Some(Self::Bash),
@@ -261,6 +263,8 @@ impl BuiltinTool {
             "web_search" => Some(Self::WebSearch),
             "web_fetch" => Some(Self::WebFetch),
             "activate_skill" => Some(Self::ActivateSkill),
+            "undo" => Some(Self::Undo),
+            "goal" => Some(Self::Goal),
             _ => None,
         }
     }
@@ -269,7 +273,6 @@ impl BuiltinTool {
     pub(crate) fn execution_class(self) -> ToolExecutionClass {
         match self {
             Self::Read => ToolExecutionClass::FileReadExact,
-            Self::Search | Self::Glob => ToolExecutionClass::FileReadRecursive,
             Self::Edit | Self::Write => ToolExecutionClass::FileWriteExact,
             Self::Bash => ToolExecutionClass::WorkspaceUnknown,
             // §5：process 工具读 registry / 控制 managed process，无文件副作用。
@@ -285,6 +288,11 @@ impl BuiltinTool {
             Self::UpdatePlan | Self::WebSearch | Self::WebFetch | Self::ActivateSkill => {
                 ToolExecutionClass::Pure
             }
+            // §B1：undo/redo 是 journal CAS 回滚——写目标文件，但路径由 journal
+            // 决定（不在 args 中）。声明 WorkspaceUnknown：串行执行、write-ahead、
+            // 与其它写隔离；不参与 path 资源锁（无 args.path）。
+            Self::Undo => ToolExecutionClass::WorkspaceUnknown,
+            Self::Goal => ToolExecutionClass::Pure,
         }
     }
 
@@ -307,46 +315,23 @@ Follows .gitignore, skips symlinks, binaries and files over 2MiB. \
 Use to inspect files before editing, or for a directory overview before searching. \
 Example: read src/main.rs; read src depth=2"
             }
-            BuiltinTool::Search => {
-                "Search file contents with a rust regex (ripgrep kernel; 100 matches max, \
-one line 300 chars). Follows .gitignore. \
-Output: matched lines with file paths; cursor pages without rescanning. \
-Path may be a directory (recursive) or a single file. \
-Use max_results to bound hits, include to filter by glob (e.g. `**/*.rs`), \
-exclude to skip path components (e.g. \"tests\", \"vendor\") or glob patterns \
-(e.g. `**/vendor/**`). \
-context=N shows N lines before/after each match (context lines use `path-N- text` \
-format and don't count toward max_results); literal=true treats pattern as plain \
-text instead of regex (`rg -F`). \
-Use when you know the text pattern but not which file. \
-Example: search pattern=\"fn estimate_request\" include=[\"**/*.rs\"] context=3"
-            }
-            BuiltinTool::Glob => {
-                "Find files by filename glob pattern (e.g. `**/*.rs`, `src/**/*.ts`, `Cargo.toml`). \
-Follows .gitignore, skips symlinks; results sorted by modification time (newest first). \
-Use when you know the filename/path shape but not the location; prefer over search \
-when the match is on file names, not contents. \
-Example: glob pattern=\"**/*test*.rs\""
-            }
             BuiltinTool::Edit => {
-                "Atomically edit one file: revision-bound, replace existing text with new text (V3). \
+                "Atomically edit one file: replace existing text with new text (V3, no revision needed). \
 Each entry maps old_text → new_text; old_text must uniquely match the file (with \
 canonical normalization: Exact → NormalizeEOL → IgnoreTrailingWhitespace → \
 EquivalentIndentation; >1 match is rejected). old_text serves as location, \
 precondition, context and structural boundary — no line numbers needed. \
 Insert = old_text only (new_text empty... use a non-empty new_text for insert; \
-delete = empty new_text). Batch: all entries resolve against the same base \
-revision; any failure or overlap rejects the whole batch — the file stays unchanged. \
-Output: unified diff + applied count + previous/current revision. \
+delete = empty new_text). Batch: all entries resolve atomically; any failure or overlap rejects the whole batch — the file stays unchanged. \
+Output: unified diff + applied count. \
 Prefer edit over write for localized changes. \
-Example: edit path=src/main.rs revision=b3:<hex> replacements=[{\"old_text\": \"let x = 1;\\n\", \"new_text\": \"let x = 2;\\n\"}]"
+Example: edit path=src/main.rs replacements=[{\"old_text\": \"let x = 1;\\n\", \"new_text\": \"let x = 2;\\n\"}]"
             }
             BuiltinTool::Write => {
-                "Write an entire file (creates if missing; if it exists, `revision` must match \
-the current one — use edit for localized changes). \
+                "Write an entire file: creates if missing, overwrites atomically if exists (no revision needed). \
 Output: unified diff + applied count. \
-Use for new files or full rewrites. \
-Example: write path=README.md content=... revision=..."
+Use for new files or full rewrites/overwrites. \
+Example: write path=README.md content=..."
             }
             BuiltinTool::Bash => {
                 "Run a command through Git Bash (`set -o pipefail` enabled; stderr is not \
@@ -448,6 +433,26 @@ workflow — they are NOT tools themselves. \
 Use when the task matches a skill's description. \
 Example: activate_skill name=\"rust-review\""
             }
+            BuiltinTool::Undo => {
+                "Undo or redo file changes committed by this session's edit/write tools, \
+based on the Mutation Journal (before/after snapshots recorded on every successful \
+edit/write). CAS semantics: a file is restored only if its current content matches \
+the journal snapshot; if any file conflicts (externally modified), NOTHING is written \
+and all files are reported — safe against partial rollback. \
+This works WITHOUT git: use it to revert your own mistaken edits, roll back an \
+experimental change, or restore a file deleted/rewritten via write. \
+It does NOT cover changes made through bash (external writes are invisible to the journal). \
+Actions: undo (default) restores previous content; redo reapplies. \
+Scope: last (default) reverts the most recent mutation; all reverts the whole session \
+to the earliest state. \
+Example: undo; undo action=redo scope=all"
+            }
+            BuiltinTool::Goal => {
+                "Manage the durable completion goal for multi-round autonomous work. \
+Ops: get (current goal), complete (mark achieved, must evidence), drop (clear). \
+Do not use for trivial single-turn work. Use get before complete. \
+Example: goal op=get; goal op=complete"
+            }
         }
     }
 
@@ -455,8 +460,6 @@ Example: activate_skill name=\"rust-review\""
     pub fn schema(&self) -> ToolDef {
         let parameters = match self {
             BuiltinTool::Read => schema_value::<files::ReadArgs>("read"),
-            BuiltinTool::Search => schema_value::<search::SearchArgs>("search"),
-            BuiltinTool::Glob => schema_value::<search::GlobArgs>("glob"),
             BuiltinTool::Edit => schema_value::<edit::EditArgs>("edit"),
             BuiltinTool::Write => schema_value::<files::WriteArgs>("write"),
             BuiltinTool::Bash => schema_value::<command::BashArgs>("bash"),
@@ -474,6 +477,8 @@ Example: activate_skill name=\"rust-review\""
             BuiltinTool::ActivateSkill => {
                 schema_value::<crate::skills::activate::ActivateSkillArgs>("activate_skill")
             }
+            BuiltinTool::Undo => schema_value::<undo::UndoArgs>("undo"),
+            BuiltinTool::Goal => schema_value::<crate::tool::goal::GoalArgs>("goal"),
         };
         ToolDef {
             name: self.name().to_string(),
@@ -486,8 +491,6 @@ Example: activate_skill name=\"rust-review\""
     pub fn parse_args(&self, arguments: &str) -> Result<ValidatedArgs, ArgsError> {
         match self {
             BuiltinTool::Read => parse_args_typed("read", arguments, ValidatedArgs::Read),
-            BuiltinTool::Search => parse_args_typed("search", arguments, ValidatedArgs::Search),
-            BuiltinTool::Glob => parse_args_typed("glob", arguments, ValidatedArgs::Glob),
             BuiltinTool::Edit => parse_args_typed("edit", arguments, ValidatedArgs::Edit),
             BuiltinTool::Write => parse_args_typed("write", arguments, ValidatedArgs::Write),
             BuiltinTool::Bash => parse_args_typed("bash", arguments, ValidatedArgs::Bash),
@@ -513,6 +516,8 @@ Example: activate_skill name=\"rust-review\""
             BuiltinTool::ActivateSkill => {
                 parse_args_typed("activate_skill", arguments, ValidatedArgs::ActivateSkill)
             }
+            BuiltinTool::Undo => parse_args_typed("undo", arguments, ValidatedArgs::Undo),
+            BuiltinTool::Goal => parse_args_typed("goal", arguments, ValidatedArgs::Goal),
         }
     }
 }
@@ -521,8 +526,6 @@ Example: activate_skill name=\"rust-review\""
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidatedArgs {
     Read(files::ReadArgs),
-    Search(search::SearchArgs),
-    Glob(search::GlobArgs),
     Edit(edit::EditArgs),
     Write(files::WriteArgs),
     Bash(command::BashArgs),
@@ -534,6 +537,8 @@ pub enum ValidatedArgs {
     WebSearch(web::WebSearchArgs),
     WebFetch(web::WebFetchArgs),
     ActivateSkill(crate::skills::activate::ActivateSkillArgs),
+    Undo(undo::UndoArgs),
+    Goal(crate::tool::goal::GoalArgs),
 }
 
 impl ValidatedArgs {
@@ -542,8 +547,6 @@ impl ValidatedArgs {
     pub(crate) fn tool(&self) -> BuiltinTool {
         match self {
             Self::Read(_) => BuiltinTool::Read,
-            Self::Search(_) => BuiltinTool::Search,
-            Self::Glob(_) => BuiltinTool::Glob,
             Self::Edit(_) => BuiltinTool::Edit,
             Self::Write(_) => BuiltinTool::Write,
             Self::Bash(_) => BuiltinTool::Bash,
@@ -555,6 +558,8 @@ impl ValidatedArgs {
             Self::WebSearch(_) => BuiltinTool::WebSearch,
             Self::WebFetch(_) => BuiltinTool::WebFetch,
             Self::ActivateSkill(_) => BuiltinTool::ActivateSkill,
+            Self::Undo(_) => BuiltinTool::Undo,
+            Self::Goal(_) => BuiltinTool::Goal,
         }
     }
 
@@ -563,8 +568,6 @@ impl ValidatedArgs {
     pub(crate) fn path(&self) -> Option<&str> {
         match self {
             Self::Read(args) => Some(&args.path),
-            Self::Search(args) => Some(&args.path),
-            Self::Glob(args) => Some(&args.path),
             Self::Edit(args) => Some(&args.path),
             Self::Write(args) => Some(&args.path),
             Self::Bash(_)
@@ -575,7 +578,9 @@ impl ValidatedArgs {
             | Self::UpdatePlan(_)
             | Self::WebSearch(_)
             | Self::WebFetch(_)
-            | Self::ActivateSkill(_) => None,
+            | Self::ActivateSkill(_)
+            | Self::Undo(_)
+            | Self::Goal(_) => None,
         }
     }
 }
@@ -610,7 +615,7 @@ pub struct ToolContext {
     pub call_id: tpi_core::ids::ToolCallId,
     /// 流式输出通道（bash 实时输出；None = 无 UI 订阅）。
     pub output_tx: Option<tokio::sync::mpsc::Sender<ToolStreamEvent>>,
-    /// list/search 分页 snapshot（session 作用域；cursor 翻页不重新扫描，§8.4）。
+    /// 遗留的 scan snapshot 类型（search/glob 已删除；字段保留以最小改动面）。
     pub scan_snapshots:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, search::ScanSnapshot>>>,
     /// Git Bash 路径解析（§11.2；None = 自动探测）。
@@ -619,6 +624,9 @@ pub struct ToolContext {
     pub snapshot_store: std::sync::Arc<std::sync::Mutex<crate::tool::edit::SnapshotStore>>,
     /// 当前原子短计划（§13；agent loop 持有，update_plan 原子替换）。
     pub current_plan: std::sync::Arc<std::sync::Mutex<Option<tpi_core::plan::Plan>>>,
+    /// 当前 goal（与 plan 同为 durable harness state；user /goal + 模型 goal tool 共用）。
+    #[allow(clippy::type_complexity)]
+    pub current_goal: Option<std::sync::Arc<std::sync::Mutex<Option<tpi_core::goal::Goal>>>>,
     /// Logical Shell Session（任务书 §S1：属于 Workspace；bash 工具读写）。
     /// 与 `workspace` 内的 shell 是同一状态源（构造时共享 Arc）。
     pub shell: std::sync::Arc<std::sync::Mutex<crate::shell::ShellSessionState>>,
@@ -934,6 +942,26 @@ pub async fn execute(
         (BuiltinTool::ActivateSkill, ValidatedArgs::ActivateSkill(args)) => {
             crate::skills::activate::activate_skill(args, ctx)
         }
+        // §B1：undo/redo 是同步文件回滚（journal CAS；blocking 池执行）。
+        (BuiltinTool::Undo, ValidatedArgs::Undo(args)) => {
+            let ctx = ctx.clone();
+            tokio::task::spawn_blocking(move || undo::undo(args, &ctx))
+                .await
+                .unwrap_or_else(|e| {
+                    ToolOutcome::failed(
+                        "undo",
+                        ModelPayload {
+                            status: ToolStatus::Failed,
+                            program: Some("undo".into()),
+                            exit_code: None,
+                            duration_ms: 0,
+                            output: format!("undo 任务失败: {e}"),
+                            effect: None,
+                            artifact: None,
+                        },
+                    )
+                })
+        }
         // §11/BUG-009：同步工具（文件 IO/正则扫描）挪到 blocking 池，避免大目录扫描、
         // 大文件读取、网络盘遍历阻塞 Tokio worker——并行 4 个工具时可能占满全部
         // worker，导致 TUI 事件循环（ui_rx/ticker/键盘）明显卡顿。
@@ -942,12 +970,11 @@ pub async fn execute(
             let plan = plan.cloned();
             tokio::task::spawn_blocking(move || match (tool, args) {
                 (BuiltinTool::Read, ValidatedArgs::Read(args)) => files::read(args, &ctx),
-                (BuiltinTool::Search, ValidatedArgs::Search(args)) => search::search(args, &ctx),
-                (BuiltinTool::Glob, ValidatedArgs::Glob(args)) => search::glob(args, &ctx),
                 (BuiltinTool::Edit, ValidatedArgs::Edit(args)) => files::edit(args, &ctx, plan.as_ref()),
                 (BuiltinTool::Write, ValidatedArgs::Write(args)) => files::write(args, &ctx, plan.as_ref()),
                 // §13：update_plan 是原生同步控制操作。
                 (BuiltinTool::UpdatePlan, ValidatedArgs::UpdatePlan(args)) => plan_exec::update_plan(args, &ctx),
+                (BuiltinTool::Goal, ValidatedArgs::Goal(args)) => goal::goal(args, &ctx),
                 (tool, args) => {
                     // 内部不变量：ValidatedArgs 由同工具解析产生；异常组合按失败上报。
                     tracing::error!(
@@ -995,8 +1022,6 @@ pub async fn execute(
 pub fn implemented_tools() -> Vec<BuiltinTool> {
     vec![
         BuiltinTool::Read,
-        BuiltinTool::Search,
-        BuiltinTool::Glob,
         BuiltinTool::Edit,
         BuiltinTool::Write,
         BuiltinTool::Bash,
@@ -1008,6 +1033,7 @@ pub fn implemented_tools() -> Vec<BuiltinTool> {
         BuiltinTool::WebSearch,
         BuiltinTool::WebFetch,
         BuiltinTool::ActivateSkill,
+        BuiltinTool::Goal,
     ]
 }
 
@@ -1099,9 +1125,7 @@ mod tests {
     fn recovery_policy_consistent_with_execution_class() {
         for tool in implemented_tools() {
             let expected = match tool.execution_class() {
-                ToolExecutionClass::Pure
-                | ToolExecutionClass::FileReadExact
-                | ToolExecutionClass::FileReadRecursive => {
+                ToolExecutionClass::Pure | ToolExecutionClass::FileReadExact => {
                     tpi_core::outcome::ToolRecoveryPolicy::NoEffect
                 }
                 ToolExecutionClass::FileWriteExact => {
@@ -1120,25 +1144,30 @@ mod tests {
         }
     }
 
-    /// §4 ACI：工具 description 必须含典型调用示例（书中：示例提升工具准确率 72%→90%），
-    /// 高频工具（bash/search/web_fetch/edit）必须含执行代价或边界说明。
+    /// §4 ACI：工具 description 必须含典型调用示例（书中：示例提升工具准确率 72%→90%）。
     #[test]
     fn tool_descriptions_carry_examples_and_cost() {
         for tool in implemented_tools() {
             let desc = tool.description();
+            // “Example”前缀兼容单数/复数形式（terminal 列举多个示例用 Examples:）。
             assert!(
-                desc.contains("Example:"),
+                desc.contains("Example"),
                 "{} description 必须含典型示例: {desc}",
                 tool.name()
             );
         }
-        // 高频工具必须有执行代价或边界（bash 代价 / web_fetch 代价+SSRF / search 何时用）。
+        // terminal 用复数形式列举多个示例（同样满足“必须含示例”约束）。
+        let terminal = BuiltinTool::Terminal.description();
+        assert!(
+            terminal.contains("Examples:") && terminal.contains("terminal action=open"),
+            "terminal description 必须含典型示例"
+        );
+        // 高频工具必须有执行代价或边界（bash 代价 / web_fetch 代价+SSRF）。
         for (name, marker) in [
             ("bash", "timeout_ms"),
             ("web_fetch", "SSRF"),
             ("web_search", "discovery only"),
-            ("search", "Use when"),
-            ("edit", "revision-bound"),
+            ("edit", "Atomically edit"),
         ] {
             let tool = BuiltinTool::from_name(name).unwrap();
             assert!(
@@ -1162,14 +1191,6 @@ mod tests {
         assert!(
             params.contains("120000"),
             "bash.timeout_ms 默认值必须进 schema: {params}"
-        );
-        let search_schema = BuiltinTool::Search.schema();
-        assert!(
-            search_schema
-                .parameters
-                .to_string()
-                .contains("fn estimate_request"),
-            "search.pattern 示例必须进 schema"
         );
         let fetch_schema = BuiltinTool::WebFetch.schema();
         assert!(
@@ -1216,6 +1237,7 @@ mod tests {
             shell_path: None,
             snapshot_store: Default::default(),
             current_plan: Default::default(),
+            current_goal: None,
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),
@@ -1254,9 +1276,10 @@ mod tests {
             "错误必须说明期望 shape: {msg}"
         );
         assert!(msg.contains("path"), "expected shape 必须含 path: {msg}");
+        // V3 后 revision 已从协议移除（内部 BLAKE3 CAS，模型不可见）。
         assert!(
-            msg.contains("revision"),
-            "expected shape 必须含 revision: {msg}"
+            !msg.contains("revision"),
+            "V3 协议不得再要求 revision: {msg}"
         );
         assert!(
             msg.contains("replacements"),

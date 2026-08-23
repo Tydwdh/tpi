@@ -6,6 +6,7 @@
 //! 长期兼容面：**P2-01 拆分不改任何字段/序列化**（golden hash 证明）。
 
 use serde::{Deserialize, Serialize};
+use tpi_core::goal::Goal;
 use tpi_core::ids::{AgentId, DelegationId, EventId, RequestId, RunId, SessionId, ToolCallId};
 use tpi_core::message::ToolCall;
 use tpi_core::outcome::StoredToolOutcome;
@@ -195,6 +196,11 @@ pub enum SessionEvent {
     PlanReplaced {
         plan: Plan,
     },
+    /// Goal：跨轮 objective（轻量版 deepseek-harness goal/domain + oh-my-pi GoalModeState）。
+    GoalSet {
+        goal: Goal,
+    },
+    GoalCleared,
     CompactionCommitted {
         covered: EventRange,
         summary: CompactSummary,
@@ -267,6 +273,8 @@ impl SessionEvent {
             SessionEvent::ToolStarted { .. } => "tool_started",
             SessionEvent::ToolCompleted { .. } => "tool_completed",
             SessionEvent::PlanReplaced { .. } => "plan_replaced",
+            SessionEvent::GoalSet { .. } => "goal_set",
+            SessionEvent::GoalCleared => "goal_cleared",
             SessionEvent::CompactionCommitted { .. } => "compaction_committed",
             SessionEvent::MutationCommitted { .. } => "mutation_committed",
             SessionEvent::RunCompleted { .. } => "run_completed",
@@ -323,6 +331,12 @@ pub enum EventBody {
     },
     PlanReplaced {
         payload: PlanReplacedPayload,
+    },
+    GoalSet {
+        payload: GoalSetPayload,
+    },
+    GoalCleared {
+        payload: GoalClearedPayload,
     },
     CompactionCommitted {
         payload: CompactionCommittedPayload,
@@ -430,6 +444,14 @@ pub struct PlanReplacedPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalSetPayload {
+    pub goal: Goal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalClearedPayload {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionCommittedPayload {
     pub covered: EventRange,
     pub summary: CompactSummary,
@@ -508,6 +530,12 @@ impl Envelope {
             },
             SessionEvent::PlanReplaced { plan } => EventBody::PlanReplaced {
                 payload: PlanReplacedPayload { plan: plan.clone() },
+            },
+            SessionEvent::GoalSet { goal } => EventBody::GoalSet {
+                payload: GoalSetPayload { goal: goal.clone() },
+            },
+            SessionEvent::GoalCleared => EventBody::GoalCleared {
+                payload: GoalClearedPayload {},
             },
             SessionEvent::CompactionCommitted { covered, summary } => {
                 EventBody::CompactionCommitted {
@@ -647,6 +675,10 @@ impl Envelope {
             EventBody::PlanReplaced { payload } => SessionEvent::PlanReplaced {
                 plan: payload.plan.clone(),
             },
+            EventBody::GoalSet { payload } => SessionEvent::GoalSet {
+                goal: payload.goal.clone(),
+            },
+            EventBody::GoalCleared { .. } => SessionEvent::GoalCleared,
             EventBody::CompactionCommitted { payload } => SessionEvent::CompactionCommitted {
                 covered: payload.covered,
                 summary: payload.summary.clone(),

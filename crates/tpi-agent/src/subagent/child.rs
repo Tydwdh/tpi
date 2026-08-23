@@ -174,14 +174,14 @@ impl<P: Provider + Send, F: Fn() -> P + Send> SubagentProvider for InProcessChil
                 let Some(text) = child_event_to_text(&event) else {
                     continue;
                 };
-                // channel 满/关闭时丢弃（实时观察是尽力而为，不阻塞 child）。
-                let _ = tx
-                    .send(ToolStreamEvent {
-                        call_id,
-                        stream: 1,
-                        text,
-                    })
-                    .await;
+                // channel 满时丢弃新帧（lossy telemetry，BUG-012 同款处理）：
+                // 实时观察是尽力而为；`send().await` 会背压到 child 的
+                // LiveEvent 消费路径（64 容量），慢 UI 会拖慢 child。
+                let _ = tx.try_send(ToolStreamEvent {
+                    call_id,
+                    stream: 1,
+                    text,
+                });
             }
         });
 
@@ -397,7 +397,7 @@ mod tests {
                 SubagentRequest {
                     instruction: "调查 src/main.rs".into(),
                     child_session: child,
-                    capabilities: vec![ReadOnlyCapability::Read, ReadOnlyCapability::Search],
+                    capabilities: vec![ReadOnlyCapability::Read],
                     parent: None,
                 },
                 CancellationToken::new(),
@@ -450,10 +450,9 @@ mod tests {
     /// 只读 registry：白名单之外的工具不可用（无写/进程工具）。
     #[test]
     fn read_only_registry_excludes_writers() {
-        let caps = vec![ReadOnlyCapability::Read, ReadOnlyCapability::Search];
+        let caps = vec![ReadOnlyCapability::Read];
         let registry = read_only_registry(&caps);
         assert!(registry.get("read").is_some(), "read 可用");
-        assert!(registry.get("search").is_some(), "search 可用");
         assert!(registry.get("bash").is_none(), "bash 不可用");
         assert!(registry.get("edit").is_none(), "edit 不可用");
         assert!(registry.get("write").is_none(), "write 不可用");

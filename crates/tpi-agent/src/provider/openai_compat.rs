@@ -48,9 +48,40 @@ pub struct OpenAiCompatClient {
 }
 
 impl OpenAiCompatClient {
+    /// 进程级 reqwest Client 缓存：key = base_url。Client 内部是 Arc 连接池，
+    /// clone 廉价；复用后 child provider（subagent/spawn_agent 工厂每次调用
+    /// `new`）与 parent 共享连接池与 keep-alive 连接，避免每个子代理首次请求
+    /// 都重建 Client（Windows system-proxy 查询）+ TCP + TLS 握手——这是
+    /// “spawn 后卡片长时间静止”的主要延迟源之一。
+    fn shared_client(base_url: &str) -> reqwest::Client {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = match cache.lock() {
+            Ok(g) => g,
+            // 中毒锁：直接新建，不阻塞请求路径（行为退化为旧行为）。
+            Err(p) => p.into_inner(),
+        };
+        if let Some(client) = guard.get(base_url) {
+            return client.clone();
+        }
+        // 连接超时（§7.3）：TCP 连接建立上限，防网络 hang 无限阻塞。
+        // 注意：**不设置整体 timeout**——SSE 流可能长时间保持打开，
+        // reqwest 的 `.timeout()` 是整请求总超时，会误杀长流；
+        // 流读取空闲由 consume_stream 的 cancel 处理。
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        guard.insert(base_url.to_string(), client.clone());
+        client
+    }
+
     /// `model/reasoning/max_output_tokens/context_window` 是请求级配置，
     /// 由每次 [`ModelRequest`] 携带；此处仅保留连接级参数（签名保留以便
-    /// 调用方最小改动，多余参数被忽略）。
+    /// 调用方最小改动，多余参数被忽略）。reqwest Client 经进程级缓存复用
+    /// （同 base_url 共享连接池；见 [`shared_client`]）。
     pub fn new(
         base_url: String,
         _model: String,
@@ -62,16 +93,7 @@ impl OpenAiCompatClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
-            // 连接超时（§7.3）：TCP 连接建立上限，防网络 hang 无限阻塞
-            // （此前无超时，连接卡住会耗尽重试预算）。
-            // 注意：**不设置整体 timeout**——SSE 流可能长时间保持打开
-            // （模型长 thinking / tool 间无 token），reqwest 的 `.timeout()`
-            // 是整请求总超时，会误杀长流（`error decoding response body`）。
-            // 流读取空闲由 consume_stream 的 cancel 处理。
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: Self::shared_client(&base_url),
         }
     }
 
@@ -526,11 +548,17 @@ impl Provider for OpenAiCompatClient {
                         return Err(classify_error(error, attempt));
                     }
                     tracing::warn!(
-                        attempt,
+                        retry_attempt = attempt + 1,
                         error = %error,
                         backoff_ms = delay.as_millis(),
                         "provider: 请求发送失败，重试",
                     );
+                    let _ = events
+                        .send(ProviderEvent::Retrying {
+                            attempt: attempt + 1,
+                            backoff_ms: delay.as_millis() as u64,
+                        })
+                        .await;
                     if !wait_or_cancelled(&cancel, delay).await {
                         return Err(ProviderError::Cancelled);
                     }
@@ -572,11 +600,17 @@ impl Provider for OpenAiCompatClient {
                                 return Err(error);
                             }
                             tracing::warn!(
-                                attempt,
+                                retry_attempt = attempt + 1,
                                 error = %error,
                                 backoff_ms = delay.as_millis(),
                                 "provider: 响应流读取失败且未收到事件，重试",
                             );
+                            let _ = events
+                                .send(ProviderEvent::Retrying {
+                                    attempt: attempt + 1,
+                                    backoff_ms: delay.as_millis() as u64,
+                                })
+                                .await;
                             if !wait_or_cancelled(&cancel, delay).await {
                                 return Err(ProviderError::Cancelled);
                             }
@@ -604,10 +638,16 @@ impl Provider for OpenAiCompatClient {
                         return Err(retryable_status_error(status, attempt));
                     }
                     tracing::warn!(
-                        attempt,
+                        retry_attempt = attempt + 1,
                         backoff_ms = delay.as_millis(),
                         "provider: 服务端要求退避，等待后重试",
                     );
+                    let _ = events
+                        .send(ProviderEvent::Retrying {
+                            attempt: attempt + 1,
+                            backoff_ms: delay.as_millis() as u64,
+                        })
+                        .await;
                     if !wait_or_cancelled(&cancel, delay).await {
                         return Err(ProviderError::Cancelled);
                     }

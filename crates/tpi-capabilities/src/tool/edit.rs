@@ -16,7 +16,7 @@
 //!   （免重新 read）；否则仍 `stale_revision` 拒绝，并回填当前文件相关区域
 //!   内容，模型免 read 即可纠正。
 //! - no-op（old_text == new_text）项跳过不整批拒绝（§修复）；全部 no-op 才报错。
-//! - §7：`write` 是 create-only——目标已存在时拒绝，模型必须使用 `edit`。
+//! - §7：`write` 支持创建或覆盖——已存在文件直接原子覆盖（无需 revision）。
 //! - M3：Windows 提交使用 `ReplaceFileW` + 同卷唯一 backup（§10.7）；
 //!   成功校验 backup digest，失败/校验不符进入可诊断恢复。
 
@@ -1600,8 +1600,7 @@ fn write_temp_synced_from(temp_path: &std::path::Path, bytes: &[u8]) -> std::io:
     Ok(())
 }
 
-/// write 的新建路径（§10.6）：temp + sync + no-clobber move；
-/// 仅当目标不存在时走此路径（已存在文件走 revision 校验后的整体重写）。
+/// write 路径（§10.6）：允许覆盖——原子 temp+replace，支持 create 与 overwrite。
 pub fn write_new_file(
     path: &Utf8PathBuf,
     content: &[u8],
@@ -1615,7 +1614,22 @@ pub fn write_new_file(
         path: path.clone(),
         message: format!("create dirs: {e}"),
     })?;
-    // §10.7：temp 路径来自提交计划（ToolStarted 前已持久化）。
+    // 已存在则直接走覆盖路径（复用 commit_edit 的原子 ReplaceFileW/rename 语义）。
+    if path.as_std_path().exists() {
+        let previous_raw = read_raw_file(path).unwrap_or_default();
+        let result = EditResult {
+            previous_revision: revision_of(&previous_raw),
+            current_revision: revision_of(content),
+            applied: 1,
+            skipped_noops: 0,
+            tier: MatchTier::Exact,
+            previous_raw,
+            new_raw: content.to_vec(),
+        };
+        commit_edit(&result, path, plan)?;
+        return Ok(revision_of(content));
+    }
+    // 不存在：尝试 no-clobber 创建。
     let temp_path = &plan.temp_path;
     write_temp_synced_from(temp_path, content).map_err(|e| EditError::Io {
         path: path.clone(),
@@ -1627,8 +1641,20 @@ pub fn write_new_file(
             Ok(revision_of(content))
         }
         Err(InstallError::AlreadyExists) => {
+            // 并发创建：回退到覆盖路径（需清理已创建的 temp，供 commit_edit 重新创建）。
             let _ = std::fs::remove_file(temp_path);
-            Err(EditError::AlreadyExists { path: path.clone() })
+            let previous_raw = read_raw_file(path).unwrap_or_default();
+            let result = EditResult {
+                previous_revision: revision_of(&previous_raw),
+                current_revision: revision_of(content),
+                applied: 1,
+                skipped_noops: 0,
+                tier: MatchTier::Exact,
+                previous_raw,
+                new_raw: content.to_vec(),
+            };
+            commit_edit(&result, path, plan)?;
+            Ok(revision_of(content))
         }
         Err(InstallError::Io(message)) => {
             let _ = std::fs::remove_file(temp_path);
@@ -2086,7 +2112,6 @@ mod tests {
         // 重叠。
         let error = apply_edit(
             &path,
-            &revision,
             &[
                 Replacement {
                     old_text: "let a = 1".into(),
@@ -2207,11 +2232,12 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().join("new.txt")).unwrap();
         let revision = write_new_file(&path, b"hello\n", &prepare_commit(&path)).unwrap();
         assert!(revision.starts_with("b3:"));
-        let error = write_new_file(&path, b"again\n", &prepare_commit(&path)).unwrap_err();
-        assert_eq!(error.code(), "already_exists");
+        // 已放开覆盖：第二次写入直接覆盖，不再 already_exists。
+        let revision2 = write_new_file(&path, b"again\n", &prepare_commit(&path)).unwrap();
+        assert!(revision2.starts_with("b3:"));
         assert_eq!(
             std::fs::read_to_string(path.as_std_path()).unwrap(),
-            "hello\n"
+            "again\n"
         );
     }
 

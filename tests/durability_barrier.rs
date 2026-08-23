@@ -25,6 +25,7 @@ struct FaultyStore {
     session_id: SessionId,
     run_id: RunId,
     fail_sync: AtomicBool,
+    state: tpi::session::SessionState,
 }
 
 impl FaultyStore {
@@ -35,6 +36,7 @@ impl FaultyStore {
             session_id: SessionId::new_v7(),
             run_id: RunId::new_v7(),
             fail_sync: AtomicBool::new(fail_sync),
+            state: tpi::session::SessionState::default(),
         }
     }
     fn events(&self) -> &[SessionEvent] {
@@ -59,6 +61,7 @@ impl SessionStore for FaultyStore {
     fn append_event(&mut self, event: &SessionEvent) -> std::io::Result<u64> {
         self.events.push(event.clone());
         self.seq = self.seq.saturating_add(1);
+        self.state.apply(event);
         Ok(self.seq)
     }
     fn sync_data(&mut self) -> std::io::Result<()> {
@@ -86,6 +89,9 @@ impl SessionStore for FaultyStore {
             outcome: outcome.clone(),
         })?;
         self.sync_data()
+    }
+    fn state(&self) -> &tpi::session::SessionState {
+        &self.state
     }
     fn events_with_seq(&self) -> std::io::Result<Vec<(u64, SessionEvent)>> {
         Ok(self

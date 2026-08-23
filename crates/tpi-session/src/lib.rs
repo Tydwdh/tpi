@@ -16,13 +16,14 @@ pub mod projector;
 pub mod protocol;
 pub mod recovery;
 pub mod repair;
+pub mod state;
 pub mod store;
 pub mod telemetry;
 
 // P2-01：store 层 re-export（原 mod.rs 的 public API 保持不变；迁移完成后
 // 调用方可改 `session::store::` 直引，re-export 留待 P10 清理）。
 pub use inbox::{Inbox, InboxEntry, MAX_INBOX_CAPACITY};
-pub use projector::{ConversationProjector, plan_from_events};
+pub use projector::{ConversationProjector, goal_from_events, plan_from_events};
 pub use protocol::{
     AssistantMessage, CompactSummary, CompletionReason, Envelope, EventBody, EventRange,
     InterruptCause, MAX_SESSION_EVENT_BYTES, ModelRef, RecoveryMetadata, RunLimits, SCHEMA_VERSION,
@@ -34,10 +35,12 @@ pub use telemetry::{
     PROJECTOR_VERSION, SessionTelemetryProjector, TelemetryCounts, TelemetryGap, TelemetryRecord,
 };
 
+pub use state::SessionState;
 pub use store::{
-    SessionLog, compacted_range, latest_plan, latest_plan_from_events, project_domain_messages,
-    project_messages, project_messages_with_ranges, read_events, read_events_and_max_seq,
-    read_events_with_seq, replay_domain_messages, replay_messages, workspace_id_for,
+    SessionLog, compacted_range, latest_goal, latest_goal_from_events, latest_plan,
+    latest_plan_from_events, project_domain_messages, project_messages,
+    project_messages_with_ranges, read_events, read_events_and_max_seq, read_events_with_seq,
+    replay_domain_messages, replay_messages, workspace_id_for,
 };
 
 #[cfg(test)]

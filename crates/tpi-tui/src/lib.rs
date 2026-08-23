@@ -89,6 +89,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("doctor", "环境检查（config/模型/API key/Git Bash）"),
     ("compact", "手动压缩上下文"),
     ("retry", "重试上一次失败/中断的 turn"),
+    ("goal", "设置/查看跨轮目标（自动续跑）"),
     ("quit", "退出 TPI"),
 ];
 

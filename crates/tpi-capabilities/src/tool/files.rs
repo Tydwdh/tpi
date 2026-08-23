@@ -5,7 +5,7 @@
 //! 每行带 `{n}: ` 行号前缀（§read 精度：模型可精确引用单行）。
 //!
 //! §5/§6：模型不再可见 revision token——内部 BLAKE3 仅用于 CAS 和 journal。
-//! §7：`write` 是 create-only——目标已存在时拒绝，模型必须使用 `edit`。
+//! §7：`write` 支持创建或覆盖——已存在文件直接原子覆盖（无需 revision）。
 
 use crate::tool::edit::{self, EditError};
 use crate::tool::{
@@ -407,6 +407,11 @@ fn edit_success_outcome(
     tool: &'static str,
 ) -> ToolOutcome {
     // §B1：记录 Mutation Journal（before/after 快照；undo 与崩溃恢复数据源）。
+    // §fix：append 失败不能静默吞掉——否则编辑已落盘但 journal 缺行，undo/
+    // 恢复无法回滚。编辑本身已 durable（commit 先行），此处不改状态（编辑成功
+    // 是真），只把 journal 写入失败的警告合进 output，让用户/模型知道该次编辑
+    // 不可撤销。
+    let mut journal_warning: Option<String> = None;
     let payload = tpi_session::protocol::MutationCommittedPayload {
         mutation_id: tpi_core::ids::EventId::new_v7().to_string(),
         files: vec![tpi_session::protocol::MutationFile {
@@ -419,7 +424,16 @@ fn edit_success_outcome(
             after_content: result.new_raw.clone(),
         }],
     };
-    let _ = tpi_session::journal::append_mutation(&ctx.artifacts_root, &ctx.session_id, &payload);
+    if let Err(e) =
+        tpi_session::journal::append_mutation(&ctx.artifacts_root, &ctx.session_id, &payload)
+    {
+        tracing::error!(
+            path = %path,
+            error = %e,
+            "edit: journal append 失败——本次编辑已提交但不可 undo/恢复"
+        );
+        journal_warning = Some(format!("\njournal_warning: undo/恢复记录写入失败 ({e})"));
+    }
     let diff = crate::tool::edit::unified_diff(&result);
     // 内部 journal/resource 仍用完整 BLAKE3（不暴露给模型）。
     let mut output = format!(
@@ -429,6 +443,9 @@ fn edit_success_outcome(
     );
     if result.skipped_noops > 0 {
         output.push_str(&format!("\nskipped_noops: {}", result.skipped_noops));
+    }
+    if let Some(warning) = journal_warning {
+        output.push_str(&warning);
     }
     let mut outcome = ToolOutcome::succeeded(tool, output);
     outcome
@@ -479,24 +496,9 @@ pub fn write(
             },
         );
     };
-    // §7：write 仅限创建新文件；已存在文件必须使用 edit。
-    if path.as_std_path().exists() {
-        return ToolOutcome::failed(
-            "write",
-            ModelPayload {
-                status: ToolStatus::Rejected,
-                program: None,
-                exit_code: None,
-                duration_ms: 0,
-                output: format!(
-                    "status: failed\ntool: write\nerror: already_exists\n\n文件已存在: {}\nhint: 已存在的文件请使用 edit 工具进行修改，不要使用 write 覆盖。",
-                    display_path(&ctx.workspace_root, &path)
-                ),
-                effect: None,
-                artifact: None,
-            },
-        );
-    }
+    // 保存旧内容用于覆盖时的 before/after 与 diff（不存在则为空）。
+    let previous_raw_for_write = std::fs::read(path.as_std_path()).unwrap_or_default();
+    let existed_before = path.as_std_path().exists();
     match edit::write_new_file(&path, args.content.as_bytes(), plan) {
         Ok(revision) => {
             // 保存 snapshot（内部 CAS / recovery 用），不再向模型输出 revision。
@@ -515,40 +517,66 @@ pub fn write(
             );
             let mut outcome = ToolOutcome::succeeded("write", output);
             let new_raw = args.content.into_bytes();
-            // §B1：新建文件记录 journal（before = 空）。
+            // §B1：记录 journal（新建：before 空；覆盖：before 为旧内容）。
             let payload = tpi_session::protocol::MutationCommittedPayload {
                 mutation_id: tpi_core::ids::EventId::new_v7().to_string(),
                 files: vec![tpi_session::protocol::MutationFile {
                     path: path.as_std_path().to_string_lossy().to_string(),
-                    before_revision: crate::tool::edit::revision_of(&[]),
+                    before_revision: if existed_before {
+                        crate::tool::edit::revision_of(&previous_raw_for_write)
+                    } else {
+                        crate::tool::edit::revision_of(&[])
+                    },
                     after_revision: revision.clone(),
-                    before_exists: false,
+                    before_exists: existed_before,
                     after_exists: true,
-                    before_content: Vec::new(),
+                    before_content: if existed_before {
+                        previous_raw_for_write.clone()
+                    } else {
+                        Vec::new()
+                    },
                     after_content: new_raw.clone(),
                 }],
             };
-            let _ = tpi_session::journal::append_mutation(
+            // §fix：与 edit 路径一致——journal append 失败不静默吞掉，
+            // 在 output 里追加可见警告（文件已建、但不可 undo/恢复）。
+            if let Err(e) = tpi_session::journal::append_mutation(
                 &ctx.artifacts_root,
                 &ctx.session_id,
                 &payload,
-            );
+            ) {
+                tracing::error!(
+                    path = %path,
+                    error = %e,
+                    "write: journal append 失败——文件已建但不可 undo/恢复"
+                );
+                outcome
+                    .model_payload
+                    .output
+                    .push_str(&format!("\njournal_warning: undo/恢复记录写入失败 ({e})"));
+            }
             outcome
                 .observed_resources
                 .push(tpi_core::outcome::ResourceVersion {
                     path: display_path(&ctx.workspace_root, &path),
                     revision: revision.clone(),
                 });
-            // §用户诉求（修复）：新建文件同样生成 unified diff（空 → 新内容，
-            // 全 `+` 行），与 edit / 重写路径一致——否则 TUI 卡片既无 diff 也
-            // 无正文（total==0），点击展开无任何内容变化（"write 无法展开"）。
+            // §用户诉求（修复）：生成 unified diff（新建：空 → 新内容；覆盖：旧 → 新）。
             let diff = crate::tool::edit::unified_diff(&crate::tool::edit::EditResult {
-                previous_revision: crate::tool::edit::revision_of(&[]),
+                previous_revision: if existed_before {
+                    crate::tool::edit::revision_of(&previous_raw_for_write)
+                } else {
+                    crate::tool::edit::revision_of(&[])
+                },
                 current_revision: revision.clone(),
                 applied: 1,
                 skipped_noops: 0,
                 tier: crate::tool::edit::MatchTier::Exact,
-                previous_raw: Vec::new(),
+                previous_raw: if existed_before {
+                    previous_raw_for_write.clone()
+                } else {
+                    Vec::new()
+                },
                 new_raw: new_raw.clone(),
             });
             outcome.session_metadata = ToolMetadata {
@@ -676,6 +704,7 @@ mod tests {
             shell_path: None,
             snapshot_store: Default::default(),
             current_plan: Default::default(),
+            current_goal: None,
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),
@@ -743,6 +772,7 @@ mod tests {
             shell_path: None,
             snapshot_store: Default::default(),
             current_plan: Default::default(),
+            current_goal: None,
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),
@@ -755,7 +785,7 @@ mod tests {
             workspace_session: None,
         };
         let plan = crate::tool::edit::prepare_commit(&path);
-        // §7：write 已存在文件 → 拒绝（already_exists）
+        // §7（已放开覆盖）：已存在文件直接覆盖。
         let outcome = write(
             WriteArgs {
                 path: path.to_string(),
@@ -764,14 +794,8 @@ mod tests {
             &ctx,
             Some(&plan),
         );
-        assert_eq!(outcome.status, ToolStatus::Failed);
-        assert!(
-            outcome.model_payload.output.contains("already_exists"),
-            "已存在文件必须返回 already_exists: {}",
-            outcome.model_payload.output
-        );
-        // 原文件内容不得被修改
-        assert_eq!(std::fs::read(path.as_std_path()).unwrap(), b"old");
+        assert_eq!(outcome.status, ToolStatus::Succeeded);
+        assert_eq!(std::fs::read(path.as_std_path()).unwrap(), b"new");
     }
 
     /// §用户诉求（修复）：write 新建文件也必须带 unified diff（空 → 新内容），
@@ -797,6 +821,7 @@ mod tests {
             shell_path: None,
             snapshot_store: Default::default(),
             current_plan: Default::default(),
+            current_goal: None,
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),
@@ -863,6 +888,7 @@ mod tests {
             shell_path: None,
             snapshot_store: Default::default(),
             current_plan: Default::default(),
+            current_goal: None,
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),
@@ -932,6 +958,7 @@ mod tests {
             shell_path: None,
             snapshot_store: Default::default(),
             current_plan: Default::default(),
+            current_goal: None,
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),

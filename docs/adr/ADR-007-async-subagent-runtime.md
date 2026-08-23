@@ -185,7 +185,7 @@ child worker（独立 task）
 ### 3.3 默认状态保留（V1 语义）
 
 - 默认 `context mode = Fresh`（child 只拿任务指令 + 只读能力，无 parent 历史）。
-- **V1 只读**（child 白名单 read/search/glob）。
+- **V1 只读**（child 白名单 read；search/glob 已下线，目录浏览/检索由 read 与 bash 承担）。
 - 允许同一 assistant step **并行 spawn 多个 child**（每个独立 AgentId，互不阻塞）。
 - `depth = 1`（child 不递归）。
 

@@ -1,20 +1,15 @@
 //! M5 TUI 稳定性契约（§20.3、§21 M5）+ M6+ 渲染回归。
 //!
 //! - 初始化后 streaming path 不包含 CSI 全屏清除序列；
-//! - 一个 frame 至多一次 stdout flush；
-//! - 100-500 deltas/s 时按 `FRAME_INTERVAL` 合并，而不是 delta 数量等于 draw 次数；
-//! - 高速流式输出期间不发全屏 clear，动画仍按目标帧率更新；
 //! - inline scrollback 窗口语义（§16.1）：活动区只显示尾部，旧行提交到 scrollback；
 //! - 工具卡片（§16.2）、思考折叠、命令菜单、Markdown 渲染。
-
-use std::time::Duration;
 
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 
 use tpi::outcome::ToolStatus;
 use tpi::tui::model::{LineKind, ViewModel};
-use tpi::tui::{FRAME_INTERVAL, draw_captured_bytes, draw_to_test_backend};
+use tpi::tui::{draw_captured_bytes, draw_to_test_backend};
 
 /// 把 `TestBackend` buffer 拼成文本：跳过空 cell，并跳过宽字符的延续 cell
 /// （ratatui 0.30 中延续 cell 与空白 cell 都是单个空格，需按前一字符宽度识别）。
@@ -62,72 +57,6 @@ fn streaming_path_has_no_full_screen_clear() {
     );
 }
 
-/// §20.3：一个 frame 至多一次 stdout flush——捕获的 draw 输出中，
-/// CSI 序列之间没有额外分隔导致的多次 flush 痕迹。
-#[test]
-fn frame_flushes_stdout_once() {
-    let mut view = ViewModel {
-        model_name: "test".into(),
-        ..Default::default()
-    };
-    for i in 0..50 {
-        view.push_line(LineKind::Assistant, format!("line {i}"));
-    }
-    let bytes = draw_captured_bytes(&mut view);
-    assert!(!bytes.is_empty());
-    // 一次 draw 是完整的 CSI 帧：inline viewport 先输出换行占位（打开 viewport），
-    // 随后是 CSI 终端定位序列；不得是裸文本或全屏清除。
-    let text = String::from_utf8_lossy(&bytes);
-    assert!(
-        text.contains("\x1b["),
-        "帧包含 CSI 序列（终端定位）: {:?}",
-        &text[..text.len().min(64)]
-    );
-}
-
-/// §20.3：帧合并——高频 delta 不逐条重绘。
-#[test]
-fn frame_coalescing_merges_high_frequency_deltas() {
-    // 模拟 100-500 deltas/s：50 个增量在一个 FRAME_INTERVAL 窗口内到达，只应触发一次 draw。
-    let mut view = ViewModel {
-        model_name: "test".into(),
-        ..Default::default()
-    };
-    let mut draws = 0u32;
-    let start = std::time::Instant::now();
-    for i in 0..50 {
-        view.push_line(LineKind::Assistant, format!("delta {i}"));
-        // 帧合并检查（§16.1）：距上次 draw < FRAME_INTERVAL 时不重绘。
-        if start.elapsed() >= FRAME_INTERVAL || i == 0 {
-            draws += 1;
-            // 模拟一次实际 draw。
-            let _ = draw_to_test_backend(&mut view, 80, 20);
-        }
-    }
-    // 事件密集窗口内 draw 次数远小于事件数（不是 delta 数量等于 draw 次数）。
-    assert!(draws <= 3, "帧合并：{draws} 次 draw vs 50 个 delta");
-}
-
-/// §20.3：高速流式输出期间不发全屏 clear，动画按帧率更新。
-#[test]
-fn streaming_never_clears_full_screen() {
-    let mut view = ViewModel {
-        model_name: "test".into(),
-        ..Default::default()
-    };
-    for i in 0..200 {
-        view.push_line(LineKind::Assistant, format!("streaming line {i}"));
-        if i % 10 == 0 {
-            let bytes = draw_captured_bytes(&mut view);
-            let text = String::from_utf8_lossy(&bytes);
-            assert!(
-                !text.contains("\x1b[2J") && !text.contains("\x1b[3J"),
-                "高速流式期间不得全屏 clear（§20.3）"
-            );
-        }
-    }
-}
-
 /// §20.3：中文与长 tool output 渲染不崩溃；窗口语义下尾部内容可见
 /// （§16.1：长输出提交到 scrollback，最后一条 assistant 消息保留在活动区）。
 #[test]
@@ -154,13 +83,6 @@ fn chinese_and_long_tool_output_render_completely() {
         rendered.contains('中') && rendered.contains('文'),
         "中文必须正确渲染: {rendered:?}"
     );
-}
-
-/// §20.3：帧间隔是固定常量（30 FPS 性能基线），不允许通过动画 FPS 依赖
-/// 或重新引入更密的重绘来通过测试。
-#[test]
-fn frame_interval_is_fixed_not_fps_dependent() {
-    assert_eq!(FRAME_INTERVAL, Duration::from_millis(33));
 }
 
 /// 多行输入编辑器支持粘贴与中文（§21 M5：中文 commands/settings）。

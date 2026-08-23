@@ -140,6 +140,7 @@ mod tests {
                 crate::tool::edit::SnapshotStore::new(4, 2),
             )),
             current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            current_goal: None,
             processes: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::process::managed::ProcessRegistry::new(),
             )),

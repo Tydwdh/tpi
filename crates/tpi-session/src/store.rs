@@ -89,6 +89,8 @@ pub trait SessionStore {
     /// 读取全部事件（含 seq）——投影/恢复的最小读取接口。
     /// agent 不直接碰文件路径（P2-02：path() 仅诊断用）。
     fn events_with_seq(&self) -> std::io::Result<Vec<(u64, SessionEvent)>>;
+    /// O(1) 增量投影读取（goal/plan；append_event 时同步更新）。
+    fn state(&self) -> &crate::state::SessionState;
 
     // ---- P2-04 durability barrier：类型化刷盘意图（不改时序）----
 
@@ -131,6 +133,8 @@ pub struct SessionLog {
     /// 无法回滚的部分写会使 append 边界失去可信性；此后拒绝继续追加。
     poisoned: bool,
     protocol: SessionProtocolState,
+    /// 增量投影（O(1) 读取 goal/plan；append_event 时同步更新）。
+    state: crate::state::SessionState,
 }
 
 impl SessionLog {
@@ -177,6 +181,7 @@ impl SessionLog {
             pending_sync: false,
             poisoned: false,
             protocol: SessionProtocolState::default(),
+            state: crate::state::SessionState::default(),
         };
         Ok(log)
     }
@@ -229,6 +234,9 @@ impl SessionLog {
             pending_sync: false,
             poisoned: false,
             protocol,
+            state: crate::state::SessionState::from_events(
+                &parsed.envelopes.iter().map(|e| (e.seq, e.to_session_event())).collect::<Vec<_>>(),
+            ),
         };
         Ok(log)
     }
@@ -303,7 +311,14 @@ impl SessionLog {
         self.protocol.apply(&envelope.body);
         self.seq = next_seq;
         self.pending_sync = true;
+        // 增量更新投影（O(1)）：GoalSet/GoalCleared/PlanReplaced 等。
+        self.state.apply(event);
         Ok(self.seq)
+    }
+
+    /// 读取增量投影（O(1) goal/plan）。
+    pub fn state(&self) -> &crate::state::SessionState {
+        &self.state
     }
 
     /// 等待数据落盘（write-ahead 的 durable boundary）。
@@ -375,6 +390,9 @@ impl SessionStore for SessionLog {
     fn events_with_seq(&self) -> std::io::Result<Vec<(u64, SessionEvent)>> {
         crate::read_events_with_seq(SessionLog::path(self))
     }
+    fn state(&self) -> &crate::state::SessionState {
+        SessionLog::state(self)
+    }
 }
 
 /// 读取 session 的全部事件（含残行丢弃）。
@@ -402,6 +420,23 @@ pub fn latest_plan_from_events(events: &[(u64, SessionEvent)]) -> std::io::Resul
         SessionEvent::PlanReplaced { plan } => Some(plan.clone()),
         _ => None,
     }))
+}
+
+/// 返回最新 goal（last-wins；GoalCleared 后为 None）。
+pub fn latest_goal(path: &Path) -> std::io::Result<Option<tpi_core::goal::Goal>> {
+    Ok(crate::projector::goal_from_events(
+        &read_events_with_seq(path)?
+            .into_iter()
+            .map(|(seq, e)| (seq, e))
+            .collect::<Vec<_>>(),
+    ))
+}
+
+/// latest_goal 的 events 版。
+pub fn latest_goal_from_events(
+    events: &[(u64, SessionEvent)],
+) -> std::io::Result<Option<tpi_core::goal::Goal>> {
+    Ok(crate::projector::goal_from_events(events))
 }
 
 /// 读取全部事件并保留 envelope seq（P0-3/§19B：中间存在损坏行时

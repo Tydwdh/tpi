@@ -22,8 +22,13 @@ pub mod manager;
 /// 引用（测试契约）；新代码请直接用 `tpi_capabilities::tool::scheduler`，
 /// 测试引用迁移完成后删除本行（AGENTS.md §27 清理）。
 pub use tpi_capabilities::tool::scheduler;
+pub mod context_builder;
+pub mod goal_controller;
 mod tool_runtime;
+pub mod turn_context;
+use self::context_builder::{ContextParts, DynamicContext};
 use self::tool_runtime::{BatchEnd, ToolBatchExecutor, ToolRuntime};
+use self::turn_context::{TurnContext, WorkspaceIdentity};
 use crate::provider::{ChatMessage, ModelRequest, Provider, ProviderEvent};
 use tpi_core::ids::{EventId, RequestId, ToolCallId};
 use tpi_core::outcome::{StoredToolOutcome, ToolStatus};
@@ -35,14 +40,17 @@ use tpi_session::{
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
 
 /// §4.3 第二阶段：text-only attempt 断联后的最大自动续写次数。
-/// §用户诉求：与第 1 层传输层重试一致提升到 10 次（每次续写注入 recovery
-/// instruction，从断点继续且不复述）；已出现 tool delta 的 attempt 不自动续。
-pub const MAX_STREAM_RECOVERIES: u32 = 10;
+/// 每次续写是一个全新逻辑请求（自带第 1 层 10 次 HTTP 重试预算），
+/// 若此处也取 10 会形成 10×10 的乘法放大。§用户诉求（网络抖动场景）：
+/// 2 次偏少——已收到部分内容后断流（StreamInterrupted）不重放、只能
+/// 靠续写/重生成自愈，抖劣时 2 次不够。提为 5 次，配合增大的退避。
+pub const MAX_STREAM_RECOVERIES: u32 = 5;
 
 /// §4.3 第三阶段：partial tool-call 后整个 model turn 重新生成的最大次数。
-/// §用户诉求：同样提升到 10 次；每次重新发起原始请求（不续接 partial JSON，
-/// 避免解析风险），全部失败后如实上报 ProviderInterrupted。
-pub const MAX_TURN_RESTARTS: u32 = 10;
+/// 同 [`MAX_STREAM_RECOVERIES`]：每次重启也是新逻辑请求，避免乘法放大。
+/// 每次重新发起原始请求（不续接 partial JSON，避免解析风险），全部失败后
+/// 如实上报 ProviderInterrupted。§用户诉求：提为 5 次（同续写），应对网络抖动。
+pub const MAX_TURN_RESTARTS: u32 = 5;
 
 /// §用户诉求（软着陆）：达到 max_model_turns 前的最后一轮注入收尾指令——
 /// 让模型总结已完成工作与剩余建议（OpenCode 式），而不是硬断。
@@ -222,6 +230,8 @@ pub enum LiveEvent {
     StreamRecovering { attempt: u32 },
     /// partial tool-call 后整个 model step 重新生成。
     TurnRestarting { attempt: u32 },
+    /// provider 内部重试（§用户诉求：连接层重试对用户可见）。
+    ProviderRetrying { attempt: u32, backoff_ms: u64 },
     /// 手动 /compact 的结果反馈。
     CompactionNotice { message: String },
     /// P8-06：子代理调查完成（summary card 投影；parent 可见 structured report）。
@@ -287,6 +297,8 @@ pub enum RuntimeEvent {
     /// partial tool-call 后整个 model turn 重新生成（第三阶段 §4.3）。
     /// UI 应丢弃当前 attempt 的 partial 展示（不进 transcript）。
     TurnRestarting { attempt: u32 },
+    /// provider 内部重试（§用户诉求：连接层重试对用户可见）。
+    ProviderRetrying { attempt: u32, backoff_ms: u64 },
     /// 手动 /compact 的结果反馈（§用户诉求：压缩未生效时用户可见，
     /// 此前只写日志、界面无感知）。
     CompactionNotice { message: String },
@@ -450,12 +462,7 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
 
     let mut usage_total = Usage::default();
     let mut messages: Vec<ChatMessage> = history.to_vec();
-    let initial_plan = tpi_session::latest_plan_from_events(
-        &session
-            .events_with_seq()
-            .map_err(|e| RunFailure::Session(format!("read events: {e}")))?,
-    )
-    .map_err(|e| RunFailure::Session(format!("restore plan: {e}")))?;
+    let initial_plan = session.state().plan().cloned();
     // plan 不再在恢复/压缩边界注入为系统消息，
     // 而是通过正常的 assistant(update_plan) → tool result 协议事实进入上下文。
     let manual_retry_continuation = user_message.is_empty()
@@ -585,6 +592,24 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
             break CompletionReason::MaxTurns;
         }
         turn += 1;
+        // O(1) 增量投影：tool_runtime 中 goal 工具已 commit GoalSet/GoalCleared
+        // 到 session，此处从增量投影读取最新状态（不再重放全部事件）。
+        let goal_snapshot = session.state().goal().cloned();
+        tool_runtime.set_goal(goal_snapshot.clone());
+        // turn 级别 snapshot：goal/workspace/process 在 turn 内不变。
+        // ContextBuilder 每次 inference 引用同一个 TurnContext。
+        let ws_snapshot = tool_runtime.workspace_snapshot();
+        let turn_ctx = TurnContext::new(
+            goal_snapshot.as_ref(),
+            WorkspaceIdentity {
+                id: ws_snapshot.id().to_string(),
+                cwd: {
+                    let shell = tpi_core::util::lock_mutex(ws_snapshot.shell(), "workspace_shell");
+                    shell.cwd.to_string()
+                },
+            },
+            tool_runtime.processes_snapshot(),
+        );
         // 一个 request_id 标识一个逻辑 model turn；自动续写/restart 沿用它，
         // 下一轮（通常在工具结果之后）必须分配新 id。
         let request_id = RequestId::new_v7();
@@ -694,7 +719,6 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
             // 整个回答开头重放；若边收边直接 push 到 TUI，去重时已经太晚。
             let recovering_text = stream_recoveries > 0;
             let mut recovery_content = String::new();
-            let ws_snapshot = tool_runtime.workspace_snapshot();
             let pending_reports_text;
             {
                 let reports = tool_runtime.drain_reports();
@@ -729,17 +753,21 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                     )
                 };
             }
-            let process_snapshot = tool_runtime.processes_snapshot();
             let request = ModelRequest {
                 model: agent_cfg.model.name.clone(),
-                messages: build_context(
-                    config,
-                    &messages,
-                    ephemeral_system.as_deref(),
-                    Some(&ws_snapshot),
-                    process_snapshot.as_deref(),
-                    pending_reports_text.as_deref(),
-                ),
+                messages: {
+                    let base = system_prompt_text(agent_cfg.system_prompt_extra.as_deref(), None);
+                    let parts = ContextParts {
+                        base_prompt: &base,
+                        turn: &turn_ctx,
+                        dynamic: DynamicContext {
+                            pending_reports: pending_reports_text.as_deref(),
+                            ephemeral_system: ephemeral_system.as_deref(),
+                        },
+                        transcript: &messages,
+                    };
+                    parts.build()
+                },
                 tools: tool_defs.clone(),
                 max_output_tokens: agent_cfg.model.max_output_tokens,
                 reasoning: agent_cfg.model.reasoning.clone(),
@@ -1182,7 +1210,9 @@ async fn consume_stream_event(
             *saw_any_semantic = true;
             *saw_tool_calls = true;
         }
-        ProviderEvent::ReasoningDelta(_) | ProviderEvent::Usage(_) => {}
+        ProviderEvent::ReasoningDelta(_)
+        | ProviderEvent::Usage(_)
+        | ProviderEvent::Retrying { .. } => {}
     }
     forward_provider_event(event, request_id, content, ui, emit_text).await;
 }
@@ -1329,16 +1359,31 @@ async fn forward_provider_event(
         ProviderEvent::ToolCallStarted { .. }
         | ProviderEvent::ToolArgumentsDelta { .. }
         | ProviderEvent::Usage(_) => {}
+        ProviderEvent::Retrying {
+            attempt,
+            backoff_ms,
+        } => {
+            let _ = ui
+                .send(LiveEvent::ProviderRetrying {
+                    attempt,
+                    backoff_ms,
+                })
+                .await;
+        }
     }
 }
 
 /// 把 provider 错误分类为会话中断原因（§4.3）。
 /// §bug 修复：续写/重启之间的指数退避（此前零退避——服务端持续故障时
 /// MAX_STREAM_RECOVERIES/MAX_TURN_RESTARTS 次尝试瞬间耗尽，用户看不到
-/// 重试过程，等于没重试）。`500ms * 2^attempt`，封顶 8s；等待期间用户
+/// 重试过程，等于没重试）。`500ms * 2^attempt`，封顶 30s；等待期间用户
 /// 取消返回 false（不重发请求）。
+/// §用户诉求：重试上限提高到 5 次后，退避也相应延长——网络抖动需要更长的
+/// 恢复窗口（丢包/弱网时短退避容易连续失败）。
 async fn wait_retry_backoff(cancel: &CancellationToken, attempt: u32) -> bool {
-    let shift = attempt.min(4); // 2^4 = 16 → 500ms*16 = 8s 封顶
+    // 封顶 6：500ms * 2^6 = 32s，四舍五入控制 ≈30s。attempt ≤ MAX=5，
+    // 但续写/重启两个独立计数器交替时单个 attempt 可由 1..=5 递增。
+    let shift = attempt.min(6);
     let delay = std::time::Duration::from_millis(500).saturating_mul(1u32 << shift);
     tokio::select! {
         _ = cancel.cancelled() => false,
@@ -1583,6 +1628,7 @@ fn system_prompt_text(system_prompt_extra: Option<&str>, ephemeral_system: Optio
 /// plan 不再注入为系统消息——plan 是 session state，
 /// 通过正常的 assistant(update_plan) → tool result 协议事实进入上下文，
 /// UI 从 session projection 读取。
+#[allow(dead_code)]
 fn build_context(
     config: &Config,
     messages: &[ChatMessage],
@@ -1590,6 +1636,26 @@ fn build_context(
     workspace: Option<&tpi_capabilities::workspace::ActiveWorkspace>,
     process_snapshot: Option<&str>,
     pending_reports: Option<&str>,
+) -> Vec<ChatMessage> {
+    build_context_with_goal(
+        config,
+        messages,
+        ephemeral_system,
+        workspace,
+        process_snapshot,
+        pending_reports,
+        None,
+    )
+}
+
+fn build_context_with_goal(
+    config: &Config,
+    messages: &[ChatMessage],
+    ephemeral_system: Option<&str>,
+    workspace: Option<&tpi_capabilities::workspace::ActiveWorkspace>,
+    process_snapshot: Option<&str>,
+    pending_reports: Option<&str>,
+    goal: Option<&tpi_core::goal::Goal>,
 ) -> Vec<ChatMessage> {
     // P1-05：build_context 只读窄视图 AgentConfig。
     let agent_cfg = config.agent_config();
@@ -1632,6 +1698,12 @@ fn build_context(
         out.push(ChatMessage::System(format!(
             "[Managed processes]\n{process_snapshot}\n\n（后台进程由 TPI 管理；需要结果时用 `process` wait/status，不要频繁轮询）"
         )));
+    }
+    if let Some(ctx) = goal
+        .as_ref()
+        .and_then(|g| tpi_core::goal::goal_context(Some(g)))
+    {
+        out.push(ChatMessage::System(ctx));
     }
     out
 }
@@ -1827,7 +1899,7 @@ mod tests {
 
     /// §40：确定性非法请求（HTTP 400/422，InvalidRequest）既不是瞬时传输错误，
     /// 也不可恢复——重发相同 JSON 必然再 400，agent 必须立即终态失败，
-    /// **不得**自动重启/续写（否则出现“第 N/10 次重新生成”刷屏）。
+    /// **不得**自动重启/续写（否则出现“第 N/MAX 次重新生成”刷屏）。
     #[test]
     fn invalid_request_is_never_auto_retried_or_recovered() {
         use crate::provider::ProviderError;

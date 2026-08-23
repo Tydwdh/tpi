@@ -13,11 +13,11 @@ use tpi_core::outcome::ToolOutcome;
 /// 子代理只读能力白名单（P7-02 拆 crate：从 subagent 下沉到 capabilities——
 /// 它本就是"只读调查工具白名单"，属 capabilities 概念；subagent crate
 /// re-export 保持 `tpi::subagent::ReadOnlyCapability` 路径兼容）。
+/// search/glob 已删除（改由 bash + rg/find/ls 承担）；仅保留 Read；
+/// 目录浏览由 read depth 承担。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadOnlyCapability {
     Read,
-    Search,
-    Glob,
 }
 
 /// 工具来源（README2 §2.1：只能作为 metadata，Agent Loop 不据此分支执行）。
@@ -473,6 +473,7 @@ mod tests {
                 crate::tool::edit::SnapshotStore::new(4, 2),
             )),
             current_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            current_goal: None,
             shell: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::shell::ShellSessionState::new(camino::Utf8PathBuf::from("/tmp")),
             )),
@@ -728,16 +729,14 @@ async fn setup_transaction_rolls_back_on_fault() {
     assert!(!reg.overlay_has("bash"), "事务失败后不得留下 bash overlay");
 }
 
-/// P8-04：只读 registry——只注册只读调查工具（read/search/glob；
-/// §list 并入 read：目录浏览由 read 承担）。
+/// P8-04：只读 registry——只注册只读调查工具（read；search/glob 已删除，
+/// 目录浏览由 read 承担）。
 /// child subagent 用它限制能力（写/进程/网络工具不存在于 registry → 不可调用）。
 pub fn read_only_registry(caps: &[ReadOnlyCapability]) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     for tool in crate::tool::implemented_tools() {
         let allowed = match tool.name() {
             "read" => caps.contains(&ReadOnlyCapability::Read),
-            "search" => caps.contains(&ReadOnlyCapability::Search),
-            "glob" => caps.contains(&ReadOnlyCapability::Glob),
             _ => false,
         };
         if allowed {

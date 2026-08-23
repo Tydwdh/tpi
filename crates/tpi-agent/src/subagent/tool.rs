@@ -1,7 +1,7 @@
 //! P8-03/P8-04 接线：把 in-process child 调查暴露为 `subagent` 工具。
 //!
 //! 模型可调用 `subagent` 发起一次**只读调查**（depth=1、concurrency=1）：
-//! child 拥有独立 session/trace，只读工具白名单（read/list/search/glob），
+//! child 拥有独立 session/trace，只读工具白名单（read），
 //! 完成返回 structured report（summary + evidence）。parent 只接收 report，
 //! 不接收 child 的流式事件（raw stream 不灌主 transcript）。
 
@@ -64,7 +64,7 @@ struct SubagentArgs {
     /// 由模型在同一 wave 发多个 `subagent` 调用（ReadOnly 类别批内并行）。
     #[serde(default)]
     instruction: String,
-    /// 只读能力白名单（默认 read/list/search/glob；显式传则覆盖）。
+    /// 只读能力白名单（默认 read；显式传则覆盖）。
     #[serde(default)]
     capabilities: Option<Vec<String>>,
 }
@@ -72,20 +72,14 @@ struct SubagentArgs {
 impl SubagentArgs {
     fn parse_capabilities(&self) -> Result<Vec<ReadOnlyCapability>, String> {
         let Some(caps) = &self.capabilities else {
-            return Ok(vec![
-                ReadOnlyCapability::Read,
-                ReadOnlyCapability::Search,
-                ReadOnlyCapability::Glob,
-            ]);
+            return Ok(vec![ReadOnlyCapability::Read]);
         };
         let mut out = Vec::new();
         for name in caps {
             let cap = match name.as_str() {
                 "read" => ReadOnlyCapability::Read,
-                "search" => ReadOnlyCapability::Search,
-                "glob" => ReadOnlyCapability::Glob,
                 other => {
-                    return Err(format!("未知只读能力: {other:?}（可用: read/search/glob）"));
+                    return Err(format!("未知只读能力: {other:?}（可用: read）"));
                 }
             };
             if !out.contains(&cap) {
@@ -107,7 +101,7 @@ where
 
     fn description(&self) -> &str {
         "发起一次只读子代理调查：child 拥有独立 session/trace，只能调用只读工具 \
-         (read/search/glob)，返回结构化报告（summary + 证据引用）。适合并行 \
+         (read)，返回结构化报告（summary + 证据引用）。适合并行 \
          独立调查、问题定位、代码审计：一次调用 = 一个 child；需要并行时在同一 \
          wave 发起多个 subagent 调用（每个独立卡片、独立观察）。depth=1（child 不再发起 child）。"
     }
@@ -122,11 +116,11 @@ where
                 },
                 "capabilities": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["read", "search", "glob"] },
-                    "description": "只读能力白名单（默认 read/search/glob；目录浏览走 read depth）"
+                    "items": { "type": "string", "enum": ["read"] },
+                    "description": "只读能力白名单（默认 read；目录浏览走 read depth）"
                 }
             },
-            "description": "发起一次只读子代理调查：child 拥有独立 session/trace，只能调用只读工具 (read/search/glob)，返回结构化报告（summary + 证据引用）。适合并行独立调查、问题定位、代码审计：一次调用 = 一个 child；需要并行时在同一 wave 发起多个 subagent 调用（每个独立卡片、独立观察）。depth=1（child 不再发起 child）。"
+            "description": "发起一次只读子代理调查：child 拥有独立 session/trace，只能调用只读工具 (read)，返回结构化报告（summary + 证据引用）。适合并行独立调查、问题定位、代码审计：一次调用 = 一个 child；需要并行时在同一 wave 发起多个 subagent 调用（每个独立卡片、独立观察）。depth=1（child 不再发起 child）。"
         })
     }
 
@@ -134,8 +128,8 @@ where
         ToolOrigin::Builtin
     }
 
-    /// P8-10：`subagent` 是只读工具（child 白名单仅 read/list/search/glob，
-    /// 无写副作用）——声明 `ReadOnly` 使其与批内 read/search 并行执行
+    /// P8-10：`subagent` 是只读工具（child 白名单仅 read，
+    /// 无写副作用）——声明 `ReadOnly` 使其与批内 read 并行执行
     ///（默认 WorkspaceUnknown 会按独立 wave 串行）。
     fn access_class(&self) -> tpi_capabilities::tool::registry::ToolAccessClass {
         tpi_capabilities::tool::registry::ToolAccessClass::ReadOnly
@@ -369,6 +363,7 @@ mod tool_tests {
             terminals: Default::default(),
             registry: Default::default(),
             interactive: false,
+            current_goal: None,
             workspace_session: None,
         }
     }

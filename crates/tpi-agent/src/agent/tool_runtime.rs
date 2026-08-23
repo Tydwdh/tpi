@@ -30,6 +30,7 @@ pub(super) struct ToolRuntime {
     scan_snapshots: Arc<Mutex<HashMap<String, ScanSnapshot>>>,
     snapshot_store: Arc<Mutex<SnapshotStore>>,
     current_plan: Arc<Mutex<Option<Plan>>>,
+    current_goal: Arc<Mutex<Option<tpi_core::goal::Goal>>>,
     shell: Arc<Mutex<tpi_capabilities::shell::ShellSessionState>>,
     workspace: Arc<Mutex<tpi_capabilities::workspace::ActiveWorkspace>>,
     /// ManagedProcess registry（session 级；background bash + process 工具共享）。
@@ -107,6 +108,7 @@ impl ToolRuntime {
             scan_snapshots: Default::default(),
             snapshot_store: Default::default(),
             current_plan: Arc::new(Mutex::new(initial_plan)),
+            current_goal: Arc::new(Mutex::new(None)),
             shell,
             workspace,
             processes,
@@ -134,6 +136,14 @@ impl ToolRuntime {
 
     pub(super) fn plan_snapshot(&self) -> Option<Plan> {
         tpi_core::util::lock_mutex(&self.current_plan, "current_plan").clone()
+    }
+
+    pub(super) fn goal_snapshot(&self) -> Option<tpi_core::goal::Goal> {
+        tpi_core::util::lock_mutex(&self.current_goal, "current_goal").clone()
+    }
+
+    pub(super) fn set_goal(&self, goal: Option<tpi_core::goal::Goal>) {
+        *tpi_core::util::lock_mutex(&self.current_goal, "current_goal") = goal;
     }
 
     /// P4-03：构建当前 Step 的不可变工具快照并返回 defs（Step 内执行共用）。
@@ -211,6 +221,7 @@ impl ToolRuntime {
             shell_path: self.config.shell_path.clone(),
             snapshot_store: self.snapshot_store.clone(),
             current_plan: self.current_plan.clone(),
+            current_goal: Some(self.current_goal.clone()),
             shell: self.shell.clone(),
             workspace: self.workspace.clone(),
             processes: self.processes.clone(),
@@ -667,6 +678,29 @@ error: invalid_arguments
                     let _ = ui.send(LiveEvent::PlanUpdated { plan }).await;
                 }
             }
+            // goal 工具：get=只读，无持久化；complete/drop 的持久化在 goal.rs 内内存槽位，
+            // 此处同步落 durable GoalSet/GoalCleared（与 PlanReplaced 同模式）。
+            if outcome.status == ToolStatus::Succeeded
+                && BuiltinTool::from_name(&calls[index].name) == Some(BuiltinTool::Goal)
+            {
+                let payload = outcome.model_payload.output.clone();
+                if payload.contains("op: complete") || payload.contains("\"phase\": \"complete\"") {
+                    let cur = tool_runtime.goal_snapshot();
+                    if let Some(g) = cur {
+                        let next = tpi_core::goal::transition_goal(
+                            &g,
+                            tpi_core::goal::GoalPhase::Complete,
+                        );
+                        session
+                            .commit(&SessionEvent::GoalSet { goal: next })
+                            .map_err(|e| RunFailure::Session(e.to_string()))?;
+                    }
+                } else if payload.contains("op: drop") || payload.contains("goal cleared") {
+                    session
+                        .commit(&SessionEvent::GoalCleared)
+                        .map_err(|e| RunFailure::Session(e.to_string()))?;
+                }
+            }
             // §12.3：edit/write 成功 → workspace epoch 增加（允许基于新状态重试）。
             if outcome.status == ToolStatus::Succeeded
                 && matches!(outcome.session_metadata.tool.as_str(), "edit" | "write")
@@ -1121,15 +1155,23 @@ fn recovery_metadata(
                 allow_outside_workspace,
             )
             .ok()?;
-            // 并发保护由 commit_edit 内部 BLAKE3 CAS 完成，不需要模型传入 revision。
-            let candidate_revision = tool::edit::apply_edit(&target, &parsed.replacements)
-                .ok()
-                .map(|result| result.current_revision);
+            // §9.1：内部记录使用绝对路径。并发保护由 commit_edit 内部 BLAKE3
+            // CAS 完成，不需要模型传入 revision。
+            // §fix：apply_edit 是纯计算（只读快照，不落盘），返回 previous（编辑
+            // 前）/current（编辑后）两个 revision。此处 expected_revision 必须
+            // 是**写入前**的 previous_revision——`classify_effect` 与 edit 内部
+            // commit 都以 expected==写入前内容作为“未提交”的判定基准。若误把
+            // current（新内容）写入 expected，崩溃恢复会把已提交误判为 not_applied
+            //（target==expected 成立），反之亦然（详见 recovery.rs classify_effect）。
+            let result = tool::edit::apply_edit(&target, &parsed.replacements).ok();
             Some(RecoveryMetadata {
                 tool: "edit".into(),
                 target_path: target.to_string(),
-                expected_revision: candidate_revision.clone().unwrap_or_default(),
-                candidate_revision,
+                expected_revision: result
+                    .as_ref()
+                    .map(|r| r.previous_revision.clone())
+                    .unwrap_or_default(),
+                candidate_revision: result.map(|r| r.current_revision),
                 temp_path: temp,
                 backup_path: backup,
             })
@@ -1163,6 +1205,16 @@ fn recovery_metadata(
                 backup_path: None,
             })
         }
+        // §B1：undo 写目标文件但路径在 journal 中（不在 args）；无 temp/backup
+        //（undo 自身是 CAS 安全操作：任一 Conflict 整体不写）。
+        (BuiltinTool::Undo, _) => Some(RecoveryMetadata {
+            tool: "undo".into(),
+            target_path: "(journal-driven)".into(),
+            expected_revision: String::new(),
+            candidate_revision: None,
+            temp_path: String::new(),
+            backup_path: None,
+        }),
         _ => None,
     }
 }
@@ -1190,6 +1242,70 @@ mod tests {
         assert!(!backup_cleanup_allowed(ToolStatus::Failed));
         assert!(!backup_cleanup_allowed(ToolStatus::Rejected));
         assert!(!backup_cleanup_allowed(ToolStatus::Cancelled));
+    }
+
+    /// §fix：edit 崩溃恢复 effect 判定的生产往返——`recovery_metadata` 生成的
+    /// expected_revision 必须是**写入前**（previous）revision，与
+    /// `classify_effect` 的 “target==expected ⇒ not_applied” 语义一致。
+    ///
+    /// 语义分叉背景：曾把 expected_revision 误写为候选新内容（current）——
+    /// replace 前崩溃时 target(旧)!=expected(新) → 判 Unknown（应 not_applied）；
+    /// replace 后崩溃时 backup=旧内容==expected(新) 不成立 → 判 Unknown（应 committed）。
+    ///
+    /// 用真实 temp/backup 文件模拟 ReplaceFileW 前后两种崩溃时刻。
+    #[test]
+    fn edit_recovery_expected_revision_is_prewrite() {
+        use camino::Utf8PathBuf;
+        use tpi_capabilities::tool::edit;
+        use tpi_core::outcome::Effect;
+        use tpi_session::RecoveryMetadata;
+        use tpi_session::recovery::classify_effect;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        let temp = dir.path().join(".tpi-edit-x.tmp");
+        let backup = dir.path().join(".tpi-edit-x.bak");
+        std::fs::write(&target, "fn a() {}\n").unwrap();
+        let target_u = Utf8PathBuf::from_path_buf(target.clone()).unwrap();
+
+        // 复用生产 `recovery_metadata` 的 edit 分支逻辑：apply_edit 纯计算，
+        // expected=previous（写入前），candidate=current（写入后）。
+        let result = edit::apply_edit(
+            &target_u,
+            &[edit::Replacement {
+                old_text: "fn a() {}".into(),
+                new_text: "fn b() {}".into(),
+            }],
+        )
+        .unwrap();
+        let expected = result.previous_revision;
+        let candidate = result.current_revision;
+        let metadata = RecoveryMetadata {
+            tool: "edit".into(),
+            target_path: target.to_string_lossy().into_owned(),
+            expected_revision: expected.clone(),
+            candidate_revision: Some(candidate),
+            temp_path: temp.to_string_lossy().into_owned(),
+            backup_path: Some(backup.to_string_lossy().into_owned()),
+        };
+
+        // 场景 1：replace 前崩溃——temp 已写好新内容(未移动)、backup 未创建、
+        // target 仍是旧内容(previous)。修复前 expected=candidate(新) 判 Unknown。
+        std::fs::write(&temp, "fn b() {}\n").unwrap();
+        assert_eq!(classify_effect("edit", Some(&metadata)), Effect::NotApplied);
+
+        // 场景 2：replace 后、ToolCompleted 前崩溃——temp 已移走(清理)、backup
+        // 保存旧内容(previous)、target 已是新内容(candidate)。修复前判 Unknown。
+        let _ = std::fs::remove_file(&temp);
+        std::fs::write(&target, "fn b() {}\n").unwrap();
+        std::fs::write(&backup, "fn a() {}\n").unwrap();
+        assert_eq!(classify_effect("edit", Some(&metadata)), Effect::Committed);
+
+        // 场景 3：外部改写成无关内容、且 temp/backup 皆无线索 → unknown
+        //（target 既非 expected 也非 candidate，无法判定）。
+        std::fs::write(&target, "fn c() {}\n").unwrap();
+        let _ = std::fs::remove_file(&backup);
+        assert_eq!(classify_effect("edit", Some(&metadata)), Effect::Unknown);
     }
 
     /// §用户诉求（C）：从 web_fetch 输出中提取 `<external_content>` 正文——

@@ -68,63 +68,6 @@ Example: read src/main.rs; read src depth=2"
     }
 }
 
-pub struct SearchTool;
-#[async_trait]
-impl Tool for SearchTool {
-    fn name(&self) -> &str {
-        "search"
-    }
-    fn description(&self) -> &str {
-        "Search file contents with a rust regex (ripgrep kernel; 100 matches max, \
-one line 300 chars). Follows .gitignore. \
-Output: matched lines with file paths; cursor pages without rescanning. \
-Example: search pattern=\"fn estimate_request\" include=[\"**/*.rs\"] context=3"
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        crate::tool::schema_value::<crate::tool::search::SearchArgs>("search")
-    }
-    fn origin(&self) -> ToolOrigin {
-        ToolOrigin::Builtin
-    }
-    fn access_class(&self) -> ToolAccessClass {
-        ToolAccessClass::ReadOnly
-    }
-    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
-        match serde_json::from_str::<crate::tool::search::SearchArgs>(args) {
-            Ok(a) => crate::tool::search::search(a, ctx),
-            Err(e) => rejected("search", e),
-        }
-    }
-}
-
-pub struct GlobTool;
-#[async_trait]
-impl Tool for GlobTool {
-    fn name(&self) -> &str {
-        "glob"
-    }
-    fn description(&self) -> &str {
-        "Find files by filename glob pattern (e.g. `**/*.rs`, `src/**/*.ts`, `Cargo.toml`). \
-Follows .gitignore, skips symlinks; results sorted by modification time (newest first). \
-Example: glob pattern=\"**/*test*.rs\""
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        crate::tool::schema_value::<crate::tool::search::GlobArgs>("glob")
-    }
-    fn origin(&self) -> ToolOrigin {
-        ToolOrigin::Builtin
-    }
-    fn access_class(&self) -> ToolAccessClass {
-        ToolAccessClass::ReadOnly
-    }
-    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
-        match serde_json::from_str::<crate::tool::search::GlobArgs>(args) {
-            Ok(a) => crate::tool::search::glob(a, ctx),
-            Err(e) => rejected("glob", e),
-        }
-    }
-}
-
 pub struct EditTool;
 #[async_trait]
 impl Tool for EditTool {
@@ -132,7 +75,7 @@ impl Tool for EditTool {
         "edit"
     }
     fn description(&self) -> &str {
-        "Atomically edit one file: revision-bound, replace existing text with new text (V3). \
+        "Atomically edit one file: replace existing text with new text (V3, no revision needed). \
 Each entry maps old_text → new_text; old_text must uniquely match the file. \
 Prefer edit over write for localized changes. \
 Example: edit path=src/main.rs replacements=[{\"old_text\": \"let x = 1;\\n\", \"new_text\": \"let x = 2;\\n\"}]"
@@ -165,8 +108,8 @@ impl Tool for WriteTool {
         "write"
     }
     fn description(&self) -> &str {
-        "Write an entire file (creates if missing; if it exists, returns error — use edit). \
-Output: unified diff + applied count. Use for new files or full rewrites. \
+        "Write an entire file: creates if missing, overwrites atomically if exists (no revision needed). \
+Output: unified diff + applied count. Use for new files or full rewrites/overwrites. \
 Example: write path=README.md content=..."
     }
     fn input_schema(&self) -> serde_json::Value {
@@ -186,6 +129,32 @@ Example: write path=README.md content=..."
                 crate::tool::files::write(a, ctx, Some(&plan))
             }
             Err(e) => rejected("write", e),
+        }
+    }
+}
+
+pub struct GoalTool;
+#[async_trait]
+impl Tool for GoalTool {
+    fn name(&self) -> &str {
+        "goal"
+    }
+    fn description(&self) -> &str {
+        "Manage the durable completion goal for multi-round autonomous work. \
+Ops: get (current goal), complete (mark achieved, must evidence), drop (clear). \
+Do not use for trivial single-turn work. Use get before complete. \
+Example: goal op=get; goal op=complete"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        crate::tool::schema_value::<crate::tool::goal::GoalArgs>("goal")
+    }
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
+        match serde_json::from_str::<crate::tool::goal::GoalArgs>(args) {
+            Ok(a) => crate::tool::goal::goal(a, ctx),
+            Err(e) => rejected("goal", e),
         }
     }
 }
@@ -430,6 +399,39 @@ Example: activate_skill name=\"rust-review\""
     }
 }
 
+pub struct UndoTool;
+#[async_trait]
+impl Tool for UndoTool {
+    fn name(&self) -> &str {
+        "undo"
+    }
+    fn description(&self) -> &str {
+        "Undo or redo file changes committed by this session's edit/write tools, \
+based on the Mutation Journal (before/after snapshots recorded on every successful \
+edit/write). CAS semantics: a file is restored only if its current content matches \
+the journal snapshot; if any file conflicts (externally modified), NOTHING is written. \
+Use it to revert your own mistaken edits without git. Does NOT cover changes made \
+through bash. Actions: undo (default) / redo; scope: last (default) / all. \
+Example: undo; undo action=redo scope=all"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        crate::tool::schema_value::<crate::tool::undo::UndoArgs>("undo")
+    }
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+    /// undo 是 journal CAS 回滚（写目标文件，路径在 journal 中）：串行保守。
+    fn access_class(&self) -> crate::tool::registry::ToolAccessClass {
+        crate::tool::registry::ToolAccessClass::WorkspaceUnknown
+    }
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
+        match serde_json::from_str::<crate::tool::undo::UndoArgs>(args) {
+            Ok(a) => crate::tool::undo::undo(a, ctx),
+            Err(e) => rejected("undo", e),
+        }
+    }
+}
+
 // ===================================================================
 // §11：注册所有 builtin 工具——直接走 Tool trait，不再经过
 // BuiltinToolAdapter / ValidatedArgs / execute_builtin 双轨。
@@ -438,8 +440,6 @@ Example: activate_skill name=\"rust-review\""
 pub fn register_all_builtin(registry: &mut crate::tool::registry::ToolRegistry) {
     let tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadTool),
-        Arc::new(SearchTool),
-        Arc::new(GlobTool),
         Arc::new(EditTool),
         Arc::new(WriteTool),
         Arc::new(BashTool),
@@ -451,6 +451,7 @@ pub fn register_all_builtin(registry: &mut crate::tool::registry::ToolRegistry) 
         Arc::new(WebSearchTool),
         Arc::new(WebFetchTool),
         Arc::new(ActivateSkillTool),
+        Arc::new(UndoTool),
     ];
     for tool in tools {
         let _ = registry.register_validated(tool);

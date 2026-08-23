@@ -976,6 +976,28 @@ fn handle_agent(state: &mut UiState, event: RuntimeEvent) {
                 );
             }
         }
+        RuntimeEvent::ProviderRetrying {
+            attempt,
+            backoff_ms,
+        } => {
+            // §用户诉求：连接层重试对用户可见（此前 provider 内部 10 次重试
+            // 对 UI 静默，用户误以为"瞬间失败"）。footer 轻提示，首个 retry
+            // 追加一条系统行；后端背光由 footer/spinner 承担，不据此刷行。
+            view.transient_hint = Some(format!(
+                "⟳ 网络重试中（第 {attempt} 次，等待 {}s）…",
+                backoff_ms / 1000
+            ));
+            if attempt == 1 {
+                view.push_line(
+                    LineKind::System,
+                    format!(
+                        "[{}] ⟳ 网络中断，正在自动重试…（等待 {}s）",
+                        now_hhmmss(),
+                        backoff_ms / 1000
+                    ),
+                );
+            }
+        }
         RuntimeEvent::CompactionNotice { message } => {
             // §用户诉求：手动 /compact 结果反馈（成功/未生效）写入系统行。
             view.push_line(LineKind::System, message);

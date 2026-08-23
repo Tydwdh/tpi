@@ -87,6 +87,7 @@ pub fn json_event(event: &LiveEvent) -> JsonEvent {
         | LiveEvent::PlanUpdated { .. }
         | LiveEvent::StreamRecovering { .. }
         | LiveEvent::TurnRestarting { .. }
+        | LiveEvent::ProviderRetrying { .. }
         | LiveEvent::CompactionNotice { .. }
         | LiveEvent::SubagentReported { .. } => JsonEvent {
             v: JSON_OUTPUT_VERSION,

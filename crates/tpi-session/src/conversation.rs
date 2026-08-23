@@ -126,12 +126,20 @@ impl Conversation {
         self.log.as_ref()
     }
 
+    pub fn log_mut(&mut self) -> Option<&mut SessionLog> {
+        self.log.as_mut()
+    }
+
     pub fn history(&mut self) -> &[ChatMessage] {
         self.projector.history()
     }
 
     pub fn plan(&mut self) -> Option<&Plan> {
         self.projector.plan()
+    }
+
+    pub fn goal(&mut self) -> Option<tpi_core::goal::Goal> {
+        self.projector.goal().cloned()
     }
 
     /// agent run 所需的两个一致视图。

@@ -4,6 +4,7 @@
 //! 计划数据（`plan`）、工具结果协议（`outcome`）、通用工具（`util`）。
 //! 不依赖 session/capabilities/agent/TUI——是依赖 DAG 的最底层。
 
+pub mod goal;
 pub mod ids;
 pub mod message;
 pub mod outcome;

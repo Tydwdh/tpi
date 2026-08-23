@@ -28,8 +28,6 @@ russh-sftp = "2.4.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "system-proxy", "charset", "http2", "json", "stream"] }
 similar = "2"
 ignore = "0.4"
-grep = "0.3"
-globset = "0.4"
 portable-pty = "0.9"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

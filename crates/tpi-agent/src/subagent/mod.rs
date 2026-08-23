@@ -98,7 +98,7 @@ mod tests {
                 SubagentRequest {
                     instruction: "检查 src/main.rs".into(),
                     child_session: child,
-                    capabilities: vec![ReadOnlyCapability::Read, ReadOnlyCapability::Search],
+                    capabilities: vec![ReadOnlyCapability::Read],
                     parent: None,
                 },
                 tokio_util::sync::CancellationToken::new(),
@@ -120,16 +120,11 @@ mod tests {
             parent: None,
         };
         assert_eq!(req.capabilities, vec![ReadOnlyCapability::Read]);
-        // 类型层面保证只读：ReadOnlyCapability 没有写能力变体（读/搜索/glob
-        // 全部无副作用；目录浏览由 read 承担）——编译期即拒绝写工具进入白名单。
+        // 类型层面保证只读：ReadOnlyCapability 没有写能力变体（读无副作用；
+        // 目录浏览由 read 承担）——编译期即拒绝写工具进入白名单。
         for cap in req.capabilities {
             assert!(
-                matches!(
-                    cap,
-                    ReadOnlyCapability::Read
-                        | ReadOnlyCapability::Search
-                        | ReadOnlyCapability::Glob
-                ),
+                matches!(cap, ReadOnlyCapability::Read),
                 "白名单只含只读能力"
             );
         }

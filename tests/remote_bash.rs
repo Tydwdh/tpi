@@ -51,6 +51,7 @@ async fn setup_remote_ctx() -> (tempfile::TempDir, tpi::tool::ToolContext) {
         scan_snapshots: Arc::new(Mutex::new(std::collections::HashMap::new())),
         shell_path: None,
         snapshot_store: Arc::new(Mutex::new(tpi::tool::edit::SnapshotStore::new(16, 4))),
+        current_goal: None,
         current_plan: Arc::new(Mutex::new(None)),
         shell: remote.shell.clone(),
         workspace: Arc::new(Mutex::new(active)),

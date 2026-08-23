@@ -31,6 +31,13 @@ pub enum ProviderEvent {
         chunk: String,
     },
     Usage(Usage),
+    /// 请求（发送/读流）重试：attempt = 本次逻辑请求内的第几次重试
+    /// （1-based），backoff_ms 为将要等待的退避时长。
+    /// 由 provider 内部重试循环发出（§用户诉求：重试对用户可见，避免"瞬间报错"错觉）。
+    Retrying {
+        attempt: u32,
+        backoff_ms: u64,
+    },
 }
 
 /// Provider 流的结束原因（§6.2：明确的完成/失败分类）。

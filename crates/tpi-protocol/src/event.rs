@@ -167,6 +167,12 @@ pub enum RuntimeEvent {
     StreamRecovering { session_id: SessionId, attempt: u32 },
     /// partial tool-call 后 model turn 重新生成。
     TurnRestarting { session_id: SessionId, attempt: u32 },
+    /// provider 内部重试（连接层重试对用户可见）。
+    ProviderRetrying {
+        session_id: SessionId,
+        attempt: u32,
+        backoff_ms: u64,
+    },
     /// 手动 /compact 反馈。
     CompactionNotice {
         session_id: SessionId,

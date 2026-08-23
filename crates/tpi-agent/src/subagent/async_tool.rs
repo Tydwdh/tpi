@@ -76,27 +76,21 @@ where
 struct SpawnAgentArgs {
     #[serde(default)]
     instruction: String,
-    /// 只读能力白名单（默认 read/search/glob）。
+    /// 只读能力白名单（默认 read）。
     #[serde(default)]
     capabilities: Option<Vec<String>>,
 }
 
 fn parse_capabilities(names: Option<&Vec<String>>) -> Result<Vec<ReadOnlyCapability>, String> {
     let Some(names) = names else {
-        return Ok(vec![
-            ReadOnlyCapability::Read,
-            ReadOnlyCapability::Search,
-            ReadOnlyCapability::Glob,
-        ]);
+        return Ok(vec![ReadOnlyCapability::Read]);
     };
     let mut out = Vec::new();
     for name in names {
         let cap = match name.as_str() {
             "read" => ReadOnlyCapability::Read,
-            "search" => ReadOnlyCapability::Search,
-            "glob" => ReadOnlyCapability::Glob,
             other => {
-                return Err(format!("未知只读能力: {other:?}（可用: read/search/glob）"));
+                return Err(format!("未知只读能力: {other:?}（可用: read）"));
             }
         };
         if !out.contains(&cap) {
@@ -217,7 +211,7 @@ where
 
     fn description(&self) -> &str {
         "发起一次**非阻塞**只读子代理调查：立即返回 agent_id（不等待完成），child 拥有独立 \
-         session/trace，只能调用只读工具(read/search/glob)。主代理应继续其他工作，之后用 \
+         session/trace，只能调用只读工具(read)。主代理应继续其他工作，之后用 \
          `agent` 工具查询/等待结果；已完成的报告会在下一次模型输入边界自动注入。需要并行 \
          调查时连续发起多个 spawn_agent（每个独立 agent）。depth=1。"
     }
@@ -232,8 +226,8 @@ where
                 },
                 "capabilities": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["read", "search", "glob"] },
-                    "description": "只读能力白名单（默认 read/search/glob）"
+                    "items": { "type": "string", "enum": ["read"] },
+                    "description": "只读能力白名单（默认 read）"
                 }
             },
             "required": ["instruction"]
@@ -658,7 +652,10 @@ mod tests {
 
     #[test]
     fn capabilities_parse_defaults_and_errors() {
-        assert_eq!(parse_capabilities(None).unwrap().len(), 3);
+        assert_eq!(
+            parse_capabilities(None).unwrap(),
+            vec![ReadOnlyCapability::Read]
+        );
         let caps = parse_capabilities(Some(&vec!["read".into()])).unwrap();
         assert_eq!(caps, vec![ReadOnlyCapability::Read]);
         assert!(parse_capabilities(Some(&vec![])).is_err());

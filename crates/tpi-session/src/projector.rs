@@ -19,6 +19,7 @@
 //! 投影器；恢复/刷新经 `events_with_seq()`（P2-02 port）喂给 `rebuild`。
 
 use crate::protocol::{Plan, SessionEvent};
+use tpi_core::goal::Goal;
 use crate::store::compacted_range;
 use tpi_core::message::ChatMessage;
 
@@ -29,6 +30,7 @@ pub struct ConversationProjector {
     events: Vec<(u64, SessionEvent)>,
     history: Vec<ChatMessage>,
     plan: Option<Plan>,
+    goal: Option<Goal>,
     /// 投影是否与 events 同步（apply 后置脏，读时重投影）。
     dirty: bool,
 }
@@ -42,10 +44,12 @@ impl ConversationProjector {
     pub fn rebuild(events: &[(u64, SessionEvent)]) -> Self {
         let history = crate::store::project_messages(events);
         let plan = plan_from_events(events);
+        let goal = goal_from_events(events);
         Self {
             events: events.to_vec(),
             history,
             plan,
+            goal,
             dirty: false,
         }
     }
@@ -68,6 +72,12 @@ impl ConversationProjector {
         self.plan.as_ref()
     }
 
+    /// 当前 goal（读时惰性投影）。
+    pub fn goal(&mut self) -> Option<&Goal> {
+        self.refresh_if_dirty();
+        self.goal.as_ref()
+    }
+
     /// 已应用事件数。
     pub fn applied(&self) -> usize {
         self.events.len()
@@ -81,6 +91,7 @@ impl ConversationProjector {
             events: Vec::new(),
             history,
             plan,
+            goal: None,
             dirty: false,
         }
     }
@@ -93,6 +104,7 @@ impl ConversationProjector {
             self.events = events;
             self.history = rebuilt.history;
             self.plan = rebuilt.plan;
+            self.goal = rebuilt.goal;
             self.dirty = false;
         }
     }
@@ -104,6 +116,19 @@ pub fn plan_from_events(events: &[(u64, SessionEvent)]) -> Option<Plan> {
         SessionEvent::PlanReplaced { plan } => Some(plan.clone()),
         _ => None,
     })
+}
+
+/// 从事件序列重建 goal（纯函数；last-wins，GoalCleared 后为 None）。
+pub fn goal_from_events(events: &[(u64, SessionEvent)]) -> Option<Goal> {
+    let mut goal: Option<Goal> = None;
+    for (_, event) in events {
+        match event {
+            SessionEvent::GoalSet { goal: g } => goal = Some(g.clone()),
+            SessionEvent::GoalCleared => goal = None,
+            _ => {}
+        }
+    }
+    goal
 }
 
 /// 兼容引用（compacted_range 供 project_domain_messages 内部使用，此处避免

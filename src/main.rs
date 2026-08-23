@@ -582,15 +582,17 @@ fn run_journal_cmd(
     if conflicts.is_empty() {
         println!("{action} 完成：应用 {applied} 个，已处于目标状态 {already} 个");
     } else {
+        // 与工具侧/undo_all 同语义：任一 Conflict = 整体未写入（CAS 原子性），
+        // 此处 applied/already 必为 0；列出冲突文件供用户决策。
+        debug_assert_eq!(applied, 0, "CAS 原子性：存在 Conflict 时不得有 Applied");
         println!(
-            "{} 冲突：{} 个文件已被外部修改，未写文件（CAS 拒绝）：",
+            "{} 冲突：{} 个文件已被外部修改，未写任何文件（CAS 拒绝）：",
             action,
             conflicts.len()
         );
         for p in conflicts {
             println!("  {p}");
         }
-        println!("  已应用 {applied} 个，已处于目标状态 {already} 个");
     }
     Ok(())
 }

@@ -75,9 +75,7 @@ pub fn tool_access(
     match class {
         ToolExecutionClass::Pure => ToolAccess::Pure,
         ToolExecutionClass::WorkspaceUnknown => ToolAccess::WorkspaceUnknown,
-        ToolExecutionClass::FileReadExact
-        | ToolExecutionClass::FileReadRecursive
-        | ToolExecutionClass::FileWriteExact => {
+        ToolExecutionClass::FileReadExact | ToolExecutionClass::FileWriteExact => {
             let Some(raw_path) = args.path() else {
                 tracing::error!(
                     tool = ?tool,
@@ -90,9 +88,6 @@ pub fn tool_access(
             match class {
                 ToolExecutionClass::FileReadExact => {
                     file_lock(FileScope::Exact(path), AccessMode::Read)
-                }
-                ToolExecutionClass::FileReadRecursive => {
-                    file_lock(FileScope::Recursive(path), AccessMode::Read)
                 }
                 ToolExecutionClass::FileWriteExact => {
                     file_lock(FileScope::Exact(path), AccessMode::Write)

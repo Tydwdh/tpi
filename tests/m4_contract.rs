@@ -308,7 +308,7 @@ async fn update_plan_and_compaction_integration() {
     // 动态基线：先用 agent 同款估算算「空会话请求」的系统开销（system prompt +
     // 工具 schema），窗口设在该基线之上，保证首轮不触发压缩、
     // 多次 read 累积后触发。工具集/系统提示变化自动适应，无需手调 magic number。
-    // 当前基线实测 ~3393 tokens（含 glob/search 参数 schema）；窗口 = 基线 + 800，
+    // 当前基线实测 ~3000+ tokens（工具 schema）；窗口 = 基线 + 800，
     // 8 轮 read 累积后触发 compaction，compaction 后回到基线+summary 仍能继续。
     let baseline = tpi::context::estimate_request(
         tpi::agent::DEFAULT_SYSTEM_PROMPT,

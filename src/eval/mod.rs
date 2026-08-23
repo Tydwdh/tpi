@@ -439,7 +439,7 @@ fn stats_from_events(events: &[(i128, SessionEvent)]) -> EvalStats {
                 stats.input_tokens = stats.input_tokens.saturating_add(usage.input_tokens);
                 stats.output_tokens = stats.output_tokens.saturating_add(usage.output_tokens);
             }
-            SessionEvent::PlanReplaced { .. } => {}
+            SessionEvent::PlanReplaced { .. } | SessionEvent::GoalSet { .. } | SessionEvent::GoalCleared => {}
             // ADR-007：subagent 委托/报告/终态事件是 trace/审计事实，不计入
             // 本轮 eval 统计（child 自身运行指标由其独立 session 的 eval 承担）。
             SessionEvent::SubagentSpawned { .. }

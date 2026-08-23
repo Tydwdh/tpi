@@ -11,8 +11,7 @@ use fixtures::test_tool_context;
 use tpi::outcome::ToolStatus;
 use tpi::tool::files::{WriteArgs, write};
 
-/// §7：write 是 create-only——已存在文件必须使用 edit。
-/// 已存在文件不带 revision → 明确拒绝（already_exists）。
+/// §7：write 支持覆盖——已存在文件直接原子覆盖。
 #[test]
 fn p2_write_rejects_existing_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -22,7 +21,7 @@ fn p2_write_rejects_existing_file() {
     let target = workspace.join("app.txt");
     std::fs::write(&target, "old content\n").unwrap();
 
-    // §7：已存在文件 → 拒绝（already_exists）。
+    // 已放开覆盖：已存在文件直接覆盖成功。
     let plan = tpi::tool::edit::prepare_commit(&target);
     let outcome = write(
         WriteArgs {
@@ -34,17 +33,14 @@ fn p2_write_rejects_existing_file() {
     );
     assert_eq!(
         outcome.status,
-        ToolStatus::Rejected,
+        ToolStatus::Succeeded,
         "{}",
         outcome.model_text()
     );
-    let text = outcome.model_text();
-    assert!(text.contains("already_exists"), "{text}");
-    // 原文件内容不得被修改
     assert_eq!(
         std::fs::read_to_string(&target).unwrap(),
-        "old content\n",
-        "文件内容不得被 write 修改"
+        "new content\n",
+        "文件内容应被 write 覆盖"
     );
 }
 

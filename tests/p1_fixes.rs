@@ -1044,7 +1044,7 @@ impl Provider for AlwaysInterruptProvider {
 }
 
 /// §4.3 第二阶段：续写一直断联时不得无限循环——以 `ProviderInterrupted` 结束。
-/// §用户诉求：上限提到 10 次续写（共 11 次调用）；session 记录每次中断。
+/// session 记录每次中断；次数上限 = MAX_STREAM_RECOVERIES（首次 + N 次续写）。
 #[tokio::test]
 async fn recovery_capped_after_max_attempts() {
     let dir = tempfile::tempdir().unwrap();
@@ -1098,8 +1098,12 @@ async fn recovery_capped_after_max_attempts() {
         .iter()
         .filter(|e| matches!(e, SessionEvent::AssistantAttemptInterrupted { .. }))
         .count();
-    // 首次 + 10 次续写各记录一次中断（上限 10，共 11 次调用）。
-    assert_eq!(interrupted, 11, "每次中断都必须记录: {events:?}");
+    // 首次 + MAX_STREAM_RECOVERIES 次续写各记录一次中断。
+    assert_eq!(
+        interrupted,
+        1 + agent::MAX_STREAM_RECOVERIES as usize,
+        "每次中断都必须记录: {events:?}"
+    );
 }
 
 /// §4.3 第三阶段：已收到 tool delta 后断联 → **整个 model turn 重新生成**。
@@ -1248,8 +1252,11 @@ impl Provider for ToolDeltaAlwaysInterruptProvider {
         _cancel: CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
         self.calls += 1;
-        // 首次 + 10 次 restart = 11 次；第 12 次说明 restart 未封顶（防无限循环）。
-        assert!(self.calls <= 11, "restart 必须封顶（防无限循环）");
+        // 首次 + MAX_TURN_RESTARTS 次 restart；超出说明 restart 未封顶（防无限循环）。
+        assert!(
+            self.calls <= 1 + agent::MAX_TURN_RESTARTS,
+            "restart 必须封顶（防无限循环）"
+        );
         events
             .send(ProviderEvent::ToolCallStarted {
                 index: 0,
@@ -1310,17 +1317,22 @@ async fn tool_delta_restart_is_capped() {
     drain.abort();
     assert_eq!(outcome.reason, CompletionReason::ProviderInterrupted);
     assert_eq!(
-        provider.calls, 11,
-        "restart 必须封顶为 10 次（共 11 次调用）"
+        provider.calls,
+        1 + agent::MAX_TURN_RESTARTS,
+        "restart 必须封顶（首次 + MAX_TURN_RESTARTS 次调用）"
     );
 
-    // 每次中断都记录（首次 + 10 次 restart）。
+    // 每次中断都记录（首次 + MAX_TURN_RESTARTS 次 restart）。
     let events = tpi::session::read_events(session.path()).unwrap();
     let interrupted = events
         .iter()
         .filter(|e| matches!(e, SessionEvent::AssistantAttemptInterrupted { .. }))
         .count();
-    assert_eq!(interrupted, 11, "每次中断都必须记录: {events:?}");
+    assert_eq!(
+        interrupted,
+        1 + agent::MAX_TURN_RESTARTS as usize,
+        "每次中断都必须记录: {events:?}"
+    );
 }
 
 /// §4.3 `/retry`：空 `user_message` = retry 语义。
