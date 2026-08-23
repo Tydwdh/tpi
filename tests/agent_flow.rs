@@ -95,8 +95,12 @@ async fn tool_call_loop_terminates_and_reports_completion() {
     let config = test_config(&workspace);
     let mut provider = FakeProvider::new(vec![
         FakeResponse::with_tool_calls(vec![fixtures::fake_provider::tool_call(
-            "read",
-            serde_json::json!({"path": "missing.txt"}),
+            "bash",
+            serde_json::json!({
+                "command": "cat missing.txt",
+                "timeout_ms": 1000,
+                "background": false,
+            }),
         )]),
         FakeResponse::text("finally"),
     ]);
@@ -114,7 +118,7 @@ async fn tool_call_loop_terminates_and_reports_completion() {
         &config,
         agent::RunInput {
             history: &[],
-            user_message: "read a file".into(),
+            user_message: "run a file command".into(),
             ui: tx,
             cancel: CancellationToken::new(),
             interactive: true,
@@ -153,7 +157,7 @@ async fn tool_call_loop_terminates_and_reports_completion() {
         .collect();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].status, tpi::outcome::ToolStatus::Failed);
-    assert!(completed[0].model_payload.output.contains("not_found"));
+    assert!(!completed[0].model_payload.output.is_empty());
 }
 
 #[tokio::test]

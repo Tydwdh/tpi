@@ -19,20 +19,31 @@ use tpi::ids::RunId;
 use tpi::outcome::ToolStatus;
 use tpi::session::{CompletionReason, SessionEvent, SessionLog, read_events};
 
+fn builtin_kind(
+    tool: tpi::tool::BuiltinTool,
+    args: serde_json::Value,
+) -> tpi::agent::scheduler::PreparedKind {
+    tpi::agent::scheduler::PreparedKind::Tool {
+        name: tool.name().into(),
+        args_json: args.to_string(),
+        adapter: std::sync::Arc::new(tpi::tool::registry::BuiltinToolAdapter::new(tool)),
+        builtin: Some(tool),
+    }
+}
+
 /// §12.2：同 wave 无冲突 read 并行；冲突 write 独立 wave（不重叠）。
 #[test]
 fn waves_parallelize_reads_and_serialize_writes() {
     let mk = |index: usize, access: ToolAccess| PreparedCall {
         source_index: index,
-        kind: tpi::agent::scheduler::PreparedKind::Builtin {
-            tool: tpi::tool::BuiltinTool::Read,
-            args: tpi::tool::ValidatedArgs::Read(tpi::tool::files::ReadArgs {
-                path: format!("f{index}.txt"),
-                start_line: 1,
-                line_count: 10,
-                depth: None,
+        kind: builtin_kind(
+            tpi::tool::BuiltinTool::Read,
+            serde_json::json!({
+                "path": format!("f{index}.txt"),
+                "start_line": 1,
+                "line_count": 10,
             }),
-        },
+        ),
         access,
         action_key: format!("k{index}"),
         plan: None,
@@ -81,30 +92,28 @@ fn waves_parallelize_reads_and_serialize_writes() {
 fn bash_serializes_all_following_tools() {
     let bash_call = |index: usize| PreparedCall {
         source_index: index,
-        kind: tpi::agent::scheduler::PreparedKind::Builtin {
-            tool: tpi::tool::BuiltinTool::Bash,
-            args: tpi::tool::ValidatedArgs::Bash(tpi::tool::command::BashArgs {
-                command: "echo hi".into(),
-                cwd: None,
-                timeout_ms: 1000,
-                background: false,
+        kind: builtin_kind(
+            tpi::tool::BuiltinTool::Bash,
+            serde_json::json!({
+                "command": "echo hi",
+                "timeout_ms": 1000,
+                "background": false,
             }),
-        },
+        ),
         access: ToolAccess::WorkspaceUnknown,
         action_key: format!("b{index}"),
         plan: None,
     };
     let file_read = |index: usize, path: &str| PreparedCall {
         source_index: index,
-        kind: tpi::agent::scheduler::PreparedKind::Builtin {
-            tool: tpi::tool::BuiltinTool::Read,
-            args: tpi::tool::ValidatedArgs::Read(tpi::tool::files::ReadArgs {
-                path: path.into(),
-                start_line: 1,
-                line_count: 10,
-                depth: None,
+        kind: builtin_kind(
+            tpi::tool::BuiltinTool::Read,
+            serde_json::json!({
+                "path": path,
+                "start_line": 1,
+                "line_count": 10,
             }),
-        },
+        ),
         access: ToolAccess::Resources(vec![tpi::agent::scheduler::ResourceLock {
             resource: tpi::agent::scheduler::ResourceId::File(
                 tpi::agent::scheduler::FileScope::Exact(camino::Utf8PathBuf::from(path)),
@@ -141,16 +150,13 @@ fn bash_serializes_all_following_tools() {
 fn file_write(index: usize, path: &str) -> PreparedCall {
     PreparedCall {
         source_index: index,
-        kind: tpi::agent::scheduler::PreparedKind::Builtin {
-            tool: tpi::tool::BuiltinTool::Edit,
-            args: tpi::tool::ValidatedArgs::Edit(tpi::tool::edit::EditArgs {
-                path: path.into(),
-                replacements: vec![tpi::tool::edit::Replacement {
-                    old_text: "x".into(),
-                    new_text: "y".into(),
-                }],
+        kind: builtin_kind(
+            tpi::tool::BuiltinTool::Edit,
+            serde_json::json!({
+                "path": path,
+                "replacements": [{"old_text": "x", "new_text": "y"}],
             }),
-        },
+        ),
         access: ToolAccess::Resources(vec![tpi::agent::scheduler::ResourceLock {
             resource: tpi::agent::scheduler::ResourceId::File(
                 tpi::agent::scheduler::FileScope::Exact(camino::Utf8PathBuf::from(path)),
@@ -308,8 +314,8 @@ async fn update_plan_and_compaction_integration() {
     // 动态基线：先用 agent 同款估算算「空会话请求」的系统开销（system prompt +
     // 工具 schema），窗口设在该基线之上，保证首轮不触发压缩、
     // 多次 read 累积后触发。工具集/系统提示变化自动适应，无需手调 magic number。
-    // 当前基线实测 ~3000+ tokens（工具 schema）；窗口 = 基线 + 800，
-    // 8 轮 read 累积后触发 compaction，compaction 后回到基线+summary 仍能继续。
+    // 当前基线实测 ~3000+ tokens（工具 schema）；窗口只留少量增长空间，
+    // bash 累积结果后触发 compaction，compaction 后回到基线+summary 仍能继续。
     let baseline = tpi::context::estimate_request(
         tpi::agent::DEFAULT_SYSTEM_PROMPT,
         &[],
@@ -319,9 +325,9 @@ async fn update_plan_and_compaction_integration() {
             .collect::<Vec<_>>(),
     );
     // 空会话 + 无计划时基线即系统开销；window = 基线 + 预留增长空间。
-    // 每轮 read 的结果会进入 messages（累计增长），window 只须容纳约 8 轮 +
+    // 每轮 bash 的结果会进入 messages（累计增长），window 只须容纳首轮 +
     // compaction 后的 summary 仍能继续。
-    config.model.context_window = Some(baseline + 800);
+    config.model.context_window = Some(baseline + 50);
     config.safety_reserve_tokens = 100;
 
     // 单闭包状态机：工具请求按序推进（update_plan → read×N → 完成）；
@@ -372,8 +378,12 @@ async fn update_plan_and_compaction_integration() {
         } else if current <= 8 {
             step.set(current + 1);
             fake_provider::FakeResponse::with_tool_calls(vec![fake_provider::tool_call(
-                "read",
-                serde_json::json!({"path": "sample.txt"}),
+                "bash",
+                serde_json::json!({
+                    "command": "cat sample.txt",
+                    "timeout_ms": 1000,
+                    "background": false,
+                }),
             )])
         } else {
             fake_provider::FakeResponse::text("完成")
@@ -381,7 +391,7 @@ async fn update_plan_and_compaction_integration() {
     }));
 
     let workspace_write = workspace.clone();
-    // 30 行文件：read 结果（estimate ~300 tokens）不触发 prune，但多次 read 累计触发 compaction。
+    // 30 行文件：bash 结果（estimate ~300 tokens）不触发 prune，但多次 bash 累计触发 compaction。
     std::fs::write(
         workspace_write.join("sample.txt"),
         (1..=30).map(|i| format!("line {i}\n")).collect::<String>(),
@@ -461,17 +471,21 @@ async fn repeated_failing_action_blocked_in_agent_loop() {
     let mut config = test_config(&workspace);
     // §用户诉求：默认不限制（0）；本测试专门验证无进展拦截，需显式开启。
     config.limits.max_identical_no_progress = 2;
-    let missing_read = || {
+    let missing_bash = || {
         fake_provider::FakeResponse::with_tool_calls(vec![fake_provider::tool_call(
-            "read",
-            serde_json::json!({"path": "missing.txt"}),
+            "bash",
+            serde_json::json!({
+                "command": "cat missing.txt",
+                "timeout_ms": 1000,
+                "background": false,
+            }),
         )])
     };
     // 每轮一个动作（§12.3 关注跨轮重复；同 wave 并行批次不做执行前拦截）。
     let mut provider = fake_provider::FakeProvider::scripted(vec![
-        Box::new(move |_request| missing_read()),
-        Box::new(move |_request| missing_read()),
-        Box::new(move |_request| missing_read()),
+        Box::new(move |_request| missing_bash()),
+        Box::new(move |_request| missing_bash()),
+        Box::new(move |_request| missing_bash()),
         // 完成。
         Box::new(move |_request| fake_provider::FakeResponse::text("done")),
     ]);
@@ -488,7 +502,7 @@ async fn repeated_failing_action_blocked_in_agent_loop() {
         &config,
         agent::RunInput {
             history: &[],
-            user_message: "read it".into(),
+            user_message: "run it".into(),
             ui: tx,
             cancel: CancellationToken::new(),
             interactive: true,
@@ -513,7 +527,7 @@ async fn repeated_failing_action_blocked_in_agent_loop() {
     .expect("run succeeds");
     assert_eq!(outcome.reason, CompletionReason::Stop);
 
-    // 3 次 read 调用中第 3 次被拦截（rejected repeated_without_progress）。
+    // 3 次 bash 调用中第 3 次被拦截（rejected repeated_without_progress）。
     let events = read_events(session.path()).unwrap();
     let tool_completed: Vec<_> = events
         .iter()
@@ -548,7 +562,7 @@ fn read_only_external_tools_share_wave_with_reads_but_not_writes() {
     let root = Utf8PathBuf::from("C:/ws");
     let external_readonly = |index: usize| PreparedCall {
         source_index: index,
-        kind: tpi::agent::scheduler::PreparedKind::External {
+        kind: tpi::agent::scheduler::PreparedKind::Tool {
             name: "subagent".into(),
             args_json: r#"{"instruction":"调查"}"#.into(),
             adapter: std::sync::Arc::new(tpi::tool::registry::BuiltinToolAdapter::new(
@@ -557,6 +571,7 @@ fn read_only_external_tools_share_wave_with_reads_but_not_writes() {
                     .find(|t| t.name() == "read")
                     .unwrap(),
             )),
+            builtin: None,
         },
         access: read_workspace_lock(&root, true),
         action_key: format!("s{index}"),
@@ -564,15 +579,14 @@ fn read_only_external_tools_share_wave_with_reads_but_not_writes() {
     };
     let file_read = |index: usize, path: &str| PreparedCall {
         source_index: index,
-        kind: tpi::agent::scheduler::PreparedKind::Builtin {
-            tool: tpi::tool::BuiltinTool::Read,
-            args: tpi::tool::ValidatedArgs::Read(tpi::tool::files::ReadArgs {
-                path: path.into(),
-                start_line: 1,
-                line_count: 10,
-                depth: None,
+        kind: builtin_kind(
+            tpi::tool::BuiltinTool::Read,
+            serde_json::json!({
+                "path": path,
+                "start_line": 1,
+                "line_count": 10,
             }),
-        },
+        ),
         access: ToolAccess::Resources(vec![ResourceLock {
             resource: ResourceId::File(FileScope::Exact(Utf8PathBuf::from(path))),
             mode: tpi::agent::scheduler::AccessMode::Read,
@@ -582,13 +596,10 @@ fn read_only_external_tools_share_wave_with_reads_but_not_writes() {
     };
     let file_write = |index: usize, path: &str| PreparedCall {
         source_index: index,
-        kind: tpi::agent::scheduler::PreparedKind::Builtin {
-            tool: tpi::tool::BuiltinTool::Write,
-            args: tpi::tool::ValidatedArgs::Write(tpi::tool::files::WriteArgs {
-                path: path.into(),
-                content: "x".into(),
-            }),
-        },
+        kind: builtin_kind(
+            tpi::tool::BuiltinTool::Write,
+            serde_json::json!({"path": path, "content": "x"}),
+        ),
         access: ToolAccess::Resources(vec![ResourceLock {
             resource: ResourceId::File(FileScope::Exact(Utf8PathBuf::from(path))),
             mode: tpi::agent::scheduler::AccessMode::Write,

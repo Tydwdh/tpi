@@ -554,6 +554,7 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
     let tool_runtime = ToolRuntime::new(
         config,
         session.session_id().to_string(),
+        session.path().parent(),
         cancel.clone(),
         interactive,
         initial_plan,
@@ -564,7 +565,8 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
         processes,
         terminals,
         agents,
-    );
+    )
+    .map_err(RunFailure::ToolInfrastructure)?;
 
     let mut turn = 0u32;
     let mut tool_calls_total = 0u32;

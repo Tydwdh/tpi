@@ -107,7 +107,7 @@ async fn run_with(
     (outcome, events)
 }
 
-/// §`15：max_parallel_tools=1` 基线——同轮 3 个 read 完全串行。
+/// §15：max_parallel_tools=1 基线——同轮 3 个只读调用完全串行。
 #[tokio::test]
 async fn max_parallel_one_serializes_everything() {
     point_host_at_real_tpi();
@@ -122,9 +122,18 @@ async fn max_parallel_one_serializes_everything() {
     let mut provider = FakeProvider::scripted(vec![
         Box::new(move |_request| {
             FakeResponse::with_tool_calls(vec![
-                tool_call("read", serde_json::json!({"path": "a.txt"})),
-                tool_call("read", serde_json::json!({"path": "b.txt"})),
-                tool_call("read", serde_json::json!({"path": "c.txt"})),
+                tool_call(
+                    "artifact_read",
+                    serde_json::json!({"path": "@artifact/session/a"}),
+                ),
+                tool_call(
+                    "artifact_read",
+                    serde_json::json!({"path": "@artifact/session/b"}),
+                ),
+                tool_call(
+                    "artifact_read",
+                    serde_json::json!({"path": "@artifact/session/c"}),
+                ),
             ])
         }),
         Box::new(move |_request| FakeResponse::text("done")),
@@ -133,10 +142,10 @@ async fn max_parallel_one_serializes_everything() {
     assert_eq!(outcome.reason, CompletionReason::Stop);
     let life = lifecycle(&events);
     assert_strictly_serial(&life, "max_parallel=1 基线");
-    assert_eq!(life.len(), 6, "3 个 read 各一对 S/C");
+    assert_eq!(life.len(), 6, "3 个 artifact_read 各一对 S/C");
 }
 
-/// §15：read + edit 同文件冲突 → 强制串行（edit 在 read 完成后才启动）。
+/// §15：只读调用 + edit 冲突 → 强制串行（edit 在只读调用完成后才启动）。
 #[tokio::test]
 async fn conflicting_read_and_edit_are_serialized() {
     point_host_at_real_tpi();
@@ -152,7 +161,10 @@ async fn conflicting_read_and_edit_are_serialized() {
             let raw = std::fs::read(&path).unwrap();
             let revision = tpi::tool::edit::revision_of(&raw);
             FakeResponse::with_tool_calls(vec![
-                tool_call("read", serde_json::json!({"path": "a.txt"})),
+                tool_call(
+                    "artifact_read",
+                    serde_json::json!({"path": "@artifact/session/a"}),
+                ),
                 tool_call(
                     "edit",
                     serde_json::json!({
@@ -170,9 +182,9 @@ async fn conflicting_read_and_edit_are_serialized() {
     let (outcome, events) = run_with(&config_of(&workspace), &mut provider, "改 a.txt").await;
     assert_eq!(outcome.reason, CompletionReason::Stop);
     let life = lifecycle(&events);
-    assert_strictly_serial(&life, "read+edit 冲突");
-    // 顺序：read 先、edit 后。
-    assert_eq!(life[0], ('S', "read".into()));
+    assert_strictly_serial(&life, "只读+edit 冲突");
+    // 顺序：只读调用先、edit 后。
+    assert_eq!(life[0], ('S', "artifact_read".into()));
     assert_eq!(life[2], ('S', "edit".into()));
     assert!(
         std::fs::read_to_string(&fixture)
@@ -268,7 +280,7 @@ async fn edit_and_edit_same_file_are_serialized() {
     );
 }
 
-/// §15：bash 是隔离点——同轮 bash + read 必须串行。
+/// §15：bash 是隔离点——同轮 bash + 只读调用必须串行。
 #[tokio::test]
 async fn bash_is_an_isolation_point() {
     point_host_at_real_tpi();
@@ -280,7 +292,10 @@ async fn bash_is_an_isolation_point() {
         Box::new(move |_request| {
             FakeResponse::with_tool_calls(vec![
                 tool_call("bash", serde_json::json!({"command": "echo hello"})),
-                tool_call("read", serde_json::json!({"path": "a.txt"})),
+                tool_call(
+                    "artifact_read",
+                    serde_json::json!({"path": "@artifact/session/a"}),
+                ),
             ])
         }),
         Box::new(move |_request| FakeResponse::text("done")),
@@ -292,13 +307,13 @@ async fn bash_is_an_isolation_point() {
     assert_eq!(life[0], ('S', "bash".into()), "bash 按源顺序在前: {life:?}");
 }
 
-/// §15：并行 read 真正并行（S,S 连续），结果按 provider index 回填。
+/// §15：并行只读调用真正并行（S,S 连续），结果按 provider index 回填。
 #[tokio::test]
 async fn parallel_reads_complete_and_results_follow_source_index() {
     point_host_at_real_tpi();
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-    // b.txt 明显更大：若并行，完成时间不同；回填顺序仍必须 a 在前。
+    // 第二个 artifact 引用明显更长：回填顺序仍必须保持 provider index。
     std::fs::write(workspace.join("a.txt"), "A").unwrap();
     std::fs::write(workspace.join("b.txt"), "B".repeat(50_000)).unwrap();
 
@@ -307,8 +322,16 @@ async fn parallel_reads_complete_and_results_follow_source_index() {
     let mut provider = FakeProvider::scripted(vec![
         Box::new(move |_request| {
             FakeResponse::with_tool_calls(vec![
-                tool_call("read", serde_json::json!({"path": "a.txt"})),
-                tool_call("read", serde_json::json!({"path": "b.txt"})),
+                tool_call(
+                    "artifact_read",
+                    serde_json::json!({"path": "@artifact/session/a"}),
+                ),
+                tool_call(
+                    "artifact_read",
+                    serde_json::json!({
+                        "path": format!("@artifact/session/{}", "b".repeat(50_000))
+                    }),
+                ),
             ])
         }),
         Box::new(move |_request| FakeResponse::text("done")),
@@ -316,7 +339,7 @@ async fn parallel_reads_complete_and_results_follow_source_index() {
     let (outcome, events) = run_with(&config, &mut provider, "并行读两个文件").await;
     assert_eq!(outcome.reason, CompletionReason::Stop);
     let life = lifecycle(&events);
-    assert_parallel_start(&life, "并行 read");
+    assert_parallel_start(&life, "并行只读调用");
     assert_eq!(life.len(), 4);
     // 结果按原始 index 回填：a（短输出）的 Tool 消息必须在 b（长输出）之前。
     let tool_msgs: Vec<&ChatMessage> = outcome
@@ -333,7 +356,7 @@ async fn parallel_reads_complete_and_results_follow_source_index() {
     };
     assert!(
         ca.len() < cb.len(),
-        "index 0 的结果必须回填在前（a 短 b 长）: {} vs {}",
+        "index 0 的结果必须回填在前（引用短、引用长）: {} vs {}",
         ca.len(),
         cb.len()
     );

@@ -20,8 +20,34 @@ pub fn create_workspace_manager(
     session_id: &str,
     artifacts_root: &Path,
 ) -> Result<SharedWorkspaceManager, String> {
+    create_workspace_manager_with_runtime_roots(workspace_root, session_id, artifacts_root, &[])
+}
+
+/// Create a workspace manager while excluding runtime-owned directories from
+/// the workspace index. Session JSONL files and artifacts are runtime state,
+/// not user mutations; scanning them can also race with their lock files.
+pub fn create_workspace_manager_with_runtime_roots(
+    workspace_root: &Path,
+    session_id: &str,
+    artifacts_root: &Path,
+    runtime_roots: &[&Path],
+) -> Result<SharedWorkspaceManager, String> {
+    let mut tracking_policy = TrackingPolicy::default();
+    for runtime_root in runtime_roots {
+        let workspace_for_compare =
+            std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+        let runtime_for_compare =
+            std::fs::canonicalize(runtime_root).unwrap_or_else(|_| (*runtime_root).to_path_buf());
+        if let Ok(relative) = runtime_for_compare.strip_prefix(&workspace_for_compare)
+            && !relative.as_os_str().is_empty()
+        {
+            tracking_policy
+                .exclude
+                .push(relative.to_string_lossy().into_owned());
+        }
+    }
     let config = WorkspaceConfig {
-        tracking_policy: TrackingPolicy::default(),
+        tracking_policy,
         safety_policy: MutationSafetyPolicy::BestEffort,
     };
     let mgr = WorkspaceManager::open(workspace_root, session_id, artifacts_root, config)

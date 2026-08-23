@@ -58,6 +58,43 @@ pub trait Tool: Send + Sync {
     fn origin(&self) -> ToolOrigin;
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome;
 
+    /// Validate arguments and derive the scheduler footprint in one tool-owned
+    /// preparation step. Builtins can use typed validation here; external tools
+    /// use their declared access class by default.
+    fn prepare(
+        &self,
+        _args: &str,
+        workspace_root: &camino::Utf8PathBuf,
+        allow_outside_workspace: bool,
+    ) -> Result<crate::tool::scheduler::ToolAccess, String> {
+        Ok(match self.access_class() {
+            ToolAccessClass::Pure => crate::tool::scheduler::ToolAccess::Pure,
+            ToolAccessClass::ReadOnly => {
+                crate::tool::scheduler::read_workspace_lock(workspace_root, allow_outside_workspace)
+            }
+            ToolAccessClass::WorkspaceUnknown => {
+                crate::tool::scheduler::ToolAccess::WorkspaceUnknown
+            }
+        })
+    }
+
+    /// Whether this tool needs the durable write-ahead event before execution.
+    fn requires_write_ahead(&self) -> bool {
+        false
+    }
+
+    /// Unified execution entry after scheduler preparation. The default keeps
+    /// external tools on the same path; builtin adapters override it only to
+    /// pass the prepared commit plan to their existing typed implementation.
+    async fn execute_prepared(
+        &self,
+        args: &str,
+        ctx: &ToolContext,
+        _plan: Option<&crate::tool::edit::CommitPlan>,
+    ) -> ToolOutcome {
+        self.execute(args, ctx).await
+    }
+
     /// P4-04：definition 投影（name/schema/origin 的不可变描述；handler 保持
     /// `execute`）。默认从基础方法组装；自定义实现可覆写（如带 limits 的声明）。
     fn definition(&self) -> ToolSpec {
@@ -347,9 +384,36 @@ impl Tool for BuiltinToolAdapter {
         ToolOrigin::Builtin
     }
 
-    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
+    fn prepare(
+        &self,
+        args: &str,
+        workspace_root: &camino::Utf8PathBuf,
+        allow_outside_workspace: bool,
+    ) -> Result<crate::tool::scheduler::ToolAccess, String> {
+        let validated = self
+            .tool
+            .parse_args(args)
+            .map_err(|error| error.to_string())?;
+        Ok(crate::tool::scheduler::tool_access(
+            self.tool,
+            &validated,
+            workspace_root,
+            allow_outside_workspace,
+        ))
+    }
+
+    fn requires_write_ahead(&self) -> bool {
+        self.tool.requires_write_ahead()
+    }
+
+    async fn execute_prepared(
+        &self,
+        args: &str,
+        ctx: &ToolContext,
+        plan: Option<&crate::tool::edit::CommitPlan>,
+    ) -> ToolOutcome {
         match self.tool.parse_args(args) {
-            Ok(validated) => crate::tool::execute(self.tool, validated, ctx, None).await,
+            Ok(validated) => self.execute_with_plan(&validated, ctx, plan).await,
             Err(error) => tpi_core::outcome::ToolOutcome::failed(
                 self.tool.name(),
                 tpi_core::outcome::ModelPayload {
@@ -366,6 +430,10 @@ impl Tool for BuiltinToolAdapter {
                 },
             ),
         }
+    }
+
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolOutcome {
+        self.execute_prepared(args, ctx, None).await
     }
 }
 

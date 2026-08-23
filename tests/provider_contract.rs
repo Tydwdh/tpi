@@ -731,19 +731,19 @@ async fn invalid_tool_args_produce_observation_without_breaking_session() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     let config = fixtures::test_config(&workspace);
-    // 第 1 次请求返回非法 args 的 read（缺必填 path）；
+    // 第 1 次请求返回非法 args 的 bash（缺必填 command）；
     // 第 2 次请求模型根据 observation 修正（这次给合法 args）。
     let mut provider = fixtures::fake_provider::FakeProvider::scripted(vec![
         Box::new(move |_request| {
             fixtures::fake_provider::FakeResponse::with_tool_calls(vec![
-                fixtures::fake_provider::tool_call("read", serde_json::json!({})),
+                fixtures::fake_provider::tool_call("bash", serde_json::json!({})),
             ])
         }),
         Box::new(move |_request| {
             fixtures::fake_provider::FakeResponse::with_tool_calls(vec![
                 fixtures::fake_provider::tool_call(
-                    "read",
-                    serde_json::json!({"path": "probe.txt"}),
+                    "bash",
+                    serde_json::json!({"command": "cat probe.txt"}),
                 ),
             ])
         }),
@@ -764,7 +764,7 @@ async fn invalid_tool_args_produce_observation_without_breaking_session() {
         &config,
         tpi::agent::RunInput {
             history: &[],
-            user_message: "读 probe.txt".into(),
+            user_message: "读取 probe.txt".into(),
             ui: tx,
             cancel: CancellationToken::new(),
             interactive: true,

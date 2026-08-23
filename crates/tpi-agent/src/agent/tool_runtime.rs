@@ -50,18 +50,52 @@ pub(super) struct ToolRuntime {
     workspace_session: Option<Arc<tpi_capabilities::workspace::session::WorkspaceSession>>,
 }
 
-/// P4-03：Step 内不可变工具快照（descriptors + external lookup 共用）。
-/// Step 开始构建一次；Step 内执行不再锁 registry（MCP reload 不改变当前 Step）。
+/// P4-03：Step 内不可变工具快照。
+///
+/// `defs` 与 `executable` 必须从同一组选中工具构建。这样模型看不到的工具
+/// 也不会因为 runtime 重新查全量 registry 而重新变得可执行。
 #[derive(Clone)]
 pub(super) struct ActiveToolSet {
     /// 发给模型的工具定义（selector 结果；P4-06 canonical output 会消费）。
-    #[allow(dead_code)]
     pub defs: Vec<crate::provider::ToolDef>,
-    /// 外部工具 lookup（MCP adapter；builtin 经 BuiltinTool::from_name）。
-    pub external: std::collections::HashMap<
+    /// 当前 Step 唯一的执行入口。只包含 `defs` 中的工具。
+    executable: std::collections::HashMap<
         String,
         std::sync::Arc<dyn tpi_capabilities::tool::registry::Tool>,
     >,
+}
+
+impl ActiveToolSet {
+    fn from_selected(
+        registry: &tpi_capabilities::tool::registry::ToolRegistry,
+        selected: impl IntoIterator<Item = tpi_capabilities::tool::registry::ToolSpec>,
+    ) -> Self {
+        let mut defs = Vec::new();
+        let mut executable = std::collections::HashMap::new();
+        for descriptor in selected {
+            let Some(tool) = registry.get(&descriptor.name) else {
+                // `descriptors()` 与 `get()` 应该来自同一 registry snapshot；
+                // 如果未来 registry 引入并发 overlay 变更，宁可缩小 capability
+                // surface，也不要把一个没有可执行句柄的定义发给模型。
+                tracing::warn!(tool = %descriptor.name, "active tool disappeared during reload");
+                continue;
+            };
+            executable.insert(descriptor.name.clone(), tool);
+            defs.push(crate::provider::ToolDef {
+                name: descriptor.name,
+                description: descriptor.description,
+                parameters: descriptor.parameters,
+            });
+        }
+        Self { defs, executable }
+    }
+
+    fn resolve(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<dyn tpi_capabilities::tool::registry::Tool>> {
+        self.executable.get(name).cloned()
+    }
 }
 
 #[derive(Clone)]
@@ -77,6 +111,7 @@ impl ToolRuntime {
     pub(super) fn new(
         config: &Config,
         session_id: String,
+        session_storage_root: Option<&std::path::Path>,
         cancel: CancellationToken,
         interactive: bool,
         initial_plan: Option<Plan>,
@@ -85,7 +120,7 @@ impl ToolRuntime {
         processes: Arc<std::sync::Mutex<tpi_capabilities::process::managed::ProcessRegistry>>,
         terminals: Arc<std::sync::Mutex<tpi_capabilities::terminal::TerminalRegistry>>,
         agents: Arc<std::sync::Mutex<crate::agent::manager::AgentManager>>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         // §W0/R4：workspace 由调用方注入（默认 Local；测试可传 remote）。
         // ctx.shell 与 workspace 内 shell 共享同一 Arc。
         let workspace = Arc::new(Mutex::new(active_workspace));
@@ -106,7 +141,7 @@ impl ToolRuntime {
             if let Ok(root_session) = tpi_core::ids::SessionId::parse_str(&session_id) {
                 manager
                     .ensure_root(root_session, cancel.clone())
-                    .unwrap_or_else(|error| panic!("root agent registration failed: {error}"));
+                    .map_err(|error| format!("root agent registration failed: {error}"))?;
             }
             let scheduler = manager.effect_scheduler();
             let owner_agent_id = tpi_core::ids::SessionId::parse_str(&session_id)
@@ -131,25 +166,48 @@ impl ToolRuntime {
                         .map(|id| id.to_string()),
                 }
             };
-            let workspace_session = manager.workspace_session().or_else(|| {
-                let shared = tpi_capabilities::workspace::session::create_workspace_manager(
-                    config.workspace_root.as_std_path(),
-                    &session_id,
-                    &policy.artifacts_root,
-                )
-                .ok()
-                .map(tpi_capabilities::workspace::session::WorkspaceSession::new)
-                .map(Arc::new);
-                if let Some(session) = &shared {
+            let workspace_session = match manager.workspace_session() {
+                Some(session) => session,
+                None => {
+                    // Workspace tracking is part of the production mutation
+                    // contract. Initialization failure must stop this runtime;
+                    // continuing with `None` would make edit/bash appear
+                    // successful while silently losing journal/undo coverage.
+                    let mut runtime_roots = vec![
+                        policy.sessions_root.as_path(),
+                        policy.artifacts_root.as_path(),
+                    ];
+                    if let Some(session_storage_root) = session_storage_root {
+                        runtime_roots.push(session_storage_root);
+                    }
+                    let shared = tpi_capabilities::workspace::session::create_workspace_manager_with_runtime_roots(
+                        config.workspace_root.as_std_path(),
+                        &session_id,
+                        &policy.artifacts_root,
+                        &runtime_roots,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "workspace session initialization failed for {}: {error}",
+                            config.workspace_root
+                        )
+                    })?;
+                    let session = Arc::new(
+                        tpi_capabilities::workspace::session::WorkspaceSession::new(shared),
+                    );
                     manager.set_workspace_session(session.clone());
+                    session
                 }
-                shared
-            });
-            let workspace_session = workspace_session
-                .map(|session| Arc::new(session.as_ref().clone().with_provenance(provenance)));
+            };
+            let workspace_session = Arc::new(
+                workspace_session
+                    .as_ref()
+                    .clone()
+                    .with_provenance(provenance),
+            );
             (scheduler, workspace_session)
         };
-        Self {
+        Ok(Self {
             config: RuntimeConfig {
                 workspace_root: config.workspace_root.clone(),
                 allow_outside_workspace: policy.allow_outside_workspace,
@@ -171,8 +229,8 @@ impl ToolRuntime {
             agents,
             effect_scheduler,
             registry,
-            workspace_session,
-        }
+            workspace_session: Some(workspace_session),
+        })
     }
 
     /// Set the workspace session (called during agent init).
@@ -223,33 +281,16 @@ impl ToolRuntime {
     pub(super) fn reload(&self, context: &str) -> Vec<crate::provider::ToolDef> {
         let registry = tpi_core::util::lock_mutex(&self.registry, "tool_registry");
         let selector = tpi_capabilities::tool::selector::ToolSelector::default();
-        let defs: Vec<crate::provider::ToolDef> = selector
+        let selected = selector
             .select(registry.descriptors(), context)
             .into_iter()
             // §tool-surface：主 agent 模型不再暴露 `read`（判死刑）。
             // 内部实现（ReadTool / files::read）保留：artifact 读取机制仍依赖
-            // 它。模型改由
-            // `bash`(rg/cat/sed/nl) 读取文件内容。
-            .filter(|d| d.name != "read")
-            .map(|d| crate::provider::ToolDef {
-                name: d.name,
-                description: d.description,
-                parameters: d.parameters,
-            })
-            .collect();
-        let external: std::collections::HashMap<
-            String,
-            std::sync::Arc<dyn tpi_capabilities::tool::registry::Tool>,
-        > = registry
-            .list()
-            .into_iter()
-            .filter(|tool| BuiltinTool::from_name(tool.name()).is_none())
-            .map(|tool| (tool.name().to_string(), tool))
-            .collect();
-        *tpi_core::util::lock_mutex(&self.active, "active_tool_set") = Some(ActiveToolSet {
-            defs: defs.clone(),
-            external,
-        });
+            // 它。模型改由 `bash`(rg/cat/sed/nl) 读取文件内容。
+            .filter(|descriptor| descriptor.name != "read");
+        let active = ActiveToolSet::from_selected(&registry, selected);
+        let defs = active.defs.clone();
+        *tpi_core::util::lock_mutex(&self.active, "active_tool_set") = Some(active);
         defs
     }
 
@@ -391,8 +432,7 @@ async fn execute_batch<P: Provider, S: tpi_session::store::SessionStore>(
     use futures_util::future::join_all;
     use std::collections::HashMap;
     use tpi_capabilities::tool::scheduler::{
-        PreparedCall, ToolAccess, action_key, action_key_from_name, build_waves,
-        stable_observation, state_stamp_from_ctx,
+        PreparedCall, action_key_from_name, build_waves, stable_observation, state_stamp_from_ctx,
     };
 
     let ToolBatchExecutor {
@@ -404,6 +444,9 @@ async fn execute_batch<P: Provider, S: tpi_session::store::SessionStore>(
         ui,
     } = executor;
     let max_parallel = config.limits.max_parallel_tools as usize;
+    // P4-03：本批所有调用都使用同一份 Step 快照；不能在预检过程中回查
+    // 全量 registry，否则隐藏工具会重新获得执行资格。
+    let active_tools = tool_runtime.active_set();
 
     // 1. 预检全部参数（§12.2 第 1 条）。
     let mut prepared: Vec<PreparedCall> = Vec::with_capacity(calls.len());
@@ -455,41 +498,11 @@ async fn execute_batch<P: Provider, S: tpi_session::store::SessionStore>(
             return Ok(BatchEnd::BudgetExceeded);
         }
         *tool_calls_total += 1;
-        // §Phase 5：先按 builtin 解析；失败则查 ToolRegistry（MCP 工具）。
-        let Some(tool) = BuiltinTool::from_name(&call.name) else {
-            // 外部工具（MCP adapter）？P4-03：用 Step 快照（不锁 registry）。
-            if let Some(adapter) = tool_runtime.active_set().external.get(&call.name).cloned() {
-                // External tools declare an effect class. ReadOnly here means
-                // workspace read access, not a reduced agent tool directory.
-                let access = match adapter.access_class() {
-                    tpi_capabilities::tool::registry::ToolAccessClass::Pure => ToolAccess::Pure,
-                    tpi_capabilities::tool::registry::ToolAccessClass::ReadOnly => {
-                        tpi_capabilities::tool::scheduler::read_workspace_lock(
-                            &config.workspace_root,
-                            config.allow_outside_workspace,
-                        )
-                    }
-                    tpi_capabilities::tool::registry::ToolAccessClass::WorkspaceUnknown => {
-                        ToolAccess::WorkspaceUnknown
-                    }
-                };
-                prepared.push(PreparedCall {
-                    source_index: index,
-                    kind: tpi_capabilities::tool::scheduler::PreparedKind::External {
-                        name: call.name.clone(),
-                        args_json: call.arguments.clone(),
-                        adapter,
-                    },
-                    access,
-                    action_key: action_key_from_name(&call.name, &call.arguments),
-                    plan: None,
-                });
-                continue;
-            }
-            // §30 第 9 条：rejected 的 observation 必须持久化——runtime messages
-            // 有 Tool 消息而 session 无 ToolRequested/ToolCompleted 时，restart 后
-            // observation 丢失（P0-3 不变量违反）。
-            let outcome = unknown_tool_outcome(&call.name);
+        // §Phase 5：ActiveToolSet 是唯一的调用解析入口。调用不在当前 step
+        // capability surface 内时，即使它是 builtin 或仍存在于全量 registry，
+        // 也必须拒绝。
+        let Some(active_tool) = active_tools.resolve(&call.name) else {
+            let outcome = inactive_tool_outcome(&call.name);
             session
                 .append_event(&SessionEvent::ToolRequested { call: call.clone() })
                 .and_then(|_| session.complete_tool(call.call_id, &outcome))
@@ -497,58 +510,62 @@ async fn execute_batch<P: Provider, S: tpi_session::store::SessionStore>(
             rejected.insert(index, outcome);
             continue;
         };
-        match tool.parse_args(&call.arguments) {
-            Ok(args) => {
-                let access = tpi_capabilities::tool::scheduler::tool_access(
-                    tool,
-                    &args,
-                    &config.workspace_root,
-                    config.allow_outside_workspace,
-                );
-                // §10.7：写工具预检时生成一次提交计划；write-ahead 与执行复用。
-                let plan = write_tool_plan(
-                    tool,
-                    call,
-                    &config.workspace_root,
-                    config.allow_outside_workspace,
-                );
-                prepared.push(PreparedCall {
-                    source_index: index,
-                    kind: tpi_capabilities::tool::scheduler::PreparedKind::Builtin { tool, args },
-                    access,
-                    action_key: action_key(tool, &call.arguments),
-                    plan,
-                });
-            }
+        let adapter = active_tool;
+        let access = match adapter.prepare(
+            &call.arguments,
+            &config.workspace_root,
+            config.allow_outside_workspace,
+        ) {
+            Ok(access) => access,
             Err(message) => {
                 let outcome = ToolOutcome::failed(
-                    tool.name(),
+                    adapter.name(),
                     tpi_core::outcome::ModelPayload {
                         status: ToolStatus::Rejected,
                         program: None,
                         exit_code: None,
                         duration_ms: 0,
                         output: format!(
-                            "status: rejected
-tool: {}
-error: invalid_arguments
-
-{message}",
-                            tool.name()
+                            "status: rejected\ntool: {}\nerror: invalid_arguments\n\n{message}",
+                            adapter.name()
                         ),
                         effect: None,
                         artifact: None,
                     },
                 )
                 .into_stored();
-                // §30 第 9 条：rejected 的 observation 必须持久化（同未知工具）。
+                // §30 第 9 条：rejected 的 observation 必须持久化。
                 session
                     .append_event(&SessionEvent::ToolRequested { call: call.clone() })
                     .and_then(|_| session.complete_tool(call.call_id, &outcome))
                     .map_err(|e| RunFailure::Session(e.to_string()))?;
                 rejected.insert(index, outcome);
+                continue;
             }
-        }
+        };
+        // §10.7：写工具预检时生成一次提交计划；write-ahead 与执行复用。
+        // 该 typed projection 仅服务 recovery metadata；真正执行统一走 adapter。
+        let builtin = BuiltinTool::from_name(adapter.name());
+        let plan = builtin.and_then(|tool| {
+            write_tool_plan(
+                tool,
+                call,
+                &config.workspace_root,
+                config.allow_outside_workspace,
+            )
+        });
+        prepared.push(PreparedCall {
+            source_index: index,
+            kind: tpi_capabilities::tool::scheduler::PreparedKind::Tool {
+                name: adapter.name().to_string(),
+                args_json: call.arguments.clone(),
+                adapter,
+                builtin,
+            },
+            access,
+            action_key: action_key_from_name(&call.name, &call.arguments),
+            plan,
+        });
     }
 
     // 2-3. waves（§12.2 第 3-4 条）。
@@ -563,23 +580,23 @@ error: invalid_arguments
                 .map_err(|e| RunFailure::Session(e.to_string()))?;
         }
 
-        // write-ahead（§14.2）：wave 内写工具先持久化 ToolStarted。
-        // 外部（MCP）工具无 write-ahead（非本地文件/进程副作用工具）。
+        // write-ahead（§14.2）：wave 内需要恢复证据的工具先持久化 ToolStarted。
         for call in &wave {
             let source = &calls[call.source_index];
             let requires_wa = match &call.kind {
-                tpi_capabilities::tool::scheduler::PreparedKind::Builtin { tool, .. } => {
-                    tool.requires_write_ahead()
+                tpi_capabilities::tool::scheduler::PreparedKind::Tool { adapter, .. } => {
+                    adapter.requires_write_ahead()
                 }
-                tpi_capabilities::tool::scheduler::PreparedKind::External { .. } => false,
             };
             // §10.7：复用预检阶段生成的同一 plan（temp/backup 路径一致）。
             let recovery = if requires_wa {
-                if let tpi_capabilities::tool::scheduler::PreparedKind::Builtin { tool, .. } =
-                    call.kind
+                if let tpi_capabilities::tool::scheduler::PreparedKind::Tool {
+                    builtin: Some(tool),
+                    ..
+                } = &call.kind
                 {
                     recovery_metadata(
-                        tool,
+                        *tool,
                         source,
                         call.plan.as_ref(),
                         &config.workspace_root,
@@ -696,15 +713,15 @@ error: invalid_arguments
                                 let _ = manager.mark_running(owner_agent_id);
                             }
                             match kind {
-                                tpi_capabilities::tool::scheduler::PreparedKind::Builtin {
-                                    tool,
-                                    args,
-                                } => tool::execute(tool, args, &ctx, plan.as_ref()).await,
-                                tpi_capabilities::tool::scheduler::PreparedKind::External {
-                                    name: _,
+                                tpi_capabilities::tool::scheduler::PreparedKind::Tool {
                                     args_json,
                                     adapter,
-                                } => adapter.execute(&args_json, &ctx).await,
+                                    ..
+                                } => {
+                                    adapter
+                                        .execute_prepared(&args_json, &ctx, plan.as_ref())
+                                        .await
+                                }
                             }
                         }
                         Err(tpi_capabilities::tool::scheduler::EffectAcquireError::Cancelled) => {
@@ -1190,8 +1207,8 @@ fn tool_result_message(call: &ToolCall, outcome: &StoredToolOutcome) -> ChatMess
     }
 }
 
-/// 未知工具：Rejected（不进入 chat 流，防止幻觉工具产生副作用）。
-fn unknown_tool_outcome(name: &str) -> StoredToolOutcome {
+/// 不在当前 ActiveToolSet 的工具：Rejected（防止幻觉或隐藏工具产生副作用）。
+fn inactive_tool_outcome(name: &str) -> StoredToolOutcome {
     ToolOutcome::failed(
         name,
         tpi_core::outcome::ModelPayload {
@@ -1199,7 +1216,7 @@ fn unknown_tool_outcome(name: &str) -> StoredToolOutcome {
             program: None,
             exit_code: None,
             duration_ms: 0,
-            output: format!("status: rejected\ntool: {name}\nerror: unknown_tool"),
+            output: format!("status: rejected\ntool: {name}\nerror: inactive_tool"),
             effect: None,
             artifact: None,
         },
@@ -1334,6 +1351,77 @@ fn recovery_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_tool_set_is_the_only_execution_surface() {
+        let registry = tpi_capabilities::tool::registry::builtin_registry();
+        let selector = tpi_capabilities::tool::selector::ToolSelector::default();
+        let selected = selector
+            .select(registry.descriptors(), "inspect the workspace")
+            .into_iter()
+            .filter(|descriptor| descriptor.name != "read");
+        let active = ActiveToolSet::from_selected(&registry, selected);
+
+        assert!(!active.defs.iter().any(|def| def.name == "read"));
+        assert!(active.resolve("read").is_none());
+        assert!(active.resolve("bash").is_some());
+        for def in &active.defs {
+            assert!(
+                active.resolve(&def.name).is_some(),
+                "model-visible tool must have an execution handle: {}",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_fails_closed_when_workspace_session_cannot_initialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked_root = dir.path().join("workspace-file");
+        std::fs::write(&blocked_root, b"not a directory").unwrap();
+        let workspace_root = camino::Utf8PathBuf::from_path_buf(blocked_root).unwrap();
+        let mut config = tpi_config::config::test_config(&workspace_root);
+        config.artifacts_root = dir.path().join("artifacts");
+        std::fs::create_dir_all(&config.artifacts_root).unwrap();
+
+        let active_workspace = tpi_capabilities::workspace::ActiveWorkspace::local(
+            tpi_capabilities::workspace::LocalWorkspace::new(workspace_root.clone(), true),
+        );
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(
+            tpi_capabilities::tool::registry::builtin_registry(),
+        ));
+        let processes = std::sync::Arc::new(std::sync::Mutex::new(
+            tpi_capabilities::process::managed::ProcessRegistry::new(),
+        ));
+        let terminals = std::sync::Arc::new(std::sync::Mutex::new(
+            tpi_capabilities::terminal::TerminalRegistry::default(),
+        ));
+        let agents = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::agent::manager::AgentManager::new(),
+        ));
+
+        let result = ToolRuntime::new(
+            &config,
+            tpi_core::ids::SessionId::new_v7().to_string(),
+            None,
+            CancellationToken::new(),
+            false,
+            None,
+            active_workspace,
+            registry,
+            processes,
+            terminals,
+            agents,
+        );
+        let error = match result {
+            Ok(_) => panic!("workspace tracking failure must stop runtime initialization"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("workspace session initialization failed"),
+            "unexpected initialization error: {error}"
+        );
+    }
 
     /// P2：no-progress 拒绝输出必须带 suggestions（可恢复引导）。
     #[test]

@@ -292,28 +292,27 @@ pub struct PreparedCall {
     pub plan: Option<crate::tool::edit::CommitPlan>,
 }
 
-/// 已预检的工具种类：builtin（类型化）或外部（MCP adapter，README2 §2.1）。
+/// 已预检的工具调用。
+///
+/// Builtin 和 MCP 都通过同一个 `Tool` adapter 执行；`builtin` 只保留给
+/// agent 层的旧 recovery metadata helper 做 typed projection，不参与执行
+/// 分发。这样 scheduler 不再拥有 builtin/external 两套 execution branch。
 /// 不 derive Debug：`Arc<dyn Tool>` 不实现 Debug。
 #[derive(Clone)]
 pub enum PreparedKind {
-    /// 内建工具（类型化 args + commit plan 语义）。
-    Builtin {
-        tool: BuiltinTool,
-        args: ValidatedArgs,
-    },
-    /// 外部工具（MCP 等；JSON args，经 Tool trait 执行）。
-    External {
+    Tool {
         name: String,
         args_json: String,
         adapter: std::sync::Arc<dyn crate::tool::registry::Tool>,
+        /// Legacy typed projection used only for write-ahead recovery metadata.
+        builtin: Option<BuiltinTool>,
     },
 }
 
 impl PreparedKind {
     pub fn name(&self) -> &str {
         match self {
-            PreparedKind::Builtin { tool, .. } => tool.name(),
-            PreparedKind::External { name, .. } => name,
+            PreparedKind::Tool { name, .. } => name,
         }
     }
 }
@@ -321,12 +320,7 @@ impl PreparedKind {
 impl std::fmt::Debug for PreparedKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PreparedKind::Builtin { tool, .. } => {
-                write!(f, "Builtin({})", tool.name())
-            }
-            PreparedKind::External { name, .. } => {
-                write!(f, "External({name})")
-            }
+            PreparedKind::Tool { name, .. } => write!(f, "Tool({name})"),
         }
     }
 }
@@ -622,7 +616,8 @@ mod global_scheduler_tests {
                 .is_err()
         );
         drop(first);
-        let _second = waiter.await.unwrap();
+        let second = waiter.await.unwrap();
+        drop(second);
 
         let unknown = scheduler
             .acquire(request(ToolAccess::WorkspaceUnknown), &cancel)
