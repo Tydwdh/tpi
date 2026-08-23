@@ -12,6 +12,7 @@ serde_json = "1"
 schemars = { version = "1.2", features = ["derive"] }
 tracing = "0.1"
 blake3 = "1"
+notify = "7"
 
 [dev-dependencies]
 tempfile = "3"

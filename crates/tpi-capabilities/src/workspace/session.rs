@@ -83,70 +83,17 @@ impl WorkspaceSession {
     /// Reconcile workspace after a command/bash execution.
     /// Detects which files changed since the last state, records mutations
     /// in the journal, and updates the persistent index.
+    ///
+    /// P2.3：唯一 delta→journal 转换点已下沉到
+    /// [`WorkspaceManager::reconcile_unknown_effect`]（watcher Healthy→增量
+    /// `reconcile_paths`，Uncertain/无 watcher→全量 `reconcile`）。此处仅委托。
     pub fn reconcile_after_execution(
         &self,
         cause: MutationCause,
         _workspace_root: &std::path::Path,
     ) -> Result<Reversibility, String> {
         let mut mgr = self.shared.lock().map_err(|e| e.to_string())?;
-
-        // Reconcile the index against current filesystem state.
-        let exclude: Vec<String> = Vec::new();
-        let delta = mgr.reconcile_index(&exclude).map_err(|e| e.to_string())?;
-
-        let total_changes = delta.created.len() + delta.modified.len() + delta.deleted.len();
-        if total_changes == 0 {
-            return Ok(Reversibility::Exact);
-        }
-
-        // Build WorkspaceMutations from the delta.
-        let mut mutations = Vec::new();
-        for (path, entry) in &delta.created {
-            if let Some(blob_id) = &entry.blob_id {
-                mutations.push(WorkspaceMutation::Create {
-                    path: path.clone(),
-                    content: blob_id.clone(),
-                });
-            }
-        }
-        for m in &delta.modified {
-            if let (Some(before_blob), Some(after_blob)) = (&m.before.blob_id, &m.after.blob_id) {
-                mutations.push(WorkspaceMutation::Modify {
-                    path: m.path.clone(),
-                    // preimage = 修改前的旧 blob。类型上 modify 必有 before，
-                    // 不再需要 BlobId("") sentinel。
-                    before: before_blob.clone(),
-                    after: after_blob.clone(),
-                });
-            } else {
-                tracing::warn!(
-                    path = %m.path,
-                    "workspace reconcile: 跳过一个无 blob 的 modified entry (kind={:?})",
-                    m.before.kind,
-                );
-            }
-        }
-        for d in &delta.deleted {
-            if let Some(content) = &d.before.blob_id {
-                mutations.push(WorkspaceMutation::Delete {
-                    path: d.path.clone(),
-                    // preimage = 删除前的旧 blob（undo 恢复原内容）。
-                    content: content.clone(),
-                });
-            } else {
-                tracing::warn!(
-                    path = %d.path,
-                    "workspace reconcile: 跳过一个无 blob 的 deleted entry (kind={:?})",
-                    d.before.kind,
-                );
-            }
-        }
-
-        // Begin and commit a transaction.
-        let handle = mgr.begin_transaction(cause).map_err(|e| e.to_string())?;
-        let tx_id = handle.tx_id().clone();
-        drop(handle);
-        mgr.commit_transaction(&tx_id, mutations)
+        mgr.reconcile_unknown_effect(cause)
             .map_err(|e| e.to_string())
     }
 }

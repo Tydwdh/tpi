@@ -12,7 +12,7 @@
 
 use super::blob::BlobStore;
 use super::checkpoint::Checkpoint;
-use super::index::WorkspaceIndex;
+use super::index::{IndexDelta, WorkspaceIndex};
 use super::journal::{JournalEntry, MutationJournal};
 use super::mutation::WorkspaceMutation;
 use super::policy::{
@@ -21,6 +21,8 @@ use super::policy::{
 };
 use super::transaction::{MutationCause, TransactionState, WorkspaceTransaction};
 use super::types::{CheckpointId, NormalizedPath, TransactionId};
+use super::watcher::{WatchState, WorkspaceWatcher};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Configuration for opening a workspace.
@@ -55,6 +57,9 @@ pub struct WorkspaceManager {
     active_transactions: Vec<WorkspaceTransaction>,
     /// Current checkpoint id (the latest committed state).
     current_checkpoint: Option<CheckpointId>,
+    /// Optional filesystem watcher (P2.x：watcher-assisted incremental tracking)。
+    /// None 表示未启用（打开时不自动附加；由调用方决定）。
+    watcher: Option<WorkspaceWatcher>,
 }
 
 impl WorkspaceManager {
@@ -122,6 +127,7 @@ impl WorkspaceManager {
             checkpoints,
             active_transactions: Vec::new(),
             current_checkpoint,
+            watcher: None,
         })
     }
 
@@ -483,6 +489,117 @@ impl WorkspaceManager {
             .map_err(|e| ManagerError::IndexInit(e.to_string()))
     }
 
+    /// 附加（取代已存在的）filesystem watcher。
+    /// watcher 生命周期属于本 manager（随 manager 存活），由调用方在 session
+    /// 初始化时调用一次——避免每次 bash 前后 start/stop 造成观察窗口漏洞。
+    pub fn attach_watcher(&mut self) -> Result<(), String> {
+        self.watcher = Some(WorkspaceWatcher::new(&self.root).map_err(|e| e.to_string())?);
+        Ok(())
+    }
+
+    /// 当前 watcher 信任状态（无 watcher 视为 Uncertain→全量 fallback）。
+    pub fn watcher_state(&self) -> WatchState {
+        self.watcher
+            .as_ref()
+            .map(|w| w.watch_state())
+            .unwrap_or(WatchState::Uncertain {
+                reason: "no watcher attached".into(),
+            })
+    }
+
+    /// 取走并清空 dirty paths（相对 workspace 规范化路径）。
+    pub fn take_dirty_paths(&self) -> HashSet<String> {
+        self.watcher
+            .as_ref()
+            .map(|w| w.take_dirty())
+            .unwrap_or_default()
+    }
+
+    /// P2.3：arbitrary effect（bash/terminal）后的统一 reconcile 入口。
+    ///
+    /// 策略：
+    /// - watcher Healthy + dirty 非空 → 增量 `reconcile_paths(dirty)`
+    /// - watcher Uncertain / 未 attach → 全量 `reconcile`
+    /// - **watcher Healthy + dirty 空 → 仍全量 `reconcile`**
+    ///
+    /// 为什么 healthy+dirty 空仍全量：bash 退出与最后一个 FS 事件到达之间存在
+    /// 竞态窗口——事件可能还没投递。且 dirty 语义是“必须检查”（invalidation
+    /// signal），不是“一定变了”。因此 watcher 永远只是**性能加速器**（收集到
+    /// dirty 时跳过全量 metadata scan），绝不能作为“无需 reconcile”的判据
+    /// （correctness oracle）。P1 保证全量 reconcile 不重 hash 未变文件，所以
+    /// 无论走哪条路，复杂度都不会退回 O(all bytes)。
+    pub fn reconcile_unknown_effect(
+        &mut self,
+        cause: MutationCause,
+    ) -> Result<Reversibility, ManagerError> {
+        let healthy = self.watcher_state() == WatchState::Healthy;
+        let dirty = self.take_dirty_paths();
+
+        let delta = if healthy && !dirty.is_empty() {
+            let paths: Vec<NormalizedPath> = dirty
+                .iter()
+                .map(|p| NormalizedPath::new(&self.root.join(p.as_str()), &self.root))
+                .collect();
+            self.reconcile_paths(&paths)?
+        } else {
+            // Uncertain / 无 watcher / healthy 但 dirty 空（竞态窗口）→ 全量 reconcile。
+            let exclude: Vec<String> = Vec::new();
+            self.reconcile_index(&exclude)?
+        };
+
+        self.commit_delta(cause, delta)
+    }
+
+    /// 把 reconcile 产出的 delta 转为 journal mutation 并提交。
+    /// 从 session 层下沉的唯一 delta→journal 转换点（单一事实源）。
+    pub(crate) fn commit_delta(
+        &mut self,
+        cause: MutationCause,
+        delta: IndexDelta,
+    ) -> Result<Reversibility, ManagerError> {
+        let created = delta.created.len();
+        let modified = delta.modified.len();
+        let deleted = delta.deleted.len();
+        if created + modified + deleted == 0 {
+            return Ok(Reversibility::Exact);
+        }
+
+        let mut mutations = Vec::new();
+        for (path, entry) in &delta.created {
+            if let Some(blob_id) = &entry.blob_id {
+                mutations.push(WorkspaceMutation::Create {
+                    path: path.clone(),
+                    content: blob_id.clone(),
+                });
+            }
+        }
+        for m in &delta.modified {
+            if let (Some(before_blob), Some(after_blob)) = (&m.before.blob_id, &m.after.blob_id) {
+                mutations.push(WorkspaceMutation::Modify {
+                    path: m.path.clone(),
+                    before: before_blob.clone(),
+                    after: after_blob.clone(),
+                });
+            }
+        }
+        for d in &delta.deleted {
+            if let Some(content) = &d.before.blob_id {
+                mutations.push(WorkspaceMutation::Delete {
+                    path: d.path.clone(),
+                    content: content.clone(),
+                });
+            }
+        }
+
+        if mutations.is_empty() {
+            return Ok(Reversibility::Exact);
+        }
+        let handle = self.begin_transaction(cause)?;
+        let tx_id = handle.tx_id().clone();
+        drop(handle);
+        self.commit_transaction(&tx_id, mutations)
+    }
+
     /// Workspace root directory.
     pub fn root(&self) -> &Path {
         &self.root
@@ -701,5 +818,80 @@ mod tests {
                 other => panic!("expected undo applied, got {other:?}"),
             }
         }
+    }
+
+    /// P2.3：无 watcher → `reconcile_unknown_effect` 走全量 fallback，
+    /// 正确识别外部文件修改并写入 journal（可 undo）。
+    #[test]
+    fn reconcile_unknown_effect_no_watcher_full_scan() {
+        let (_root, workspace, artifacts) = setup_workspace();
+        let mut mgr =
+            WorkspaceManager::open(&workspace, "s1", &artifacts, WorkspaceConfig::default())
+                .unwrap();
+        // 先建立 index 基准。
+        mgr.reconcile_index(&[]).unwrap();
+
+        std::fs::write(workspace.join("hello.txt"), b"overwritten").unwrap();
+        let rev = mgr
+            .reconcile_unknown_effect(MutationCause::Command {
+                command_id: "bash-1".into(),
+            })
+            .unwrap();
+        assert!(rev.is_exact());
+
+        // journal 记录了一条 Modify（带 before preimage）。
+        let state = mgr.journal.load().unwrap();
+        assert_eq!(state.entries.len(), 1);
+        let m = &state.entries[0].mutations[0];
+        assert!(matches!(m, WorkspaceMutation::Modify { .. }));
+
+        // undo 恢复原始字节。
+        if state.entries[0].reversibility.is_exact() {
+            let tx = state.entries[0].transaction_id.clone();
+            let res = mgr.undo(&tx).unwrap();
+            assert!(matches!(res, UndoResult::Applied { .. }));
+            assert_eq!(
+                std::fs::read(workspace.join("hello.txt")).unwrap(),
+                b"hello world"
+            );
+        }
+    }
+
+    /// P2.3：attach watcher 后，bash 写入 → 事件 → `reconcile_unknown_effect`
+    /// 走增量 `reconcile_paths`（healthy + dirty 非空）。容忍平台事件延迟：
+    /// 若事件未及时到达则走 unhealthy→全量 fallback，两种路径结果一致（都记录
+    /// mutation）——这正好验证“watcher 只是加速器，不影响 correctness”。
+    #[test]
+    fn reconcile_unknown_effect_with_watcher_is_consistent() {
+        let (_root, workspace, artifacts) = setup_workspace();
+        let mut mgr =
+            WorkspaceManager::open(&workspace, "s2", &artifacts, WorkspaceConfig::default())
+                .unwrap();
+        mgr.reconcile_index(&[]).unwrap();
+        mgr.attach_watcher().unwrap();
+
+        // sleep 让 watcher 就绪（平台差异，放宽）。
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::fs::write(workspace.join("config.toml"), b"[section]\nkey = 2").unwrap();
+        // 等 watcher 事件（≤2s）。
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let rev = mgr
+            .reconcile_unknown_effect(MutationCause::Command {
+                command_id: "bash-w".into(),
+            })
+            .unwrap();
+        assert!(rev.is_exact(), "无论增量/全量都应 Exact");
+
+        // 该 mutation 必须进 journal（config.toml 被修改）。
+        let state = mgr.journal.load().unwrap();
+        assert!(
+            state.entries.iter().any(|e| {
+                e.mutations.iter().any(|m| {
+                    matches!(m, WorkspaceMutation::Modify { path, .. } if path.as_str() == "config.toml")
+                })
+            }),
+            "journal 必须记录 config.toml 的修改"
+        );
     }
 }
