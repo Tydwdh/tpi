@@ -88,23 +88,34 @@ async fn do_open(
     } else {
         "/bin/sh".into()
     };
-    let workspace =
+    let resources = ctx.resource_manager();
+    let rows = rows.unwrap_or(24);
+    let cols = cols.unwrap_or(80);
+    let resource_meta = ctx.resource_meta(lifetime, WorkspaceAccess::ExternallyMutable);
+    let result = if let Some(workspace_session) = ctx.workspace_session.clone() {
+        resources.open_terminal(
+            &shell,
+            ctx.workspace_root.as_std_path(),
+            rows,
+            cols,
+            Some(workspace_session),
+            resource_meta,
+        )
+    } else {
         match crate::workspace::tracked::TrackedWorkspace::capture(ctx.workspace_root.clone()) {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                return outcome("terminal", Err(format!("workspace_tracking: {error}")));
-            }
-        };
-    let result = ctx.resource_manager().open_terminal(
-        &shell,
-        ctx.workspace_root.as_std_path(),
-        rows.unwrap_or(24),
-        cols.unwrap_or(80),
-        workspace,
-        ctx.artifacts_root.clone(),
-        ctx.session_id.clone(),
-        ctx.resource_meta(lifetime, WorkspaceAccess::ExternallyMutable),
-    );
+            Ok(workspace) => resources.open_tracked_terminal(
+                &shell,
+                ctx.workspace_root.as_std_path(),
+                rows,
+                cols,
+                workspace,
+                ctx.artifacts_root.clone(),
+                ctx.session_id.clone(),
+                resource_meta,
+            ),
+            Err(error) => Err(format!("workspace_tracking: {error}")),
+        }
+    };
     outcome(
         "terminal",
         result.map(|id| format!("action: open\nstatus: opened\nterminal_id: {id}")),

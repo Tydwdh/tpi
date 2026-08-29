@@ -3,7 +3,8 @@
 //! §6.2 一轮的精确算法：接收用户消息 → append UserSubmitted → 构建 context →
 //! 发起一次 provider request → 消费规范化 stream → 原子提交 assistant message →
 //! 若有 tool calls：校验、调度执行、按原 index 回填 tool messages → 再次请求；
-//! 若无 tool call 且 finish=stop，立即完成 run，绝不追加第二次模型请求（§3.2 不变量 2）。
+//! 若无 tool call 且 finish=stop 且有可见正文，立即完成 run；只有 provider
+//! 空正文 stop 时才会进行一次受限恢复请求。
 
 use std::path::PathBuf;
 
@@ -79,6 +80,13 @@ const MANUAL_CONTINUE_INSTRUCTION: &str = "\
 The previous assistant response did not complete successfully.
 Continue it from the exact point where it stopped.
 Do not restart, summarize, or repeat text already present in the conversation.";
+
+/// reasoning 模型有时会只输出隐藏推理就以 `stop` 结束；这不构成用户可见答案。
+const MAX_EMPTY_FINAL_RECOVERIES: u32 = 1;
+const EMPTY_FINAL_RECOVERY_INSTRUCTION: &str = "\
+Your previous response ended without any user-visible final answer.
+Continue the task from the current tool results. When the task is complete, provide
+a concise visible final answer to the user; do not end with reasoning only.";
 
 const MIN_RECOVERY_OVERLAP_BYTES: usize = 8;
 
@@ -591,6 +599,8 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
     let mut progress = tpi_capabilities::tool::scheduler::ProgressTracker::default();
     // §15.4：同一阈值区间内 compaction 失败后不反复调用模型。
     let mut compaction_failed = false;
+    // 只允许一次空最终答复恢复；成功工具批后复位。
+    let mut empty_final_recoveries = 0u32;
     let final_reason: CompletionReason = 'run_loop: loop {
         // §用户诉求：max_model_turns=0 = 不限制（默认）。
         if agent_cfg.limits.max_model_turns > 0 && turn >= agent_cfg.limits.max_model_turns {
@@ -727,6 +737,8 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
                 Some(STREAM_RECOVERY_INSTRUCTION.replace("{partial}", &content))
             } else if manual_retry_continuation && turn == 1 {
                 Some(MANUAL_CONTINUE_INSTRUCTION.to_string())
+            } else if empty_final_recoveries > 0 {
+                Some(EMPTY_FINAL_RECOVERY_INSTRUCTION.to_string())
             } else {
                 None
             };
@@ -1097,6 +1109,35 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
             "model turn completed"
         );
 
+        // reasoning-only 的 stop 没有给用户任何最终答复。不要把空 assistant
+        // turn 写进 durable transcript；否则重试会变成连续 assistant 消息，
+        // UI 也会错误显示“run 完成”。
+        if response.tool_calls.is_empty()
+            && response.finish_reason == crate::provider::FinishReason::Stop
+            && content.trim().is_empty()
+        {
+            if empty_final_recoveries < MAX_EMPTY_FINAL_RECOVERIES {
+                empty_final_recoveries += 1;
+                tracing::warn!(
+                    turn,
+                    "provider stopped without a visible final answer; retrying"
+                );
+                continue;
+            }
+            cleanup_resources_before_terminal(
+                &tool_runtime,
+                crate::agent::manager::AgentState::Completed,
+            )
+            .await;
+            session
+                .commit_terminal(&SessionEvent::RunCompleted {
+                    reason: CompletionReason::Error,
+                    usage: usage_total,
+                })
+                .map_err(|e| RunFailure::Session(e.to_string()))?;
+            break 'run_loop CompletionReason::Error;
+        }
+
         // 5. 原子提交 assistant turn（durable boundary，§14.2）。
         // P0-2：即使 content 为空（纯 tool-call 轮）也必须提交——assistant turn
         // 是 provider 协议的最小原子单元，缺失会导致 resume 重建出非法消息序列。
@@ -1119,6 +1160,7 @@ async fn run_inner<P: Provider, S: tpi_session::store::SessionStore>(
 
         // 6. 工具调用（§12.2 batch 调度）。
         if !response.tool_calls.is_empty() {
+            empty_final_recoveries = 0;
             let batch = ToolBatchExecutor::<'_, _>::new(
                 config,
                 session,

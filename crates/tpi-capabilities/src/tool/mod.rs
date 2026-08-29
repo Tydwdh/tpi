@@ -44,21 +44,41 @@ pub(crate) fn schema_value<T: schemars::JsonSchema>(tool: &'static str) -> serde
     }
 }
 
-/// 统一工具 parameters 的 schema invariant（§协议）：`type: object` 的 schema
-/// **必须始终带 `properties`**（min：空 `{}`）。
+/// 统一工具 parameters 的 schema invariant（§协议）：根节点必须是
+/// `type: object`，且 **必须始终带 `properties`**（min：空 `{}`）。
 ///
 /// schemars 对无字段结构体（如 `InspectArgs {}`）只生成 `{"type":"object"}`，
 /// **没有 `properties`**。LM Studio 0.4.x 等严格 validator（LMStudio issue
 /// #2203）在 `function.parameters.properties` 缺失时报 HTTP 400，而 DeepSeek/
 /// OpenAI 等宽松 provider 接受该缺省——schema 不合法被掩饰，直到遇到严格
 /// 端才暴露。这里把该 invariant 集中收敛：所有工具（含无参数工具）发出的
-/// parameters 都是合法 JSON Schema。
+/// parameters 都是 LM Studio/OpenAI function calling 可接受的 JSON Schema。
+///
+/// `TerminalArgs` 等 tagged union 在 schemars 中会生成为 root `oneOf`，其
+/// 每个分支都是 object，但 root 本身没有 `type`。这在通用 JSON Schema 中
+/// 合法，LM Studio 的 function 参数校验器却要求 root `type` 严格为
+/// `"object"`。为全 object 的 union 补 root discriminator 不改变 union
+/// 的实际约束。
 fn normalize_tool_parameters(schema: serde_json::Value) -> serde_json::Value {
     let mut schema = match schema {
         serde_json::Value::Object(map) => map,
         other => return other,
     };
-    if schema.get("type").and_then(|t| t.as_str()) == Some("object") {
+    let has_object_root = schema.get("type").and_then(|t| t.as_str()) == Some("object");
+    let has_object_union = schema.get("type").is_none()
+        && schema
+            .get("oneOf")
+            .and_then(|variants| variants.as_array())
+            .is_some_and(|variants| {
+                !variants.is_empty()
+                    && variants.iter().all(|variant| {
+                        variant.get("type").and_then(|ty| ty.as_str()) == Some("object")
+                    })
+            });
+    if has_object_root || has_object_union {
+        schema
+            .entry("type")
+            .or_insert_with(|| serde_json::json!("object"));
         schema
             .entry("properties")
             .or_insert_with(|| serde_json::json!({}));
@@ -1145,6 +1165,13 @@ mod tests {
             assert!(
                 params.is_object(),
                 "{}/{} 参数 schema 必须是 object: {params}",
+                tool.name(),
+                def.name
+            );
+            assert_eq!(
+                params.get("type"),
+                Some(&serde_json::json!("object")),
+                "{}/{} 的 parameters 根 type 必须严格为 object（OpenAI/LM Studio function calling 要求）: {params}",
                 tool.name(),
                 def.name
             );

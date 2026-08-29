@@ -11,7 +11,6 @@ use tpi_core::resource::{AgentIdentity, ResourceLifetime, ResourceMeta};
 
 use crate::process::managed::{ManagedProcess, ManagedProcessState, ProcessId, ProcessRegistry};
 use crate::terminal::{TerminalRead, TerminalRegistry};
-use crate::workspace::tracked::TrackedWorkspace;
 
 pub type SharedResourceManager = Arc<ResourceManager>;
 
@@ -131,14 +130,37 @@ impl ResourceManager {
             .collect()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn open_terminal(
         &self,
         program: &str,
         cwd: &std::path::Path,
         rows: u16,
         cols: u16,
-        workspace: TrackedWorkspace,
+        workspace_session: Option<std::sync::Arc<crate::workspace::session::WorkspaceSession>>,
+        resource_meta: ResourceMeta,
+    ) -> Result<String, String> {
+        tpi_core::util::lock_mutex(&self.terminals, "terminal_registry")
+            .open_with_workspace_session_meta(
+                program,
+                cwd,
+                rows,
+                cols,
+                workspace_session,
+                resource_meta,
+            )
+    }
+
+    /// Compatibility boundary for embedded/low-level tool contexts that do
+    /// not own a persistent `WorkspaceSession`. Normal runtimes should use
+    /// `open_terminal` so PTY creation never requires another full snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_tracked_terminal(
+        &self,
+        program: &str,
+        cwd: &std::path::Path,
+        rows: u16,
+        cols: u16,
+        workspace: crate::workspace::tracked::TrackedWorkspace,
         artifacts_root: std::path::PathBuf,
         session_id: String,
         resource_meta: ResourceMeta,
@@ -293,6 +315,7 @@ impl ResourceManager {
     /// Session shutdown boundary: cancel every active process and close every
     /// terminal after the runtime has stopped accepting new work.
     pub async fn shutdown(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
         let process_ids = {
             let registry = tpi_core::util::lock_mutex(&self.processes, "process_registry");
             registry
@@ -302,12 +325,18 @@ impl ResourceManager {
                 .collect::<Vec<_>>()
         };
         for id in &process_ids {
+            // `false` can mean the process won the race and already became
+            // terminal; the wait below is the authoritative outcome check.
             let _ = tpi_core::util::lock_mutex(&self.processes, "process_registry").cancel(*id);
         }
         for id in process_ids {
-            let _ =
-                crate::process::managed::wait_process(&self.processes, id, Duration::from_secs(5))
-                    .await;
+            match crate::process::managed::wait_process(&self.processes, id, Duration::from_secs(5))
+                .await
+            {
+                Some(state) if state.is_terminal() => {}
+                Some(state) => errors.push(format!("resource {id} did not stop: {state:?}")),
+                None => errors.push(format!("resource {id} disappeared before shutdown")),
+            }
         }
         let terminal_ids = {
             let registry = tpi_core::util::lock_mutex(&self.terminals, "terminal_registry");
@@ -315,9 +344,15 @@ impl ResourceManager {
         };
         let mut registry = tpi_core::util::lock_mutex(&self.terminals, "terminal_registry");
         for id in terminal_ids {
-            let _ = registry.close_with_checkpoint(&id);
+            if let Err(error) = registry.close_with_checkpoint(&id) {
+                errors.push(format!("terminal {id} cleanup failed: {error}"));
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 }
 
@@ -400,5 +435,81 @@ mod tests {
             .unwrap();
 
         assert!(manager.process(&identity(other), id).is_some());
+    }
+
+    #[test]
+    fn terminal_open_does_not_take_a_legacy_full_workspace_snapshot() {
+        let workspace = tempfile::tempdir().unwrap();
+        // A sparse file over the retired 64 MiB snapshot cap. Opening a
+        // terminal must inspect neither its contents nor its size; mutation
+        // tracking is delegated to WorkspaceSession checkpoints instead.
+        std::fs::File::create(workspace.path().join("large-generated.bin"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+        let shell = if cfg!(windows) {
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
+        } else {
+            "/bin/sh".into()
+        };
+        let manager = ResourceManager::new();
+        let owner = AgentId::new_v7();
+        let id = manager
+            .open_terminal(
+                &shell,
+                workspace.path(),
+                24,
+                80,
+                None,
+                meta(owner, ResourceLifetime::Agent),
+            )
+            .expect("large workspace must not prevent terminal creation");
+
+        manager.close_terminal(&identity(owner), &id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tracked_terminal_cleanup_commits_final_workspace_delta() {
+        let workspace = tempfile::tempdir().unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let workspace_root = camino::Utf8PathBuf::from_path_buf(workspace.path().to_path_buf())
+            .expect("temporary workspace path must be UTF-8");
+        let tracked = crate::workspace::tracked::TrackedWorkspace::capture(workspace_root).unwrap();
+        let shell = if cfg!(windows) {
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
+        } else {
+            "/bin/sh".into()
+        };
+        let manager = ResourceManager::new();
+        let owner = AgentId::new_v7();
+        manager
+            .open_tracked_terminal(
+                &shell,
+                workspace.path(),
+                24,
+                80,
+                tracked,
+                artifacts.path().to_path_buf(),
+                "terminal-session".into(),
+                meta(owner, ResourceLifetime::Agent),
+            )
+            .unwrap();
+
+        std::fs::write(workspace.path().join("created-by-terminal.txt"), "tracked").unwrap();
+        manager.cleanup_agent(owner).await.unwrap();
+
+        let journal = tpi_session::journal::load_journal(&tpi_session::journal::journal_path(
+            artifacts.path(),
+            "terminal-session",
+        ))
+        .unwrap();
+        assert!(journal.mutations.iter().any(|mutation| {
+            mutation.files.iter().any(|file| {
+                file.path.ends_with("created-by-terminal.txt")
+                    && !file.before_exists
+                    && file.after_exists
+                    && file.after_content == b"tracked"
+            })
+        }));
     }
 }

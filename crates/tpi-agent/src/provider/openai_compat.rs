@@ -264,20 +264,35 @@ fn message_to_json(message: &ChatMessage) -> serde_json::Value {
     }
 }
 
-/// 协议 invariant 兜底（§provider 边界）：`type: object` 的 tool parameters
-/// **必须始终带 `properties`**（min：空 `{}`）。
+/// 协议 invariant 兜底（§provider 边界）：function parameters 的根节点必须是
+/// `type: object`，且 **必须始终带 `properties`**（min：空 `{}`）。
 ///
 /// schemars 对空结构体只生成 `{"type":"object"}`（见 capabilities 层
 /// [`normalize_tool_parameters`]），本处作为发往 provider 前的最终防线：
 /// 即便某些工具来源（第三方/MCP/手写 adapter）返回了缺 `properties` 的
-/// object schema，也不会触发 LM Studio 0.4.x 等严格 validator 的 HTTP 400
-/// （`function.parameters.properties` required）。非 object 参数原样透传。
+/// object schema，也不会触发 LM Studio 等严格 validator 的 HTTP 400。
+/// tagged union 若所有 `oneOf` 分支都是 object，也可安全补根 type；其他
+/// 非 object schema 原样透传，交由注册边界或 provider 给出明确错误。
 fn normalize_parameters(parameters: &serde_json::Value) -> serde_json::Value {
     let mut value = match parameters {
         serde_json::Value::Object(map) => map.clone(),
         other => return other.clone(),
     };
-    if value.get("type").and_then(|t| t.as_str()) == Some("object") {
+    let has_object_root = value.get("type").and_then(|t| t.as_str()) == Some("object");
+    let has_object_union = value.get("type").is_none()
+        && value
+            .get("oneOf")
+            .and_then(|variants| variants.as_array())
+            .is_some_and(|variants| {
+                !variants.is_empty()
+                    && variants.iter().all(|variant| {
+                        variant.get("type").and_then(|ty| ty.as_str()) == Some("object")
+                    })
+            });
+    if has_object_root || has_object_union {
+        value
+            .entry("type")
+            .or_insert_with(|| serde_json::json!("object"));
         value
             .entry("properties")
             .or_insert_with(|| serde_json::json!({}));
@@ -320,7 +335,9 @@ struct SseChoice {
 struct SseDelta {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    /// OpenAI-compatible providers commonly use `reasoning_content`; LM Studio
+    /// streams gpt-oss reasoning under `reasoning` instead.
+    #[serde(default, alias = "reasoning")]
     reasoning_content: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_vec")]
     tool_calls: Vec<SseToolCallDelta>,
@@ -1626,6 +1643,17 @@ mod tests {
         // 字段完全缺失仍默认空（原有行为不回退）。
         let chunk: SseChunk = serde_json::from_str(r#"{}"#).expect("缺字段默认");
         assert!(chunk.choices.is_empty());
+    }
+
+    #[test]
+    fn sse_chunk_accepts_lm_studio_reasoning_field() {
+        let chunk: SseChunk =
+            serde_json::from_str(r#"{"choices":[{"delta":{"reasoning":"先分析问题"}}]}"#)
+                .expect("LM Studio reasoning 字段应可解析");
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("先分析问题")
+        );
     }
 
     #[test]

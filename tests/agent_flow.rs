@@ -84,6 +84,53 @@ async fn finish_stop_without_tool_calls_completes_run_without_second_request() {
 }
 
 #[tokio::test]
+async fn empty_stop_is_retried_once_instead_of_being_reported_as_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+    let config = test_config(&workspace);
+    let mut provider = FakeProvider::new(vec![FakeResponse::text(""), FakeResponse::text("done")]);
+    let mut session = SessionLog::create(
+        &config.sessions_root,
+        workspace.as_std_path(),
+        RunId::new_v7(),
+    )
+    .expect("create session");
+    let (tx, _rx) = mpsc::channel(16);
+
+    let outcome = agent::run(
+        &mut provider,
+        &mut session,
+        &config,
+        agent::RunInput {
+            history: &[],
+            user_message: "hi".into(),
+            ui: tx,
+            cancel: CancellationToken::new(),
+            interactive: true,
+            force_compaction: false,
+            workspace: None,
+            registry: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi::tool::registry::builtin_registry(),
+            )),
+            resources: std::sync::Arc::new(tpi::resource::ResourceManager::new()),
+            agents: std::sync::Arc::new(std::sync::Mutex::new(
+                tpi_agent::agent::manager::AgentManager::new(),
+            )),
+        },
+    )
+    .await
+    .expect("run succeeds after recovery");
+
+    assert_eq!(provider.request_count, 2);
+    assert_eq!(outcome.reason, CompletionReason::Stop);
+    assert_eq!(outcome.assistant_text, "done");
+    assert!(provider.requests[1]
+        .messages
+        .iter()
+        .any(|message| matches!(message, ChatMessage::System(text) if text.contains("without any user-visible final answer"))));
+}
+
+#[tokio::test]
 async fn tool_call_loop_terminates_and_reports_completion() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();

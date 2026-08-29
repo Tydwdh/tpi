@@ -21,6 +21,9 @@ struct Terminal {
     output: Arc<Mutex<Output>>,
     workspace: Option<crate::workspace::tracked::TrackedWorkspace>,
     journal: Option<(std::path::PathBuf, String)>,
+    /// Production terminals share the persistent incremental workspace
+    /// tracker; the legacy full snapshot is retained for low-level callers.
+    workspace_session: Option<std::sync::Arc<crate::workspace::session::WorkspaceSession>>,
     resource_meta: Option<tpi_core::resource::ResourceMeta>,
 }
 #[derive(Default)]
@@ -43,7 +46,7 @@ impl TerminalRegistry {
         rows: u16,
         cols: u16,
     ) -> Result<String, String> {
-        self.open_inner(program, cwd, rows, cols, None, None, None)
+        self.open_inner(program, cwd, rows, cols, None, None, None, None)
     }
 
     /// Open a PTY with a workspace snapshot owned for the whole terminal
@@ -67,6 +70,7 @@ impl TerminalRegistry {
             cols,
             Some(workspace),
             Some((artifacts_root, session_id)),
+            None,
             None,
         )
     }
@@ -93,6 +97,32 @@ impl TerminalRegistry {
             Some(workspace),
             Some((artifacts_root, session_id)),
             Some(resource_meta),
+            None,
+        )
+    }
+
+    /// Open an agent-facing terminal backed by the shared workspace session.
+    /// This avoids taking a second full in-memory workspace snapshot merely to
+    /// create a PTY; that snapshot had a smaller, unrelated budget and could
+    /// reject otherwise usable workspaces before the terminal was started.
+    pub fn open_with_workspace_session_meta(
+        &mut self,
+        program: &str,
+        cwd: &std::path::Path,
+        rows: u16,
+        cols: u16,
+        workspace_session: Option<std::sync::Arc<crate::workspace::session::WorkspaceSession>>,
+        resource_meta: tpi_core::resource::ResourceMeta,
+    ) -> Result<String, String> {
+        self.open_inner(
+            program,
+            cwd,
+            rows,
+            cols,
+            None,
+            None,
+            Some(resource_meta),
+            workspace_session,
         )
     }
 
@@ -106,6 +136,7 @@ impl TerminalRegistry {
         workspace: Option<crate::workspace::tracked::TrackedWorkspace>,
         journal: Option<(std::path::PathBuf, String)>,
         resource_meta: Option<tpi_core::resource::ResourceMeta>,
+        workspace_session: Option<std::sync::Arc<crate::workspace::session::WorkspaceSession>>,
     ) -> Result<String, String> {
         if self.terminals.len() >= MAX_TERMINALS {
             return Err(format!(
@@ -178,6 +209,7 @@ impl TerminalRegistry {
                 output,
                 workspace,
                 journal,
+                workspace_session,
                 resource_meta,
             },
         );
@@ -221,9 +253,19 @@ impl TerminalRegistry {
             .terminals
             .get_mut(id)
             .ok_or_else(|| "terminal not found".to_string())?;
-        match &mut terminal.workspace {
-            Some(workspace) => workspace.commit(artifacts, session),
-            None => Ok(0),
+        if let Some(workspace_session) = &terminal.workspace_session {
+            workspace_session
+                .reconcile_after_execution(
+                    tpi_core::workspace::transaction::MutationCause::Terminal {
+                        terminal_id: id.to_owned(),
+                    },
+                )
+                .map(|_| 0)
+        } else {
+            match &mut terminal.workspace {
+                Some(workspace) => workspace.commit(artifacts, session),
+                None => Ok(0),
+            }
         }
     }
     pub fn read(&self, id: &str, after: u64) -> Result<TerminalRead, String> {
@@ -278,6 +320,31 @@ impl TerminalRegistry {
     /// is the cleanup path used by `ResourceManager`; a raw `close` remains a
     /// low-level operation for callers that already checkpointed explicitly.
     pub fn close_with_checkpoint(&mut self, id: &str) -> Result<(), String> {
+        // Stop further writes before observing the final workspace state. The
+        // previous checkpoint-before-kill order allowed the PTY child to race
+        // a mutation into the gap and leave it outside the journal.
+        let terminal = self
+            .terminals
+            .get_mut(id)
+            .ok_or_else(|| "terminal not found".to_string())?;
+        let still_running = terminal
+            .child
+            .try_wait()
+            .map_err(|error| format!("terminal status: {error}"))?
+            .is_none();
+        if still_running {
+            terminal
+                .child
+                .kill()
+                .map_err(|error| format!("terminal signal: {error}"))?;
+        }
+        if self
+            .terminals
+            .get(id)
+            .is_some_and(|terminal| terminal.workspace_session.is_some())
+        {
+            self.checkpoint_workspace(id, std::path::Path::new(""), "")?;
+        }
         let journal = self
             .terminals
             .get(id)
@@ -285,13 +352,23 @@ impl TerminalRegistry {
         if let Some((artifacts_root, session_id)) = journal {
             self.checkpoint_workspace(id, &artifacts_root, &session_id)?;
         }
-        self.close(id)
+        self.terminals.remove(id);
+        Ok(())
     }
 }
 impl Drop for TerminalRegistry {
     fn drop(&mut self) {
-        for t in self.terminals.values_mut() {
+        for (id, t) in &mut self.terminals {
             let _ = t.child.kill();
+            if let Some(workspace_session) = &t.workspace_session
+                && let Err(error) = workspace_session.reconcile_after_execution(
+                    tpi_core::workspace::transaction::MutationCause::Terminal {
+                        terminal_id: id.clone(),
+                    },
+                )
+            {
+                tracing::error!(%error, terminal = %id, "terminal workspace reconcile failed during shutdown");
+            }
             if let (Some(workspace), Some((artifacts_root, session_id))) =
                 (&mut t.workspace, &t.journal)
                 && let Err(error) = workspace.commit(artifacts_root, session_id)

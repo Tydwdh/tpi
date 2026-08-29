@@ -35,56 +35,51 @@ impl<'a> ContextParts<'a> {
     /// 构造最终 request messages。
     ///
     /// 顺序：
-    /// 1. System prompt（base + ephemeral 合并）
-    /// 2. Workspace identity（turn snapshot）
-    /// 3. Subagent reports（dynamic）
-    /// 4. Transcript（conversation history）
-    /// 5. Process snapshot（turn snapshot）
-    /// 6. Goal context（turn snapshot）
+    /// 1. 唯一的开头 System message（base + 所有 harness overlay）
+    /// 2. Transcript（conversation history）
+    ///
+    /// 一些严格的 chat template（如 Qwen）要求 system 只能位于对话开头。
+    /// 所有内部 overlay 必须合并到同一条 system message，不能插在 tool/
+    /// assistant 历史之后。
     pub fn build(&self) -> Vec<ChatMessage> {
-        let mut out = Vec::with_capacity(self.transcript.len() + 6);
+        let mut out = Vec::with_capacity(self.transcript.len() + 1);
+        let mut system = build_system_prompt(self.base_prompt, self.dynamic.ephemeral_system);
 
-        // 1. System prompt（base + ephemeral 合并）
-        out.push(ChatMessage::System(build_system_prompt(
-            self.base_prompt,
-            self.dynamic.ephemeral_system,
-        )));
-
-        // 2. Workspace identity（turn snapshot）
+        // Workspace identity（turn snapshot）
         let ws = &self.turn.workspace;
-        out.push(ChatMessage::System(format!(
-            "[当前 workspace]\nWorkspace: {}\nShell cwd: {}\n\n（工作区状态由 harness 管理，无需模型自行执行 ssh/cd 确认。）",
+        system.push_str(&format!(
+            "\n\n[当前 workspace]\nWorkspace: {}\nShell cwd: {}\n\n（工作区状态由 harness 管理，无需模型自行执行 ssh/cd 确认。）",
             ws.id, ws.cwd,
-        )));
+        ));
 
-        // 3. Subagent reports（dynamic overlay）
+        // Subagent reports（dynamic overlay）
         if let Some(reports) = self.dynamic.pending_reports
             && !reports.is_empty()
         {
-            out.push(ChatMessage::System(format!(
-                "[子代理报告]（以下为后台调查的最新结果；用 `agent` 工具查看/等待更多详情）：\n{reports}"
-            )));
+            system.push_str(&format!(
+                "\n\n[子代理报告]（以下为后台调查的最新结果；用 `agent` 工具查看/等待更多详情）：\n{reports}"
+            ));
         }
 
-        // 4. Transcript（conversation history）
-        out.extend_from_slice(self.transcript);
-
-        // 5. Process snapshot（turn snapshot）
+        // Process snapshot（turn snapshot）
         if let Some(snapshot) = &self.turn.process_snapshot {
-            out.push(ChatMessage::System(format!(
-                "[Managed processes]\n{snapshot}\n\n（后台进程由 TPI 管理；需要结果时用 `process` wait/status，不要频繁轮询）"
-            )));
+            system.push_str(&format!(
+                "\n\n[Managed processes]\n{snapshot}\n\n（后台进程由 TPI 管理；需要结果时用 `process` wait/status，不要频繁轮询）"
+            ));
         }
 
-        // 6. Goal context（turn snapshot）
+        // Goal context（turn snapshot）
         if let Some(ctx) = self
             .turn
             .goal
             .and_then(|g| tpi_core::goal::goal_context(Some(g)))
         {
-            out.push(ChatMessage::System(ctx));
+            system.push_str("\n\n");
+            system.push_str(&ctx);
         }
 
+        out.push(ChatMessage::System(system));
+        out.extend_from_slice(self.transcript);
         out
     }
 }
@@ -218,5 +213,50 @@ mod tests {
         };
         assert!(system_msg.contains("base prompt"));
         assert!(system_msg.contains("ephemeral instruction"));
+    }
+
+    #[test]
+    fn build_emits_only_one_leading_system_message() {
+        let g = build_goal("finish task", None).unwrap();
+        let tc = TurnContext::new(Some(&g), make_ws(), Some("p42: running".to_string()));
+        let transcript = vec![
+            ChatMessage::User("do work".into()),
+            ChatMessage::Assistant {
+                content: "working".into(),
+                tool_calls: Vec::new(),
+            },
+        ];
+        let parts = ContextParts {
+            base_prompt: "base",
+            turn: &tc,
+            dynamic: DynamicContext {
+                pending_reports: Some("child report"),
+                ephemeral_system: Some("retry now"),
+            },
+            transcript: &transcript,
+        };
+        let messages = parts.build();
+        assert!(matches!(messages.first(), Some(ChatMessage::System(_))));
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, ChatMessage::System(_)))
+                .count(),
+            1,
+            "严格模板只能收到唯一的开头 system message"
+        );
+        let ChatMessage::System(system) = &messages[0] else {
+            unreachable!()
+        };
+        for expected in [
+            "base",
+            "retry now",
+            "当前 workspace",
+            "child report",
+            "p42: running",
+            "finish task",
+        ] {
+            assert!(system.contains(expected), "missing {expected:?}: {system}");
+        }
     }
 }

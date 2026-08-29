@@ -444,9 +444,13 @@ pub struct BackgroundStartRequest {
     pub command: String,
     pub artifacts_root: std::path::PathBuf,
     pub session_id: String,
-    /// Optional workspace snapshot owned by the drain task. It is committed
-    /// only after the child reaches a terminal state, so long-running jobs do
-    /// not bypass the mutation journal.
+    /// Shared persistent workspace tracker. It is reconciled only after the
+    /// child reaches a terminal state, so long-running jobs do not bypass the
+    /// mutation journal or require a second full workspace snapshot.
+    pub workspace_session: Option<std::sync::Arc<crate::workspace::session::WorkspaceSession>>,
+    /// Compatibility fallback for callers that do not construct a full
+    /// `WorkspaceSession`. Production runtimes leave this `None` and use the
+    /// shared incremental tracker above.
     pub workspace_tracker: Option<crate::workspace::tracked::TrackedWorkspace>,
     /// Session-scoped resource owner. The request deliberately does not accept
     /// a child-local registry, so background processes cannot escape the
@@ -470,6 +474,7 @@ pub async fn start_background(request: BackgroundStartRequest) -> Result<Process
         command,
         artifacts_root,
         session_id,
+        workspace_session,
         workspace_tracker,
         resources,
         resource_meta,
@@ -493,6 +498,7 @@ pub async fn start_background(request: BackgroundStartRequest) -> Result<Process
             command: String::new(),
             artifacts_root,
             session_id,
+            workspace_session,
             workspace_tracker,
             resources,
             resource_meta,
@@ -522,6 +528,7 @@ fn spawn_drain(
             command: _,
             artifacts_root,
             session_id,
+            workspace_session,
             workspace_tracker,
             resources,
             resource_meta: _resource_meta,
@@ -534,6 +541,7 @@ fn spawn_drain(
             started_tx,
             &artifacts_root,
             &session_id,
+            workspace_session,
             workspace_tracker,
         )
         .await
@@ -561,6 +569,7 @@ async fn drain_loop(
     started_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     artifacts_root: &std::path::Path,
     session_id: &str,
+    workspace_session: Option<std::sync::Arc<crate::workspace::session::WorkspaceSession>>,
     mut workspace_tracker: Option<crate::workspace::tracked::TrackedWorkspace>,
 ) -> Result<(), String> {
     let cancel = {
@@ -742,13 +751,21 @@ async fn drain_loop(
             Some(reference),
         );
     }
-    if let Some(tracker) = workspace_tracker.as_mut()
+    if let Some(workspace_session) = workspace_session {
+        if let Err(error) = workspace_session.reconcile_after_execution(
+            tpi_core::workspace::transaction::MutationCause::Job {
+                process_id: id.to_string(),
+            },
+        ) {
+            // The process is already terminal; preserve its real lifecycle state
+            // and record the journal failure as a high-severity diagnostic rather
+            // than silently pretending the workspace remained observable.
+            tracing::error!(process = %id, %error, "managed process workspace reconcile failed");
+        }
+    } else if let Some(tracker) = workspace_tracker.as_mut()
         && let Err(error) = tracker.commit(artifacts_root, session_id)
     {
-        // The process is already terminal; preserve its real lifecycle state
-        // and record the journal failure as a high-severity diagnostic rather
-        // than silently pretending the workspace remained observable.
-        tracing::error!(process = %id, %error, "managed process workspace journal failed");
+        tracing::error!(process = %id, %error, "managed process legacy workspace journal failed");
     }
     // 唤醒 process wait（§20）。
     tpi_core::util::lock_mutex(registry, "process_registry")

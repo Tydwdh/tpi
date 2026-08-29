@@ -144,11 +144,7 @@ impl WorkspaceSession {
     /// P2.3：唯一 delta→journal 转换点已下沉到
     /// [`WorkspaceManager::reconcile_unknown_effect`]（watcher Healthy→增量
     /// `reconcile_paths`，Uncertain/无 watcher→全量 `reconcile`）。此处仅委托。
-    pub fn reconcile_after_execution(
-        &self,
-        cause: MutationCause,
-        _workspace_root: &std::path::Path,
-    ) -> Result<Reversibility, String> {
+    pub fn reconcile_after_execution(&self, cause: MutationCause) -> Result<Reversibility, String> {
         let mut mgr = self.shared.lock().map_err(|e| e.to_string())?;
         mgr.reconcile_unknown_effect(self.cause(cause))
             .map_err(|e| e.to_string())

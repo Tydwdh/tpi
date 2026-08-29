@@ -56,17 +56,63 @@ fn push_system_line(
 /// 输入回答或选项编号。`options` 仅在单问题带选项时非空（数字映射用；
 /// 多问题按行回答，不做有歧义的编号映射）。
 ///
-/// `dismissed` 与 `answer` 互斥：Esc 拒绝后不应再注入答案（调用方
-/// 在设置 dismissed=true 时应清空 answer，见 `src/app/mod.rs` 的 Esc 分支）。
 struct PendingInput {
     /// 单问题时的选项列表（数字编号 → 选项文本映射；多问题/无选项为空）。
     options: Vec<String>,
     /// `request_input` 模态已提交的答案（Some = 自动 resume，不等待输入框）。
-    /// 与 `dismissed` 互斥：dismissed=true 时必须为 None。
     answer: Option<String>,
-    /// 模态被 Esc 拒绝（dismissed 语义）：resume 时给出拒绝反馈。
-    /// 与 `answer` 互斥：dismissed=true 时 answer 必须为 None。
+    /// 模态被 Esc 拒绝（dismissed 语义）。此时 `answer` 保存给模型的
+    /// 明确拒绝反馈，因此两者会同时有值。
     dismissed: bool,
+}
+
+/// 只消费已经由模态提交/拒绝的输入。挂起请求刚建立时 `answer=None`，
+/// 必须一直保留到用户动作到达；无条件 `take()` 会在同一轮末尾把它丢掉。
+fn take_ready_pending_input(pending: &mut Option<PendingInput>) -> Option<PendingInput> {
+    if pending.as_ref().is_some_and(|input| input.answer.is_some()) {
+        pending.take()
+    } else {
+        None
+    }
+}
+
+/// 从 durable 事件重建尚未回答的输入请求。不能只检查最后一条事件：
+/// request_input 之后仍可能写入 goal/subagent 等正交事实。
+fn unresolved_input_prompt(events: &[SessionEvent]) -> Option<String> {
+    let mut pending = None;
+    for event in events {
+        match event {
+            SessionEvent::UserInputRequested { prompt } => pending = Some(prompt.clone()),
+            SessionEvent::UserInputReceived { .. } => pending = None,
+            SessionEvent::RunCompleted { reason, .. }
+                if *reason != crate::session::CompletionReason::AwaitingUserInput =>
+            {
+                pending = None;
+            }
+            _ => {}
+        }
+    }
+    pending
+}
+
+fn next_goal_round(goal: &tpi_core::goal::Goal) -> tpi_core::goal::Goal {
+    let mut next = goal.clone();
+    next.rounds += 1;
+    // GoalSet 是完整状态修订；轮数变化也必须推进 CAS revision。
+    next.revision += 1;
+    next
+}
+
+fn persist_goal_round(
+    conversation: &mut Conversation,
+    goal: tpi_core::goal::Goal,
+) -> Result<(), String> {
+    let log = conversation
+        .log_mut()
+        .ok_or_else(|| "goal 自动续跑缺少活动 session".to_string())?;
+    log.commit(&SessionEvent::GoalSet { goal })
+        .map_err(|error| format!("持久化 goal 自动续跑轮次失败: {error}"))?;
+    conversation.refresh_from_log()
 }
 
 /// §13（内联）：挂起时用户提交的回答——单问题带选项时，纯数字（1..=N）
@@ -1361,47 +1407,38 @@ where
                             ui_state.view.load_history(conversation.history());
                             ui_state.view.plan = conversation.plan().cloned();
                             last_failed = None;
-                            // §13：跨会话的 request_input 挂起不可恢复（旧 session 的
-                            // 问题不属于新会话上下文）；恢复的会话若尾部有未回答的
-                            // UserInputRequested，提示用户直接输入即可继续。
+                            // 从恢复会话自己的 durable 事件重建 request_input 状态。
+                            // 结构化选项未写入日志，因此恢复为可自由输入的问题；回答
+                            // 仍走 UserInputReceived + resume，而不是误作新话题。
                             pending_question = None;
                             ui_state.view.question = None;
-                            let resumed_pending_input = conversation
-                                .log()
-                                .and_then(|log| {
-                                    crate::session::read_events(log.path())
-                                        .ok()
-                                        .and_then(|events| {
-                                            let ended_awaiting = events.last().is_some_and(
-                                                |last| {
-                                                    matches!(
-                                                        last,
-                                                        SessionEvent::RunCompleted {
-                                                            reason:
-                                                                crate::session::CompletionReason::AwaitingUserInput,
-                                                            ..
-                                                        }
-                                                    )
-                                                },
-                                            );
-                                            if !ended_awaiting {
-                                                return None;
-                                            }
-                                            events.iter().rev().find_map(|event| match event {
-                                                SessionEvent::UserInputRequested { prompt } => {
-                                                    Some(prompt.clone())
-                                                }
-                                                _ => None,
-                                            })
-                                        })
-                                });
+                            let resumed_pending_input = conversation.log().and_then(|log| {
+                                crate::session::read_events(log.path())
+                                    .ok()
+                                    .and_then(|events| unresolved_input_prompt(&events))
+                            });
                             let label =
                                 session_resume_label(conversation.log(), &config.artifacts_root);
                             ui_state.view.push_line(LineKind::System, label);
-                            if let Some(_prompt) = resumed_pending_input {
+                            if let Some(prompt) = resumed_pending_input {
+                                pending_question = Some(PendingInput {
+                                    options: Vec::new(),
+                                    answer: None,
+                                    dismissed: false,
+                                });
+                                ui_state.view.question =
+                                    Some(crate::tui::model::QuestionModalState::new(vec![
+                                        crate::tui::model::QuestionView {
+                                            question: prompt,
+                                            header: Some("恢复的输入请求".to_string()),
+                                            options: Vec::new(),
+                                            multiple: false,
+                                            custom: true,
+                                        },
+                                    ]));
                                 ui_state.view.push_line(
                                     LineKind::System,
-                                    "该会话曾因 request_input 挂起：直接输入回答即可继续（或忽略它开启新话题）"
+                                    "已恢复挂起的 request_input：在问题框回答，Esc 可明确拒绝"
                                         .to_string(),
                                 );
                             }
@@ -1588,13 +1625,9 @@ where
                 && goal.phase == tpi_core::goal::GoalPhase::Active
                 && goal.rounds < goal.max_rounds
             {
-                let next_round = goal.rounds + 1;
-                let mut next = goal.clone();
-                next.rounds = next_round;
-                if let Some(log) = conversation.log_mut() {
-                    let _ = log.commit(&SessionEvent::GoalSet { goal: next.clone() });
-                }
-                let _ = conversation.refresh_from_log();
+                let next = next_goal_round(&goal);
+                let next_round = next.rounds;
+                persist_goal_round(conversation, next)?;
                 ui_state.request_goal_continue(next_round);
             }
             ui_state.view.push_line(LineKind::System, "─".repeat(40));
@@ -1713,14 +1746,11 @@ where
                 && ui_state.pending_messages.is_empty();
             if should_auto_continue {
                 let goal = conversation.goal().unwrap();
-                let round = goal.rounds + 1;
-                let mut next = goal.clone();
-                next.rounds = round;
-                // 先 durable increment rounds（防崩溃重放重复 round）
-                if let Some(log) = conversation.log_mut() {
-                    let _ = log.commit(&SessionEvent::GoalSet { goal: next.clone() });
-                }
-                let _ = conversation.refresh_from_log();
+                let next = next_goal_round(&goal);
+                let round = next.rounds;
+                // 先 durable increment rounds/revision（防崩溃重放重复 round）。
+                // 写盘失败时不得继续调度，否则内存进度会领先事实源。
+                persist_goal_round(conversation, next)?;
                 ui_state.view.goal = conversation
                     .goal()
                     .map(|g| format!("{} [{}]", g.objective, g.phase));
@@ -1778,7 +1808,7 @@ where
         // resume。独立于 pending 消息分支：模态提交时通常没有排队消息，
         // 原实现把检查放在 `pop_pending()` 分支内，导致答案滞留到下一次任意
         // 消息提交才被消费（且会被 slash 分支 continue 跳过、与普通消息互吞）。
-        if let Some(pending) = pending_question.take()
+        if let Some(pending) = take_ready_pending_input(&mut pending_question)
             && let Some(answer) = pending.answer
         {
             // 模态提交即关闭模态（无论后续 run 成败，模态不再留在屏幕上）。
@@ -3706,6 +3736,82 @@ mod tests {
             dismissed: false,
         };
         assert_eq!(map_pending_answer(&free, "1"), "1", "无选项时数字原样");
+    }
+
+    #[test]
+    fn unanswered_pending_input_is_preserved_until_modal_submission() {
+        let mut pending = Some(PendingInput {
+            options: vec!["yes".into()],
+            answer: None,
+            dismissed: false,
+        });
+
+        assert!(take_ready_pending_input(&mut pending).is_none());
+        assert!(pending.is_some(), "尚未回答的请求不能在循环末尾被消费");
+
+        pending.as_mut().unwrap().answer = Some("yes".into());
+        let ready = take_ready_pending_input(&mut pending).expect("已提交答案应被消费");
+        assert_eq!(ready.answer.as_deref(), Some("yes"));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn unresolved_input_is_rebuilt_from_lifecycle_not_last_event() {
+        let mut events = vec![
+            SessionEvent::UserInputRequested {
+                prompt: "选择环境".into(),
+            },
+            SessionEvent::RunCompleted {
+                reason: crate::session::CompletionReason::AwaitingUserInput,
+                usage: crate::session::Usage::default(),
+            },
+            // 正交事实可以出现在 run completion 后；它不应隐藏挂起请求。
+            SessionEvent::GoalSet {
+                goal: tpi_core::goal::Goal::default(),
+            },
+        ];
+        assert_eq!(
+            unresolved_input_prompt(&events).as_deref(),
+            Some("选择环境")
+        );
+
+        events.push(SessionEvent::UserInputReceived {
+            content: "生产".into(),
+        });
+        assert!(unresolved_input_prompt(&events).is_none());
+
+        events.push(SessionEvent::UserInputRequested {
+            prompt: "确认部署".into(),
+        });
+        events.push(SessionEvent::RunCompleted {
+            reason: crate::session::CompletionReason::Stop,
+            usage: crate::session::Usage::default(),
+        });
+        assert!(
+            unresolved_input_prompt(&events).is_none(),
+            "非挂起终态不得恢复陈旧问题"
+        );
+    }
+
+    #[test]
+    fn advancing_goal_round_updates_round_and_revision() {
+        let goal = tpi_core::goal::Goal {
+            rounds: 7,
+            revision: 11,
+            ..tpi_core::goal::Goal::default()
+        };
+        let next = next_goal_round(&goal);
+        assert_eq!(next.rounds, 8);
+        assert_eq!(next.revision, 12);
+        assert_eq!(goal.rounds, 7, "派生不得修改旧快照");
+    }
+
+    #[test]
+    fn goal_round_is_not_scheduled_without_a_durable_session() {
+        let mut conversation = Conversation::new();
+        let error = persist_goal_round(&mut conversation, tpi_core::goal::Goal::default())
+            .expect_err("没有 session log 时必须失败");
+        assert!(error.contains("缺少活动 session"));
     }
 
     /// §13 修复：RequestInputQuestion → `QuestionView` 投影——无选项且禁止

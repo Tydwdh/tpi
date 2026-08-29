@@ -113,9 +113,7 @@ pub async fn bash(args: BashArgs, ctx: &ToolContext) -> ToolOutcome {
                     let cause = tpi_core::workspace::transaction::MutationCause::Command {
                         command_id: uuid::Uuid::now_v7().to_string(),
                     };
-                    if let Err(error) =
-                        session.reconcile_after_execution(cause, ctx.workspace_root.as_std_path())
-                    {
+                    if let Err(error) = session.reconcile_after_execution(cause) {
                         tracing::warn!(%error, "workspace reconcile failed after bash");
                     }
                 }
@@ -477,12 +475,18 @@ async fn local_bash_background(args: BashArgs, ctx: &ToolContext) -> ToolOutcome
         let ws = tpi_core::util::lock_mutex(&ctx.workspace, "workspace");
         ws.id().to_string()
     };
-    let workspace_tracker =
+    // Production runtimes reconcile through the shared incremental workspace
+    // session. Low-level/embedded callers may not have one, so retain the
+    // legacy snapshot only as a correctness fallback instead of silently
+    // dropping their journal/undo coverage.
+    let workspace_tracker = if ctx.workspace_session.is_none() {
         match crate::workspace::tracked::TrackedWorkspace::capture(ctx.workspace_root.clone()) {
-            Ok(snapshot) => snapshot,
+            Ok(snapshot) => Some(snapshot),
             Err(error) => return rejected_bash("workspace_tracking", error),
-        };
-    // background 命令原样执行（无 capture wrapper：不捕获、不 commit §10）。
+        }
+    } else {
+        None
+    };
     let run_args = RunArgs {
         program: bash_exe,
         args: vec![
@@ -504,7 +508,8 @@ async fn local_bash_background(args: BashArgs, ctx: &ToolContext) -> ToolOutcome
         command: args.command.clone(),
         artifacts_root: ctx.artifacts_root.clone(),
         session_id: ctx.session_id.clone(),
-        workspace_tracker: Some(workspace_tracker),
+        workspace_session: ctx.workspace_session.clone(),
+        workspace_tracker,
         resources: ctx.resource_manager(),
         resource_meta: ctx.resource_meta(args.lifetime, WorkspaceAccess::ExternallyMutable),
     };
